@@ -3,19 +3,32 @@ mod googleapis {
 }
 mod emulator;
 
+use clap::Parser;
 use emulator::FirestoreEmulator;
 use googleapis::google::firestore::v1::firestore_server::FirestoreServer;
-use std::env;
+use std::net::SocketAddr;
 use tonic::transport::Server;
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+#[derive(Parser, Debug)]
+struct Args {
+    /// The host:port to which the emulator should be bound.
+    #[arg(long, env = "FIRESTORE_EMULATOR_HOST")]
+    host_port: SocketAddr,
+}
+
+#[tokio::main(flavor = "multi_thread")]
+async fn main() -> color_eyre::Result<()> {
     color_eyre::install()?;
 
-    Server::builder()
+    let args = Args::parse();
+
+    let server = Server::builder()
         .add_service(FirestoreServer::new(FirestoreEmulator::default()))
-        .serve(env::var("FIRESTORE_EMULATOR_HOST")?.parse()?)
-        .await?;
+        .serve(args.host_port);
+
+    eprintln!("Firestore Emulator started");
+
+    server.await?;
 
     Ok(())
 }

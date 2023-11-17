@@ -5,41 +5,41 @@ use std::{collections::HashMap, sync::Arc};
 use tonic::{Result, Status};
 
 #[derive(Default)]
-pub(crate) struct Collection {
+pub struct Collection {
     documents: DashMap<String, Arc<Document>>,
 }
 
 #[derive(Default)]
-pub(crate) struct Database {
+pub struct Database {
     collections: DashMap<String, Arc<Collection>>,
 }
 
 impl Database {
-    pub(crate) fn split_name(name: &str) -> Result<(&str, &str)> {
+    pub fn split_name(name: &str) -> Result<(&str, &str)> {
         name.rsplit_once('/').ok_or_else(|| {
             Status::invalid_argument("invalid document path, missing collection-name")
         })
     }
 
-    pub(crate) fn get_by_name(&self, name: &str) -> Result<Option<Arc<Document>>> {
+    pub fn get_by_name(&self, name: &str) -> Result<Option<Arc<Document>>> {
         let (collection, id) = Self::split_name(name)?;
         Ok(self.get_doc(collection, id))
     }
 
-    pub(crate) fn get_doc(&self, collection: &str, id: &str) -> Option<Arc<Document>> {
+    pub fn get_doc(&self, collection: &str, id: &str) -> Option<Arc<Document>> {
         let collection = self.collections.get(collection)?;
         let arc = collection.documents.get(id)?;
         Some(arc.clone())
     }
 
-    pub(crate) fn get_collection(&self, collection: impl Into<String>) -> Arc<Collection> {
+    pub fn get_collection(&self, collection: impl Into<String>) -> Arc<Collection> {
         self.collections
             .entry(collection.into())
             .or_default()
             .clone()
     }
 
-    pub(crate) fn add(
+    pub fn add(
         &self,
         name: String,
         fields: HashMap<String, Value>,
