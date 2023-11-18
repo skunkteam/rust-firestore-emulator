@@ -1,8 +1,9 @@
-use crate::googleapis::google::firestore::v1::{precondition::ConditionType, write::Operation, *};
+use crate::googleapis::google::firestore::v1::*;
+use async_stream::try_stream;
 use itertools::Itertools;
 use std::{pin::Pin, sync::Arc, time::SystemTime};
 use tokio_stream::{Stream, StreamExt};
-use tonic::{async_trait, Request, Response, Result};
+use tonic::{async_trait, Request, Response, Result, Status};
 
 mod database;
 
@@ -18,7 +19,9 @@ impl firestore_server::Firestore for FirestoreEmulator {
         &self,
         _request: Request<GetDocumentRequest>,
     ) -> Result<Response<Document>> {
-        unimplemented!("GetDocument is not used by the admin SDK")
+        Err(Status::unimplemented(
+            "GetDocument is not used by the admin SDK",
+        ))
     }
 
     /// Server streaming response type for the BatchGetDocuments method.
@@ -36,17 +39,20 @@ impl firestore_server::Firestore for FirestoreEmulator {
         let request = request.into_inner();
         let database = self.database.clone();
         let transaction = vec![];
-        let stream = tokio_stream::iter(request.documents).map(move |name| {
-            let doc = database.get_by_name(&name)?;
-            Ok(BatchGetDocumentsResponse {
-                result: Some(match doc {
-                    None => batch_get_documents_response::Result::Missing(name),
-                    Some(doc) => batch_get_documents_response::Result::Found(Document::clone(&doc)),
-                }),
-                read_time: Some(SystemTime::now().into()),
-                transaction: transaction.clone(),
-            })
-        });
+        let stream = try_stream! {
+            for name in request.documents {
+                let doc = database.get_by_name(&name)?;
+                use batch_get_documents_response::Result;
+                yield BatchGetDocumentsResponse {
+                    result: Some(match doc {
+                        None => Result::Missing(name),
+                        Some(doc) => Result::Found(Document::clone(&doc)),
+                    }),
+                    read_time: Some(SystemTime::now().into()),
+                    transaction: transaction.clone(),
+                };
+            }
+        };
 
         Ok(Response::new(Box::pin(stream)))
     }
@@ -58,26 +64,7 @@ impl firestore_server::Firestore for FirestoreEmulator {
         let write_results = request
             .writes
             .into_iter()
-            .map(|write| -> Result<WriteResult> {
-                let (Some(operation), Some(condition)) = (
-                    write.operation,
-                    write.current_document.and_then(|c| c.condition_type),
-                ) else {
-                    todo!("Missing operation or condition");
-                };
-
-                match (operation, condition) {
-                    (Operation::Update(doc), ConditionType::Exists(false)) => {
-                        self.database.add(doc.name, doc.fields, commit_time.clone())
-                    }
-                    (Operation::Update(_), ConditionType::Exists(true)) => {
-                        todo!("update")
-                    }
-                    (Operation::Update(_), _) => todo!("update with other precondition"),
-                    (Operation::Delete(_), _) => todo!("delete"),
-                    (Operation::Transform(_), _) => todo!("transform"),
-                }
-            })
+            .map(|write| self.database.perform_write(write, commit_time.clone()))
             .try_collect()?;
 
         Ok(Response::new(CommitResponse {
@@ -91,7 +78,9 @@ impl firestore_server::Firestore for FirestoreEmulator {
         &self,
         _request: Request<CreateDocumentRequest>,
     ) -> Result<Response<Document>> {
-        unimplemented!("CreateDocument is not used by the admin SDK")
+        Err(Status::unimplemented(
+            "CreateDocument is not used by the admin SDK",
+        ))
     }
 
     /// Lists documents.
@@ -99,7 +88,7 @@ impl firestore_server::Firestore for FirestoreEmulator {
         &self,
         _request: Request<ListDocumentsRequest>,
     ) -> Result<Response<ListDocumentsResponse>> {
-        todo!("list_documents")
+        Err(Status::unimplemented("list_documents"))
     }
 
     /// Updates or inserts a document.
@@ -107,7 +96,7 @@ impl firestore_server::Firestore for FirestoreEmulator {
         &self,
         _request: Request<UpdateDocumentRequest>,
     ) -> Result<Response<Document>> {
-        todo!("update_document")
+        Err(Status::unimplemented("update_document"))
     }
 
     /// Deletes a document.
@@ -115,7 +104,7 @@ impl firestore_server::Firestore for FirestoreEmulator {
         &self,
         _request: Request<DeleteDocumentRequest>,
     ) -> Result<Response<()>> {
-        todo!("delete_document")
+        Err(Status::unimplemented("delete_document"))
     }
 
     /// Starts a new transaction.
@@ -123,23 +112,24 @@ impl firestore_server::Firestore for FirestoreEmulator {
         &self,
         _request: Request<BeginTransactionRequest>,
     ) -> Result<Response<BeginTransactionResponse>> {
-        todo!("begin_transaction")
+        Err(Status::unimplemented("begin_transaction"))
     }
 
     /// Rolls back a transaction.
     async fn rollback(&self, _request: Request<RollbackRequest>) -> Result<Response<()>> {
-        todo!("rollback")
+        Err(Status::unimplemented("rollback"))
     }
 
     /// Server streaming response type for the RunQuery method.
-    type RunQueryStream = tonic::Streaming<RunQueryResponse>;
+    type RunQueryStream = Pin<Box<dyn Stream<Item = Result<RunQueryResponse>> + Send + 'static>>;
 
     /// Runs a query.
     async fn run_query(
         &self,
-        _request: Request<RunQueryRequest>,
+        request: Request<RunQueryRequest>,
     ) -> Result<Response<Self::RunQueryStream>> {
-        todo!("run_query")
+        let stream = self.database.run_query(request.into_inner())?;
+        Ok(Response::new(Box::pin(stream)))
     }
 
     /// Server streaming response type for the RunAggregationQuery method.
@@ -162,7 +152,7 @@ impl firestore_server::Firestore for FirestoreEmulator {
         &self,
         _request: Request<RunAggregationQueryRequest>,
     ) -> Result<Response<Self::RunAggregationQueryStream>> {
-        todo!("run_aggregation_query")
+        Err(Status::unimplemented("run_aggregation_query"))
     }
 
     /// Partitions a query by returning partition cursors that can be used to run
@@ -172,19 +162,40 @@ impl firestore_server::Firestore for FirestoreEmulator {
         &self,
         _request: Request<PartitionQueryRequest>,
     ) -> Result<Response<PartitionQueryResponse>> {
-        todo!("partition_query")
+        Err(Status::unimplemented("partition_query"))
     }
 
     /// Server streaming response type for the Write method.
-    type WriteStream = tonic::Streaming<WriteResponse>;
+    type WriteStream = Pin<Box<dyn Stream<Item = Result<WriteResponse>> + Send + 'static>>;
 
     /// Streams batches of document updates and deletes, in order. This method is
     /// only available via gRPC or WebChannel (not REST).
     async fn write(
         &self,
-        _request: Request<tonic::Streaming<WriteRequest>>,
+        request: Request<tonic::Streaming<WriteRequest>>,
     ) -> Result<Response<Self::WriteStream>> {
-        todo!("write")
+        let database = self.database.clone();
+        Ok(Response::new(Box::pin(request.into_inner().map(
+            move |wr| -> Result<WriteResponse> {
+                let WriteRequest {
+                    stream_id,
+                    writes,
+                    stream_token,
+                    ..
+                } = wr?;
+                let commit_time = Some(SystemTime::now().into());
+                let write_results = writes
+                    .into_iter()
+                    .map(|write| database.perform_write(write, commit_time.clone()))
+                    .try_collect()?;
+                Ok(WriteResponse {
+                    stream_id,
+                    stream_token,
+                    write_results,
+                    commit_time,
+                })
+            },
+        ))))
     }
 
     /// Server streaming response type for the Listen method.
@@ -196,15 +207,20 @@ impl firestore_server::Firestore for FirestoreEmulator {
         &self,
         _request: Request<tonic::Streaming<ListenRequest>>,
     ) -> Result<Response<Self::ListenStream>> {
-        todo!("listen")
+        Err(Status::unimplemented("listen"))
     }
 
     /// Lists all the collection IDs underneath a document.
     async fn list_collection_ids(
         &self,
-        _request: Request<ListCollectionIdsRequest>,
+        request: Request<ListCollectionIdsRequest>,
     ) -> Result<Response<ListCollectionIdsResponse>> {
-        todo!("list_collection_ids")
+        let request = request.into_inner();
+        let collection_ids = self.database.get_collection_ids(&request.parent);
+        Ok(Response::new(ListCollectionIdsResponse {
+            collection_ids,
+            next_page_token: "".to_string(),
+        }))
     }
 
     /// Applies a batch of write operations.
@@ -219,8 +235,32 @@ impl firestore_server::Firestore for FirestoreEmulator {
     /// [Commit][google.firestore.v1.Firestore.Commit] instead.
     async fn batch_write(
         &self,
-        _request: Request<BatchWriteRequest>,
+        request: Request<BatchWriteRequest>,
     ) -> Result<Response<BatchWriteResponse>> {
-        todo!("batch_write")
+        let request = request.into_inner();
+        let commit_time = Some(SystemTime::now().into());
+        let (write_results, status): (Vec<_>, Vec<_>) = request
+            .writes
+            .into_iter()
+            .map(move |write| {
+                use crate::googleapis::google::rpc::Status;
+                let result = self.database.perform_write(write, commit_time.clone());
+                match result {
+                    Ok(write_result) => (write_result, Default::default()),
+                    Err(status) => (
+                        Default::default(),
+                        Status {
+                            code: status.code().into(),
+                            details: vec![],
+                            message: status.message().to_string(),
+                        },
+                    ),
+                }
+            })
+            .unzip();
+        Ok(Response::new(BatchWriteResponse {
+            write_results,
+            status,
+        }))
     }
 }

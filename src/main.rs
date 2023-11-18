@@ -7,7 +7,7 @@ use clap::Parser;
 use emulator::FirestoreEmulator;
 use googleapis::google::firestore::v1::firestore_server::FirestoreServer;
 use std::net::SocketAddr;
-use tonic::transport::Server;
+use tonic::{codec::CompressionEncoding, transport::Server};
 
 #[derive(Parser, Debug)]
 struct Args {
@@ -20,13 +20,17 @@ struct Args {
 async fn main() -> color_eyre::Result<()> {
     color_eyre::install()?;
 
-    let args = Args::parse();
+    let Args { host_port } = Args::parse();
 
-    let server = Server::builder()
-        .add_service(FirestoreServer::new(FirestoreEmulator::default()))
-        .serve(args.host_port);
+    let emulator = FirestoreEmulator::default();
+    let firestore = FirestoreServer::new(emulator)
+        .accept_compressed(CompressionEncoding::Gzip)
+        .send_compressed(CompressionEncoding::Gzip)
+        .max_decoding_message_size(usize::MAX);
 
-    eprintln!("Firestore Emulator started");
+    let server = Server::builder().add_service(firestore).serve(host_port);
+
+    eprintln!("Firestore listening on {}", host_port);
 
     server.await?;
 
