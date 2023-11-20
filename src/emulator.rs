@@ -1,5 +1,4 @@
 use crate::googleapis::google::firestore::v1::*;
-use async_stream::try_stream;
 use itertools::Itertools;
 use std::{pin::Pin, sync::Arc, time::SystemTime};
 use tokio_stream::{Stream, StreamExt};
@@ -37,24 +36,22 @@ impl firestore_server::Firestore for FirestoreEmulator {
         request: Request<BatchGetDocumentsRequest>,
     ) -> Result<Response<Self::BatchGetDocumentsStream>> {
         let request = request.into_inner();
-        let database = self.database.clone();
         let transaction = vec![];
-        let stream = try_stream! {
-            for name in request.documents {
-                let doc = database.get_by_name(&name)?;
-                use batch_get_documents_response::Result;
-                yield BatchGetDocumentsResponse {
-                    result: Some(match doc {
-                        None => Result::Missing(name),
-                        Some(doc) => Result::Found(Document::clone(&doc)),
-                    }),
-                    read_time: Some(SystemTime::now().into()),
-                    transaction: transaction.clone(),
-                };
-            }
-        };
+        let database = self.database.clone();
+        let documents = request.documents.into_iter().map(move |name| {
+            let doc = database.get_by_name(&name)?;
+            use batch_get_documents_response::Result;
+            Ok(BatchGetDocumentsResponse {
+                result: Some(match doc {
+                    None => Result::Missing(name),
+                    Some(doc) => Result::Found(Document::clone(&doc)),
+                }),
+                read_time: Some(SystemTime::now().into()),
+                transaction: transaction.clone(),
+            })
+        });
 
-        Ok(Response::new(Box::pin(stream)))
+        Ok(Response::new(Box::pin(tokio_stream::iter(documents))))
     }
 
     /// Commits a transaction, while optionally updating documents.

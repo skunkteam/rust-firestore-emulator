@@ -1,11 +1,12 @@
-use crate::googleapis::google::firestore::v1::*;
-use async_stream::try_stream;
+use crate::{emulator::database::query::Query, googleapis::google::firestore::v1::*};
 use dashmap::{mapref::entry::Entry, DashMap};
 use itertools::Itertools;
 use prost_types::Timestamp;
 use std::{collections::HashMap, sync::Arc, time::SystemTime};
-use tokio_stream::Stream;
+use tokio_stream::{Stream, StreamExt};
 use tonic::{Code, Result, Status};
+
+mod query;
 
 #[derive(Default)]
 pub struct Collection {
@@ -61,30 +62,39 @@ impl Database {
         })
     }
 
+    pub fn delete(&self, name: String) -> Result<WriteResult> {
+        let (collection, id) = split_name(&name)?;
+        let collection = self.get_collection(collection);
+        collection
+            .documents
+            .remove(id)
+            .ok_or(Status::failed_precondition(format!(
+                "document not found: {name}"
+            )))?;
+        Ok(WriteResult {
+            update_time: None,
+            transform_results: vec![],
+        })
+    }
+
     pub fn perform_write(
         &self,
         write: Write,
         commit_time: Option<Timestamp>,
     ) -> Result<WriteResult> {
-        let (Some(operation), Some(condition)) = (
-            write.operation,
-            write.current_document.and_then(|c| c.condition_type),
-        ) else {
-            todo!("Missing operation or condition");
-        };
+        let operation = write
+            .operation
+            .ok_or(Status::unimplemented("missing operation in write"))?;
+        let condition = write.current_document.and_then(|cd| cd.condition_type);
 
-        use precondition::ConditionType;
-        use write::Operation;
+        use precondition::ConditionType::*;
+        use write::Operation::*;
         match (operation, condition) {
-            (Operation::Update(doc), ConditionType::Exists(false)) => {
-                self.add(doc.name, doc.fields, commit_time)
-            }
-            (Operation::Update(_), ConditionType::Exists(true)) => {
-                todo!("update")
-            }
-            (Operation::Update(_), _) => todo!("update with other precondition"),
-            (Operation::Delete(_), _) => todo!("delete"),
-            (Operation::Transform(_), _) => todo!("transform"),
+            (Update(doc), Some(Exists(false))) => self.add(doc.name, doc.fields, commit_time),
+            (Update(_), Some(Exists(true))) => todo!("update"),
+            (Update(_), _) => todo!("update with other precondition"),
+            (Delete(name), _) => self.delete(name),
+            (Transform(_), _) => todo!("transform"),
         }
     }
 
@@ -120,71 +130,45 @@ impl Database {
                 "consistency_selector is not supported yet",
             ));
         }
-        let StructuredQuery {
-            select,
-            from,
-            r#where,
-            order_by,
-            start_at,
-            end_at,
-            offset,
-            limit,
-        } = query;
-        if select.is_some() {
-            return Err(Status::unimplemented("select is not supported yet"));
-        }
-        if r#where.is_some() {
-            return Err(Status::unimplemented("where is not supported yet"));
-        }
-        if !order_by.is_empty() {
-            return Err(Status::unimplemented("order_by is not supported yet"));
-        }
-        if start_at.is_some() {
-            return Err(Status::unimplemented("start_at is not supported yet"));
-        }
-        if end_at.is_some() {
-            return Err(Status::unimplemented("end_at is not supported yet"));
-        }
-        if offset != 0 {
-            return Err(Status::unimplemented("offset is not supported yet"));
-        }
-        if limit.is_some() {
-            return Err(Status::unimplemented("limit is not supported yet"));
-        }
+        let query = Query::new(parent, query)?;
 
         let collections = self
             .collections
             .iter()
-            .filter_map(move |entry| {
-                let path = entry.key();
-                let path = path.strip_prefix(&parent)?;
-                let path = path.strip_prefix('/')?;
-                from.iter()
-                    .any(|selector| {
-                        if selector.all_descendants {
-                            path.starts_with(&selector.collection_id)
-                        } else {
-                            path == selector.collection_id
-                        }
-                    })
-                    .then(|| entry.clone())
+            .filter_map(|entry| {
+                query
+                    .includes_collection(entry.key())
+                    .then(|| entry.value().clone())
             })
             .collect_vec();
 
-        Ok(try_stream! {
-            for collection in collections {
-                for entry in collection.documents.iter() {
-                    let document = entry.value().clone();
-                    yield RunQueryResponse {
-                        transaction: vec![],
-                        document: Some(Document::clone(&document)),
-                        continuation_selector: None,
-                        read_time: Some(SystemTime::now().into()),
-                        skipped_results:0
-                    }
+        let documents: Vec<_> = collections
+            .iter()
+            .flat_map(|col| col.documents.iter())
+            .filter_map(|entry| {
+                let doc = entry.value();
+                match query.includes_document(doc) {
+                    Ok(true) => Some(Ok(doc.clone())),
+                    Ok(false) => None,
+                    Err(err) => Some(Err(err)),
                 }
-            }
-        })
+            })
+            .try_collect()?;
+
+        let limit = query.limit();
+        let stream = tokio_stream::iter(documents)
+            .map(move |doc| {
+                Ok(RunQueryResponse {
+                    transaction: vec![],
+                    document: Some(query.project(&doc)?),
+                    continuation_selector: None,
+                    read_time: Some(SystemTime::now().into()),
+                    skipped_results: 0,
+                })
+            })
+            .take(limit);
+
+        Ok(stream)
     }
 }
 

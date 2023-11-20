@@ -9,6 +9,8 @@ use googleapis::google::firestore::v1::firestore_server::FirestoreServer;
 use std::net::SocketAddr;
 use tonic::{codec::CompressionEncoding, transport::Server};
 
+const MAX_MESSAGE_SIZE: usize = 50 * 1024 * 1024;
+
 #[derive(Parser, Debug)]
 struct Args {
     /// The host:port to which the emulator should be bound.
@@ -26,7 +28,7 @@ async fn main() -> color_eyre::Result<()> {
     let firestore = FirestoreServer::new(emulator)
         .accept_compressed(CompressionEncoding::Gzip)
         .send_compressed(CompressionEncoding::Gzip)
-        .max_decoding_message_size(usize::MAX);
+        .max_decoding_message_size(MAX_MESSAGE_SIZE);
 
     let server = Server::builder().add_service(firestore).serve(host_port);
 
