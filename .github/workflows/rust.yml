@@ -17,6 +17,8 @@ jobs:
       - name: Install Protoc
         uses: arduino/setup-protoc@v2
       - uses: actions/checkout@v3
+        with:
+          submodules: "true"
       - name: Build
         run: cargo build --verbose
       - name: Run tests
