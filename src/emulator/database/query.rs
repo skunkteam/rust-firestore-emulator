@@ -6,7 +6,15 @@ use crate::googleapis::google::firestore::v1::{
 use std::borrow::Cow;
 use tonic::{Result, Status};
 
+/// The virtual field-name that represents the document-name.
 const NAME: &str = "__name__";
+
+/// Datastore allowed numeric IDs where Firestore only allows strings. Numeric
+/// IDs are exposed to Firestore as `__idNUM__`, so this is the lowest possible
+/// negative numeric value expressed in that format.
+///
+/// This constant is used to specify startAt/endAt values when querying for all
+/// descendants in a single collection.
 const REFERENCE_NAME_MIN_ID: &str = "__id-9223372036854775808__";
 
 pub struct Query {
