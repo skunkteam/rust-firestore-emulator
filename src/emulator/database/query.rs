@@ -1,3 +1,4 @@
+use super::document::StoredDocumentVersion;
 use crate::googleapis::google::firestore::v1::{
     structured_query::{filter::FilterType, *},
     value::ValueType,
@@ -25,16 +26,16 @@ pub struct Query {
 impl Query {
     pub fn new(parent: String, query: StructuredQuery) -> Result<Self> {
         if !query.order_by.is_empty() {
-            return Err(Status::unimplemented("order_by is not supported yet"));
+            unimplemented!("order_by");
         }
         if query.start_at.is_some() {
-            return Err(Status::unimplemented("start_at is not supported yet"));
+            unimplemented!("start_at");
         }
         if query.end_at.is_some() {
-            return Err(Status::unimplemented("end_at is not supported yet"));
+            unimplemented!("end_at");
         }
         if query.offset != 0 {
-            return Err(Status::unimplemented("offset is not supported yet"));
+            unimplemented!("offset");
         }
         Ok(Self { parent, query })
     }
@@ -55,7 +56,7 @@ impl Query {
         })
     }
 
-    pub fn includes_document(&self, doc: &Document) -> Result<bool> {
+    pub fn includes_document(&self, doc: &StoredDocumentVersion) -> Result<bool> {
         let Some(filter) = &self.query.r#where else {
             return Ok(true);
         };
@@ -66,25 +67,25 @@ impl Query {
         self.query.limit.unwrap_or(i32::MAX) as usize
     }
 
-    pub fn project(&self, doc: &Document) -> Result<Document> {
+    pub fn project(&self, doc: &StoredDocumentVersion) -> Result<Document> {
         let Some(ref projection) = self.query.select else {
-            return Ok(doc.clone());
+            return Ok(doc.to_document());
         };
 
         match &projection.fields[..] {
-            [] => Ok(doc.clone()),
+            [] => Ok(doc.to_document()),
             [single_ref] if single_ref.field_path == NAME => Ok(Document {
                 fields: Default::default(),
-                ..doc.clone()
+                create_time: Some(doc.create_time.clone()),
+                update_time: Some(doc.update_time.clone()),
+                name: doc.name.clone(),
             }),
-            _ => Err(Status::unimplemented(
-                "select with fields is not supported yet",
-            )),
+            _ => unimplemented!("select with fields is not supported yet"),
         }
     }
 }
 
-fn eval_filter(filter: &Filter, doc: &Document) -> Result<bool> {
+fn eval_filter(filter: &Filter, doc: &StoredDocumentVersion) -> Result<bool> {
     match &filter.filter_type {
         None => Ok(true),
         Some(FilterType::CompositeFilter(filter)) => eval_composite_filter(filter, doc),
@@ -93,7 +94,7 @@ fn eval_filter(filter: &Filter, doc: &Document) -> Result<bool> {
     }
 }
 
-fn eval_composite_filter(filter: &CompositeFilter, doc: &Document) -> Result<bool> {
+fn eval_composite_filter(filter: &CompositeFilter, doc: &StoredDocumentVersion) -> Result<bool> {
     use composite_filter::Operator::*;
     let op = filter.op();
     for filter in &filter.filters {
@@ -112,7 +113,7 @@ fn eval_composite_filter(filter: &CompositeFilter, doc: &Document) -> Result<boo
     Ok(op == And)
 }
 
-fn eval_field_filter(filter: &FieldFilter, doc: &Document) -> Result<bool> {
+fn eval_field_filter(filter: &FieldFilter, doc: &StoredDocumentVersion) -> Result<bool> {
     let field = filter
         .field
         .as_ref()
@@ -141,7 +142,10 @@ fn eval_field_filter(filter: &FieldFilter, doc: &Document) -> Result<bool> {
     }
 }
 
-fn get_field<'a>(doc: &'a Document, field: &FieldReference) -> Option<Cow<'a, ValueType>> {
+fn get_field<'a>(
+    doc: &'a StoredDocumentVersion,
+    field: &FieldReference,
+) -> Option<Cow<'a, ValueType>> {
     if field.field_path == NAME {
         return Some(Cow::Owned(ValueType::ReferenceValue(doc.name.clone())));
     }

@@ -1,8 +1,13 @@
-use crate::googleapis::google::firestore::v1::*;
-use itertools::Itertools;
+use self::database::{ConsistencySelector, Database};
+use crate::{
+    googleapis::google::firestore::v1::{transaction_options::ReadWrite, *},
+    unimplemented, unimplemented_bool, unimplemented_collection, unimplemented_option,
+};
+use prost_types::Timestamp;
 use std::{pin::Pin, sync::Arc, time::SystemTime};
-use tokio_stream::{Stream, StreamExt};
-use tonic::{async_trait, Request, Response, Result, Status};
+use tokio::sync::mpsc;
+use tokio_stream::{wrappers::ReceiverStream, Stream, StreamExt};
+use tonic::{async_trait, Code, Request, Response, Result, Status};
 
 mod database;
 
@@ -16,16 +21,25 @@ impl firestore_server::Firestore for FirestoreEmulator {
     /// Gets a single document.
     async fn get_document(
         &self,
-        _request: Request<GetDocumentRequest>,
+        request: Request<GetDocumentRequest>,
     ) -> Result<Response<Document>> {
-        Err(Status::unimplemented(
-            "GetDocument is not used by the admin SDK",
-        ))
+        let GetDocumentRequest {
+            name,
+            mask,
+            consistency_selector,
+        } = request.into_inner();
+        unimplemented_option!(mask);
+
+        let doc = self
+            .database
+            .get_doc(&name, &consistency_selector.try_into()?)
+            .await?
+            .ok_or_else(|| Status::not_found(Code::NotFound.description()))?;
+        Ok(Response::new(doc))
     }
 
     /// Server streaming response type for the BatchGetDocuments method.
-    type BatchGetDocumentsStream =
-        Pin<Box<dyn Stream<Item = Result<BatchGetDocumentsResponse>> + Send + 'static>>;
+    type BatchGetDocumentsStream = ReceiverStream<Result<BatchGetDocumentsResponse>>;
 
     /// Gets multiple documents.
     ///
@@ -35,34 +49,61 @@ impl firestore_server::Firestore for FirestoreEmulator {
         &self,
         request: Request<BatchGetDocumentsRequest>,
     ) -> Result<Response<Self::BatchGetDocumentsStream>> {
-        let request = request.into_inner();
-        let transaction = vec![];
+        let BatchGetDocumentsRequest {
+            database: _,
+            documents,
+            mask,
+            consistency_selector,
+        } = request.into_inner();
+        unimplemented_option!(mask);
+
+        // Only used for new transactions.
+        let (mut new_transaction, consistency) = match consistency_selector {
+            Some(batch_get_documents_request::ConsistencySelector::NewTransaction(
+                transaction_options,
+            )) => {
+                unimplemented_option!(transaction_options.mode);
+                let id = self.database.new_txn()?;
+                (Some(id.into()), ConsistencySelector::Transaction(id))
+            }
+            s => (None, s.try_into()?),
+        };
+
+        let (tx, rx) = mpsc::channel(16);
         let database = self.database.clone();
-        let documents = request.documents.into_iter().map(move |name| {
-            let doc = database.get_by_name(&name)?;
-            use batch_get_documents_response::Result;
-            Ok(BatchGetDocumentsResponse {
-                result: Some(match doc {
-                    None => Result::Missing(name),
-                    Some(doc) => Result::Found(Document::clone(&doc)),
-                }),
-                read_time: Some(SystemTime::now().into()),
-                transaction: transaction.clone(),
-            })
+        tokio::spawn(async move {
+            for name in documents {
+                use batch_get_documents_response::Result::*;
+                let msg = match database.get_doc(&name, &consistency).await {
+                    Ok(doc) => Ok(BatchGetDocumentsResponse {
+                        result: Some(match doc {
+                            None => Missing(name),
+                            Some(doc) => Found(Document::clone(&doc)),
+                        }),
+                        read_time: Some(SystemTime::now().into()),
+                        transaction: new_transaction.take().unwrap_or_default(),
+                    }),
+                    Err(err) => Err(err),
+                };
+                if tx.send(msg).await.is_err() {
+                    break;
+                }
+            }
         });
 
-        Ok(Response::new(Box::pin(tokio_stream::iter(documents))))
+        Ok(Response::new(ReceiverStream::new(rx)))
     }
 
     /// Commits a transaction, while optionally updating documents.
     async fn commit(&self, request: Request<CommitRequest>) -> Result<Response<CommitResponse>> {
-        let request = request.into_inner();
-        let commit_time = Some(SystemTime::now().into());
-        let write_results = request
-            .writes
-            .into_iter()
-            .map(|write| self.database.perform_write(write, commit_time.clone()))
-            .try_collect()?;
+        let CommitRequest {
+            database: _,
+            writes,
+            transaction,
+        } = request.into_inner();
+        unimplemented_collection!(transaction);
+
+        let (commit_time, write_results) = perform_writes(&self.database, writes).await?;
 
         Ok(Response::new(CommitResponse {
             write_results,
@@ -75,9 +116,7 @@ impl firestore_server::Firestore for FirestoreEmulator {
         &self,
         _request: Request<CreateDocumentRequest>,
     ) -> Result<Response<Document>> {
-        Err(Status::unimplemented(
-            "CreateDocument is not used by the admin SDK",
-        ))
+        unimplemented!("CreateDocument")
     }
 
     /// Lists documents.
@@ -85,7 +124,7 @@ impl firestore_server::Firestore for FirestoreEmulator {
         &self,
         _request: Request<ListDocumentsRequest>,
     ) -> Result<Response<ListDocumentsResponse>> {
-        Err(Status::unimplemented("list_documents"))
+        unimplemented!("list_documents")
     }
 
     /// Updates or inserts a document.
@@ -93,7 +132,7 @@ impl firestore_server::Firestore for FirestoreEmulator {
         &self,
         _request: Request<UpdateDocumentRequest>,
     ) -> Result<Response<Document>> {
-        Err(Status::unimplemented("update_document"))
+        unimplemented!("update_document")
     }
 
     /// Deletes a document.
@@ -101,20 +140,45 @@ impl firestore_server::Firestore for FirestoreEmulator {
         &self,
         _request: Request<DeleteDocumentRequest>,
     ) -> Result<Response<()>> {
-        Err(Status::unimplemented("delete_document"))
+        unimplemented!("delete_document")
     }
 
     /// Starts a new transaction.
     async fn begin_transaction(
         &self,
-        _request: Request<BeginTransactionRequest>,
+        request: Request<BeginTransactionRequest>,
     ) -> Result<Response<BeginTransactionResponse>> {
-        Err(Status::unimplemented("begin_transaction"))
+        let BeginTransactionRequest {
+            database: _,
+            options,
+        } = request.into_inner();
+        use transaction_options::Mode;
+        match options {
+            None => (),
+            Some(TransactionOptions {
+                mode: None | Some(Mode::ReadOnly(_)),
+            }) => {
+                unimplemented!("read-only transactions")
+            }
+            Some(TransactionOptions {
+                mode: Some(Mode::ReadWrite(ReadWrite { retry_transaction })),
+            }) => unimplemented_collection!(retry_transaction),
+        };
+
+        Ok(Response::new(BeginTransactionResponse {
+            transaction: self.database.new_txn()?.into(),
+        }))
     }
 
     /// Rolls back a transaction.
-    async fn rollback(&self, _request: Request<RollbackRequest>) -> Result<Response<()>> {
-        Err(Status::unimplemented("rollback"))
+    async fn rollback(&self, request: Request<RollbackRequest>) -> Result<Response<()>> {
+        let RollbackRequest {
+            database: _,
+            transaction,
+        } = request.into_inner();
+        self.database
+            .rollback(&transaction.try_into()?)
+            .map(Response::new)
     }
 
     /// Server streaming response type for the RunQuery method.
@@ -125,7 +189,29 @@ impl firestore_server::Firestore for FirestoreEmulator {
         &self,
         request: Request<RunQueryRequest>,
     ) -> Result<Response<Self::RunQueryStream>> {
-        let stream = self.database.run_query(request.into_inner())?;
+        let RunQueryRequest {
+            parent,
+            query_type,
+            consistency_selector,
+        } = request.into_inner();
+        let Some(run_query_request::QueryType::StructuredQuery(query)) = query_type else {
+            unimplemented!("query without query")
+        };
+
+        let (tx, rx) = mpsc::channel(16);
+
+        self.database
+            .run_query(parent, query, &consistency_selector.try_into()?, tx)?;
+        let stream = ReceiverStream::new(rx).map(|doc| {
+            Ok(RunQueryResponse {
+                transaction: vec![],
+                document: Some(doc?),
+                read_time: Some(SystemTime::now().into()),
+                skipped_results: 0,
+                continuation_selector: None,
+            })
+        });
+
         Ok(Response::new(Box::pin(stream)))
     }
 
@@ -149,7 +235,7 @@ impl firestore_server::Firestore for FirestoreEmulator {
         &self,
         _request: Request<RunAggregationQueryRequest>,
     ) -> Result<Response<Self::RunAggregationQueryStream>> {
-        Err(Status::unimplemented("run_aggregation_query"))
+        unimplemented!("run_aggregation_query")
     }
 
     /// Partitions a query by returning partition cursors that can be used to run
@@ -159,11 +245,11 @@ impl firestore_server::Firestore for FirestoreEmulator {
         &self,
         _request: Request<PartitionQueryRequest>,
     ) -> Result<Response<PartitionQueryResponse>> {
-        Err(Status::unimplemented("partition_query"))
+        unimplemented!("partition_query")
     }
 
     /// Server streaming response type for the Write method.
-    type WriteStream = Pin<Box<dyn Stream<Item = Result<WriteResponse>> + Send + 'static>>;
+    type WriteStream = ReceiverStream<Result<WriteResponse>>;
 
     /// Streams batches of document updates and deletes, in order. This method is
     /// only available via gRPC or WebChannel (not REST).
@@ -171,28 +257,37 @@ impl firestore_server::Firestore for FirestoreEmulator {
         &self,
         request: Request<tonic::Streaming<WriteRequest>>,
     ) -> Result<Response<Self::WriteStream>> {
+        let (tx, rx) = mpsc::channel(16);
+
         let database = self.database.clone();
-        Ok(Response::new(Box::pin(request.into_inner().map(
-            move |wr| -> Result<WriteResponse> {
+        tokio::spawn(async move {
+            let mut write_requests = request.into_inner();
+            while let Some(wr) = write_requests.message().await? {
                 let WriteRequest {
                     stream_id,
                     writes,
                     stream_token,
-                    ..
-                } = wr?;
-                let commit_time = Some(SystemTime::now().into());
-                let write_results = writes
-                    .into_iter()
-                    .map(|write| database.perform_write(write, commit_time.clone()))
-                    .try_collect()?;
-                Ok(WriteResponse {
+                    database: _,
+                    labels,
+                } = wr;
+                unimplemented_collection!(labels);
+
+                let (commit_time, write_results) = perform_writes(&database, writes).await?;
+
+                let msg = Ok(WriteResponse {
                     stream_id,
                     stream_token,
                     write_results,
                     commit_time,
-                })
-            },
-        ))))
+                });
+                if tx.send(msg).await.is_err() {
+                    break;
+                }
+            }
+            Ok(())
+        });
+
+        Ok(Response::new(ReceiverStream::new(rx)))
     }
 
     /// Server streaming response type for the Listen method.
@@ -204,7 +299,7 @@ impl firestore_server::Firestore for FirestoreEmulator {
         &self,
         _request: Request<tonic::Streaming<ListenRequest>>,
     ) -> Result<Response<Self::ListenStream>> {
-        Err(Status::unimplemented("listen"))
+        unimplemented!("listen")
     }
 
     /// Lists all the collection IDs underneath a document.
@@ -212,8 +307,17 @@ impl firestore_server::Firestore for FirestoreEmulator {
         &self,
         request: Request<ListCollectionIdsRequest>,
     ) -> Result<Response<ListCollectionIdsResponse>> {
-        let request = request.into_inner();
-        let collection_ids = self.database.get_collection_ids(&request.parent);
+        let ListCollectionIdsRequest {
+            parent,
+            page_size,
+            page_token,
+            consistency_selector,
+        } = request.into_inner();
+        let collection_ids = self.database.get_collection_ids(&parent);
+        unimplemented_bool!(collection_ids.len() as i32 > page_size);
+        unimplemented_collection!(page_token);
+        unimplemented_option!(consistency_selector);
+
         Ok(Response::new(ListCollectionIdsResponse {
             collection_ids,
             next_page_token: "".to_string(),
@@ -234,30 +338,87 @@ impl firestore_server::Firestore for FirestoreEmulator {
         &self,
         request: Request<BatchWriteRequest>,
     ) -> Result<Response<BatchWriteResponse>> {
-        let request = request.into_inner();
-        let commit_time = Some(SystemTime::now().into());
-        let (write_results, status): (Vec<_>, Vec<_>) = request
-            .writes
-            .into_iter()
-            .map(move |write| {
-                use crate::googleapis::google::rpc::Status;
-                let result = self.database.perform_write(write, commit_time.clone());
-                match result {
-                    Ok(write_result) => (write_result, Default::default()),
-                    Err(status) => (
-                        Default::default(),
-                        Status {
-                            code: status.code().into(),
-                            details: vec![],
-                            message: status.message().to_string(),
-                        },
-                    ),
+        let BatchWriteRequest {
+            database: _,
+            writes,
+            labels,
+        } = request.into_inner();
+        unimplemented_collection!(labels);
+
+        let time: Timestamp = SystemTime::now().into();
+        let mut write_results = Vec::with_capacity(writes.len());
+        let mut status = Vec::with_capacity(writes.len());
+        for write in writes {
+            let result = perform_write(&self.database, write, time.clone()).await;
+            use crate::googleapis::google::rpc::Status;
+            match result {
+                Ok(wr) => {
+                    status.push(Default::default());
+                    write_results.push(wr);
                 }
-            })
-            .unzip();
+                Err(err) => {
+                    status.push(Status {
+                        code: err.code().into(),
+                        message: err.message().to_string(),
+                        details: vec![],
+                    });
+                    write_results.push(Default::default());
+                }
+            }
+        }
         Ok(Response::new(BatchWriteResponse {
             write_results,
             status,
         }))
     }
+}
+
+async fn perform_write(
+    database: &Database,
+    write: Write,
+    commit_time: Timestamp,
+) -> Result<WriteResult> {
+    let Write {
+        update_mask,
+        update_transforms,
+        current_document,
+        operation,
+    } = write;
+    unimplemented_option!(update_mask);
+    unimplemented_collection!(update_transforms);
+    let operation = operation.ok_or(Status::unimplemented("missing operation in write"))?;
+    let condition = current_document
+        .and_then(|cd| cd.condition_type)
+        .map(Into::into);
+
+    use write::Operation::*;
+    match operation {
+        Update(doc) => {
+            database
+                .set(doc.name, doc.fields, commit_time.clone(), condition)
+                .await?;
+        }
+        Delete(name) => {
+            database
+                .delete(name, commit_time.clone(), condition)
+                .await?;
+        }
+        Transform(_) => unimplemented!("transform"),
+    }
+    Ok(WriteResult {
+        update_time: Some(commit_time),
+        transform_results: vec![],
+    })
+}
+
+async fn perform_writes(
+    database: &Database,
+    writes: Vec<Write>,
+) -> Result<(Option<Timestamp>, Vec<WriteResult>)> {
+    let time: Timestamp = SystemTime::now().into();
+    let mut write_results = Vec::with_capacity(writes.len());
+    for write in writes {
+        write_results.push(perform_write(database, write, time.clone()).await?);
+    }
+    Ok((Some(time), write_results))
 }

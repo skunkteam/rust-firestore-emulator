@@ -2,6 +2,8 @@ mod googleapis {
     tonic::include_proto!("googleapis");
 }
 mod emulator;
+#[macro_use]
+mod utils;
 
 use clap::Parser;
 use emulator::FirestoreEmulator;
