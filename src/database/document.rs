@@ -3,14 +3,15 @@ use crate::{
     utils::CmpTimestamp,
 };
 use prost_types::Timestamp;
-use std::{collections::HashMap, future::Future, sync::Arc, time::Duration};
+use std::{collections::HashMap, sync::Arc, time::Duration};
 use tokio::{
     sync::{Mutex, OwnedMutexGuard, RwLock},
     time::{error::Elapsed, timeout},
 };
 use tonic::{Code, Result, Status};
 
-const LOCK_TIMEOUT: Duration = Duration::from_secs(30);
+const WAIT_LOCK_TIMEOUT: Duration = Duration::from_secs(30);
+const TRY_LOCK_TIMEOUT: Duration = Duration::from_millis(50);
 
 pub struct DocumentMeta {
     /// The resource name of the document, for example
@@ -30,20 +31,20 @@ impl DocumentMeta {
     }
 
     pub async fn wait_lock(self: Arc<Self>) -> Result<DocumentGuard> {
-        Ok(DocumentGuard {
-            doc: self.clone(),
-            guard: lock_timeout(self.txn_lock.clone().lock_owned()).await?,
-        })
+        self.lock_with_timeout(WAIT_LOCK_TIMEOUT).await
     }
 
-    pub fn try_lock(self: Arc<Self>) -> Result<DocumentGuard> {
+    pub async fn try_lock(self: Arc<Self>) -> Result<DocumentGuard> {
+        self.lock_with_timeout(TRY_LOCK_TIMEOUT).await
+    }
+
+    async fn lock_with_timeout(self: Arc<Self>, duration: Duration) -> Result<DocumentGuard> {
+        let guard = timeout(duration, Arc::clone(&self.txn_lock).lock_owned())
+            .await
+            .map_err(|_: Elapsed| Status::aborted("timeout waiting for lock on document"))?;
         Ok(DocumentGuard {
-            doc: self.clone(),
-            guard: self
-                .txn_lock
-                .clone()
-                .try_lock_owned()
-                .map_err(|_| Status::aborted("document already locked"))?,
+            doc: self,
+            _guard: guard,
         })
     }
 
@@ -117,7 +118,7 @@ impl DocumentVersion {
     fn stored_document(&self) -> Option<Arc<StoredDocumentVersion>> {
         match self {
             DocumentVersion::Deleted(_) => None,
-            DocumentVersion::Stored(version) => Some(version.clone()),
+            DocumentVersion::Stored(version) => Some(Arc::clone(version)),
         }
     }
 }
@@ -183,7 +184,7 @@ pub struct DeletedDocumentVersion {
 
 pub struct DocumentGuard {
     doc: Arc<DocumentMeta>,
-    guard: OwnedMutexGuard<()>,
+    _guard: OwnedMutexGuard<()>,
 }
 
 impl DocumentGuard {
@@ -205,6 +206,10 @@ impl DocumentGuard {
             }
             _ => Ok(()),
         }
+    }
+
+    pub async fn current_version(&self) -> Option<Arc<StoredDocumentVersion>> {
+        self.doc.current_version().await
     }
 
     pub async fn add_version(&self, fields: HashMap<String, Value>, update_time: Timestamp) {
@@ -253,14 +258,4 @@ impl From<precondition::ConditionType> for DocumentPrecondition {
             precondition::ConditionType::UpdateTime(time) => DocumentPrecondition::UpdateTime(time),
         }
     }
-}
-
-fn timeout_err(_: Elapsed) -> Status {
-    Status::aborted("timeout waiting for lock on document")
-}
-
-async fn lock_timeout<T>(future: impl Future<Output = T>) -> Result<T> {
-    timeout(LOCK_TIMEOUT, future)
-        .await
-        .map_err(|_: Elapsed| Status::aborted("timeout waiting for lock on document"))
 }

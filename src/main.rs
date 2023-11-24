@@ -1,15 +1,17 @@
-mod googleapis {
-    tonic::include_proto!("googleapis");
-}
-mod emulator;
-#[macro_use]
-mod utils;
-
 use clap::Parser;
 use emulator::FirestoreEmulator;
 use googleapis::google::firestore::v1::firestore_server::FirestoreServer;
 use std::net::SocketAddr;
 use tonic::{codec::CompressionEncoding, transport::Server};
+
+mod googleapis {
+    tonic::include_proto!("googleapis");
+}
+
+mod database;
+mod emulator;
+#[macro_use]
+mod utils;
 
 const MAX_MESSAGE_SIZE: usize = 50 * 1024 * 1024;
 

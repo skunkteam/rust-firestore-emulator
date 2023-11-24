@@ -1,19 +1,44 @@
-use self::database::{ConsistencySelector, Database};
 use crate::{
+    database::{get_doc_name_from_write, Database, ReadConsistency},
     googleapis::google::firestore::v1::{transaction_options::ReadWrite, *},
     unimplemented, unimplemented_bool, unimplemented_collection, unimplemented_option,
 };
+use futures::future::try_join_all;
 use prost_types::Timestamp;
 use std::{pin::Pin, sync::Arc, time::SystemTime};
 use tokio::sync::mpsc;
 use tokio_stream::{wrappers::ReceiverStream, Stream, StreamExt};
 use tonic::{async_trait, Code, Request, Response, Result, Status};
 
-mod database;
-
 #[derive(Default)]
 pub struct FirestoreEmulator {
-    database: Arc<database::Database>,
+    pub database: Arc<Database>,
+}
+
+impl FirestoreEmulator {
+    async fn eval_command(&self, writes: &[Write]) -> Option<WriteResult> {
+        let [Write {
+            operation: Some(write::Operation::Update(update)),
+            ..
+        }] = writes
+        else {
+            return None;
+        };
+        let path = update.name.strip_prefix("projects/")?;
+        let (_project_id, path) = path.split_once("/databases/")?;
+        let (_database_name, path) = path.split_once("/documents/")?;
+        let command_name = path.strip_prefix("__COMMANDS__/")?;
+        match command_name {
+            "CLEAR_EMULATOR" => {
+                self.database.clear().await;
+                Some(WriteResult {
+                    update_time: Some(SystemTime::now().into()),
+                    transform_results: vec![],
+                })
+            }
+            _ => None,
+        }
+    }
 }
 
 #[async_trait]
@@ -63,14 +88,14 @@ impl firestore_server::Firestore for FirestoreEmulator {
                 transaction_options,
             )) => {
                 unimplemented_option!(transaction_options.mode);
-                let id = self.database.new_txn()?;
-                (Some(id.into()), ConsistencySelector::Transaction(id))
+                let id = self.database.new_txn().await?;
+                (Some(id.into()), ReadConsistency::Transaction(id))
             }
             s => (None, s.try_into()?),
         };
 
         let (tx, rx) = mpsc::channel(16);
-        let database = self.database.clone();
+        let database = Arc::clone(&self.database);
         tokio::spawn(async move {
             for name in documents {
                 use batch_get_documents_response::Result::*;
@@ -101,13 +126,25 @@ impl firestore_server::Firestore for FirestoreEmulator {
             writes,
             transaction,
         } = request.into_inner();
-        unimplemented_collection!(transaction);
 
-        let (commit_time, write_results) = perform_writes(&self.database, writes).await?;
+        if let Some(write_result) = self.eval_command(&writes).await {
+            return Ok(Response::new(CommitResponse {
+                write_results: vec![write_result],
+                commit_time: Some(SystemTime::now().into()),
+            }));
+        }
+
+        let (commit_time, write_results) = if transaction.is_empty() {
+            perform_writes(&self.database, writes).await?
+        } else {
+            self.database
+                .commit(writes, &transaction.try_into()?)
+                .await?
+        };
 
         Ok(Response::new(CommitResponse {
             write_results,
-            commit_time,
+            commit_time: Some(commit_time),
         }))
     }
 
@@ -166,7 +203,7 @@ impl firestore_server::Firestore for FirestoreEmulator {
         };
 
         Ok(Response::new(BeginTransactionResponse {
-            transaction: self.database.new_txn()?.into(),
+            transaction: self.database.new_txn().await?.into(),
         }))
     }
 
@@ -178,6 +215,7 @@ impl firestore_server::Firestore for FirestoreEmulator {
         } = request.into_inner();
         self.database
             .rollback(&transaction.try_into()?)
+            .await
             .map(Response::new)
     }
 
@@ -201,7 +239,8 @@ impl firestore_server::Firestore for FirestoreEmulator {
         let (tx, rx) = mpsc::channel(16);
 
         self.database
-            .run_query(parent, query, &consistency_selector.try_into()?, tx)?;
+            .run_query(parent, query, &consistency_selector.try_into()?, tx)
+            .await?;
         let stream = ReceiverStream::new(rx).map(|doc| {
             Ok(RunQueryResponse {
                 transaction: vec![],
@@ -249,45 +288,15 @@ impl firestore_server::Firestore for FirestoreEmulator {
     }
 
     /// Server streaming response type for the Write method.
-    type WriteStream = ReceiverStream<Result<WriteResponse>>;
+    type WriteStream = tonic::Streaming<WriteResponse>;
 
     /// Streams batches of document updates and deletes, in order. This method is
     /// only available via gRPC or WebChannel (not REST).
     async fn write(
         &self,
-        request: Request<tonic::Streaming<WriteRequest>>,
+        _request: Request<tonic::Streaming<WriteRequest>>,
     ) -> Result<Response<Self::WriteStream>> {
-        let (tx, rx) = mpsc::channel(16);
-
-        let database = self.database.clone();
-        tokio::spawn(async move {
-            let mut write_requests = request.into_inner();
-            while let Some(wr) = write_requests.message().await? {
-                let WriteRequest {
-                    stream_id,
-                    writes,
-                    stream_token,
-                    database: _,
-                    labels,
-                } = wr;
-                unimplemented_collection!(labels);
-
-                let (commit_time, write_results) = perform_writes(&database, writes).await?;
-
-                let msg = Ok(WriteResponse {
-                    stream_id,
-                    stream_token,
-                    write_results,
-                    commit_time,
-                });
-                if tx.send(msg).await.is_err() {
-                    break;
-                }
-            }
-            Ok(())
-        });
-
-        Ok(Response::new(ReceiverStream::new(rx)))
+        unimplemented!("write");
     }
 
     /// Server streaming response type for the Listen method.
@@ -313,7 +322,7 @@ impl firestore_server::Firestore for FirestoreEmulator {
             page_token,
             consistency_selector,
         } = request.into_inner();
-        let collection_ids = self.database.get_collection_ids(&parent);
+        let collection_ids = self.database.get_collection_ids(&parent).await;
         unimplemented_bool!(collection_ids.len() as i32 > page_size);
         unimplemented_collection!(page_token);
         unimplemented_option!(consistency_selector);
@@ -346,26 +355,30 @@ impl firestore_server::Firestore for FirestoreEmulator {
         unimplemented_collection!(labels);
 
         let time: Timestamp = SystemTime::now().into();
-        let mut write_results = Vec::with_capacity(writes.len());
-        let mut status = Vec::with_capacity(writes.len());
-        for write in writes {
-            let result = perform_write(&self.database, write, time.clone()).await;
-            use crate::googleapis::google::rpc::Status;
-            match result {
-                Ok(wr) => {
-                    status.push(Default::default());
-                    write_results.push(wr);
-                }
-                Err(err) => {
-                    status.push(Status {
+
+        let (status, write_results) = try_join_all(writes.into_iter().map(|write| async {
+            let name = get_doc_name_from_write(&write)?;
+            let guard = self.database.get_doc_meta_mut(name).await?;
+            let result = self
+                .database
+                .perform_write(write, &guard, time.clone())
+                .await;
+            use crate::googleapis::google::rpc;
+            Ok(match result {
+                Ok(wr) => (Default::default(), wr),
+                Err(err) => (
+                    rpc::Status {
                         code: err.code().into(),
                         message: err.message().to_string(),
                         details: vec![],
-                    });
-                    write_results.push(Default::default());
-                }
-            }
-        }
+                    },
+                    Default::default(),
+                ),
+            }) as Result<_, Status>
+        }))
+        .await?
+        .into_iter()
+        .unzip();
         Ok(Response::new(BatchWriteResponse {
             write_results,
             status,
@@ -373,52 +386,16 @@ impl firestore_server::Firestore for FirestoreEmulator {
     }
 }
 
-async fn perform_write(
-    database: &Database,
-    write: Write,
-    commit_time: Timestamp,
-) -> Result<WriteResult> {
-    let Write {
-        update_mask,
-        update_transforms,
-        current_document,
-        operation,
-    } = write;
-    unimplemented_option!(update_mask);
-    unimplemented_collection!(update_transforms);
-    let operation = operation.ok_or(Status::unimplemented("missing operation in write"))?;
-    let condition = current_document
-        .and_then(|cd| cd.condition_type)
-        .map(Into::into);
-
-    use write::Operation::*;
-    match operation {
-        Update(doc) => {
-            database
-                .set(doc.name, doc.fields, commit_time.clone(), condition)
-                .await?;
-        }
-        Delete(name) => {
-            database
-                .delete(name, commit_time.clone(), condition)
-                .await?;
-        }
-        Transform(_) => unimplemented!("transform"),
-    }
-    Ok(WriteResult {
-        update_time: Some(commit_time),
-        transform_results: vec![],
-    })
-}
-
 async fn perform_writes(
     database: &Database,
     writes: Vec<Write>,
-) -> Result<(Option<Timestamp>, Vec<WriteResult>)> {
+) -> Result<(Timestamp, Vec<WriteResult>)> {
     let time: Timestamp = SystemTime::now().into();
-    let mut write_results = Vec::with_capacity(writes.len());
-    for write in writes {
-        write_results.push(perform_write(database, write, time.clone()).await?);
-    }
-    Ok((Some(time), write_results))
+    let write_results = try_join_all(writes.into_iter().map(|write| async {
+        let name = get_doc_name_from_write(&write)?;
+        let guard = database.get_doc_meta_mut(name).await?;
+        database.perform_write(write, &guard, time.clone()).await
+    }))
+    .await?;
+    Ok((time, write_results))
 }
