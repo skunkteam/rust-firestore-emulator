@@ -155,7 +155,7 @@ fn eval_filter(filter: &Filter, doc: &StoredDocumentVersion) -> Result<bool> {
         None => Ok(true),
         Some(FilterType::CompositeFilter(filter)) => eval_composite_filter(filter, doc),
         Some(FilterType::FieldFilter(filter)) => eval_field_filter(filter, doc),
-        Some(FilterType::UnaryFilter(_filter)) => todo!("unary filter"),
+        Some(FilterType::UnaryFilter(_filter)) => unimplemented!("unary filter"),
     }
 }
 

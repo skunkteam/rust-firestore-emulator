@@ -2,5 +2,13 @@
   "files.readonlyInclude": {
     "googleapis/**": true,
     "target/**": true
+  },
+  "[typescript]": {
+    "editor.defaultFormatter": "esbenp.prettier-vscode",
+    "editor.formatOnSave": true,
+    "editor.codeActionsOnSave": {
+      "source.organizeImports": true,
+      "source.fixAll": true
+    }
   }
 }

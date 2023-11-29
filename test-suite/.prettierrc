@@ -1,0 +1,22 @@
+{
+    "arrowParens": "avoid",
+    "overrides": [
+        {
+            "files": "*.ts",
+            "options": {
+                "parser": "typescript"
+            }
+        },
+        {
+            "files": "*.yaml",
+            "options": {
+                "proseWrap": "always"
+            }
+        }
+    ],
+    "printWidth": 140,
+    "quoteProps": "consistent",
+    "singleQuote": true,
+    "tabWidth": 4,
+    "trailingComma": "all"
+}
