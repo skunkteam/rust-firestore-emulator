@@ -47,7 +47,8 @@ const strings = [
     { type: 'string', ordered: 'Æ' },
 ] satisfies Data[];
 const bytes: Data[] = strings.map(({ ordered }) => ({ type: 'bytes', ordered: Buffer.from(ordered, 'utf-8') }));
-const references: Data[] = strings.map(({ ordered }) => ({ type: 'ref', ordered: fs.collection.doc(ordered) }));
+const storedReferences: Data[] = strings.map(({ ordered }) => ({ type: 'ref', ordered: fs.collection.doc(ordered) }));
+const references = storedReferences.map(sanitizeData);
 const arrays: Data[] = [
     { type: 'array', ordered: [1, 2, 3] },
     { type: 'array', ordered: [1, 2, 3, 1] },
@@ -65,7 +66,7 @@ const maps: Data[] = fs.notImplementedInRust || [
 // `nothing` does not have an `ordered` field and will not be included if filtered/ordered by that field
 const nothing: Data = { type: 'none' };
 // All test data, ordered by the `ordered` field according to https://firebase.google.com/docs/firestore/manage-data/data-types
-const allTestData = [
+const storedTestData = [
     nullType,
     ...booleans,
     nanType,
@@ -73,14 +74,16 @@ const allTestData = [
     ...dates,
     ...strings,
     ...bytes,
-    ...references,
+    ...storedReferences,
     ...arrays,
     ...maps,
     nothing,
 ];
+// Since the Document References in `storedTestData` are tough on `Jest`, this is a copy of that data with the References sanitized
+const testData = storedTestData.map(sanitizeData);
 
 beforeAll(async () => {
-    await Promise.all(allTestData.map(data => fs.collection.doc().set(fs.writeData(data))));
+    await Promise.all(storedTestData.map(data => fs.collection.doc().set(fs.writeData(data))));
 });
 
 test('basic equality', async () => {
@@ -91,12 +94,12 @@ test('basic equality', async () => {
 describe('ordering', () => {
     test('basic string order', async () => {
         const result = await getData(fs.collection.orderBy('type'));
-        expect(result.map(r => r.type)).toEqual(allTestData.map(r => r.type).sort());
+        expect(result.map(r => r.type)).toEqual(testData.map(r => r.type).sort());
     });
 
     test('ordering all data', async () => {
         // Note that `nothing` is not present here! Because it has no `ordered` property.
-        const ordered = without(allTestData, nothing);
+        const ordered = without(testData, nothing);
         expect(await getData(fs.collection.orderBy('ordered'))).toEqual(ordered);
         expect(await getData(fs.collection.orderBy('ordered', 'asc'))).toEqual(ordered);
         expect(await getData(fs.collection.orderBy('ordered', 'desc'))).toEqual(reverse(ordered.slice()));
@@ -106,7 +109,7 @@ describe('ordering', () => {
     test(`multiple orderBy's`, async () => {
         expect(await getData(fs.collection.orderBy('type').orderBy('ordered', 'desc'))).toIncludeSameMembers(
             // Note that this still skips `nothing`, because of the missing `ordered` property.
-            orderBy(without(allTestData, nothing), ['type', 'ordered'], ['asc', 'desc']),
+            orderBy(without(testData, nothing), ['type', 'ordered'], ['asc', 'desc']),
         );
     });
 });
@@ -119,7 +122,7 @@ describe('inequality filter', () => {
             { operator: '<', compareTo: 'e', expected: [nanType, ...arrays, ...booleans, ...bytes, ...dates] },
             { operator: '>=', compareTo: 'number', expected: [...numbers, ...references, ...strings] },
             { operator: '>', compareTo: 'n', expected: [nothing, nullType, ...numbers, ...references, ...strings] },
-            { operator: '!=', compareTo: 'string', expected: without(allTestData, ...strings) },
+            { operator: '!=', compareTo: 'string', expected: without(testData, ...strings) },
         ] as const)("`type` $operator '$compareTo'", async ({ operator, compareTo, expected }) => {
             // Note that we filter on the `type` (string) field! Not the actual type of anything.
             expect(await getData(fs.collection.where('type', operator, compareTo))).toIncludeSameMembers(expected);
@@ -129,7 +132,7 @@ describe('inequality filter', () => {
     test('will implicitly order by the compared field', async () => {
         const result = await getData(fs.collection.where('type', '>', 'A')); // should be everything
 
-        expect(result.map(r => r.type)).toEqual(allTestData.map(r => r.type).sort());
+        expect(result.map(r => r.type)).toEqual(testData.map(r => r.type).sort());
 
         // less than or greater than should have the same implicit ordering
         const secondResult = await getData(fs.collection.where('type', '<', 'z')); // should be everything
@@ -153,14 +156,15 @@ describe('inequality filter', () => {
                 { type: 'number', data: numbers },
                 { type: 'string', data: strings },
                 { type: 'bytes', data: bytes },
-                { type: 'reference', data: references },
+                { type: 'reference', data: storedReferences },
                 { type: 'boolean', data: booleans },
                 { type: 'date', data: dates },
                 { type: 'array', data: arrays },
                 { type: 'map', data: maps },
             ] as const)('$type', async ({ data }) => {
-                expect(await getData(fs.collection.where('ordered', '>', data[0].ordered))).toEqual(data.slice(1));
-                expect(await getData(fs.collection.where('ordered', '<=', data[0].ordered))).toEqual(data.slice(0, 1));
+                const saneData = data.map(sanitizeData);
+                expect(await getData(fs.collection.where('ordered', '>', data[0].ordered))).toEqual(saneData.slice(1));
+                expect(await getData(fs.collection.where('ordered', '<=', data[0].ordered))).toEqual(saneData.slice(0, 1));
             });
         });
     }
@@ -183,14 +187,96 @@ describe('inequality filter', () => {
             test('can perform `!=`', async () => {
                 expect(await getData(fs.collection.where('ordered', '!=', data.ordered))).toIncludeSameMembers(
                     // `nullType` (and `nothing`) is always excluded in '!=' queries
-                    without(allTestData, data, nullType, nothing),
+                    without(testData, data, nullType, nothing),
                 );
             });
         }
     });
 });
 
+describe('paginating results', () => {
+    fs.notImplementedInRust ||
+        test('documents should implicitly be ordered by name', async () => {
+            const implicit = await getData(fs.collection);
+            const explicit = await getData(fs.collection.orderBy(fs.exported.FieldPath.documentId()));
+            expect(implicit).toEqual(explicit);
+        });
+
+    fs.notImplementedInRust ||
+        describe.each([
+            {
+                description: 'document ID',
+                orderedCollection: fs.collection.orderBy(fs.exported.FieldPath.documentId()),
+                getFieldValues: (snap: FirebaseFirestore.QueryDocumentSnapshot) => [snap.id],
+            },
+            {
+                description: 'type and ordered field',
+                orderedCollection: fs.collection.orderBy('type').orderBy('ordered', 'desc'),
+                getFieldValues: (snap: FirebaseFirestore.QueryDocumentSnapshot) => {
+                    const { type, ordered } = fs.readData<Data>(snap.data());
+                    return [type, ordered];
+                },
+            },
+        ])('ordered by $description', ({ orderedCollection, getFieldValues }) => {
+            let snapshots: FirebaseFirestore.QueryDocumentSnapshot[];
+            let docs: Data[];
+
+            beforeAll(async () => {
+                const snap = await orderedCollection.get();
+                snapshots = snap.docs;
+                docs = snapshots.map(snap => sanitizeData(fs.readData<Data>(snap.data())));
+            });
+
+            test('limit', async () => {
+                const firstTen = await getData(orderedCollection.limit(1));
+                expect(firstTen).toEqual(docs.slice(0, 1));
+            });
+
+            describe.each([
+                { using: 'snapshot', getCursor: (idx: number) => [snapshots[idx]] },
+                { using: 'fieldValues', getCursor: (idx: number) => getFieldValues(snapshots[idx]) },
+            ])('cursor using $using', ({ getCursor }) => {
+                const cursorIdx = 15;
+                test.each([
+                    { command: 'startAt', from: cursorIdx, to: undefined },
+                    { command: 'startAfter', from: cursorIdx + 1, to: undefined },
+                    { command: 'endAt', from: 0, to: cursorIdx + 1 },
+                    { command: 'endBefore', from: 0, to: cursorIdx },
+                ] as const)('$command', async ({ command, from, to }) => {
+                    const results = await getData(orderedCollection[command](...getCursor(cursorIdx)));
+                    expect(results).toEqual(docs.slice(from, to));
+                });
+
+                test('combining startAfter/endBefore', async () => {
+                    const endBeforeIdx = 20;
+                    const result = await getData(
+                        orderedCollection.startAfter(...getCursor(cursorIdx)).endBefore(...getCursor(endBeforeIdx)),
+                    );
+                    expect(result).toEqual(docs.slice(cursorIdx + 1, endBeforeIdx));
+                });
+
+                test('combining startAt/endBefore', async () => {
+                    const endBeforeIdx = 20;
+                    const result = await getData(orderedCollection.startAt(...getCursor(cursorIdx)).endBefore(...getCursor(endBeforeIdx)));
+                    expect(result).toEqual(docs.slice(cursorIdx, endBeforeIdx));
+                });
+                test('combining startAfter/endAt', async () => {
+                    const endAtIdx = 20;
+                    const result = await getData(orderedCollection.startAfter(...getCursor(cursorIdx)).endAt(...getCursor(endAtIdx)));
+                    expect(result).toEqual(docs.slice(cursorIdx + 1, endAtIdx + 1));
+                });
+            });
+        });
+});
+
 async function getData(query: FirebaseFirestore.Query) {
     const snap = await query.get();
-    return snap.docs.map(snap => fs.readData<Data>(snap.data()));
+    return snap.docs.map(snap => sanitizeData(fs.readData<Data>(snap.data())));
+}
+function sanitizeData(data: Data): Data {
+    // Document References cannot be printed correctly by `Jest`
+    if (data.ordered instanceof fs.exported.DocumentReference) {
+        return { ...data, ordered: { fsRef: data.ordered.path } };
+    }
+    return data;
 }

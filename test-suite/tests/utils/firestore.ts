@@ -6,7 +6,7 @@ app.initializeApp({
     projectId: 'firestore-test-406503',
 });
 
-const firestore = app.firestore();
+export const firestore = app.firestore();
 export const exported = app.firestore;
 
 export const connection = process.env.FIRESTORE_EMULATOR_HOST

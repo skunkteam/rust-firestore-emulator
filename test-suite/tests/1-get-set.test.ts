@@ -78,6 +78,16 @@ describe('creating', () => {
     });
 });
 
+test('getAll', async () => {
+    const firstData = { some: 'data' };
+    const secondData = { some: 'other data' };
+    const secRef = fs.collection.doc();
+    await Promise.all([docRef.set(fs.writeData(firstData)), secRef.set(fs.writeData(secondData))]);
+    const [first, second] = await fs.firestore.getAll(docRef, secRef);
+    expect(fs.readData(first.data())).toEqual(firstData);
+    expect(fs.readData(second.data())).toEqual(secondData);
+});
+
 describe('updating', () => {
     const data = fs.writeData();
 
