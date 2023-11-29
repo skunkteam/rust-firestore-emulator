@@ -1,23 +1,20 @@
+use self::filter::Filter;
 use super::{document::StoredDocumentVersion, field_path::FieldReference};
 use crate::{
-    googleapis::google::firestore::v1::{
-        structured_query::{
-            composite_filter, field_filter, filter::FilterType, CollectionSelector,
-            CompositeFilter, FieldFilter, Filter,
-        },
-        *,
-    },
+    googleapis::google::firestore::v1::{structured_query::CollectionSelector, *},
     unimplemented, unimplemented_option,
 };
 use itertools::Itertools;
 use std::{cmp, ops::Deref, sync::Arc};
 use tonic::{Result, Status};
 
+mod filter;
+
 pub struct Query {
     parent: String,
     select: Option<Vec<FieldReference>>,
     from: Vec<CollectionSelector>,
-    filter: Option<Filter>, // TODO: create own Filter type with precompiled field references
+    filter: Option<Filter>,
     order_by: Vec<Order>,
     limit: Option<usize>,
 }
@@ -39,20 +36,36 @@ impl Query {
         if offset != 0 {
             unimplemented!("offset")
         }
+        let select = select
+            .map(|projection| {
+                projection
+                    .fields
+                    .iter()
+                    .map(TryInto::try_into)
+                    .try_collect()
+            })
+            .transpose()?;
+        let filter: Option<Filter> = filter.map(TryInto::try_into).transpose()?;
+        let mut order_by: Vec<Order> = order_by.into_iter().map(TryInto::try_into).try_collect()?;
+        if order_by.is_empty() {
+            if let Some(filter) = &filter {
+                order_by.extend(
+                    filter
+                        .get_inequality_fields()
+                        .into_iter()
+                        .map(|field| Order {
+                            field: field.clone(),
+                            direction: Direction::Ascending,
+                        }),
+                );
+            }
+        }
         Ok(Self {
             parent,
-            select: select
-                .map(|projection| {
-                    projection
-                        .fields
-                        .iter()
-                        .map(TryInto::try_into)
-                        .try_collect()
-                })
-                .transpose()?,
+            select,
             from,
             filter,
-            order_by: order_by.into_iter().map(TryInto::try_into).try_collect()?,
+            order_by,
             limit: limit.map(|v| v as usize),
         })
     }
@@ -75,7 +88,7 @@ impl Query {
 
     pub fn includes_document(&self, doc: &StoredDocumentVersion) -> Result<bool> {
         if let Some(filter) = &self.filter {
-            if !eval_filter(filter, doc)? {
+            if !filter.eval(doc)? {
                 return Ok(false);
             }
         }
@@ -147,62 +160,6 @@ impl Query {
             }
             Equal
         }
-    }
-}
-
-fn eval_filter(filter: &Filter, doc: &StoredDocumentVersion) -> Result<bool> {
-    match &filter.filter_type {
-        None => Ok(true),
-        Some(FilterType::CompositeFilter(filter)) => eval_composite_filter(filter, doc),
-        Some(FilterType::FieldFilter(filter)) => eval_field_filter(filter, doc),
-        Some(FilterType::UnaryFilter(_filter)) => unimplemented!("unary filter"),
-    }
-}
-
-fn eval_composite_filter(filter: &CompositeFilter, doc: &StoredDocumentVersion) -> Result<bool> {
-    use composite_filter::Operator::*;
-    let op = filter.op();
-    for filter in &filter.filters {
-        match (op, eval_filter(filter, doc)?) {
-            (And, true) | (Or, false) => continue,
-            (And, false) => return Ok(false),
-            (Or, true) => return Ok(true),
-            (Unspecified, _) => {
-                return Err(Status::unimplemented(format!(
-                    "composite_filter operation {} not implemented",
-                    op.as_str_name()
-                )))
-            }
-        }
-    }
-    Ok(op == And)
-}
-
-fn eval_field_filter(filter: &FieldFilter, doc: &StoredDocumentVersion) -> Result<bool> {
-    let field: FieldReference = filter
-        .field
-        .as_ref()
-        .ok_or(Status::invalid_argument("FieldFilter without `field`"))?
-        .try_into()?;
-    let filter_value = filter
-        .value
-        .as_ref()
-        .ok_or(Status::invalid_argument("FieldFilter without `value`"))?;
-    let Some(value) = field.get_value(doc) else {
-        return Ok(false);
-    };
-    let value = value.as_ref();
-    use field_filter::Operator::*;
-    match filter.op() {
-        Equal => Ok(value == filter_value),
-        LessThan => Ok(value < filter_value),
-        LessThanOrEqual => Ok(value <= filter_value),
-        GreaterThan => Ok(value > filter_value),
-        GreaterThanOrEqual => Ok(value >= filter_value),
-        op => Err(Status::unimplemented(format!(
-            "field_filter operation {} not implemented",
-            op.as_str_name()
-        ))),
     }
 }
 

@@ -313,7 +313,7 @@ async fn apply_updates(
         .map(|v| v.fields.clone())
         .unwrap_or_default();
     for field_path in mask.field_paths {
-        let field_path: FieldPath = (&field_path).deref().try_into()?;
+        let field_path: FieldPath = field_path.deref().try_into()?;
         match field_path.get_value(updated_values) {
             Some(new_value) => field_path.set_value(&mut fields, new_value.clone()),
             None => {
@@ -330,7 +330,7 @@ fn apply_transform(
     transform: TransformType,
     commit_time: &Timestamp,
 ) -> Result<Value> {
-    let field_path: FieldPath = (&path).deref().try_into()?;
+    let field_path: FieldPath = path.deref().try_into()?;
     let result = match transform {
         TransformType::SetToServerValue(code) => {
             match ServerValue::try_from(code)

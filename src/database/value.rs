@@ -1,11 +1,13 @@
 use crate::{
     googleapis::google::{
-        firestore::v1::{value::ValueType, MapValue, Value},
+        firestore::v1::{value::ValueType, ArrayValue, MapValue},
         r#type::LatLng,
     },
     utils::CmpTimestamp,
 };
 use std::{borrow::Cow, cmp, collections::HashMap};
+
+pub use crate::googleapis::google::firestore::v1::Value;
 
 impl Value {
     pub fn reference(reference: String) -> Self {
@@ -32,6 +34,21 @@ impl Value {
             ValueType::MapValue(MapValue { fields }) => Some(fields),
             _ => None,
         }
+    }
+
+    pub fn as_array(&self) -> Option<&[Self]> {
+        match self.value_type() {
+            ValueType::ArrayValue(ArrayValue { values }) => Some(values),
+            _ => None,
+        }
+    }
+
+    pub fn is_nan(&self) -> bool {
+        matches!(self.value_type(), ValueType::DoubleValue(v) if v.is_nan())
+    }
+
+    pub fn is_null(&self) -> bool {
+        matches!(self.value_type(), ValueType::NullValue(_))
     }
 
     pub fn value_type(&self) -> &ValueType {

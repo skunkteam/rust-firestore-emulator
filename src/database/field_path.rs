@@ -9,6 +9,7 @@ use tonic::{Result, Status};
 /// The virtual field-name that represents the document-name.
 pub const DOC_NAME: &str = "__name__";
 
+#[derive(Clone)]
 pub enum FieldReference {
     DocumentName,
     FieldPath(FieldPath),
@@ -42,6 +43,7 @@ impl TryFrom<&str> for FieldReference {
     }
 }
 
+#[derive(Clone)]
 pub struct FieldPath(Vec<String>);
 
 /// Field paths may be used to refer to structured fields of Documents.

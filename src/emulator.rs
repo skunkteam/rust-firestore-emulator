@@ -301,7 +301,7 @@ impl firestore_server::Firestore for FirestoreEmulator {
     type RunQueryStream = Pin<Box<dyn Stream<Item = Result<RunQueryResponse>> + Send + 'static>>;
 
     /// Runs a query.
-    #[instrument(skip_all, err)]
+    #[instrument(skip_all, fields(query = ?request.get_ref().query_type), err)]
     async fn run_query(
         &self,
         request: Request<RunQueryRequest>,
