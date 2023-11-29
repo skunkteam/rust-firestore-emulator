@@ -119,25 +119,24 @@ describe('inequality filter', () => {
             { operator: '<', compareTo: 'e', expected: [nanType, ...arrays, ...booleans, ...bytes, ...dates] },
             { operator: '>=', compareTo: 'number', expected: [...numbers, ...references, ...strings] },
             { operator: '>', compareTo: 'n', expected: [nothing, nullType, ...numbers, ...references, ...strings] },
-            ...(fs.notImplementedInRust ||
-                ([{ operator: '!=', compareTo: 'string', expected: without(allTestData, ...strings) }] as const)),
+            { operator: '!=', compareTo: 'string', expected: without(allTestData, ...strings) },
         ] as const)("`type` $operator '$compareTo'", async ({ operator, compareTo, expected }) => {
             // Note that we filter on the `type` (string) field! Not the actual type of anything.
             expect(await getData(fs.collection.where('type', operator, compareTo))).toIncludeSameMembers(expected);
         });
     });
 
+    test('will implicitly order by the compared field', async () => {
+        const result = await getData(fs.collection.where('type', '>', 'A')); // should be everything
+
+        expect(result.map(r => r.type)).toEqual(allTestData.map(r => r.type).sort());
+
+        // less than or greater than should have the same implicit ordering
+        const secondResult = await getData(fs.collection.where('type', '<', 'z')); // should be everything
+        expect(secondResult).toEqual(result);
+    });
+
     if (!fs.notImplementedInRust) {
-        test('will implicitly order by the compared field', async () => {
-            const result = await getData(fs.collection.where('type', '>', 'A')); // should be everything
-
-            expect(result.map(r => r.type)).toEqual(allTestData.map(r => r.type).sort());
-
-            // less than or greater than should have the same implicit ordering
-            const secondResult = await getData(fs.collection.where('type', '<', 'z')); // should be everything
-            expect(secondResult).toEqual(result);
-        });
-
         test('cannot order by a different field than the queried inequality', async () => {
             await expect(fs.collection.where('type', '>', 'z').orderBy('ordered').get()).rejects.toThrow('3 INVALID_ARGUMENT');
 
@@ -176,11 +175,10 @@ describe('inequality filter', () => {
             );
         });
 
-        if (!fs.notImplementedInRust) {
-            test('can perform `==`', async () => {
-                expect(await getData(fs.collection.where('ordered', '==', data.ordered))).toEqual([data]);
-            });
-        }
+        test('can perform `==`', async () => {
+            expect(await getData(fs.collection.where('ordered', '==', data.ordered))).toEqual([data]);
+        });
+
         if (!fs.notImplementedInRust) {
             test('can perform `!=`', async () => {
                 expect(await getData(fs.collection.where('ordered', '!=', data.ordered))).toIncludeSameMembers(
