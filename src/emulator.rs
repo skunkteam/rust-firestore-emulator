@@ -1,6 +1,10 @@
 use crate::{
     database::{get_doc_name_from_write, Database, ReadConsistency},
-    googleapis::google::firestore::v1::{transaction_options::ReadWrite, *},
+    googleapis::google::firestore::v1::{
+        structured_query::{CollectionSelector, FieldReference},
+        transaction_options::ReadWrite,
+        *,
+    },
     unimplemented, unimplemented_bool, unimplemented_collection, unimplemented_option,
 };
 use futures::future::try_join_all;
@@ -9,41 +13,58 @@ use std::{pin::Pin, sync::Arc, time::SystemTime};
 use tokio::sync::mpsc;
 use tokio_stream::{wrappers::ReceiverStream, Stream, StreamExt};
 use tonic::{async_trait, Code, Request, Response, Result, Status};
+use tracing::{info, instrument};
 
 #[derive(Default)]
 pub struct FirestoreEmulator {
     pub database: Arc<Database>,
 }
 
+impl std::fmt::Debug for FirestoreEmulator {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FirestoreEmulator").finish_non_exhaustive()
+    }
+}
+
 impl FirestoreEmulator {
-    async fn eval_command(&self, writes: &[Write]) -> Option<WriteResult> {
+    async fn eval_command(&self, writes: &[Write]) -> Result<Option<WriteResult>> {
         let [Write {
             operation: Some(write::Operation::Update(update)),
             ..
         }] = writes
         else {
-            return None;
+            return Ok(None);
         };
-        let path = update.name.strip_prefix("projects/")?;
-        let (_project_id, path) = path.split_once("/databases/")?;
-        let (_database_name, path) = path.split_once("/documents/")?;
-        let command_name = path.strip_prefix("__COMMANDS__/")?;
+        let Some(command_name) = command_name(&update.name) else {
+            return Ok(None);
+        };
+        info!(command_name, "received command");
         match command_name {
             "CLEAR_EMULATOR" => {
                 self.database.clear().await;
-                Some(WriteResult {
+                Ok(Some(WriteResult {
                     update_time: Some(SystemTime::now().into()),
                     transform_results: vec![],
-                })
+                }))
             }
-            _ => None,
+            _ => Err(Status::invalid_argument(format!(
+                "Unknown COMMAND: {command_name}"
+            ))),
         }
     }
+}
+
+fn command_name(doc_name: &str) -> Option<&str> {
+    let path = doc_name.strip_prefix("projects/")?;
+    let (_project_id, path) = path.split_once("/databases/")?;
+    let (_database_name, path) = path.split_once("/documents/")?;
+    path.strip_prefix("__COMMANDS__/")
 }
 
 #[async_trait]
 impl firestore_server::Firestore for FirestoreEmulator {
     /// Gets a single document.
+    #[instrument(skip_all, err)]
     async fn get_document(
         &self,
         request: Request<GetDocumentRequest>,
@@ -70,6 +91,7 @@ impl firestore_server::Firestore for FirestoreEmulator {
     ///
     /// Documents returned by this method are not guaranteed to be returned in the
     /// same order that they were requested.
+    #[instrument(skip_all, fields(count = request.get_ref().documents.len()), err)]
     async fn batch_get_documents(
         &self,
         request: Request<BatchGetDocumentsRequest>,
@@ -120,6 +142,7 @@ impl firestore_server::Firestore for FirestoreEmulator {
     }
 
     /// Commits a transaction, while optionally updating documents.
+    #[instrument(skip_all, fields(count = request.get_ref().writes.len()), err)]
     async fn commit(&self, request: Request<CommitRequest>) -> Result<Response<CommitResponse>> {
         let CommitRequest {
             database: _,
@@ -127,7 +150,7 @@ impl firestore_server::Firestore for FirestoreEmulator {
             transaction,
         } = request.into_inner();
 
-        if let Some(write_result) = self.eval_command(&writes).await {
+        if let Some(write_result) = self.eval_command(&writes).await? {
             return Ok(Response::new(CommitResponse {
                 write_results: vec![write_result],
                 commit_time: Some(SystemTime::now().into()),
@@ -149,6 +172,7 @@ impl firestore_server::Firestore for FirestoreEmulator {
     }
 
     /// Creates a new document.
+    #[instrument(skip_all, err)]
     async fn create_document(
         &self,
         _request: Request<CreateDocumentRequest>,
@@ -157,14 +181,65 @@ impl firestore_server::Firestore for FirestoreEmulator {
     }
 
     /// Lists documents.
+    #[instrument(skip_all, fields(request = ?request.get_ref()), err)]
     async fn list_documents(
         &self,
-        _request: Request<ListDocumentsRequest>,
+        request: Request<ListDocumentsRequest>,
     ) -> Result<Response<ListDocumentsResponse>> {
-        unimplemented!("list_documents")
+        let ListDocumentsRequest {
+            parent,
+            collection_id,
+            page_size,
+            page_token,
+            order_by,
+            mask,
+            show_missing,
+            consistency_selector,
+        } = request.into_inner();
+
+        unimplemented_bool!(show_missing);
+        unimplemented_collection!(order_by);
+        unimplemented_collection!(page_token);
+        unimplemented_option!(mask);
+        if page_size > 0 {
+            unimplemented!("page_size");
+        }
+
+        let documents = self
+            .database
+            .run_query(
+                parent,
+                StructuredQuery {
+                    select: mask.map(|v| structured_query::Projection {
+                        fields: v
+                            .field_paths
+                            .into_iter()
+                            .map(|field_path| FieldReference { field_path })
+                            .collect(),
+                    }),
+                    from: vec![CollectionSelector {
+                        collection_id,
+                        all_descendants: false,
+                    }],
+                    r#where: None,
+                    order_by: vec![],
+                    start_at: None,
+                    end_at: None,
+                    offset: 0,
+                    limit: None,
+                },
+                &consistency_selector.try_into()?,
+            )
+            .await?;
+
+        Ok(Response::new(ListDocumentsResponse {
+            documents,
+            next_page_token: Default::default(),
+        }))
     }
 
     /// Updates or inserts a document.
+    #[instrument(skip_all, err)]
     async fn update_document(
         &self,
         _request: Request<UpdateDocumentRequest>,
@@ -173,6 +248,7 @@ impl firestore_server::Firestore for FirestoreEmulator {
     }
 
     /// Deletes a document.
+    #[instrument(skip_all, err)]
     async fn delete_document(
         &self,
         _request: Request<DeleteDocumentRequest>,
@@ -181,6 +257,7 @@ impl firestore_server::Firestore for FirestoreEmulator {
     }
 
     /// Starts a new transaction.
+    #[instrument(skip_all, err)]
     async fn begin_transaction(
         &self,
         request: Request<BeginTransactionRequest>,
@@ -208,6 +285,7 @@ impl firestore_server::Firestore for FirestoreEmulator {
     }
 
     /// Rolls back a transaction.
+    #[instrument(skip_all, err)]
     async fn rollback(&self, request: Request<RollbackRequest>) -> Result<Response<()>> {
         let RollbackRequest {
             database: _,
@@ -223,6 +301,7 @@ impl firestore_server::Firestore for FirestoreEmulator {
     type RunQueryStream = Pin<Box<dyn Stream<Item = Result<RunQueryResponse>> + Send + 'static>>;
 
     /// Runs a query.
+    #[instrument(skip_all, err)]
     async fn run_query(
         &self,
         request: Request<RunQueryRequest>,
@@ -236,15 +315,15 @@ impl firestore_server::Firestore for FirestoreEmulator {
             unimplemented!("query without query")
         };
 
-        let (tx, rx) = mpsc::channel(16);
-
-        self.database
-            .run_query(parent, query, &consistency_selector.try_into()?, tx)
+        let docs = self
+            .database
+            .run_query(parent, query, &consistency_selector.try_into()?)
             .await?;
-        let stream = ReceiverStream::new(rx).map(|doc| {
+
+        let stream = tokio_stream::iter(docs).map(|doc| {
             Ok(RunQueryResponse {
                 transaction: vec![],
-                document: Some(doc?),
+                document: Some(doc),
                 read_time: Some(SystemTime::now().into()),
                 skipped_results: 0,
                 continuation_selector: None,
@@ -270,6 +349,7 @@ impl firestore_server::Firestore for FirestoreEmulator {
     /// -- Return the number of documents in table given a filter.
     /// SELECT COUNT(*) FROM ( SELECT * FROM k where a = true );
     /// ```
+    #[instrument(skip_all, err)]
     async fn run_aggregation_query(
         &self,
         _request: Request<RunAggregationQueryRequest>,
@@ -280,6 +360,7 @@ impl firestore_server::Firestore for FirestoreEmulator {
     /// Partitions a query by returning partition cursors that can be used to run
     /// the query in parallel. The returned partition cursors are split points that
     /// can be used by RunQuery as starting/end points for the query results.
+    #[instrument(skip_all, err)]
     async fn partition_query(
         &self,
         _request: Request<PartitionQueryRequest>,
@@ -292,6 +373,7 @@ impl firestore_server::Firestore for FirestoreEmulator {
 
     /// Streams batches of document updates and deletes, in order. This method is
     /// only available via gRPC or WebChannel (not REST).
+    #[instrument(skip_all, err)]
     async fn write(
         &self,
         _request: Request<tonic::Streaming<WriteRequest>>,
@@ -304,6 +386,7 @@ impl firestore_server::Firestore for FirestoreEmulator {
 
     /// Listens to changes. This method is only available via gRPC or WebChannel
     /// (not REST).
+    #[instrument(skip_all, err)]
     async fn listen(
         &self,
         _request: Request<tonic::Streaming<ListenRequest>>,
@@ -312,6 +395,7 @@ impl firestore_server::Firestore for FirestoreEmulator {
     }
 
     /// Lists all the collection IDs underneath a document.
+    #[instrument(skip_all, err)]
     async fn list_collection_ids(
         &self,
         request: Request<ListCollectionIdsRequest>,
@@ -343,6 +427,7 @@ impl firestore_server::Firestore for FirestoreEmulator {
     ///
     /// If you require an atomically applied set of writes, use
     /// [Commit][google.firestore.v1.Firestore.Commit] instead.
+    #[instrument(skip_all, err)]
     async fn batch_write(
         &self,
         request: Request<BatchWriteRequest>,

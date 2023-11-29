@@ -51,10 +51,11 @@ impl<'a> PartialOrd for CmpTimestamp<'a> {
 
 impl<'a> Ord for CmpTimestamp<'a> {
     fn cmp(&self, other: &Self) -> cmp::Ordering {
-        match self.0.seconds.cmp(&other.0.seconds) {
-            result @ (cmp::Ordering::Less | cmp::Ordering::Greater) => result,
-            cmp::Ordering::Equal => self.0.nanos.cmp(&other.0.nanos),
-        }
+        // TODO: timestamp needs normalization before compare
+        self.0
+            .seconds
+            .cmp(&other.0.seconds)
+            .then_with(|| self.0.nanos.cmp(&other.0.nanos))
     }
 }
 

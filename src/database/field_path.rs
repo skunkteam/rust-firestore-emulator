@@ -1,73 +1,83 @@
-use crate::googleapis::google::firestore::v1::{value::ValueType, *};
-use std::collections::HashMap;
+use super::document::StoredDocumentVersion;
+use crate::googleapis::google::firestore::v1::*;
+use std::borrow::Cow;
 use std::mem::take;
+use std::ops::Deref;
+use std::{collections::HashMap, convert::Infallible};
 use tonic::{Result, Status};
+
+/// The virtual field-name that represents the document-name.
+pub const DOC_NAME: &str = "__name__";
+
+pub enum FieldReference {
+    DocumentName,
+    FieldPath(FieldPath),
+}
+
+impl FieldReference {
+    pub fn get_value<'a>(&self, doc: &'a StoredDocumentVersion) -> Option<Cow<'a, Value>> {
+        match self {
+            Self::DocumentName => Some(Cow::Owned(Value::reference(doc.name.to_string()))),
+            Self::FieldPath(field_path) => field_path.get_value(&doc.fields).map(Cow::Borrowed),
+        }
+    }
+}
+
+impl TryFrom<&structured_query::FieldReference> for FieldReference {
+    type Error = Status;
+
+    fn try_from(value: &structured_query::FieldReference) -> Result<Self, Self::Error> {
+        value.field_path.deref().try_into()
+    }
+}
+
+impl TryFrom<&str> for FieldReference {
+    type Error = Status;
+
+    fn try_from(path: &str) -> Result<Self, Self::Error> {
+        match path {
+            DOC_NAME => Ok(Self::DocumentName),
+            path => Ok(Self::FieldPath((path.try_into())?)),
+        }
+    }
+}
 
 pub struct FieldPath(Vec<String>);
 
+/// Field paths may be used to refer to structured fields of Documents.
+/// For `map_value`, the field path is represented by the simple
+/// or quoted field names of the containing fields, delimited by `.`. For
+/// example, the structured field
+/// `"foo" : { map_value: { "x&y" : { string_value: "hello" }}}` would be
+/// represented by the field path `foo.x&y`.
+///
+/// Within a field path, a quoted field name starts and ends with `` ` `` and
+/// may contain any character. Some characters, including `` ` ``, must be
+/// escaped using a `\`. For example, `` `x&y` `` represents `x&y` and
+/// `` `bak\`tik` `` represents `` bak`tik ``.
 impl FieldPath {
-    pub fn new(path: &str) -> Result<Self> {
-        if path.is_empty() {
-            return Err(Status::invalid_argument("invalid empty field path"));
-        }
-        // Poor man's parser for now.
-        let mut elements = vec![];
-        let mut iter = path.chars();
-        let mut next = String::new();
-        let mut inside_backticks = false;
-        while let Some(ch) = iter.next() {
-            match ch {
-                '.' if !inside_backticks => {
-                    elements.push(take(&mut next));
-                }
-                '`' if inside_backticks => {
-                    inside_backticks = false;
-                    if !matches!(iter.next(), Some('.')) {
-                        return Err(Status::invalid_argument(format!(
-                            "invalid field path: {path}"
-                        )));
-                    }
-                    elements.push(take(&mut next));
-                }
-                '`' => {
-                    inside_backticks = true;
-                }
-                '\\' if inside_backticks => next.push(iter.next().ok_or_else(|| {
-                    Status::invalid_argument(format!("invalid field path: {path}"))
-                })?),
-                ch => next.push(ch),
-            }
-        }
-        if !next.is_empty() {
-            elements.push(next);
-        }
-        Ok(Self(elements))
-    }
-
     pub fn get_value<'a>(&self, fields: &'a HashMap<String, Value>) -> Option<&'a Value> {
-        let mut current_value = None;
-        let mut current_map = Some(fields);
-        for key in &self.0 {
-            let Some(map) = current_map else {
-                return None;
-            };
-            current_value = map.get(key);
-            current_map = match current_value {
-                Some(Value {
-                    value_type: Some(ValueType::MapValue(MapValue { fields })),
-                }) => Some(fields),
-                _ => None,
-            }
-        }
-        current_value
+        let (first, rest) = self.0.split_first()?;
+        rest.iter()
+            .try_fold(fields.get(first)?, |prev, key| prev.as_map()?.get(key))
     }
 
     pub fn set_value(&self, fields: &mut HashMap<String, Value>, new_value: Value) {
-        transform_value(&self.0, fields, |_| new_value);
+        self.transform_value(fields, |_| new_value);
     }
 
-    pub fn delete_value(&self, fields: &mut HashMap<String, Value>) {
-        delete_value(&self.0, fields)
+    pub fn delete_value(&self, fields: &mut HashMap<String, Value>) -> Option<Value> {
+        match &self.0[..] {
+            [] => unreachable!(),
+            [key] => fields.remove(key),
+            [first, path @ .., last] => path
+                .iter()
+                .try_fold(fields.get_mut(first)?, |prev, key| {
+                    prev.as_map_mut()?.get_mut(key)
+                })?
+                .as_map_mut()?
+                .remove(last),
+        }
     }
 
     pub fn transform_value<'a>(
@@ -75,7 +85,8 @@ impl FieldPath {
         fields: &'a mut HashMap<String, Value>,
         transform: impl FnOnce(Option<Value>) -> Value,
     ) -> &'a Value {
-        transform_value(&self.0, fields, transform)
+        self.try_transform_value(fields, |val| Ok(transform(val)) as Result<_, Infallible>)
+            .unwrap()
     }
 
     pub fn try_transform_value<'a, E>(
@@ -83,108 +94,70 @@ impl FieldPath {
         fields: &'a mut HashMap<String, Value>,
         transform: impl FnOnce(Option<Value>) -> Result<Value, E>,
     ) -> Result<&'a Value, E> {
-        try_transform_value(&self.0, fields, transform)
+        {
+            let fields: &'a mut HashMap<String, Value> = fields;
+            let (last, path) = self.0.split_last().unwrap();
+            let fields = path.iter().fold(fields, |parent, key| {
+                parent
+                    .entry(key.to_string())
+                    .and_modify(|cur| {
+                        if cur.as_map().is_none() {
+                            *cur = Value::map(Default::default())
+                        }
+                    })
+                    .or_insert_with(|| Value::map(Default::default()))
+                    .as_map_mut()
+                    .unwrap()
+            });
+            let new_value = transform(fields.remove(last))?;
+            Ok(fields.entry(last.to_string()).or_insert(new_value))
+        }
     }
 }
 
-fn delete_value(path: &[String], fields: &mut HashMap<String, Value>) {
-    match path {
-        [] => unreachable!(),
-        [key] => {
-            fields.remove(key);
+impl TryFrom<&str> for FieldPath {
+    type Error = Status;
+
+    fn try_from(path: &str) -> Result<Self, Self::Error> {
+        if path.is_empty() {
+            return Err(Status::invalid_argument("invalid empty field path"));
         }
-        [first, path @ ..] => {
-            let step = fields.get_mut(first);
-            if let Some(Value {
-                value_type: Some(ValueType::MapValue(MapValue { fields })),
-            }) = step
-            {
-                delete_value(path, fields);
+        Ok(Self(parse_field_path(path)?))
+    }
+}
+
+fn parse_field_path(path: &str) -> Result<Vec<String>> {
+    let mut elements = vec![];
+    let mut cur_element = String::new();
+    let mut iter = path.chars();
+    let mut inside_backticks = false;
+    while let Some(ch) = iter.next() {
+        if inside_backticks {
+            match ch {
+                '`' => {
+                    inside_backticks = false;
+                    if !matches!(iter.next(), Some('.')) {
+                        return Err(Status::invalid_argument(format!(
+                            "invalid field path: {path}"
+                        )));
+                    }
+                    elements.push(take(&mut cur_element));
+                }
+                '\\' => cur_element.push(iter.next().ok_or_else(|| {
+                    Status::invalid_argument(format!("invalid field path: {path}"))
+                })?),
+                ch => cur_element.push(ch),
+            }
+        } else {
+            match ch {
+                '.' => elements.push(take(&mut cur_element)),
+                '`' => inside_backticks = true,
+                ch => cur_element.push(ch),
             }
         }
     }
-}
-
-fn transform_value<'a>(
-    path: &[String],
-    fields: &'a mut HashMap<String, Value>,
-    transform: impl FnOnce(Option<Value>) -> Value,
-) -> &'a Value {
-    match path {
-        [] => unreachable!(),
-        [key] => {
-            let old_value = fields.remove(key);
-            fields.insert(key.to_string(), transform(old_value));
-            &fields[key]
-        }
-        [first, path @ ..] => {
-            // Ugly, must be a better way....
-            let value_mut = fields
-                .entry(first.to_string())
-                .and_modify(|cur| match cur {
-                    Value {
-                        value_type: Some(ValueType::MapValue(_)),
-                    } => (),
-                    _ => {
-                        *cur = new_map();
-                    }
-                })
-                .or_insert_with(new_map);
-            let fields = if let Value {
-                value_type: Some(ValueType::MapValue(MapValue { fields })),
-            } = value_mut
-            {
-                fields
-            } else {
-                unreachable!()
-            };
-            transform_value(path, fields, transform)
-        }
+    if !cur_element.is_empty() {
+        elements.push(cur_element);
     }
-}
-
-fn try_transform_value<'a, E>(
-    path: &[String],
-    fields: &'a mut HashMap<String, Value>,
-    transform: impl FnOnce(Option<Value>) -> Result<Value, E>,
-) -> Result<&'a Value, E> {
-    match path {
-        [] => unreachable!(),
-        [key] => {
-            let old_value = fields.remove(key);
-            fields.insert(key.to_string(), transform(old_value)?);
-            Ok(&fields[key])
-        }
-        [first, path @ ..] => {
-            // Ugly, must be a better way....
-            let value_mut = fields
-                .entry(first.to_string())
-                .and_modify(|cur| match cur {
-                    Value {
-                        value_type: Some(ValueType::MapValue(_)),
-                    } => (),
-                    _ => {
-                        *cur = new_map();
-                    }
-                })
-                .or_insert_with(new_map);
-            let fields = if let Value {
-                value_type: Some(ValueType::MapValue(MapValue { fields })),
-            } = value_mut
-            {
-                fields
-            } else {
-                unreachable!()
-            };
-            try_transform_value(path, fields, transform)
-        }
-    }
-}
-
-fn new_map() -> Value {
-    Value {
-        value_type: Some(ValueType::MapValue(MapValue {
-            fields: Default::default(),
-        })),
-    }
+    Ok(elements)
 }

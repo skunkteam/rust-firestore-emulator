@@ -1,11 +1,11 @@
 use self::{
     collection::Collection,
     document::{DocumentGuard, DocumentMeta, StoredDocumentVersion},
+    field_path::FieldPath,
     query::Query,
     transaction::{RunningTransactions, Transaction, TransactionId},
 };
 use crate::{
-    database::field_path::FieldPath,
     googleapis::google::firestore::v1::{
         document_transform::field_transform::{ServerValue, TransformType},
         value::ValueType,
@@ -17,15 +17,17 @@ use crate::{
 use futures::future::try_join_all;
 use itertools::Itertools;
 use prost_types::Timestamp;
-use std::{collections::HashMap, sync::Arc, time::SystemTime};
-use tokio::sync::{mpsc, RwLock};
+use std::{collections::HashMap, ops::Deref, sync::Arc, time::SystemTime};
+use tokio::sync::RwLock;
 use tonic::{Result, Status};
+use tracing::instrument;
 
 mod collection;
 mod document;
 mod field_path;
 mod query;
 mod transaction;
+mod value;
 
 #[derive(Default)]
 pub struct Database {
@@ -34,6 +36,7 @@ pub struct Database {
 }
 
 impl Database {
+    #[instrument(skip_all, err)]
     pub async fn get_doc(
         &self,
         name: &str,
@@ -45,6 +48,7 @@ impl Database {
         Ok(version.map(|version| version.to_document()))
     }
 
+    #[instrument(skip_all, err)]
     pub async fn get_doc_meta(&self, name: &str) -> Result<Arc<DocumentMeta>> {
         let (collection, id) = split_name(name)?;
         let collection = self
@@ -58,6 +62,7 @@ impl Database {
         Ok(Arc::clone(&meta))
     }
 
+    #[instrument(skip_all, err)]
     pub async fn get_doc_meta_mut(&self, name: &str) -> Result<DocumentGuard> {
         self.get_doc_meta(name).await?.wait_lock().await
     }
@@ -74,6 +79,7 @@ impl Database {
         })
     }
 
+    #[instrument(skip_all, err)]
     pub async fn get_txn_for_consistency(
         &self,
         consistency: &ReadConsistency,
@@ -85,6 +91,7 @@ impl Database {
         }
     }
 
+    #[instrument(skip_all, err)]
     pub async fn get_txn(&self, id: &TransactionId) -> Result<Arc<Transaction>, Status> {
         self.transactions.get(id).await
     }
@@ -117,6 +124,7 @@ impl Database {
     //     Ok(())
     // }
 
+    #[instrument(skip_all)]
     pub async fn get_collection_ids(&self, parent: &str) -> Vec<String> {
         // Get all collections asap in order to keep the read lock time minimal.
         let all_collections = self
@@ -136,22 +144,24 @@ impl Database {
             else {
                 continue;
             };
-            if col.documents.read().await.is_empty() {
-                continue;
+            for doc in col.documents.read().await.values() {
+                if doc.exists().await {
+                    result.push(path.to_string());
+                    break;
+                }
             }
-            result.push(path.to_string());
         }
         result
     }
 
+    #[instrument(skip_all, err)]
     pub async fn run_query(
         &self,
         parent: String,
         query: StructuredQuery,
         consistency: &ReadConsistency,
-        sender: mpsc::Sender<Result<Document>>,
-    ) -> Result<()> {
-        let query = Query::new(parent, query)?;
+    ) -> Result<Vec<Document>> {
+        let query = Query::from_structured(parent, query)?;
 
         let collections = self
             .collections
@@ -165,40 +175,34 @@ impl Database {
         let limit = query.limit();
         let txn = self.get_txn_for_consistency(consistency).await?;
 
-        tokio::spawn(async move {
-            let mut count = 0;
-            for col in collections {
-                for meta in col.docs().await {
-                    let msg = async {
-                        let Some(version) = meta.current_version().await else {
-                            return Ok(None);
-                        };
-                        if query.includes_document(&version)? {
-                            maybe_register_doc(&txn, &meta).await;
-                            Ok(Some(query.project(&version)?))
-                        } else {
-                            Ok(None)
-                        }
-                    };
-                    let send_result = match msg.await {
-                        Ok(Some(document)) => sender.send(Ok(document)),
-                        Ok(None) => continue,
-                        Err(err) => sender.send(Err(err)),
-                    };
-                    if send_result.await.is_err() {
-                        return;
-                    }
-                    count += 1;
-                    if count >= limit {
-                        return;
-                    }
+        let mut result = vec![];
+        'query: for col in collections {
+            for meta in col.docs().await {
+                let Some(version) = meta.current_version().await else {
+                    continue;
+                };
+                if !query.includes_document(&version)? {
+                    continue;
+                }
+                if let Some(txn) = &txn {
+                    txn.register_doc(&meta).await;
+                }
+                result.push(version);
+                if result.len() >= limit {
+                    break 'query;
                 }
             }
-        });
+        }
 
-        Ok(())
+        result.sort_unstable_by(query.sort_fn());
+
+        result
+            .into_iter()
+            .map(|version| query.project(&version))
+            .try_collect()
     }
 
+    #[instrument(skip_all, err)]
     pub async fn commit(
         &self,
         writes: Vec<Write>,
@@ -225,6 +229,7 @@ impl Database {
         Ok((time, write_results))
     }
 
+    #[instrument(skip_all, err)]
     pub async fn perform_write(
         &self,
         write: Write,
@@ -280,14 +285,17 @@ impl Database {
         })
     }
 
+    #[instrument(skip_all, err)]
     pub async fn new_txn(&self) -> Result<TransactionId> {
         Ok(self.transactions.start().await.id)
     }
 
+    #[instrument(skip_all, err)]
     pub async fn rollback(&self, transaction: &TransactionId) -> Result<()> {
         self.transactions.stop(transaction).await
     }
 
+    #[instrument(skip_all)]
     pub async fn clear(&self) {
         self.transactions.clear().await;
         self.collections.write().await.clear();
@@ -305,10 +313,12 @@ async fn apply_updates(
         .map(|v| v.fields.clone())
         .unwrap_or_default();
     for field_path in mask.field_paths {
-        let field_path = FieldPath::new(&field_path)?;
+        let field_path: FieldPath = (&field_path).deref().try_into()?;
         match field_path.get_value(updated_values) {
             Some(new_value) => field_path.set_value(&mut fields, new_value.clone()),
-            None => field_path.delete_value(&mut fields),
+            None => {
+                field_path.delete_value(&mut fields);
+            }
         }
     }
     Ok(fields)
@@ -320,7 +330,7 @@ fn apply_transform(
     transform: TransformType,
     commit_time: &Timestamp,
 ) -> Result<Value> {
-    let field_path = FieldPath::new(&path)?;
+    let field_path: FieldPath = (&path).deref().try_into()?;
     let result = match transform {
         TransformType::SetToServerValue(code) => {
             match ServerValue::try_from(code)
@@ -376,12 +386,6 @@ fn apply_transform(
 fn split_name(name: &str) -> Result<(&str, &str)> {
     name.rsplit_once('/')
         .ok_or_else(|| Status::invalid_argument("invalid document path, missing collection-name"))
-}
-
-async fn maybe_register_doc(txn: &Option<Arc<Transaction>>, meta: &Arc<DocumentMeta>) {
-    if let Some(txn) = txn {
-        txn.register_doc(meta).await;
-    }
 }
 
 pub fn get_doc_name_from_write(write: &Write) -> Result<&str> {
@@ -444,4 +448,5 @@ macro_rules! impl_try_from_consistency_selector {
 
 impl_try_from_consistency_selector!(batch_get_documents_request);
 impl_try_from_consistency_selector!(get_document_request);
+impl_try_from_consistency_selector!(list_documents_request);
 impl_try_from_consistency_selector!(run_query_request);
