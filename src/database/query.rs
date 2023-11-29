@@ -91,20 +91,31 @@ impl Query {
         self.limit.unwrap_or(usize::MAX)
     }
 
-    pub fn project(&self, doc: &StoredDocumentVersion) -> Result<Document> {
-        let Some(ref projection) = self.select else {
-            return Ok(doc.to_document());
+    pub fn project(&self, version: &StoredDocumentVersion) -> Result<Document> {
+        let Some(projection) = &self.select else {
+            return Ok(version.to_document());
         };
 
         match &projection[..] {
-            [] => Ok(doc.to_document()),
+            [] => Ok(version.to_document()),
             [FieldReference::DocumentName] => Ok(Document {
                 fields: Default::default(),
-                create_time: Some(doc.create_time.clone()),
-                update_time: Some(doc.update_time.clone()),
-                name: doc.name.clone(),
+                create_time: Some(version.create_time.clone()),
+                update_time: Some(version.update_time.clone()),
+                name: version.name.clone(),
             }),
-            _ => unimplemented!("select with fields"),
+            fields => {
+                let mut doc: Document = Default::default();
+                for field in fields {
+                    let FieldReference::FieldPath(path) = field else {
+                        continue;
+                    };
+                    if let Some(val) = path.get_value(&version.fields) {
+                        path.set_value(&mut doc.fields, val.clone());
+                    }
+                }
+                Ok(doc)
+            }
         }
     }
 
@@ -116,7 +127,15 @@ impl Query {
         let order_by = &self.order_by;
         move |a, b| {
             for order in order_by {
-                let result = match order.field.get_value(a).cmp(&order.field.get_value(b)) {
+                let a = order
+                    .field
+                    .get_value(a)
+                    .expect("fields used in order_by MUST also be used in filter");
+                let b = order
+                    .field
+                    .get_value(b)
+                    .expect("fields used in order_by MUST also be used in filter");
+                let result = match a.cmp(&b) {
                     result @ (Less | Greater) => result,
                     Equal => continue,
                 };
