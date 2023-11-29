@@ -87,7 +87,7 @@ impl Transaction {
     }
 }
 
-#[derive(Clone, Copy, Eq, Hash, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct TransactionId(usize);
 
 impl TryFrom<Vec<u8>> for TransactionId {

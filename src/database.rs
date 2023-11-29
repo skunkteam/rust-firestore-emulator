@@ -20,7 +20,7 @@ use prost_types::Timestamp;
 use std::{collections::HashMap, ops::Deref, sync::Arc, time::SystemTime};
 use tokio::sync::RwLock;
 use tonic::{Result, Status};
-use tracing::instrument;
+use tracing::{info, instrument};
 
 mod collection;
 mod document;
@@ -159,47 +159,11 @@ impl Database {
         &self,
         parent: String,
         query: StructuredQuery,
-        consistency: &ReadConsistency,
+        consistency: ReadConsistency,
     ) -> Result<Vec<Document>> {
-        let query = Query::from_structured(parent, query)?;
-
-        let collections = self
-            .collections
-            .read()
-            .await
-            .values()
-            .filter(|&col| query.includes_collection(&col.name))
-            .map(Arc::clone)
-            .collect_vec();
-
-        let limit = query.limit();
-        let txn = self.get_txn_for_consistency(consistency).await?;
-
-        let mut result = vec![];
-        'query: for col in collections {
-            for meta in col.docs().await {
-                let Some(version) = meta.current_version().await else {
-                    continue;
-                };
-                if !query.includes_document(&version)? {
-                    continue;
-                }
-                if let Some(txn) = &txn {
-                    txn.register_doc(&meta).await;
-                }
-                result.push(version);
-                if result.len() >= limit {
-                    break 'query;
-                }
-            }
-        }
-
-        result.sort_unstable_by(query.sort_fn());
-
-        result
-            .into_iter()
-            .map(|version| query.project(&version))
-            .try_collect()
+        let query = Query::from_structured(parent, query, consistency)?;
+        info!(?query);
+        query.once(self).await
     }
 
     #[instrument(skip_all, err)]
@@ -378,7 +342,16 @@ fn apply_transform(
             });
             wrap_value(ValueType::NullValue(0))
         }
-        TransformType::RemoveAllFromArray(_) => unimplemented!("TransformType::RemoveAllFromArray"),
+        TransformType::RemoveAllFromArray(elements) => {
+            field_path.transform_value(fields, |cur_value| match cur_value.map(unwrap_value) {
+                Some(ValueType::ArrayValue(mut array)) => {
+                    array.values.retain(|v| !elements.values.contains(v));
+                    wrap_value(ValueType::ArrayValue(array))
+                }
+                _ => wrap_value(ValueType::ArrayValue(Default::default())),
+            });
+            wrap_value(ValueType::NullValue(0))
+        }
     };
     Ok(result)
 }
@@ -411,7 +384,7 @@ fn wrap_value(value_type: ValueType) -> Value {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub enum ReadConsistency {
     Default,
     ReadTime(Timestamp),

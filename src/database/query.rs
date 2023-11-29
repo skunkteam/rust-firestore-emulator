@@ -1,26 +1,118 @@
 use self::filter::Filter;
-use super::{document::StoredDocumentVersion, field_path::FieldReference};
-use crate::{
-    googleapis::google::firestore::v1::{structured_query::CollectionSelector, *},
-    unimplemented, unimplemented_option,
+use super::{
+    document::StoredDocumentVersion, field_path::FieldReference, Database, ReadConsistency,
 };
+use crate::googleapis::google::firestore::v1::{structured_query::CollectionSelector, *};
 use itertools::Itertools;
 use std::{cmp, ops::Deref, sync::Arc};
 use tonic::{Result, Status};
 
 mod filter;
 
+/// A Firestore query.
+#[derive(Debug)]
 pub struct Query {
     parent: String,
+
+    /// Optional sub-set of the fields to return.
+    ///
+    /// This acts as a [DocumentMask][google.firestore.v1.DocumentMask] over the
+    /// documents returned from a query. When not set, assumes that the caller
+    /// wants all fields returned.
     select: Option<Vec<FieldReference>>,
+
+    /// The collections to query.
     from: Vec<CollectionSelector>,
+
+    /// The filter to apply.
     filter: Option<Filter>,
+
+    /// The order to apply to the query results.
+    ///
+    /// Firestore allows callers to provide a full ordering, a partial ordering, or
+    /// no ordering at all. In all cases, Firestore guarantees a stable ordering
+    /// through the following rules:
+    ///
+    ///   * The `order_by` is required to reference all fields used with an
+    ///     inequality filter.
+    ///   * All fields that are required to be in the `order_by` but are not already
+    ///     present are appended in lexicographical ordering of the field name.
+    ///   * If an order on `__name__` is not specified, it is appended by default.
+    ///
+    /// Fields are appended with the same sort direction as the last order
+    /// specified, or 'ASCENDING' if no order was specified. For example:
+    ///
+    ///   * `ORDER BY a` becomes `ORDER BY a ASC, __name__ ASC`
+    ///   * `ORDER BY a DESC` becomes `ORDER BY a DESC, __name__ DESC`
+    ///   * `WHERE a > 1` becomes `WHERE a > 1 ORDER BY a ASC, __name__ ASC`
+    ///   * `WHERE __name__ > ... AND a > 1` becomes
+    ///      `WHERE __name__ > ... AND a > 1 ORDER BY a ASC, __name__ ASC`
     order_by: Vec<Order>,
+
+    /// A potential prefix of a position in the result set to start the query at.
+    ///
+    /// The ordering of the result set is based on the `ORDER BY` clause of the
+    /// original query.
+    ///
+    /// ```
+    /// SELECT * FROM k WHERE a = 1 AND b > 2 ORDER BY b ASC, __name__ ASC;
+    /// ```
+    ///
+    /// This query's results are ordered by `(b ASC, __name__ ASC)`.
+    ///
+    /// Cursors can reference either the full ordering or a prefix of the location,
+    /// though it cannot reference more fields than what are in the provided
+    /// `ORDER BY`.
+    ///
+    /// Continuing off the example above, attaching the following start cursors
+    /// will have varying impact:
+    ///
+    /// - `START BEFORE (2, /k/123)`: start the query right before `a = 1 AND
+    ///     b > 2 AND __name__ > /k/123`.
+    /// - `START AFTER (10)`: start the query right after `a = 1 AND b > 10`.
+    ///
+    /// Unlike `OFFSET` which requires scanning over the first N results to skip,
+    /// a start cursor allows the query to begin at a logical position. This
+    /// position is not required to match an actual result, it will scan forward
+    /// from this position to find the next document.
+    ///
+    /// Requires:
+    ///
+    /// * The number of values cannot be greater than the number of fields
+    ///    specified in the `ORDER BY` clause.
+    start_at: Option<Cursor>,
+
+    /// A potential prefix of a position in the result set to end the query at.
+    ///
+    /// This is similar to `START_AT` but with it controlling the end position
+    /// rather than the start position.
+    ///
+    /// Requires:
+    ///
+    /// * The number of values cannot be greater than the number of fields
+    ///    specified in the `ORDER BY` clause.
+    end_at: Option<Cursor>,
+
+    /// The number of documents to skip before returning the first result.
+    ///
+    /// This applies after the constraints specified by the `WHERE`, `START AT`, &
+    /// `END AT` but before the `LIMIT` clause.
+    pub offset: usize,
+
+    /// The maximum number of results to return.
+    ///
+    /// Applies after all other constraints.
     limit: Option<usize>,
+
+    consistency: ReadConsistency,
 }
 
 impl Query {
-    pub fn from_structured(parent: String, query: StructuredQuery) -> Result<Self> {
+    pub fn from_structured(
+        parent: String,
+        query: StructuredQuery,
+        consistency: ReadConsistency,
+    ) -> Result<Self> {
         let StructuredQuery {
             select,
             from,
@@ -31,11 +123,7 @@ impl Query {
             offset,
             limit,
         } = query;
-        unimplemented_option!(start_at);
-        unimplemented_option!(end_at);
-        if offset != 0 {
-            unimplemented!("offset")
-        }
+
         let select = select
             .map(|projection| {
                 projection
@@ -60,17 +148,85 @@ impl Query {
                 );
             }
         }
+        if !order_by.iter().any(|o| o.field.is_document_name()) {
+            order_by.push(Order {
+                field: FieldReference::DocumentName,
+                direction: Direction::Ascending,
+            })
+        }
         Ok(Self {
             parent,
             select,
             from,
             filter,
             order_by,
+            start_at,
+            end_at,
+            offset: offset as usize,
             limit: limit.map(|v| v as usize),
+            consistency,
         })
     }
 
-    pub fn includes_collection(&self, path: &str) -> bool {
+    pub async fn once(&self, db: &Database) -> Result<Vec<Document>> {
+        // First collect all Arc<Collection>s in a Vec to release the collection lock asap.
+        let collections = db
+            .collections
+            .read()
+            .await
+            .values()
+            .filter(|&col| self.includes_collection(&col.name))
+            .map(Arc::clone)
+            .collect_vec();
+
+        let txn = db.get_txn_for_consistency(&self.consistency).await?;
+
+        let mut buffer = vec![];
+        for col in collections {
+            for meta in col.docs().await {
+                let Some(version) = meta.current_version().await else {
+                    continue;
+                };
+                if !self.includes_document(&version)? {
+                    continue;
+                }
+                if let Some(cursor) = &self.start_at {
+                    let exclude = self.doc_on_left_of_cursor(&version, cursor);
+                    if exclude {
+                        continue;
+                    }
+                }
+                if let Some(cursor) = &self.end_at {
+                    let include = self.doc_on_left_of_cursor(&version, cursor);
+                    if !include {
+                        continue;
+                    }
+                }
+                if let Some(txn) = &txn {
+                    txn.register_doc(&meta).await;
+                }
+                buffer.push(version);
+            }
+        }
+
+        buffer.sort_unstable_by(|a, b| self.order_by_cmp(a, b));
+
+        if self.offset > 0 {
+            buffer.drain(0..self.offset);
+        }
+
+        if let Some(limit) = self.limit {
+            buffer.truncate(limit)
+        }
+
+        buffer
+            .into_iter()
+            .skip(self.offset)
+            .map(|version| self.project(&version))
+            .try_collect()
+    }
+
+    fn includes_collection(&self, path: &str) -> bool {
         let Some(path) = path
             .strip_prefix(&self.parent)
             .and_then(|path| path.strip_prefix('/'))
@@ -86,7 +242,7 @@ impl Query {
         })
     }
 
-    pub fn includes_document(&self, doc: &StoredDocumentVersion) -> Result<bool> {
+    fn includes_document(&self, doc: &StoredDocumentVersion) -> Result<bool> {
         if let Some(filter) = &self.filter {
             if !filter.eval(doc)? {
                 return Ok(false);
@@ -100,11 +256,7 @@ impl Query {
         Ok(true)
     }
 
-    pub fn limit(&self) -> usize {
-        self.limit.unwrap_or(usize::MAX)
-    }
-
-    pub fn project(&self, version: &StoredDocumentVersion) -> Result<Document> {
+    fn project(&self, version: &StoredDocumentVersion) -> Result<Document> {
         let Some(projection) = &self.select else {
             return Ok(version.to_document());
         };
@@ -118,7 +270,12 @@ impl Query {
                 name: version.name.clone(),
             }),
             fields => {
-                let mut doc: Document = Default::default();
+                let mut doc = Document {
+                    fields: Default::default(),
+                    create_time: Some(version.create_time.clone()),
+                    update_time: Some(version.update_time.clone()),
+                    name: version.name.clone(),
+                };
                 for field in fields {
                     let FieldReference::FieldPath(path) = field else {
                         continue;
@@ -132,37 +289,52 @@ impl Query {
         }
     }
 
-    pub fn sort_fn(
+    fn order_by_cmp(
         &self,
-    ) -> (impl Fn(&Arc<StoredDocumentVersion>, &Arc<StoredDocumentVersion>) -> cmp::Ordering + '_)
-    {
+        a: &Arc<StoredDocumentVersion>,
+        b: &Arc<StoredDocumentVersion>,
+    ) -> cmp::Ordering {
         use cmp::Ordering::*;
-        let order_by = &self.order_by;
-        move |a, b| {
-            for order in order_by {
-                let a = order
-                    .field
-                    .get_value(a)
-                    .expect("fields used in order_by MUST also be used in filter");
-                let b = order
-                    .field
-                    .get_value(b)
-                    .expect("fields used in order_by MUST also be used in filter");
-                let result = match a.cmp(&b) {
-                    result @ (Less | Greater) => result,
-                    Equal => continue,
-                };
-                return if matches!(order.direction, Direction::Descending) {
-                    result.reverse()
-                } else {
-                    result
-                };
-            }
-            Equal
+        for order in &self.order_by {
+            let a = order.field.get_value(a).expect(
+                "fields used in order_by MUST also be used in filter, so cannot be empty here",
+            );
+            let b = order.field.get_value(b).expect(
+                "fields used in order_by MUST also be used in filter, so cannot be empty here",
+            );
+            let result = match a.cmp(&b) {
+                result @ (Less | Greater) => result,
+                Equal => continue,
+            };
+            return if matches!(order.direction, Direction::Descending) {
+                result.reverse()
+            } else {
+                result
+            };
         }
+        Equal
+    }
+
+    /// Returns true when the given document is "on the left" of the given cursor.
+    fn doc_on_left_of_cursor(&self, doc: &Arc<StoredDocumentVersion>, cursor: &Cursor) -> bool {
+        use cmp::Ordering::*;
+        for (order, cursor_value) in self.order_by.iter().zip(&cursor.values) {
+            let doc_value = order.field.get_value(doc).expect(
+                "fields used in order_by MUST also be used in filter, so cannot be empty here",
+            );
+            match (&order.direction, doc_value.deref().cmp(cursor_value)) {
+                (Direction::Ascending, Less) | (Direction::Descending, Greater) => return true,
+                (Direction::Ascending, Greater) | (Direction::Descending, Less) => return false,
+                (_, Equal) => (),
+            };
+        }
+        // When we get here, the doc is equal to the values of the cursor. If the cursur wants to be "before" equal documents
+        // we must consider them not to be part of the left partition.
+        !cursor.before
     }
 }
 
+#[derive(Debug)]
 struct Order {
     field: FieldReference,
     direction: Direction,
@@ -185,6 +357,7 @@ impl TryFrom<structured_query::Order> for Order {
     }
 }
 
+#[derive(Debug)]
 enum Direction {
     Ascending,
     Descending,

@@ -6,6 +6,7 @@ use itertools::Itertools;
 use std::ops::Deref;
 use tonic::{Result, Status};
 
+#[derive(Debug)]
 pub enum Filter {
     Composite(CompositeFilter),
     Field(FieldFilter),
@@ -43,6 +44,7 @@ impl TryFrom<structured_query::Filter> for Filter {
     }
 }
 
+#[derive(Debug)]
 pub struct CompositeFilter {
     op: CompositeOperator,
     filters: Vec<Filter>,
@@ -83,6 +85,7 @@ impl TryFrom<structured_query::CompositeFilter> for CompositeFilter {
     }
 }
 
+#[derive(Debug)]
 enum CompositeOperator {
     And,
     Or,
@@ -113,6 +116,7 @@ impl TryFrom<structured_query::composite_filter::Operator> for CompositeOperator
     }
 }
 
+#[derive(Debug)]
 pub struct FieldFilter {
     field: FieldReference,
     op: FieldOperator,
@@ -169,6 +173,7 @@ impl TryFrom<structured_query::FieldFilter> for FieldFilter {
     }
 }
 
+#[derive(Debug)]
 enum FieldOperator {
     /// The given `field` is less than the given `value`.
     ///
@@ -274,6 +279,7 @@ impl TryFrom<structured_query::field_filter::Operator> for FieldOperator {
     }
 }
 
+#[derive(Debug)]
 pub struct UnaryFilter {
     field: FieldReference,
     op: UnaryOperator,
@@ -317,6 +323,8 @@ impl TryFrom<structured_query::UnaryFilter> for UnaryFilter {
     }
 }
 
+#[allow(clippy::enum_variant_names)]
+#[derive(Debug)]
 enum UnaryOperator {
     /// The given `field` is equal to `NaN`.
     IsNan,

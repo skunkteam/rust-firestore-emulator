@@ -9,7 +9,7 @@ use tonic::{Result, Status};
 /// The virtual field-name that represents the document-name.
 pub const DOC_NAME: &str = "__name__";
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub enum FieldReference {
     DocumentName,
     FieldPath(FieldPath),
@@ -21,6 +21,14 @@ impl FieldReference {
             Self::DocumentName => Some(Cow::Owned(Value::reference(doc.name.to_string()))),
             Self::FieldPath(field_path) => field_path.get_value(&doc.fields).map(Cow::Borrowed),
         }
+    }
+
+    /// Returns `true` if the field reference is [`DocumentName`].
+    ///
+    /// [`DocumentName`]: FieldReference::DocumentName
+    #[must_use]
+    pub fn is_document_name(&self) -> bool {
+        matches!(self, Self::DocumentName)
     }
 }
 
@@ -43,7 +51,7 @@ impl TryFrom<&str> for FieldReference {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct FieldPath(Vec<String>);
 
 /// Field paths may be used to refer to structured fields of Documents.

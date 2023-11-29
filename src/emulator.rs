@@ -228,7 +228,7 @@ impl firestore_server::Firestore for FirestoreEmulator {
                     offset: 0,
                     limit: None,
                 },
-                &consistency_selector.try_into()?,
+                consistency_selector.try_into()?,
             )
             .await?;
 
@@ -301,7 +301,7 @@ impl firestore_server::Firestore for FirestoreEmulator {
     type RunQueryStream = Pin<Box<dyn Stream<Item = Result<RunQueryResponse>> + Send + 'static>>;
 
     /// Runs a query.
-    #[instrument(skip_all, fields(query = ?request.get_ref().query_type), err)]
+    #[instrument(skip_all, err)]
     async fn run_query(
         &self,
         request: Request<RunQueryRequest>,
@@ -317,7 +317,7 @@ impl firestore_server::Firestore for FirestoreEmulator {
 
         let docs = self
             .database
-            .run_query(parent, query, &consistency_selector.try_into()?)
+            .run_query(parent, query, consistency_selector.try_into()?)
             .await?;
 
         let stream = tokio_stream::iter(docs).map(|doc| {
