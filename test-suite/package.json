@@ -6,7 +6,7 @@
     "scripts": {
         "test": "jest",
         "test:java-emulator": "firebase emulators:exec --only firestore \"jest ${npm_config_watch:+--watchAll}\"",
-        "test:rust-emulator": "RUST_EMULATOR=true FIRESTORE_EMULATOR_HOST=127.0.0.1:8080 concurrently -k -s last -n \"emulator,jest\" \"../target/debug/firestore-emulator\" \"jest ${npm_config_watch:+--watchAll}\"",
+        "test:rust-emulator": "RUST_EMULATOR=true FIRESTORE_EMULATOR_HOST=127.0.0.1:8080 concurrently -k -s command-jest -n \"emulator,jest\" \"../target/debug/firestore-emulator\" \"jest ${npm_config_watch:+--watchAll}\"",
         "build:rust": "cd .. && cargo build",
         "lint": "eslint tests && prettier -c tests"
     },

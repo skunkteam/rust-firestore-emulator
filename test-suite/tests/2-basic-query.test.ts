@@ -13,10 +13,9 @@ interface Data {
 //  4. Integer and floating-point values, sorted in numerical order
 //  5. Date values
 //  6. Text string values
-////// Not going to test the types below, for now...
 //  7. Byte values
 //  8. Cloud Firestore references
-//  9. Geographical point values (Note from Google: At this time we do not recommend using this data type)
+//  9. Geographical point values (Note from Google: At this time we do not recommend using this data type) NOT TESTED
 // 10. Array values
 // 11. Map values
 const numbers: Data[] = [
@@ -36,7 +35,7 @@ const dates: Data[] = [
     { type: 'date', ordered: fs.exported.Timestamp.fromDate(new Date('2022-01-01')) },
     { type: 'date', ordered: fs.exported.Timestamp.fromDate(new Date('2023-01-01')) },
 ];
-const strings: Data[] = [
+const strings = [
     // Should not order above any Date/Number
     { type: 'string', ordered: '1' },
     // Capitals first
@@ -46,10 +45,39 @@ const strings: Data[] = [
     { type: 'string', ordered: 'b' },
     // Special chars last
     { type: 'string', ordered: 'Æ' },
+] satisfies Data[];
+const bytes: Data[] = strings.map(({ ordered }) => ({ type: 'bytes', ordered: Buffer.from(ordered, 'utf-8') }));
+const references: Data[] = strings.map(({ ordered }) => ({ type: 'ref', ordered: fs.collection.doc(ordered) }));
+const arrays: Data[] = [
+    { type: 'array', ordered: [1, 2, 3] },
+    { type: 'array', ordered: [1, 2, 3, 1] },
+    { type: 'array', ordered: [2] },
 ];
+const maps: Data[] = fs.notImplementedInRust || [
+    { type: 'map', ordered: { a: 'aaa', b: 'baz' } },
+    { type: 'map', ordered: { a: 'foo', b: 'bar' } },
+    { type: 'map', ordered: { a: 'foo', b: 'bar', c: 'qux' } },
+    { type: 'map', ordered: { a: 'foo', b: 'baz' } },
+    { type: 'map', ordered: { b: 'aaa', c: 'baz' } },
+    { type: 'map', ordered: { c: 'aaa' } },
+];
+
 // `nothing` does not have an `ordered` field and will not be included if filtered/ordered by that field
 const nothing: Data = { type: 'none' };
-const allTestData = [nullType, ...booleans, nanType, ...numbers, ...dates, ...strings, nothing];
+// All test data, ordered by the `ordered` field according to https://firebase.google.com/docs/firestore/manage-data/data-types
+const allTestData = [
+    nullType,
+    ...booleans,
+    nanType,
+    ...numbers,
+    ...dates,
+    ...strings,
+    ...bytes,
+    ...references,
+    ...arrays,
+    ...maps,
+    nothing,
+];
 
 beforeAll(async () => {
     await Promise.all(allTestData.map(data => fs.collection.doc().set(fs.writeData(data))));
@@ -87,10 +115,10 @@ describe('inequality filter', () => {
     describe('basic string inequality', () => {
         test.each([
             // Note: the capital 'N' of 'NaN' in nanType comes before all the lower case characters
-            { operator: '<=', compareTo: 'date', expected: [...dates, ...booleans, nanType] },
-            { operator: '<', compareTo: 'e', expected: [...dates, ...booleans, nanType] },
-            { operator: '>=', compareTo: 'number', expected: [...strings, ...numbers] },
-            { operator: '>', compareTo: 'n', expected: [...strings, nullType, ...numbers, nothing] },
+            { operator: '<=', compareTo: 'date', expected: [nanType, ...arrays, ...booleans, ...bytes, ...dates] },
+            { operator: '<', compareTo: 'e', expected: [nanType, ...arrays, ...booleans, ...bytes, ...dates] },
+            { operator: '>=', compareTo: 'number', expected: [...numbers, ...references, ...strings] },
+            { operator: '>', compareTo: 'n', expected: [nothing, nullType, ...numbers, ...references, ...strings] },
             ...(fs.notImplementedInRust ||
                 ([{ operator: '!=', compareTo: 'string', expected: without(allTestData, ...strings) }] as const)),
         ] as const)("`type` $operator '$compareTo'", async ({ operator, compareTo, expected }) => {
@@ -107,7 +135,16 @@ describe('inequality filter', () => {
 
             // less than or greater than should have the same implicit ordering
             const secondResult = await getData(fs.collection.where('type', '<', 'z')); // should be everything
-            expect(secondResult.map(r => r.type)).toEqual(result);
+            expect(secondResult).toEqual(result);
+        });
+
+        test('cannot order by a different field than the queried inequality', async () => {
+            await expect(fs.collection.where('type', '>', 'z').orderBy('ordered').get()).rejects.toThrow('3 INVALID_ARGUMENT');
+
+            // The where will not match any documents, but the query should work!
+            expect(await fs.collection.where('type', '>', 'z').orderBy('type').get()).toHaveProperty('docs', []);
+            // Ordering by another field after ordering by the inequality field should work
+            expect(await fs.collection.where('type', '>', 'z').orderBy('type').orderBy('ordered', 'desc').get()).toHaveProperty('docs', []);
         });
     }
 
@@ -116,8 +153,12 @@ describe('inequality filter', () => {
             test.each([
                 { type: 'number', data: numbers },
                 { type: 'string', data: strings },
+                { type: 'bytes', data: bytes },
+                { type: 'reference', data: references },
                 { type: 'boolean', data: booleans },
                 { type: 'date', data: dates },
+                { type: 'array', data: arrays },
+                { type: 'map', data: maps },
             ] as const)('$type', async ({ data }) => {
                 expect(await getData(fs.collection.where('ordered', '>', data[0].ordered))).toEqual(data.slice(1));
                 expect(await getData(fs.collection.where('ordered', '<=', data[0].ordered))).toEqual(data.slice(0, 1));
