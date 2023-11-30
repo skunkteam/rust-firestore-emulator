@@ -51,7 +51,7 @@ test('aborting transaction', async () => {
 });
 
 describe('locks', () => {
-    fs.notImplementedInRust ||
+    fs.notImplementedInJava ||
         test('retry if document is locked', async () => {
             await docRef1.set(writeData({ some: 'data' }));
 
@@ -68,7 +68,7 @@ describe('locks', () => {
             });
         });
 
-    fs.notImplementedInRust ||
+    fs.notImplementedInJava ||
         test('lock on non-existing document', async () => {
             await runTxn('outer', [docRef1], async () => {
                 const { innerTxnCompleted } = await innerTxn('inner', [docRef1]);
@@ -92,39 +92,37 @@ describe('locks', () => {
     });
 
     // Note: Very slow on Cloud Firestore!!
-    fs.notImplementedInRust ||
-        test('chaos', async () => {
-            await runTxn('outer', [docRef1], async () => {
-                // Will need a retry because of `docRef1`,
-                const { innerTxnCompleted: first } = await innerTxn('innerFirst', [docRef2, docRef1]);
-                // Somehow only needs one try, even though `docRef2` could have been locked by 'innerFirst'
-                const { innerTxnCompleted: second } = await innerTxn('innerSecond', [docRef2]);
+    test('chaos', async () => {
+        await runTxn('outer', [docRef1], async () => {
+            // Will need a retry because of `docRef1`,
+            const { innerTxnCompleted: first } = await innerTxn('innerFirst', [docRef2, docRef1]);
+            // Somehow only needs one try, even though `docRef2` could have been locked by 'innerFirst'
+            const { innerTxnCompleted: second } = await innerTxn('innerSecond', [docRef2]);
 
-                return { awaitAfterTxn: Promise.all([first, second]) };
-            });
-            expect(await getData(docRef1.get())).toEqual({
-                outer: { tries: 1 },
-                innerFirst: { tries: 2 },
-            });
-            expect(await getData(docRef2.get())).toEqual({
-                innerFirst: { tries: 2 },
-                innerSecond: { tries: 1 },
-            });
+            return { awaitAfterTxn: Promise.all([first, second]) };
         });
-
-    fs.notImplementedInRust ||
-        test('regular `set` waits on transaction', async () => {
-            await docRef1.set(writeData({ some: 'data' }));
-
-            let setDone = false;
-            await runTxn('outer', [docRef1], async () => {
-                const updateDone = docRef1.update({ extraProp: 'foo' }).then(() => (setDone = true));
-                await time(500);
-                expect(setDone).toBeFalse();
-                return { awaitAfterTxn: updateDone };
-            });
-            expect(setDone).toBeTrue();
+        expect(await getData(docRef1.get())).toEqual({
+            outer: { tries: 1 },
+            innerFirst: { tries: 2 },
         });
+        expect(await getData(docRef2.get())).toEqual({
+            innerFirst: { tries: 2 },
+            innerSecond: { tries: 1 },
+        });
+    });
+
+    test('regular `set` waits on transaction', async () => {
+        await docRef1.set(writeData({ some: 'data' }));
+
+        let setDone = false;
+        await runTxn('outer', [docRef1], async () => {
+            const updateDone = docRef1.update({ extraProp: 'foo' }).then(() => (setDone = true));
+            await time(500);
+            expect(setDone).toBeFalse();
+            return { awaitAfterTxn: updateDone };
+        });
+        expect(setDone).toBeTrue();
+    });
 
     async function runTxn(
         name: string,

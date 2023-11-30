@@ -1,8 +1,14 @@
 use super::document::{DocumentGuard, DocumentMeta};
 use prost_types::Timestamp;
-use std::{collections::HashMap, mem, sync::Arc, time::SystemTime};
+use std::{
+    collections::{hash_map::Entry, HashMap},
+    mem,
+    sync::Arc,
+    time::SystemTime,
+};
 use tokio::sync::{Mutex, RwLock};
 use tonic::{Result, Status};
+use tracing::{info, instrument};
 
 #[derive(Default)]
 pub struct RunningTransactions {
@@ -30,6 +36,20 @@ impl RunningTransactions {
         let txn = Arc::new(Transaction::new(id));
         lock.insert(id, Arc::clone(&txn));
         txn
+    }
+
+    pub async fn start_with_id(&self, id: TransactionId) -> Result<Arc<Transaction>> {
+        let mut lock = self.map.write().await;
+        match lock.entry(id) {
+            Entry::Occupied(_) => Err(Status::failed_precondition(
+                "transaction_id already/still in use",
+            )),
+            Entry::Vacant(e) => {
+                let txn = Arc::new(Transaction::new(id));
+                e.insert(Arc::clone(&txn));
+                Ok(txn)
+            }
+        }
     }
 
     pub async fn stop(&self, id: &TransactionId) -> Result<()> {
@@ -66,14 +86,21 @@ impl Transaction {
         }
     }
 
-    pub async fn register_doc(&self, meta: &Arc<DocumentMeta>) {
+    #[instrument(skip_all)]
+    pub async fn register_doc(&self, doc: &Arc<DocumentMeta>) {
+        info!(doc.name);
         let mut status = self.status.lock().await;
         let TransactionStatus::Valid(guards) = &mut *status else {
+            info!(?self.id, "txn invalid");
             return;
         };
-        if let Ok(new_lock) = Arc::clone(meta).try_lock().await {
-            guards.insert(meta.name.clone(), new_lock);
+        if guards.contains_key(&doc.name) {
+            info!("lock already owned");
+        } else if let Ok(new_lock) = Arc::clone(doc).try_lock().await {
+            info!("lock acquired");
+            guards.insert(doc.name.clone(), new_lock);
         } else {
+            info!("lock unavailable, txn becomes invalid");
             *status = TransactionStatus::Invalid;
         }
     }

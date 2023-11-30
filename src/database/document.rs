@@ -11,7 +11,7 @@ use tokio::{
 use tonic::{Code, Result, Status};
 
 const WAIT_LOCK_TIMEOUT: Duration = Duration::from_secs(30);
-const TRY_LOCK_TIMEOUT: Duration = Duration::from_millis(50);
+const TRY_LOCK_TIMEOUT: Duration = Duration::from_millis(10);
 
 pub struct DocumentMeta {
     /// The resource name of the document, for example

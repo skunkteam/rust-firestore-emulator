@@ -13,7 +13,7 @@ use std::{pin::Pin, sync::Arc, time::SystemTime};
 use tokio::sync::mpsc;
 use tokio_stream::{wrappers::ReceiverStream, Stream, StreamExt};
 use tonic::{async_trait, Code, Request, Response, Result, Status};
-use tracing::{info, instrument};
+use tracing::{info, info_span, instrument, Instrument};
 
 #[derive(Default)]
 pub struct FirestoreEmulator {
@@ -91,7 +91,10 @@ impl firestore_server::Firestore for FirestoreEmulator {
     ///
     /// Documents returned by this method are not guaranteed to be returned in the
     /// same order that they were requested.
-    #[instrument(skip_all, fields(count = request.get_ref().documents.len()), err)]
+    #[instrument(skip_all, fields(
+        count = request.get_ref().documents.len(),
+        in_txn = is_txn(&request.get_ref().consistency_selector)
+    ), err)]
     async fn batch_get_documents(
         &self,
         request: Request<BatchGetDocumentsRequest>,
@@ -105,44 +108,52 @@ impl firestore_server::Firestore for FirestoreEmulator {
         unimplemented_option!(mask);
 
         // Only used for new transactions.
-        let (mut new_transaction, consistency) = match consistency_selector {
+        let (mut new_transaction, read_consistency) = match consistency_selector {
             Some(batch_get_documents_request::ConsistencySelector::NewTransaction(
                 transaction_options,
             )) => {
                 unimplemented_option!(transaction_options.mode);
                 let id = self.database.new_txn().await?;
+                info!("started new transaction");
                 (Some(id.into()), ReadConsistency::Transaction(id))
             }
             s => (None, s.try_into()?),
         };
+        info!(?read_consistency);
 
         let (tx, rx) = mpsc::channel(16);
         let database = Arc::clone(&self.database);
-        tokio::spawn(async move {
-            for name in documents {
-                use batch_get_documents_response::Result::*;
-                let msg = match database.get_doc(&name, &consistency).await {
-                    Ok(doc) => Ok(BatchGetDocumentsResponse {
-                        result: Some(match doc {
-                            None => Missing(name),
-                            Some(doc) => Found(Document::clone(&doc)),
+        tokio::spawn(
+            async move {
+                for name in documents {
+                    use batch_get_documents_response::Result::*;
+                    let msg = match database.get_doc(&name, &read_consistency).await {
+                        Ok(doc) => Ok(BatchGetDocumentsResponse {
+                            result: Some(match doc {
+                                None => Missing(name),
+                                Some(doc) => Found(Document::clone(&doc)),
+                            }),
+                            read_time: Some(SystemTime::now().into()),
+                            transaction: new_transaction.take().unwrap_or_default(),
                         }),
-                        read_time: Some(SystemTime::now().into()),
-                        transaction: new_transaction.take().unwrap_or_default(),
-                    }),
-                    Err(err) => Err(err),
-                };
-                if tx.send(msg).await.is_err() {
-                    break;
+                        Err(err) => Err(err),
+                    };
+                    if tx.send(msg).await.is_err() {
+                        break;
+                    }
                 }
             }
-        });
+            .instrument(info_span!("worker")),
+        );
 
         Ok(Response::new(ReceiverStream::new(rx)))
     }
 
     /// Commits a transaction, while optionally updating documents.
-    #[instrument(skip_all, fields(count = request.get_ref().writes.len()), err)]
+    #[instrument(skip_all, fields(
+        count = request.get_ref().writes.len(),
+        in_txn = !request.get_ref().transaction.is_empty(),
+    ), err)]
     async fn commit(&self, request: Request<CommitRequest>) -> Result<Response<CommitResponse>> {
         let CommitRequest {
             database: _,
@@ -160,9 +171,9 @@ impl firestore_server::Firestore for FirestoreEmulator {
         let (commit_time, write_results) = if transaction.is_empty() {
             perform_writes(&self.database, writes).await?
         } else {
-            self.database
-                .commit(writes, &transaction.try_into()?)
-                .await?
+            let txn_id = transaction.try_into()?;
+            info!(?txn_id);
+            self.database.commit(writes, &txn_id).await?
         };
 
         Ok(Response::new(CommitResponse {
@@ -267,8 +278,8 @@ impl firestore_server::Firestore for FirestoreEmulator {
             options,
         } = request.into_inner();
         use transaction_options::Mode;
-        match options {
-            None => (),
+        let txn_id = match options {
+            None => self.database.new_txn().await?,
             Some(TransactionOptions {
                 mode: None | Some(Mode::ReadOnly(_)),
             }) => {
@@ -276,11 +287,16 @@ impl firestore_server::Firestore for FirestoreEmulator {
             }
             Some(TransactionOptions {
                 mode: Some(Mode::ReadWrite(ReadWrite { retry_transaction })),
-            }) => unimplemented_collection!(retry_transaction),
+            }) => {
+                let id = retry_transaction.try_into()?;
+                self.database.new_txn_with_id(id).await?;
+                id
+            }
         };
 
+        info!(?txn_id);
         Ok(Response::new(BeginTransactionResponse {
-            transaction: self.database.new_txn().await?.into(),
+            transaction: txn_id.into(),
         }))
     }
 
@@ -483,4 +499,12 @@ async fn perform_writes(
     }))
     .await?;
     Ok((time, write_results))
+}
+
+fn is_txn(selector: &Option<batch_get_documents_request::ConsistencySelector>) -> &'static str {
+    match selector {
+        Some(batch_get_documents_request::ConsistencySelector::Transaction(_)) => "true",
+        Some(batch_get_documents_request::ConsistencySelector::NewTransaction(_)) => "new",
+        Some(batch_get_documents_request::ConsistencySelector::ReadTime(_)) | None => "false",
+    }
 }

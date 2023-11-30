@@ -36,15 +36,19 @@ pub struct Database {
 }
 
 impl Database {
-    #[instrument(skip_all, err)]
+    #[instrument(skip_all, err, fields(in_txn = consistency.is_transaction()))]
     pub async fn get_doc(
         &self,
         name: &str,
         consistency: &ReadConsistency,
     ) -> Result<Option<Document>> {
+        info!(name);
         let meta = self.get_doc_meta(name).await?;
+        if let Some(txn) = self.get_txn_for_consistency(consistency).await? {
+            txn.register_doc(&meta).await;
+        }
         let version = self.get_version(&meta, consistency).await?;
-        self.get_txn_for_consistency(consistency).await?;
+        info!(found = version.is_some());
         Ok(version.map(|version| version.to_document()))
     }
 
@@ -255,6 +259,12 @@ impl Database {
     }
 
     #[instrument(skip_all, err)]
+    pub async fn new_txn_with_id(&self, id: TransactionId) -> Result<()> {
+        self.transactions.start_with_id(id).await?;
+        Ok(())
+    }
+
+    #[instrument(skip_all, err)]
     pub async fn rollback(&self, transaction: &TransactionId) -> Result<()> {
         self.transactions.stop(transaction).await
     }
@@ -389,6 +399,16 @@ pub enum ReadConsistency {
     Default,
     ReadTime(Timestamp),
     Transaction(TransactionId),
+}
+
+impl ReadConsistency {
+    /// Returns `true` if the read consistency is [`Transaction`].
+    ///
+    /// [`Transaction`]: ReadConsistency::Transaction
+    #[must_use]
+    pub fn is_transaction(&self) -> bool {
+        matches!(self, Self::Transaction(..))
+    }
 }
 
 macro_rules! impl_try_from_consistency_selector {
