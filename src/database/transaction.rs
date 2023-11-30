@@ -88,19 +88,18 @@ impl Transaction {
 
     #[instrument(skip_all)]
     pub async fn register_doc(&self, doc: &Arc<DocumentMeta>) {
-        info!(doc.name);
         let mut status = self.status.lock().await;
         let TransactionStatus::Valid(guards) = &mut *status else {
-            info!(?self.id, "txn invalid");
+            info!(?self.id, doc.name, "txn invalid");
             return;
         };
         if guards.contains_key(&doc.name) {
-            info!("lock already owned");
+            info!(?self.id, doc.name, "lock already owned");
         } else if let Ok(new_lock) = Arc::clone(doc).try_lock().await {
-            info!("lock acquired");
+            info!(?self.id, doc.name, "lock acquired");
             guards.insert(doc.name.clone(), new_lock);
         } else {
-            info!("lock unavailable, txn becomes invalid");
+            info!(?self.id, doc.name, "lock unavailable, txn becomes invalid");
             *status = TransactionStatus::Invalid;
         }
     }

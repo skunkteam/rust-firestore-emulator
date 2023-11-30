@@ -39,7 +39,7 @@ fn main() -> color_eyre::Result<()> {
                 EnvFilter,
             };
             let time_offset = UtcOffset::current_local_offset()?;
-            let time_format = format_description!("[hour]:[minute]:[second].[subsecond digits:4]");
+            let time_format = format_description!("[hour]:[minute]:[second].[subsecond digits:6]");
 
             tracing_subscriber::fmt::layer()
                 .with_span_events(FmtSpan::NEW | FmtSpan::CLOSE)
