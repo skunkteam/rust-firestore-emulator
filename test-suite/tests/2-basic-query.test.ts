@@ -167,10 +167,27 @@ describe('inequality filter', () => {
         });
     });
 
+    describe('inequality on type', () => {
+        test.each([
+            { type: 'number', data: numbers },
+            { type: 'string', data: strings },
+            { type: 'bytes', data: bytes },
+            // { type: 'reference', data: storedReferences }, // TODO: test references as well
+            { type: 'boolean', data: booleans },
+            { type: 'date', data: dates },
+            { type: 'array', data: arrays },
+            ...(fs.notImplementedInRust || [{ type: 'map', data: maps }]),
+        ] as const)('$type', async ({ data }) => {
+            expect(await getData(fs.collection.where('ordered', '!=', data[0].ordered))).toEqual(
+                without(testData, data[0], nullType, nothing),
+            );
+        });
+    });
+
     describe.each([
         { type: 'Null', data: nullType },
         { type: 'NaN', data: nanType },
-    ])('only ==/!= operations on $type values', ({ type, data }) => {
+    ])('only == / != operations on $type values', ({ type, data }) => {
         test.each(['>', '>=', '<', '<='] as const)('cannot perform %s', operator => {
             expect(() => fs.collection.where('ordered', operator, data.ordered)).toThrow(
                 `Invalid query. You can only perform '==' and '!=' comparisons on ${type}.`,
@@ -181,14 +198,12 @@ describe('inequality filter', () => {
             expect(await getData(fs.collection.where('ordered', '==', data.ordered))).toEqual([data]);
         });
 
-        if (!fs.notImplementedInRust) {
-            test('can perform `!=`', async () => {
-                expect(await getData(fs.collection.where('ordered', '!=', data.ordered))).toIncludeSameMembers(
-                    // `nullType` (and `nothing`) is always excluded in '!=' queries
-                    without(testData, data, nullType, nothing),
-                );
-            });
-        }
+        test('can perform `!=`', async () => {
+            expect(await getData(fs.collection.where('ordered', '!=', data.ordered))).toIncludeSameMembers(
+                // `nullType` (and `nothing`) is always excluded in '!=' queries
+                without(testData, data, nullType, nothing),
+            );
+        });
     });
 });
 

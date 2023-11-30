@@ -1,6 +1,7 @@
 use crate::{
     database::{document::StoredDocumentVersion, field_path::FieldReference, value::Value},
     googleapis::google::firestore::v1::structured_query,
+    unimplemented,
 };
 use itertools::Itertools;
 use std::ops::Deref;
@@ -137,7 +138,7 @@ impl FieldFilter {
             return Ok(false);
         };
         let value = value.as_ref();
-        if !value.is_compatible_with(&self.value) {
+        if self.op.needs_type_compat() && !value.is_compatible_with(&self.value) {
             return Ok(false);
         }
         use FieldOperator::*;
@@ -147,13 +148,13 @@ impl FieldFilter {
             GreaterThan => value > &self.value,
             GreaterThanOrEqual => value >= &self.value,
             Equal => value == &self.value,
-            NotEqual => value != &self.value,
+            NotEqual => !value.is_null() && value != &self.value,
             ArrayContains => value
                 .as_array()
                 .is_some_and(|arr| arr.contains(&self.value)),
             In => self.value.as_array().is_some_and(|arr| arr.contains(value)),
-            ArrayContainsAny => todo!(),
-            NotIn => todo!(),
+            ArrayContainsAny => unimplemented!("ArrayContainsAny"),
+            NotIn => unimplemented!("NotIn"),
         })
     }
 }
@@ -257,6 +258,16 @@ impl FieldOperator {
             | FieldOperator::ArrayContainsAny => false,
         }
     }
+
+    pub fn needs_type_compat(&self) -> bool {
+        matches!(
+            self,
+            FieldOperator::LessThan
+                | FieldOperator::LessThanOrEqual
+                | FieldOperator::GreaterThan
+                | FieldOperator::GreaterThanOrEqual
+        )
+    }
 }
 
 impl TryFrom<structured_query::field_filter::Operator> for FieldOperator {
@@ -305,7 +316,7 @@ impl UnaryFilter {
         match self.op {
             UnaryOperator::IsNan => value.is_nan(),
             UnaryOperator::IsNull => value.is_null(),
-            UnaryOperator::IsNotNan => !value.is_nan(),
+            UnaryOperator::IsNotNan => !value.is_null() && !value.is_nan(),
             UnaryOperator::IsNotNull => !value.is_null(),
         }
     }
