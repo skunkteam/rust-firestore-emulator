@@ -50,8 +50,8 @@ test('aborting transaction', async () => {
     expect(await docRef1.get()).toHaveProperty('exists', false);
 });
 
-fs.notImplementedInRust ||
-    describe('locks', () => {
+describe('locks', () => {
+    fs.notImplementedInRust ||
         test('retry if document is locked', async () => {
             await docRef1.set(writeData({ some: 'data' }));
 
@@ -68,6 +68,7 @@ fs.notImplementedInRust ||
             });
         });
 
+    fs.notImplementedInRust ||
         test('lock on non-existing document', async () => {
             await runTxn('outer', [docRef1], async () => {
                 const { innerTxnCompleted } = await innerTxn('inner', [docRef1]);
@@ -81,16 +82,17 @@ fs.notImplementedInRust ||
             });
         });
 
-        test('no lock if getting separate documents', async () => {
-            await runTxn('outer', [docRef1], async () => {
-                const { innerTxnCompleted } = await innerTxn('inner', [docRef2]);
-                return { awaitAfterTxn: innerTxnCompleted };
-            });
-            expect(await getData(docRef1.get())).toEqual({ outer: { tries: 1 } });
-            expect(await getData(docRef2.get())).toEqual({ inner: { tries: 1 } });
+    test('no lock if getting separate documents', async () => {
+        await runTxn('outer', [docRef1], async () => {
+            const { innerTxnCompleted } = await innerTxn('inner', [docRef2]);
+            return { awaitAfterTxn: innerTxnCompleted };
         });
+        expect(await getData(docRef1.get())).toEqual({ outer: { tries: 1 } });
+        expect(await getData(docRef2.get())).toEqual({ inner: { tries: 1 } });
+    });
 
-        // Note: Very slow on Cloud Firestore!!
+    // Note: Very slow on Cloud Firestore!!
+    fs.notImplementedInRust ||
         test('chaos', async () => {
             await runTxn('outer', [docRef1], async () => {
                 // Will need a retry because of `docRef1`,
@@ -110,6 +112,7 @@ fs.notImplementedInRust ||
             });
         });
 
+    fs.notImplementedInRust ||
         test('regular `set` waits on transaction', async () => {
             await docRef1.set(writeData({ some: 'data' }));
 
@@ -123,40 +126,40 @@ fs.notImplementedInRust ||
             expect(setDone).toBeTrue();
         });
 
-        async function runTxn(
-            name: string,
-            refs: FirebaseFirestore.DocumentReference[],
-            runAfterGet: () => void | Promise<void | { awaitAfterTxn?: Promise<unknown> }>,
-        ) {
-            let awaitAfterTxn: Promise<unknown> | undefined;
-            let tries = 0;
-            await fs.firestore.runTransaction(async txn => {
-                tries++;
-                for (const ref of refs) {
-                    await txn.get(ref);
-                }
+    async function runTxn(
+        name: string,
+        refs: FirebaseFirestore.DocumentReference[],
+        runAfterGet: () => void | Promise<void | { awaitAfterTxn?: Promise<unknown> }>,
+    ) {
+        let awaitAfterTxn: Promise<unknown> | undefined;
+        let tries = 0;
+        await fs.firestore.runTransaction(async txn => {
+            tries++;
+            for (const ref of refs) {
+                await txn.get(ref);
+            }
 
-                ({ awaitAfterTxn } = (await runAfterGet()) ?? {});
+            ({ awaitAfterTxn } = (await runAfterGet()) ?? {});
 
-                for (const ref of refs) {
-                    txn.set(ref, writeData({ [name]: { tries } }), { merge: true });
-                }
-            });
-            awaitAfterTxn && (await awaitAfterTxn);
-        }
-        async function innerTxn(name: string, refs: FirebaseFirestore.DocumentReference[]) {
-            const { resolver, waitForIt } = createResolver();
-            const innerTxnCompleted = runTxn(name, refs, resolver);
-            await waitForIt;
-            return { innerTxnCompleted };
-        }
-        function createResolver() {
-            let resolver: undefined | (() => void);
-            const waitForIt = new Promise<void>(res => (resolver = res));
-            assert(resolver);
-            return { resolver, waitForIt };
-        }
-    });
+            for (const ref of refs) {
+                txn.set(ref, writeData({ [name]: { tries } }), { merge: true });
+            }
+        });
+        awaitAfterTxn && (await awaitAfterTxn);
+    }
+    async function innerTxn(name: string, refs: FirebaseFirestore.DocumentReference[]) {
+        const { resolver, waitForIt } = createResolver();
+        const innerTxnCompleted = runTxn(name, refs, resolver);
+        await waitForIt;
+        return { innerTxnCompleted };
+    }
+    function createResolver() {
+        let resolver: undefined | (() => void);
+        const waitForIt = new Promise<void>(res => (resolver = res));
+        assert(resolver);
+        return { resolver, waitForIt };
+    }
+});
 
 async function getData(promisedSnap: FirebaseFirestore.DocumentSnapshot | Promise<FirebaseFirestore.DocumentSnapshot>) {
     const snap = await promisedSnap;

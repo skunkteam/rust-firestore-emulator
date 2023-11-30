@@ -150,24 +150,22 @@ describe('inequality filter', () => {
         });
     }
 
-    if (!fs.notImplementedInRust) {
-        describe('implicitly filter by Type', () => {
-            test.each([
-                { type: 'number', data: numbers },
-                { type: 'string', data: strings },
-                { type: 'bytes', data: bytes },
-                { type: 'reference', data: storedReferences },
-                { type: 'boolean', data: booleans },
-                { type: 'date', data: dates },
-                { type: 'array', data: arrays },
-                { type: 'map', data: maps },
-            ] as const)('$type', async ({ data }) => {
-                const saneData = data.map(sanitizeData);
-                expect(await getData(fs.collection.where('ordered', '>', data[0].ordered))).toEqual(saneData.slice(1));
-                expect(await getData(fs.collection.where('ordered', '<=', data[0].ordered))).toEqual(saneData.slice(0, 1));
-            });
+    describe('implicitly filter by Type', () => {
+        test.each([
+            { type: 'number', data: numbers },
+            { type: 'string', data: strings },
+            { type: 'bytes', data: bytes },
+            { type: 'reference', data: storedReferences },
+            { type: 'boolean', data: booleans },
+            { type: 'date', data: dates },
+            { type: 'array', data: arrays },
+            ...(fs.notImplementedInRust || [{ type: 'map', data: maps }]),
+        ] as const)('$type', async ({ data }) => {
+            const saneData = data.map(sanitizeData);
+            expect(await getData(fs.collection.where('ordered', '>', data[0].ordered))).toEqual(saneData.slice(1));
+            expect(await getData(fs.collection.where('ordered', '<=', data[0].ordered))).toEqual(saneData.slice(0, 1));
         });
-    }
+    });
 
     describe.each([
         { type: 'Null', data: nullType },
@@ -195,78 +193,74 @@ describe('inequality filter', () => {
 });
 
 describe('paginating results', () => {
-    fs.notImplementedInRust ||
-        test('documents should implicitly be ordered by name', async () => {
-            const implicit = await getData(fs.collection);
-            const explicit = await getData(fs.collection.orderBy(fs.exported.FieldPath.documentId()));
-            expect(implicit).toEqual(explicit);
+    test('documents should implicitly be ordered by name', async () => {
+        const implicit = await getData(fs.collection);
+        const explicit = await getData(fs.collection.orderBy(fs.exported.FieldPath.documentId()));
+        expect(implicit).toEqual(explicit);
+    });
+
+    describe.each([
+        {
+            description: 'document ID',
+            orderedCollection: fs.collection.orderBy(fs.exported.FieldPath.documentId()),
+            getFieldValues: (snap: FirebaseFirestore.QueryDocumentSnapshot) => [snap.id],
+        },
+        {
+            description: 'type and ordered field',
+            orderedCollection: fs.collection.orderBy('type').orderBy('ordered', 'desc'),
+            getFieldValues: (snap: FirebaseFirestore.QueryDocumentSnapshot) => {
+                const { type, ordered } = fs.readData<Data>(snap.data());
+                return [type, ordered];
+            },
+        },
+    ])('ordered by $description', ({ orderedCollection, getFieldValues }) => {
+        let snapshots: FirebaseFirestore.QueryDocumentSnapshot[];
+        let docs: Data[];
+
+        beforeAll(async () => {
+            const snap = await orderedCollection.get();
+            snapshots = snap.docs;
+            docs = snapshots.map(snap => sanitizeData(fs.readData<Data>(snap.data())));
         });
 
-    fs.notImplementedInRust ||
+        test('limit', async () => {
+            const firstTen = await getData(orderedCollection.limit(1));
+            expect(firstTen).toEqual(docs.slice(0, 1));
+        });
+
         describe.each([
-            {
-                description: 'document ID',
-                orderedCollection: fs.collection.orderBy(fs.exported.FieldPath.documentId()),
-                getFieldValues: (snap: FirebaseFirestore.QueryDocumentSnapshot) => [snap.id],
-            },
-            {
-                description: 'type and ordered field',
-                orderedCollection: fs.collection.orderBy('type').orderBy('ordered', 'desc'),
-                getFieldValues: (snap: FirebaseFirestore.QueryDocumentSnapshot) => {
-                    const { type, ordered } = fs.readData<Data>(snap.data());
-                    return [type, ordered];
-                },
-            },
-        ])('ordered by $description', ({ orderedCollection, getFieldValues }) => {
-            let snapshots: FirebaseFirestore.QueryDocumentSnapshot[];
-            let docs: Data[];
-
-            beforeAll(async () => {
-                const snap = await orderedCollection.get();
-                snapshots = snap.docs;
-                docs = snapshots.map(snap => sanitizeData(fs.readData<Data>(snap.data())));
+            { using: 'snapshot', getCursor: (idx: number) => [snapshots[idx]] },
+            { using: 'fieldValues', getCursor: (idx: number) => getFieldValues(snapshots[idx]) },
+        ])('cursor using $using', ({ getCursor }) => {
+            const cursorIdx = 15;
+            test.each([
+                { command: 'startAt', from: cursorIdx, to: undefined },
+                { command: 'startAfter', from: cursorIdx + 1, to: undefined },
+                { command: 'endAt', from: 0, to: cursorIdx + 1 },
+                { command: 'endBefore', from: 0, to: cursorIdx },
+            ] as const)('$command', async ({ command, from, to }) => {
+                const results = await getData(orderedCollection[command](...getCursor(cursorIdx)));
+                expect(results).toEqual(docs.slice(from, to));
             });
 
-            test('limit', async () => {
-                const firstTen = await getData(orderedCollection.limit(1));
-                expect(firstTen).toEqual(docs.slice(0, 1));
+            test('combining startAfter/endBefore', async () => {
+                const endBeforeIdx = 20;
+                const result = await getData(orderedCollection.startAfter(...getCursor(cursorIdx)).endBefore(...getCursor(endBeforeIdx)));
+                expect(result).toEqual(docs.slice(cursorIdx + 1, endBeforeIdx));
             });
 
-            describe.each([
-                { using: 'snapshot', getCursor: (idx: number) => [snapshots[idx]] },
-                { using: 'fieldValues', getCursor: (idx: number) => getFieldValues(snapshots[idx]) },
-            ])('cursor using $using', ({ getCursor }) => {
-                const cursorIdx = 15;
-                test.each([
-                    { command: 'startAt', from: cursorIdx, to: undefined },
-                    { command: 'startAfter', from: cursorIdx + 1, to: undefined },
-                    { command: 'endAt', from: 0, to: cursorIdx + 1 },
-                    { command: 'endBefore', from: 0, to: cursorIdx },
-                ] as const)('$command', async ({ command, from, to }) => {
-                    const results = await getData(orderedCollection[command](...getCursor(cursorIdx)));
-                    expect(results).toEqual(docs.slice(from, to));
-                });
-
-                test('combining startAfter/endBefore', async () => {
-                    const endBeforeIdx = 20;
-                    const result = await getData(
-                        orderedCollection.startAfter(...getCursor(cursorIdx)).endBefore(...getCursor(endBeforeIdx)),
-                    );
-                    expect(result).toEqual(docs.slice(cursorIdx + 1, endBeforeIdx));
-                });
-
-                test('combining startAt/endBefore', async () => {
-                    const endBeforeIdx = 20;
-                    const result = await getData(orderedCollection.startAt(...getCursor(cursorIdx)).endBefore(...getCursor(endBeforeIdx)));
-                    expect(result).toEqual(docs.slice(cursorIdx, endBeforeIdx));
-                });
-                test('combining startAfter/endAt', async () => {
-                    const endAtIdx = 20;
-                    const result = await getData(orderedCollection.startAfter(...getCursor(cursorIdx)).endAt(...getCursor(endAtIdx)));
-                    expect(result).toEqual(docs.slice(cursorIdx + 1, endAtIdx + 1));
-                });
+            test('combining startAt/endBefore', async () => {
+                const endBeforeIdx = 20;
+                const result = await getData(orderedCollection.startAt(...getCursor(cursorIdx)).endBefore(...getCursor(endBeforeIdx)));
+                expect(result).toEqual(docs.slice(cursorIdx, endBeforeIdx));
+            });
+            test('combining startAfter/endAt', async () => {
+                const endAtIdx = 20;
+                const result = await getData(orderedCollection.startAfter(...getCursor(cursorIdx)).endAt(...getCursor(endAtIdx)));
+                expect(result).toEqual(docs.slice(cursorIdx + 1, endAtIdx + 1));
             });
         });
+    });
 });
 
 async function getData(query: FirebaseFirestore.Query) {

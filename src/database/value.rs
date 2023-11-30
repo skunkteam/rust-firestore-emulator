@@ -63,6 +63,10 @@ impl Value {
             .expect("missing value_type in value")
     }
 
+    pub fn is_compatible_with(&self, other: &Self) -> bool {
+        self.value_type_order() == other.value_type_order()
+    }
+
     fn value_type_order(&self) -> usize {
         // See: https://firebase.google.com/docs/firestore/manage-data/data-types#value_type_ordering
         match self.value_type() {

@@ -137,6 +137,9 @@ impl FieldFilter {
             return Ok(false);
         };
         let value = value.as_ref();
+        if !value.is_compatible_with(&self.value) {
+            return Ok(false);
+        }
         use FieldOperator::*;
         Ok(match self.op {
             LessThan => value < &self.value,
