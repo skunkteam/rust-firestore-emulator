@@ -25,6 +25,10 @@ const numbers: Data[] = [
     { type: 'number', ordered: 2.1 },
     { type: 'number', ordered: Number.MAX_VALUE },
 ];
+// Will be created in two steps (0.5 plus 0.5), because JavaScript doesn't know the difference between integers and doubles.
+const integerStoredAsDouble = { type: 'number', ordered: 1 } satisfies Data;
+numbers.splice(2, 0, integerStoredAsDouble);
+
 const nanType: Data = { type: 'NaN', ordered: NaN };
 const nullType: Data = { type: 'null', ordered: null };
 const booleans: Data[] = [
@@ -83,7 +87,17 @@ const storedTestData = [
 const testData = storedTestData.map(sanitizeData);
 
 beforeAll(async () => {
-    await Promise.all(storedTestData.map(data => fs.collection.doc().set(fs.writeData(data))));
+    await Promise.all(
+        storedTestData.map(async data => {
+            if (data === integerStoredAsDouble) {
+                const ref = fs.collection.doc();
+                await ref.set(fs.writeData({ ...data, ordered: integerStoredAsDouble.ordered - 0.5 }));
+                await ref.update({ ordered: fs.exported.FieldValue.increment(0.5) });
+            } else {
+                await fs.collection.doc().set(fs.writeData(data));
+            }
+        }),
+    );
 });
 
 test('basic equality', async () => {
@@ -152,7 +166,8 @@ describe('inequality filter', () => {
 
     describe('implicitly filter by Type', () => {
         test.each([
-            { type: 'number', data: numbers },
+            { type: 'number', data: numbers }, // compare using integer
+            { type: 'number', data: numbers, whereClauseValue: -499.5 }, // compare using double
             { type: 'string', data: strings },
             { type: 'bytes', data: bytes },
             { type: 'reference', data: storedReferences },
@@ -160,16 +175,17 @@ describe('inequality filter', () => {
             { type: 'date', data: dates },
             { type: 'array', data: arrays },
             ...(fs.notImplementedInRust || [{ type: 'map', data: maps }]),
-        ] as const)('$type', async ({ data }) => {
+        ] as const)('$type', async ({ data, whereClauseValue = data[0].ordered }) => {
             const saneData = data.map(sanitizeData);
-            expect(await getData(fs.collection.where('ordered', '>', data[0].ordered))).toEqual(saneData.slice(1));
-            expect(await getData(fs.collection.where('ordered', '<=', data[0].ordered))).toEqual(saneData.slice(0, 1));
+            expect(await getData(fs.collection.where('ordered', '>', whereClauseValue))).toEqual(saneData.slice(1));
+            expect(await getData(fs.collection.where('ordered', '<=', whereClauseValue))).toEqual(saneData.slice(0, 1));
         });
     });
 
     describe('inequality on type', () => {
         test.each([
             { type: 'number', data: numbers },
+            { type: 'number', data: numbers, itemToExclude: numbers.find(e => e.ordered === Number.MAX_VALUE) },
             { type: 'string', data: strings },
             { type: 'bytes', data: bytes },
             { type: 'reference', data: storedReferences },
@@ -177,10 +193,26 @@ describe('inequality filter', () => {
             { type: 'date', data: dates },
             { type: 'array', data: arrays },
             ...(fs.notImplementedInRust || [{ type: 'map', data: maps }]),
-        ] as const)('$type', async ({ data }) => {
-            expect(await getData(fs.collection.where('ordered', '!=', data[0].ordered))).toEqual(
-                without(storedTestData, data[0], nullType, nothing).map(sanitizeData),
+        ] as const)('$type', async ({ data, itemToExclude = data[0] }) => {
+            expect(await getData(fs.collection.where('ordered', '!=', itemToExclude.ordered))).toEqual(
+                without(storedTestData, itemToExclude, nullType, nothing).map(sanitizeData),
             );
+        });
+    });
+
+    describe('equality on type', () => {
+        test.each([
+            { type: 'number', data: numbers },
+            { type: 'number', data: numbers, itemToUse: numbers.find(e => e.ordered === 1) },
+            { type: 'string', data: strings },
+            { type: 'bytes', data: bytes },
+            { type: 'reference', data: storedReferences },
+            { type: 'boolean', data: booleans },
+            { type: 'date', data: dates },
+            { type: 'array', data: arrays },
+            ...(fs.notImplementedInRust || [{ type: 'map', data: maps }]),
+        ] as const)('$type', async ({ data, itemToUse = data[0] }) => {
+            expect(await getData(fs.collection.where('ordered', '==', itemToUse.ordered))).toEqual([sanitizeData(itemToUse)]);
         });
     });
 

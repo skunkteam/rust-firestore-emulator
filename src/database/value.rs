@@ -5,7 +5,8 @@ use crate::{
     },
     utils::CmpTimestamp,
 };
-use std::{borrow::Cow, cmp, collections::HashMap};
+use prost_types::Timestamp;
+use std::{borrow::Cow, cmp, collections::HashMap, ops::Add};
 
 pub use crate::googleapis::google::firestore::v1::Value;
 
@@ -16,9 +17,39 @@ impl Value {
         }
     }
 
+    pub fn array(values: Vec<Self>) -> Self {
+        Self {
+            value_type: Some(ValueType::ArrayValue(ArrayValue { values })),
+        }
+    }
+
     pub fn map(fields: HashMap<String, Self>) -> Self {
         Self {
             value_type: Some(ValueType::MapValue(MapValue { fields })),
+        }
+    }
+
+    pub fn null() -> Self {
+        Self {
+            value_type: Some(ValueType::NullValue(0)),
+        }
+    }
+
+    pub fn integer(value: i64) -> Self {
+        Self {
+            value_type: Some(ValueType::IntegerValue(value)),
+        }
+    }
+
+    pub fn double(value: f64) -> Self {
+        Self {
+            value_type: Some(ValueType::DoubleValue(value)),
+        }
+    }
+
+    pub fn timestamp(value: Timestamp) -> Self {
+        Self {
+            value_type: Some(ValueType::TimestampValue(value)),
         }
     }
 
@@ -36,6 +67,13 @@ impl Value {
         }
     }
 
+    pub fn into_array(self) -> Option<Vec<Self>> {
+        match self.into_value_type() {
+            ValueType::ArrayValue(ArrayValue { values }) => Some(values),
+            _ => None,
+        }
+    }
+
     pub fn as_array(&self) -> Option<&[Self]> {
         match self.value_type() {
             ValueType::ArrayValue(ArrayValue { values }) => Some(values),
@@ -49,6 +87,10 @@ impl Value {
 
     pub fn is_null(&self) -> bool {
         matches!(self.value_type(), ValueType::NullValue(_))
+    }
+
+    pub fn into_value_type(self) -> ValueType {
+        self.value_type.expect("missing value_type in value")
     }
 
     pub fn value_type(&self) -> &ValueType {
@@ -120,6 +162,22 @@ impl Ord for Value {
             (ValueType::MapValue(_a), ValueType::MapValue(_b)) => todo!("ordering for MapValues"),
             // Only the above types should need to be compared here, because of the type ordering above.
             _ => unreachable!("logic error in Ord implementation of Value"),
+        }
+    }
+}
+
+impl Add for Value {
+    type Output = Self;
+
+    fn add(self, rhs: Self) -> Self::Output {
+        match (self.value_type(), rhs.value_type()) {
+            (ValueType::IntegerValue(a), ValueType::IntegerValue(b)) => {
+                Self::integer(a.saturating_add(*b))
+            }
+            (ValueType::IntegerValue(a), ValueType::DoubleValue(b)) => Self::double(*a as f64 + b),
+            (ValueType::DoubleValue(a), ValueType::IntegerValue(b)) => Self::double(a + *b as f64),
+            (ValueType::DoubleValue(a), ValueType::DoubleValue(b)) => Self::double(a + b),
+            _ => rhs,
         }
     }
 }

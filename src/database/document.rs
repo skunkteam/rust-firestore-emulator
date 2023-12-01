@@ -9,6 +9,7 @@ use tokio::{
     time::{error::Elapsed, timeout},
 };
 use tonic::{Code, Result, Status};
+use tracing::{instrument, Level};
 
 const WAIT_LOCK_TIMEOUT: Duration = Duration::from_secs(30);
 const TRY_LOCK_TIMEOUT: Duration = Duration::from_millis(10);
@@ -212,6 +213,10 @@ impl DocumentGuard {
         self.doc.current_version().await
     }
 
+    #[instrument(skip_all, fields(
+        doc_name = self.doc.name,
+        time = display(&update_time),
+    ), level = Level::DEBUG)]
     pub async fn add_version(&self, fields: HashMap<String, Value>, update_time: Timestamp) {
         let create_time = self
             .doc

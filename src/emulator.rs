@@ -93,7 +93,7 @@ impl firestore_server::Firestore for FirestoreEmulator {
     /// same order that they were requested.
     #[instrument(skip_all, fields(
         count = request.get_ref().documents.len(),
-        in_txn = is_txn(&request.get_ref().consistency_selector)
+        in_txn = display(is_txn(&request.get_ref().consistency_selector))
     ), err)]
     async fn batch_get_documents(
         &self,

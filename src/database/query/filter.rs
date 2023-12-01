@@ -147,7 +147,11 @@ impl FieldFilter {
             LessThanOrEqual => value <= &self.value,
             GreaterThan => value > &self.value,
             GreaterThanOrEqual => value >= &self.value,
-            Equal => value == &self.value,
+
+            // Workaround for incompatible `PartialEq` implementation
+            #[allow(clippy::double_comparisons)]
+            Equal => value <= &self.value && value >= &self.value,
+
             NotEqual => !value.is_null() && value != &self.value,
             ArrayContains => value
                 .as_array()
@@ -266,6 +270,7 @@ impl FieldOperator {
                 | FieldOperator::LessThanOrEqual
                 | FieldOperator::GreaterThan
                 | FieldOperator::GreaterThanOrEqual
+                | FieldOperator::Equal
         )
     }
 }

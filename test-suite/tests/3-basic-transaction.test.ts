@@ -165,9 +165,7 @@ describe('concurrent tests', () => {
             let tries = 0;
             await fs.firestore.runTransaction(async txn => {
                 tries++;
-                for (const ref of read) {
-                    await txn.get(ref);
-                }
+                await txn.getAll(...read);
 
                 ({ awaitAfterTxn } = (await runAfterGet()) ?? {});
 

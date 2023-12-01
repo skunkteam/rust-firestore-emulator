@@ -8,7 +8,6 @@ use self::{
 use crate::{
     googleapis::google::firestore::v1::{
         document_transform::field_transform::{ServerValue, TransformType},
-        value::ValueType,
         *,
     },
     unimplemented, unimplemented_collection, unimplemented_option,
@@ -311,56 +310,45 @@ fn apply_transform(
                 .map_err(|_| Status::invalid_argument(format!("invalid server_value: {code}")))?
             {
                 ServerValue::RequestTime => {
-                    let new_value = wrap_value(ValueType::TimestampValue(commit_time.clone()));
+                    let new_value = Value::timestamp(commit_time.clone());
                     field_path.set_value(fields, new_value.clone());
                     new_value
                 }
                 other => unimplemented!(format!("{:?}", other)),
             }
         }
-        TransformType::Increment(value) => {
-            let ValueType::IntegerValue(value) = unwrap_value(value) else {
-                unimplemented!("TransformType::Increment on doubles");
-            };
-            field_path
-                .try_transform_value(fields, |cur| {
-                    Ok(match cur.map(unwrap_value) {
-                        Some(ValueType::IntegerValue(int)) => {
-                            wrap_value(ValueType::IntegerValue(int.saturating_add(value)))
-                        }
-                        Some(ValueType::DoubleValue(_)) => {
-                            unimplemented!("TransformType::Increment on doubles")
-                        }
-                        _ => wrap_value(ValueType::IntegerValue(value)),
-                    })
-                })?
-                .clone()
-        }
+        TransformType::Increment(value) => field_path
+            .transform_value(fields, |cur| cur.unwrap_or_else(Value::null) + value)
+            .clone(),
         TransformType::Maximum(_) => unimplemented!("TransformType::Maximum"),
         TransformType::Minimum(_) => unimplemented!("TransformType::Minimum"),
         TransformType::AppendMissingElements(elements) => {
-            field_path.transform_value(fields, |cur_value| match cur_value.map(unwrap_value) {
-                Some(ValueType::ArrayValue(mut array)) => {
-                    for el in elements.values {
-                        if !array.values.contains(&el) {
-                            array.values.push(el)
+            field_path.transform_value(fields, |cur_value| {
+                match cur_value.and_then(Value::into_array) {
+                    Some(mut array) => {
+                        for el in elements.values {
+                            if !array.contains(&el) {
+                                array.push(el)
+                            }
                         }
+                        Value::array(array)
                     }
-                    wrap_value(ValueType::ArrayValue(array))
+                    None => Value::array(elements.values),
                 }
-                _ => wrap_value(ValueType::ArrayValue(elements)),
             });
-            wrap_value(ValueType::NullValue(0))
+            Value::null()
         }
         TransformType::RemoveAllFromArray(elements) => {
-            field_path.transform_value(fields, |cur_value| match cur_value.map(unwrap_value) {
-                Some(ValueType::ArrayValue(mut array)) => {
-                    array.values.retain(|v| !elements.values.contains(v));
-                    wrap_value(ValueType::ArrayValue(array))
+            field_path.transform_value(fields, |cur_value| {
+                match cur_value.and_then(Value::into_array) {
+                    Some(mut array) => {
+                        array.retain(|v| !elements.values.contains(v));
+                        Value::array(array)
+                    }
+                    None => Value::array(vec![]),
                 }
-                _ => wrap_value(ValueType::ArrayValue(Default::default())),
             });
-            wrap_value(ValueType::NullValue(0))
+            Value::null()
         }
     };
     Ok(result)
@@ -382,16 +370,6 @@ pub fn get_doc_name_from_write(write: &Write) -> Result<&str> {
         Delete(name) => name,
         Transform(trans) => &trans.document,
     })
-}
-
-fn unwrap_value(value: Value) -> ValueType {
-    value.value_type.expect("missing value_type in value")
-}
-
-fn wrap_value(value_type: ValueType) -> Value {
-    Value {
-        value_type: Some(value_type),
-    }
 }
 
 #[derive(Clone, Debug)]

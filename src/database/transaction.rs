@@ -3,7 +3,10 @@ use prost_types::Timestamp;
 use std::{
     collections::{hash_map::Entry, HashMap},
     mem,
-    sync::Arc,
+    sync::{
+        atomic::{self, AtomicUsize},
+        Arc,
+    },
     time::SystemTime,
 };
 use tokio::sync::{Mutex, RwLock};
@@ -28,7 +31,7 @@ impl RunningTransactions {
     pub async fn start(&self) -> Arc<Transaction> {
         let mut lock = self.map.write().await;
         let id = loop {
-            let id = TransactionId(rand::random());
+            let id = TransactionId::new();
             if !lock.contains_key(&id) {
                 break id;
             }
@@ -114,7 +117,14 @@ impl Transaction {
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub struct TransactionId(usize);
+pub struct TransactionId(pub(self) usize);
+
+impl TransactionId {
+    fn new() -> Self {
+        static NEXT_TXN_ID: AtomicUsize = AtomicUsize::new(1);
+        Self(NEXT_TXN_ID.fetch_add(1, atomic::Ordering::Relaxed))
+    }
+}
 
 impl TryFrom<Vec<u8>> for TransactionId {
     type Error = Status;
