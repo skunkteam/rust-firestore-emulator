@@ -172,14 +172,14 @@ describe('inequality filter', () => {
             { type: 'number', data: numbers },
             { type: 'string', data: strings },
             { type: 'bytes', data: bytes },
-            // { type: 'reference', data: storedReferences }, // TODO: test references as well
+            { type: 'reference', data: storedReferences },
             { type: 'boolean', data: booleans },
             { type: 'date', data: dates },
             { type: 'array', data: arrays },
             ...(fs.notImplementedInRust || [{ type: 'map', data: maps }]),
         ] as const)('$type', async ({ data }) => {
             expect(await getData(fs.collection.where('ordered', '!=', data[0].ordered))).toEqual(
-                without(testData, data[0], nullType, nothing),
+                without(storedTestData, data[0], nullType, nothing).map(sanitizeData),
             );
         });
     });
@@ -205,6 +205,13 @@ describe('inequality filter', () => {
             );
         });
     });
+
+    fs.notImplementedInRust ||
+        test('multiple inequalities (should not be possible)', async () => {
+            await expect(
+                getData(fs.collection.where('ordered', '>', numbers[0].ordered).where('type', '>', numbers[0].type)),
+            ).rejects.toThrow('3 INVALID_ARGUMENT: Cannot have inequality filters on multiple properties: [ordered, type]');
+        });
 });
 
 describe('paginating results', () => {

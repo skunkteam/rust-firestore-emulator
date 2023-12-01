@@ -120,6 +120,23 @@ describe('concurrent tests', () => {
             });
         });
 
+        test.concurrent('only read locked document', async () => {
+            const [docRef1, docRef2] = refs();
+
+            await runTxn('outer', [docRef1], async () => {
+                // Will need a retry because it reads `docRef1`, even though it only writes `docRef2`
+                const { innerTxnCompleted } = await innerTxn('inner', { read: [docRef1, docRef2], write: [docRef2] });
+
+                return { awaitAfterTxn: innerTxnCompleted };
+            });
+            expect(await getData(docRef1.get())).toEqual({
+                outer: { tries: 1 },
+            });
+            expect(await getData(docRef2.get())).toEqual({
+                inner: { tries: 2 },
+            });
+        });
+
         test.concurrent('regular `set` waits on transaction', async () => {
             const [docRef1] = refs();
 
@@ -135,28 +152,32 @@ describe('concurrent tests', () => {
             expect(setDone).toBeTrue();
         });
 
+        type UsedRefs =
+            | FirebaseFirestore.DocumentReference[]
+            | { read: FirebaseFirestore.DocumentReference[]; write: FirebaseFirestore.DocumentReference[] };
         async function runTxn(
             name: string,
-            refs: FirebaseFirestore.DocumentReference[],
+            refs: UsedRefs,
             runAfterGet: () => void | Promise<void | { awaitAfterTxn?: Promise<unknown> }>,
         ) {
+            const { read, write } = Array.isArray(refs) ? { read: refs, write: refs } : refs;
             let awaitAfterTxn: Promise<unknown> | undefined;
             let tries = 0;
             await fs.firestore.runTransaction(async txn => {
                 tries++;
-                for (const ref of refs) {
+                for (const ref of read) {
                     await txn.get(ref);
                 }
 
                 ({ awaitAfterTxn } = (await runAfterGet()) ?? {});
 
-                for (const ref of refs) {
+                for (const ref of write) {
                     txn.set(ref, writeData({ [name]: { tries } }), { merge: true });
                 }
             });
             awaitAfterTxn && (await awaitAfterTxn);
         }
-        async function innerTxn(name: string, refs: FirebaseFirestore.DocumentReference[]) {
+        async function innerTxn(name: string, refs: UsedRefs) {
             const { resolver, waitForIt } = createResolver();
             const innerTxnCompleted = runTxn(name, refs, resolver);
             await waitForIt;
