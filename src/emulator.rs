@@ -6,12 +6,13 @@ use crate::{
         *,
     },
     unimplemented, unimplemented_bool, unimplemented_collection, unimplemented_option,
+    utils::timestamp,
 };
-use futures::future::try_join_all;
+use futures::{future::try_join_all, stream::BoxStream, StreamExt};
 use prost_types::Timestamp;
-use std::{pin::Pin, sync::Arc, time::SystemTime};
+use std::sync::Arc;
 use tokio::sync::mpsc;
-use tokio_stream::{wrappers::ReceiverStream, Stream, StreamExt};
+use tokio_stream::wrappers::ReceiverStream;
 use tonic::{async_trait, Code, Request, Response, Result, Status};
 use tracing::{info, info_span, instrument, Instrument};
 
@@ -43,7 +44,7 @@ impl FirestoreEmulator {
             "CLEAR_EMULATOR" => {
                 self.database.clear().await;
                 Ok(Some(WriteResult {
-                    update_time: Some(SystemTime::now().into()),
+                    update_time: Some(timestamp()),
                     transform_results: vec![],
                 }))
             }
@@ -133,7 +134,7 @@ impl firestore_server::Firestore for FirestoreEmulator {
                                 None => Missing(name),
                                 Some(doc) => Found(Document::clone(&doc)),
                             }),
-                            read_time: Some(SystemTime::now().into()),
+                            read_time: Some(timestamp()),
                             transaction: new_transaction.take().unwrap_or_default(),
                         }),
                         Err(err) => Err(err),
@@ -164,7 +165,7 @@ impl firestore_server::Firestore for FirestoreEmulator {
         if let Some(write_result) = self.eval_command(&writes).await? {
             return Ok(Response::new(CommitResponse {
                 write_results: vec![write_result],
-                commit_time: Some(SystemTime::now().into()),
+                commit_time: Some(timestamp()),
             }));
         }
 
@@ -314,7 +315,7 @@ impl firestore_server::Firestore for FirestoreEmulator {
     }
 
     /// Server streaming response type for the RunQuery method.
-    type RunQueryStream = Pin<Box<dyn Stream<Item = Result<RunQueryResponse>> + Send + 'static>>;
+    type RunQueryStream = BoxStream<'static, Result<RunQueryResponse>>;
 
     /// Runs a query.
     #[instrument(skip_all, err)]
@@ -340,13 +341,13 @@ impl firestore_server::Firestore for FirestoreEmulator {
             Ok(RunQueryResponse {
                 transaction: vec![],
                 document: Some(doc),
-                read_time: Some(SystemTime::now().into()),
+                read_time: Some(timestamp()),
                 skipped_results: 0,
                 continuation_selector: None,
             })
         });
 
-        Ok(Response::new(Box::pin(stream)))
+        Ok(Response::new(stream.boxed()))
     }
 
     /// Server streaming response type for the RunAggregationQuery method.
@@ -398,16 +399,16 @@ impl firestore_server::Firestore for FirestoreEmulator {
     }
 
     /// Server streaming response type for the Listen method.
-    type ListenStream = tonic::Streaming<ListenResponse>;
+    type ListenStream = ReceiverStream<Result<ListenResponse>>;
 
     /// Listens to changes. This method is only available via gRPC or WebChannel
     /// (not REST).
     #[instrument(skip_all, err)]
     async fn listen(
         &self,
-        _request: Request<tonic::Streaming<ListenRequest>>,
+        request: Request<tonic::Streaming<ListenRequest>>,
     ) -> Result<Response<Self::ListenStream>> {
-        unimplemented!("listen")
+        Ok(Response::new(self.database.listen(request.into_inner())))
     }
 
     /// Lists all the collection IDs underneath a document.
@@ -455,7 +456,7 @@ impl firestore_server::Firestore for FirestoreEmulator {
         } = request.into_inner();
         unimplemented_collection!(labels);
 
-        let time: Timestamp = SystemTime::now().into();
+        let time: Timestamp = timestamp();
 
         let (status, write_results) = try_join_all(writes.into_iter().map(|write| async {
             let name = get_doc_name_from_write(&write)?;
@@ -469,7 +470,7 @@ impl firestore_server::Firestore for FirestoreEmulator {
                 Ok(wr) => (Default::default(), wr),
                 Err(err) => (
                     rpc::Status {
-                        code: err.code().into(),
+                        code: err.code() as _,
                         message: err.message().to_string(),
                         details: vec![],
                     },
@@ -491,7 +492,7 @@ async fn perform_writes(
     database: &Database,
     writes: Vec<Write>,
 ) -> Result<(Timestamp, Vec<WriteResult>)> {
-    let time: Timestamp = SystemTime::now().into();
+    let time: Timestamp = timestamp();
     let write_results = try_join_all(writes.into_iter().map(|write| async {
         let name = get_doc_name_from_write(&write)?;
         let guard = database.get_doc_meta_mut(name).await?;

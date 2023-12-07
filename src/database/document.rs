@@ -1,33 +1,41 @@
+use super::collection::Collection;
 use crate::{
     googleapis::google::firestore::v1::{precondition, Document, Value},
-    utils::CmpTimestamp,
+    utils::timestamp_nanos,
 };
 use prost_types::Timestamp;
-use std::{collections::HashMap, sync::Arc, time::Duration};
+use std::{
+    collections::HashMap,
+    sync::{Arc, Weak},
+    time::Duration,
+};
 use tokio::{
     sync::{Mutex, OwnedMutexGuard, RwLock},
     time::{error::Elapsed, timeout},
 };
 use tonic::{Code, Result, Status};
-use tracing::{instrument, Level};
+use tracing::{instrument, trace, Level};
 
 const WAIT_LOCK_TIMEOUT: Duration = Duration::from_secs(30);
 const TRY_LOCK_TIMEOUT: Duration = Duration::from_millis(10);
 
+#[derive(Debug)]
 pub struct DocumentMeta {
     /// The resource name of the document, for example
     /// `projects/{project_id}/databases/{database_id}/documents/{document_path}`.
     pub name: String,
     versions: RwLock<Vec<DocumentVersion>>,
     txn_lock: Arc<Mutex<()>>,
+    collection: Weak<Collection>,
 }
 
 impl DocumentMeta {
-    pub fn new(name: String) -> Self {
+    pub fn new(name: String, collection: Weak<Collection>) -> Self {
         Self {
             name,
             versions: Default::default(),
             txn_lock: Default::default(),
+            collection,
         }
     }
 
@@ -65,7 +73,7 @@ impl DocumentMeta {
             .read()
             .await
             .iter()
-            .rfind(|version| CmpTimestamp(version.update_time()) <= CmpTimestamp(read_time))
+            .rfind(|version| timestamp_nanos(version.update_time()) <= timestamp_nanos(read_time))
             .and_then(DocumentVersion::stored_document)
     }
 
@@ -96,20 +104,28 @@ impl DocumentMeta {
     }
 }
 
+#[derive(Clone, Debug)]
 pub enum DocumentVersion {
-    Deleted(DeletedDocumentVersion),
+    Deleted(Arc<DeletedDocumentVersion>),
     Stored(Arc<StoredDocumentVersion>),
 }
 
 impl DocumentVersion {
-    fn create_time(&self) -> Option<&Timestamp> {
+    pub fn name(&self) -> &str {
+        match self {
+            DocumentVersion::Deleted(ver) => &ver.name,
+            DocumentVersion::Stored(ver) => &ver.name,
+        }
+    }
+
+    pub fn create_time(&self) -> Option<&Timestamp> {
         match self {
             DocumentVersion::Deleted(_) => None,
             DocumentVersion::Stored(ver) => Some(&ver.create_time),
         }
     }
 
-    fn update_time(&self) -> &Timestamp {
+    pub fn update_time(&self) -> &Timestamp {
         match self {
             DocumentVersion::Deleted(ver) => &ver.delete_time,
             DocumentVersion::Stored(ver) => &ver.update_time,
@@ -122,8 +138,13 @@ impl DocumentVersion {
             DocumentVersion::Stored(version) => Some(Arc::clone(version)),
         }
     }
+
+    pub fn to_document(&self) -> Option<Document> {
+        self.stored_document().map(|version| version.to_document())
+    }
 }
 
+#[derive(Debug)]
 pub struct StoredDocumentVersion {
     /// The resource name of the document, for example
     /// `projects/{project_id}/databases/{database_id}/documents/{document_path}`.
@@ -178,7 +199,11 @@ impl StoredDocumentVersion {
     }
 }
 
+#[derive(Debug)]
 pub struct DeletedDocumentVersion {
+    /// The resource name of the document, for example
+    /// `projects/{project_id}/databases/{database_id}/documents/{document_path}`.
+    pub name: String,
     /// The time at which the document was deleted.
     pub delete_time: Timestamp,
 }
@@ -218,34 +243,35 @@ impl DocumentGuard {
         time = display(&update_time),
     ), level = Level::DEBUG)]
     pub async fn add_version(&self, fields: HashMap<String, Value>, update_time: Timestamp) {
+        trace!(?fields);
         let create_time = self
             .doc
             .create_time()
             .await
             .unwrap_or_else(|| update_time.clone());
-        self.doc
-            .versions
-            .write()
-            .await
-            .push(DocumentVersion::Stored(
-                StoredDocumentVersion {
-                    name: self.doc.name.clone(),
-                    create_time,
-                    update_time,
-                    fields,
-                }
-                .into(),
-            ));
+        let version = DocumentVersion::Stored(Arc::new(StoredDocumentVersion {
+            name: self.doc.name.clone(),
+            create_time,
+            update_time,
+            fields,
+        }));
+        self.doc.versions.write().await.push(version.clone());
+        self.broadcast_event(DocumentUpdate::new(Arc::clone(&self.doc), version));
     }
 
     pub async fn delete(&self, delete_time: Timestamp) {
-        self.doc
-            .versions
-            .write()
-            .await
-            .push(DocumentVersion::Deleted(DeletedDocumentVersion {
-                delete_time,
-            }))
+        let version = DocumentVersion::Deleted(Arc::new(DeletedDocumentVersion {
+            name: self.doc.name.clone(),
+            delete_time,
+        }));
+        self.doc.versions.write().await.push(version.clone());
+        self.broadcast_event(DocumentUpdate::new(Arc::clone(&self.doc), version));
+    }
+
+    fn broadcast_event(&self, update: DocumentUpdate) {
+        if let Some(collection) = self.doc.collection.upgrade() {
+            let _ = collection.events.send(update);
+        }
     }
 }
 
@@ -261,6 +287,21 @@ impl From<precondition::ConditionType> for DocumentPrecondition {
             precondition::ConditionType::Exists(false) => DocumentPrecondition::NotExists,
             precondition::ConditionType::Exists(true) => DocumentPrecondition::Exists,
             precondition::ConditionType::UpdateTime(time) => DocumentPrecondition::UpdateTime(time),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct DocumentUpdate {
+    pub doc_meta: Arc<DocumentMeta>,
+    pub new_version: DocumentVersion,
+}
+
+impl DocumentUpdate {
+    pub fn new(doc_meta: Arc<DocumentMeta>, new_version: DocumentVersion) -> Self {
+        Self {
+            doc_meta,
+            new_version,
         }
     }
 }

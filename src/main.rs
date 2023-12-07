@@ -56,7 +56,7 @@ fn main() -> color_eyre::Result<()> {
     run(Args::parse())
 }
 
-#[tokio::main(flavor = "multi_thread")]
+#[tokio::main]
 async fn run(Args { host_port }: Args) -> color_eyre::Result<()> {
     let emulator = FirestoreEmulator::default();
     let firestore = FirestoreServer::new(emulator)

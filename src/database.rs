@@ -2,6 +2,7 @@ use self::{
     collection::Collection,
     document::{DocumentGuard, DocumentMeta, StoredDocumentVersion},
     field_path::FieldPath,
+    listener::Listener,
     query::Query,
     transaction::{RunningTransactions, Transaction, TransactionId},
 };
@@ -11,19 +12,21 @@ use crate::{
         *,
     },
     unimplemented, unimplemented_collection, unimplemented_option,
-    utils::RwLockHashMapExt,
+    utils::{timestamp, RwLockHashMapExt},
 };
 use futures::future::try_join_all;
 use itertools::Itertools;
 use prost_types::Timestamp;
-use std::{collections::HashMap, ops::Deref, sync::Arc, time::SystemTime};
+use std::{collections::HashMap, ops::Deref, sync::Arc};
 use tokio::sync::RwLock;
+use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Result, Status};
 use tracing::{info, instrument};
 
 mod collection;
 mod document;
 mod field_path;
+mod listener;
 mod query;
 mod transaction;
 mod value;
@@ -51,18 +54,22 @@ impl Database {
         Ok(version.map(|version| version.to_document()))
     }
 
+    pub async fn get_collection(&self, collection_name: &str) -> Arc<Collection> {
+        Arc::clone(
+            &*self
+                .collections
+                .get_or_insert(collection_name, || {
+                    Collection::new(collection_name.into()).into()
+                })
+                .await,
+        )
+    }
+
     #[instrument(skip_all, err)]
     pub async fn get_doc_meta(&self, name: &str) -> Result<Arc<DocumentMeta>> {
-        let (collection, id) = split_name(name)?;
-        let collection = self
-            .collections
-            .get_or_insert(collection, || Collection::new(collection.into()).into())
-            .await;
-        let meta = collection
-            .documents
-            .get_or_insert(id, || DocumentMeta::new(name.into()).into())
-            .await;
-        Ok(Arc::clone(&meta))
+        let collection = collection_name(name)?;
+        let meta = self.get_collection(collection).await.get_doc(name).await;
+        Ok(meta)
     }
 
     #[instrument(skip_all, err)]
@@ -147,11 +154,8 @@ impl Database {
             else {
                 continue;
             };
-            for doc in col.documents.read().await.values() {
-                if doc.exists().await {
-                    result.push(path.to_string());
-                    break;
-                }
+            if col.has_doc().await {
+                result.push(path.to_string());
             }
         }
         result
@@ -184,7 +188,7 @@ impl Database {
         .await?;
 
         let guards = txn.take_guards().await?;
-        let time: Timestamp = SystemTime::now().into();
+        let time = timestamp();
 
         let write_results = try_join_all(metas.into_iter().map(
             |(write, meta): (Write, Arc<DocumentMeta>)| {
@@ -273,6 +277,13 @@ impl Database {
         self.transactions.clear().await;
         self.collections.write().await.clear();
     }
+
+    pub fn listen(
+        self: &Arc<Database>,
+        request_stream: tonic::Streaming<ListenRequest>,
+    ) -> ReceiverStream<Result<ListenResponse>> {
+        Listener::start(Arc::clone(self), request_stream)
+    }
 }
 
 async fn apply_updates(
@@ -354,9 +365,11 @@ fn apply_transform(
     Ok(result)
 }
 
-fn split_name(name: &str) -> Result<(&str, &str)> {
-    name.rsplit_once('/')
-        .ok_or_else(|| Status::invalid_argument("invalid document path, missing collection-name"))
+fn collection_name(name: &str) -> Result<&str> {
+    Ok(name
+        .rsplit_once('/')
+        .ok_or_else(|| Status::invalid_argument("invalid document path, missing collection-name"))?
+        .0)
 }
 
 pub fn get_doc_name_from_write(write: &Write) -> Result<&str> {

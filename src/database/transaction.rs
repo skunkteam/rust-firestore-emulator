@@ -1,4 +1,5 @@
 use super::document::{DocumentGuard, DocumentMeta};
+use crate::utils::timestamp;
 use prost_types::Timestamp;
 use std::{
     collections::{hash_map::Entry, HashMap},
@@ -7,7 +8,6 @@ use std::{
         atomic::{self, AtomicUsize},
         Arc,
     },
-    time::SystemTime,
 };
 use tokio::sync::{Mutex, RwLock};
 use tonic::{Result, Status};
@@ -84,7 +84,7 @@ impl Transaction {
     fn new(id: TransactionId) -> Self {
         Transaction {
             id,
-            start_time: SystemTime::now().into(),
+            start_time: timestamp(),
             status: TransactionStatus::Valid(Default::default()).into(),
         }
     }

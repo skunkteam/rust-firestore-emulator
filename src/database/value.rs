@@ -3,7 +3,7 @@ use crate::{
         firestore::v1::{value::ValueType, ArrayValue, MapValue},
         r#type::LatLng,
     },
-    utils::CmpTimestamp,
+    utils::timestamp_nanos,
 };
 use prost_types::Timestamp;
 use std::{borrow::Cow, cmp, collections::HashMap, ops::Add};
@@ -150,7 +150,7 @@ impl Ord for Value {
             (ValueType::IntegerValue(a), ValueType::DoubleValue(b)) => (*a as f64).total_cmp(b),
             (ValueType::IntegerValue(a), ValueType::IntegerValue(b)) => a.cmp(b),
             (ValueType::TimestampValue(a), ValueType::TimestampValue(b)) => {
-                CmpTimestamp(a).cmp(&CmpTimestamp(b))
+                timestamp_nanos(a).cmp(&timestamp_nanos(b))
             }
             (ValueType::StringValue(a), ValueType::StringValue(b)) => a.cmp(b),
             (ValueType::BytesValue(a), ValueType::BytesValue(b)) => a.cmp(b),
