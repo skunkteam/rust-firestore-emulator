@@ -19,7 +19,7 @@ use std::{
         Arc,
     },
 };
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::mpsc;
 use tokio_stream::{
     wrappers::{errors::BroadcastStreamRecvError, BroadcastStream, ReceiverStream},
     StreamExt, StreamMap,
@@ -40,7 +40,8 @@ pub struct Listener {
     id: usize,
     database: Arc<Database>,
     sender: mpsc::Sender<Result<ListenResponse>>,
-    target_admin: Mutex<ListenerTargetAdmin>,
+    events_by_collection: StreamMap<String, BroadcastStream<DocumentUpdate>>,
+    targets_by_collection: HashMap<String, Vec<ListenerTarget>>,
 }
 
 impl Listener {
@@ -55,7 +56,8 @@ impl Listener {
             id: NEXT_ID.fetch_add(1, atomic::Ordering::Relaxed),
             database: Arc::clone(&database),
             sender,
-            target_admin: Mutex::new(ListenerTargetAdmin::new(database)),
+            events_by_collection: Default::default(),
+            targets_by_collection: Default::default(),
         };
 
         tokio::spawn(listener.go(request_stream));
@@ -63,8 +65,9 @@ impl Listener {
         ReceiverStream::new(rx)
     }
 
-    #[instrument(name = "listener", skip_all, fields(id = self.id))]
-    async fn go(self, mut request_stream: tonic::Streaming<ListenRequest>) -> Result<()> {
+    #[instrument(name = "listener", skip_all, fields(id = self.id), err)]
+    async fn go(mut self, mut request_stream: tonic::Streaming<ListenRequest>) -> Result<()> {
+        // Every Listener has a single event-loop, this is it:
         loop {
             tokio::select! {
                 req = request_stream.next() => {
@@ -81,30 +84,25 @@ impl Listener {
                     }
                 }
 
-                Some(event) = self.next_event() => {
-                    self.process_event(event).await?;
+                Some((_, event)) = self.events_by_collection.next() => {
+                    match event {
+                        Ok(event) => self.process_event(event).await?,
+                        Err(BroadcastStreamRecvError::Lagged(count)) => {
+                            error!(
+                                id = self.id,
+                                count = count,
+                                "listener missed {} events, because of buffer overflow",
+                                count
+                            );
+                        }
+                    }
                 }
             }
         }
     }
 
-    #[instrument(skip_all)]
-    async fn next_event(&self) -> Option<DocumentUpdate> {
-        loop {
-            match self.target_admin.lock().await.events.next().await? {
-                (_, Ok(event)) => return Some(event),
-                (_, Err(BroadcastStreamRecvError::Lagged(nr))) => {
-                    error!(
-                        id = self.id,
-                        "listener missed {} events, because of buffer overflow", nr
-                    );
-                }
-            }
-        }
-    }
-
-    #[instrument(skip_all)]
-    async fn process_request(&self, msg: ListenRequest) -> Result<()> {
+    #[instrument(skip_all, err)]
+    async fn process_request(&mut self, msg: ListenRequest) -> Result<()> {
         let ListenRequest {
             database: _,
             labels,
@@ -141,15 +139,15 @@ impl Listener {
         Ok(())
     }
 
-    #[instrument(skip_all)]
-    async fn process_event(&self, event: DocumentUpdate) -> Result<()> {
-        // Lock the target_admin until we're done to make sure the stream is not used for something else until we respond with our
-        // NO_CHANGE msg. That msg means that everything is up to date until that point and this is (for now) the easiest way to make
-        // sure that is actually the case. This is probably okay, but if it becomes a hotspot we might look into optimizing later.
-        let mut admin = self.target_admin.lock().await;
+    #[instrument(skip_all, err)]
+    async fn process_event(&mut self, event: DocumentUpdate) -> Result<()> {
+        // We rely on the fact that this function will complete before any other events are processed. That's why we know for sure that
+        // the output stream is not used for something else until we respond with our NO_CHANGE msg. That msg means that everything is up
+        // to date until that point and this is (for now) the easiest way to make sure that is actually the case. This is probably okay,
+        // but if it becomes a hotspot we might look into optimizing later.
         let doc_name = event.new_version.name();
         let update_time = event.new_version.update_time();
-        let target_ids = admin
+        let target_ids = self
             .targets_for_doc_name_mut(doc_name)?
             .filter_map(|target| {
                 let ListenerTarget::Document {
@@ -189,17 +187,17 @@ impl Listener {
         .await
     }
 
-    #[instrument(skip_all, fields(target_id = target_id, count = documents.len()))]
+    #[instrument(skip_all, fields(target_id = target_id, count = documents.len()), err)]
     async fn add_documents(
-        &self,
+        &mut self,
         target_id: i32,
         documents: Vec<String>,
         resume_type: Option<target::ResumeType>,
     ) -> Result<()> {
-        // Lock the target_admin until we're done to make sure the stream is not used for something else until we respond with our
-        // NO_CHANGE msg. That msg means that everything is up to date until that point and this is (for now) the easiest way to make
-        // sure that is actually the case. This is probably okay, but if it becomes a hotspot we might look into optimizing later.
-        let mut admin = self.target_admin.lock().await;
+        // We rely on the fact that this function will complete before any other events are processed. That's why we know for sure that
+        // the output stream is not used for something else until we respond with our NO_CHANGE msg. That msg means that everything is up
+        // to date until that point and this is (for now) the easiest way to make sure that is actually the case. This is probably okay,
+        // but if it becomes a hotspot we might look into optimizing later.
         let send_if_newer_than = resume_type.map(Timestamp::try_from).transpose()?;
 
         // Response: I'm on it!
@@ -214,8 +212,8 @@ impl Listener {
         for name in &documents {
             debug!(name);
             // Make sure we get to receive all updates from now on..
-            admin.ensure_listening_to_doc(name).await?;
-            admin.add_listener_target(ListenerTarget::Document {
+            self.ensure_listening_to_doc(name).await?;
+            self.add_listener_target(ListenerTarget::Document {
                 target_id,
                 name: name.to_string(),
                 last_read_time: read_time.clone(),
@@ -274,7 +272,7 @@ impl Listener {
         Ok(())
     }
 
-    #[instrument(skip_all, fields(message = display(show_response_type(&response_type))))]
+    #[instrument(skip_all, fields(message = display(show_response_type(&response_type))), err)]
     async fn send(&self, response_type: ResponseType) -> Result<()> {
         self.sender
             .send(Ok(ListenResponse {
@@ -284,41 +282,25 @@ impl Listener {
             .map_err(|_| Status::cancelled("stream closed"))
     }
 
-    #[instrument(skip(self))]
+    #[instrument(skip(self), err)]
     async fn send_err(&self, err: Status) -> Result<()> {
         self.sender
             .send(Err(err))
             .await
             .map_err(|_| Status::cancelled("stream closed"))
     }
-}
-
-struct ListenerTargetAdmin {
-    database: Arc<Database>,
-    events: StreamMap<String, BroadcastStream<DocumentUpdate>>,
-    targets_by_collection: HashMap<String, Vec<ListenerTarget>>,
-}
-
-impl ListenerTargetAdmin {
-    fn new(database: Arc<Database>) -> Self {
-        Self {
-            database,
-            events: Default::default(),
-            targets_by_collection: Default::default(),
-        }
-    }
 
     #[instrument(skip(self))]
     async fn ensure_listening_to_doc(&mut self, name: &str) -> Result<()> {
         let collection_name = collection_name(name)?;
-        if !self.events.contains_key(collection_name) {
+        if !self.events_by_collection.contains_key(collection_name) {
             let collection_events = self
                 .database
                 .get_collection(collection_name)
                 .await
                 .events
                 .subscribe();
-            self.events.insert(
+            self.events_by_collection.insert(
                 collection_name.to_string(),
                 BroadcastStream::new(collection_events),
             );
