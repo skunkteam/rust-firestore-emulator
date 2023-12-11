@@ -159,35 +159,8 @@ describe('concurrent tests', () => {
         });
 
         describe('tests with synchronized processes', () => {
-            const log: string[] = [];
-            const lastEvent$ = atom.unresolved<string>();
-            const processName = new AsyncLocalStorage<string>();
-
-            beforeEach(() => {
-                log.length = 0;
-                lastEvent$.unset();
-            });
-
-            function event(what: string) {
-                log.push(`${processName.getStore()} EVENT: ${what}`);
-                lastEvent$.set(what);
-            }
-
-            async function when(what: string) {
-                log.push(`${processName.getStore()} WAITING UNTIL: ${what}`);
-                const errorAfterTime$ = fromPromise(time(10_000)).map((): MaybeFinalState<never> => {
-                    const msg = `${processName.getStore()} timeout, current log: ${log.map(m => '\n- ' + m).join('')}`;
-                    // console.log('Current lo')
-                    return final(error(msg));
-                });
-                await lastEvent$.toPromise({ when: d$ => d$.is(what).or(errorAfterTime$) });
-            }
-
-            async function concurrently(...processes: Array<() => Promise<unknown>>) {
-                await Promise.all(processes.map(async (p, i) => processName.run(`${'       |'.repeat(i)} <<${i + 1}>> |`, p)));
-            }
-
-            test('reading the same doc from different txns', async () => {
+            test.concurrent('reading the same doc from different txns', async () => {
+                const test = new ConcurrentTest();
                 // Scenario:
                 // Process 1 - create doc
                 // Process 1 - start txn A
@@ -199,44 +172,44 @@ describe('concurrent tests', () => {
 
                 const [ref] = refs();
 
-                await concurrently(
+                await test.run(
                     // Process 1
                     async () => {
                         await ref.create(fs.writeData({ value: 'original value' }));
-                        event('doc created');
+                        test.event('doc created');
 
                         const result = await fs.firestore.runTransaction(async txn => {
-                            event('txn A started');
+                            test.event('txn A started');
 
                             const snap = await txn.get(ref);
                             const value = snap.get('value') as unknown;
-                            event('in txn A: doc read');
+                            test.event('in txn A: doc read');
 
-                            await when('txn B ended');
+                            await test.when('txn B ended');
                             return value;
                         });
-                        event('read: ' + result);
-                        event('txn A ended');
+                        test.event('read: ' + result);
+                        test.event('txn A ended');
                     },
 
                     // Process 2
                     async () => {
-                        await when('in txn A: doc read');
+                        await test.when('in txn A: doc read');
                         const result = await fs.firestore.runTransaction(async txn => {
-                            event('txn B started');
+                            test.event('txn B started');
 
                             const snap = await txn.get(ref);
                             const value = snap.get('value') as unknown;
-                            event('in txn B: doc read');
+                            test.event('in txn B: doc read');
 
                             return value;
                         });
-                        event('read: ' + result);
-                        event('txn B ended');
+                        test.event('read: ' + result);
+                        test.event('txn B ended');
                     },
                 );
 
-                expect(log).toEqual([
+                expect(test.log).toEqual([
                     '       | <<2>> | WAITING UNTIL: in txn A: doc read',
                     ' <<1>> | EVENT: doc created',
                     ' <<1>> | EVENT: txn A started',
@@ -251,7 +224,8 @@ describe('concurrent tests', () => {
                 ]);
             });
 
-            test('reading the same doc from different txns, try to write in second txn', async () => {
+            test.concurrent('reading the same doc from different txns, try to write in second txn', async () => {
+                const test = new ConcurrentTest();
                 // Scenario:
                 // Process 1 - create doc
                 // Process 1 - start txn A
@@ -265,49 +239,49 @@ describe('concurrent tests', () => {
 
                 const [ref] = refs();
 
-                await concurrently(
+                await test.run(
                     // Process 1
                     async () => {
                         await ref.create(fs.writeData({ value: 'original value' }));
-                        event('doc created');
+                        test.event('doc created');
 
                         const result = await fs.firestore.runTransaction(async txn => {
-                            event('txn A started');
+                            test.event('txn A started');
 
                             const snap = await txn.get(ref);
                             const value = snap.get('value') as unknown;
-                            event('in txn A: doc read');
+                            test.event('in txn A: doc read');
 
-                            await when('in txn B: update requested in txn');
+                            await test.when('in txn B: update requested in txn');
                             await time(500);
-                            expect(lastEvent$.get()).toBe('in txn B: update requested in txn');
-                            event('waited 500ms, txn B still pending');
+                            expect(test.lastEvent$.get()).toBe('in txn B: update requested in txn');
+                            test.event('waited 500ms, txn B still pending');
                             return value;
                         });
-                        event('txn A ended');
-                        event('read: ' + result);
+                        test.event('txn A ended');
+                        test.event('read: ' + result);
                     },
 
                     // Process 2
                     async () => {
-                        await when('in txn A: doc read');
+                        await test.when('in txn A: doc read');
                         const result = await fs.firestore.runTransaction(async txn => {
-                            event('txn B started');
+                            test.event('txn B started');
 
                             const snap = await txn.get(ref);
                             const value = snap.get('value') as unknown;
-                            event('in txn B: doc read');
+                            test.event('in txn B: doc read');
 
                             txn.update(ref, { value: 'changed by txn B' });
-                            event('in txn B: update requested in txn');
+                            test.event('in txn B: update requested in txn');
                             return value;
                         });
-                        event('txn B ended');
-                        event('read: ' + result);
+                        test.event('txn B ended');
+                        test.event('read: ' + result);
                     },
                 );
 
-                expect(log).toEqual([
+                expect(test.log).toEqual([
                     '       | <<2>> | WAITING UNTIL: in txn A: doc read',
                     ' <<1>> | EVENT: doc created',
                     ' <<1>> | EVENT: txn A started',
@@ -324,7 +298,8 @@ describe('concurrent tests', () => {
                 ]);
             });
 
-            test('reading the same doc from different txns, try to write in both txns', async () => {
+            test.concurrent('reading the same doc from different txns, try to write in both txns', async () => {
+                const test = new ConcurrentTest();
                 // Scenario:
                 // Process 1 - create doc
                 // Process 1 - start txn A
@@ -342,50 +317,50 @@ describe('concurrent tests', () => {
 
                 const [ref] = refs();
 
-                await concurrently(
+                await test.run(
                     // Process 1
                     async () => {
                         await ref.create(fs.writeData({ value: 'original value' }));
-                        event('doc created');
+                        test.event('doc created');
 
                         const result = await fs.firestore.runTransaction(async txn => {
-                            event('txn A started');
+                            test.event('txn A started');
 
                             const snap = await txn.get(ref);
                             const value = snap.get('value') as unknown;
-                            event('in txn A: doc read');
+                            test.event('in txn A: doc read');
 
-                            await when('in txn B: update requested in txn');
+                            await test.when('in txn B: update requested in txn');
                             await time(500);
-                            expect(lastEvent$.get()).toBe('in txn B: update requested in txn');
-                            event('waited 500ms, txn B still pending');
+                            expect(test.lastEvent$.get()).toBe('in txn B: update requested in txn');
+                            test.event('waited 500ms, txn B still pending');
                             txn.update(ref, { value: 'changed by txn A' });
                             return value;
                         });
-                        event('txn A ended');
-                        event('read: ' + result);
+                        test.event('txn A ended');
+                        test.event('read: ' + result);
                     },
 
                     // Process 2
                     async () => {
-                        await when('in txn A: doc read');
+                        await test.when('in txn A: doc read');
                         const result = await fs.firestore.runTransaction(async txn => {
-                            event('txn B started');
+                            test.event('txn B started');
 
                             const snap = await txn.get(ref);
                             const value = snap.get('value') as unknown;
-                            event('in txn B: doc read');
+                            test.event('in txn B: doc read');
 
                             txn.update(ref, { value: 'changed by txn B' });
-                            event('in txn B: update requested in txn');
+                            test.event('in txn B: update requested in txn');
                             return value;
                         });
-                        event('txn B ended');
-                        event('read: ' + result);
+                        test.event('txn B ended');
+                        test.event('read: ' + result);
                     },
                 );
 
-                expect(log).toEqual([
+                expect(test.log).toEqual([
                     '       | <<2>> | WAITING UNTIL: in txn A: doc read',
                     ' <<1>> | EVENT: doc created',
                     ' <<1>> | EVENT: txn A started',
@@ -408,7 +383,8 @@ describe('concurrent tests', () => {
                 ]);
             });
 
-            test('regular writes also wait until all txns-locks are released', async () => {
+            test.concurrent('regular writes also wait until all txns-locks are released', async () => {
+                const test = new ConcurrentTest();
                 // Scenario:
                 // Process 1 - create outside txn (doc 1), completes immediately.
                 // Process 2 - start txn A
@@ -426,58 +402,58 @@ describe('concurrent tests', () => {
 
                 const [ref1, ref2] = refs();
 
-                await concurrently(
+                await test.run(
                     // Process 1
                     async () => {
                         await ref1.create(fs.writeData({ log: ['created outside txn'] }));
-                        event('create outside txn succeeded');
+                        test.event('create outside txn succeeded');
 
-                        await when('in txn B: read doc 1');
+                        await test.when('in txn B: read doc 1');
                         const promise = ref1.update({ log: fs.exported.FieldValue.arrayUnion('updated outside txn in process 1') });
-                        event('started update outside of txn in process 1');
+                        test.event('started update outside of txn in process 1');
 
                         await promise;
-                        expect(lastEvent$.get()).toBe('end txn A');
-                        event('finished update outside of txn in process 1');
+                        expect(test.lastEvent$.get()).toBe('end txn A');
+                        test.event('finished update outside of txn in process 1');
                     },
                     // Process 2
                     async () => {
-                        await when('create outside txn succeeded');
+                        await test.when('create outside txn succeeded');
                         await fs.firestore.runTransaction(async txn => {
                             await txn.get(ref1);
-                            event('in txn A: read doc 1');
+                            test.event('in txn A: read doc 1');
 
-                            await when('end txn B');
+                            await test.when('end txn B');
                             txn.update(ref1, { log: fs.exported.FieldValue.arrayUnion('updated inside txn A') });
                         });
-                        event('end txn A');
+                        test.event('end txn A');
                     },
                     // Process 3
                     async () => {
-                        await when('in txn A: read doc 1');
+                        await test.when('in txn A: read doc 1');
                         await fs.firestore.runTransaction(async txn => {
                             await txn.get(ref1);
-                            event('in txn B: read doc 1');
+                            test.event('in txn B: read doc 1');
 
-                            await when('started update outside of txn in process 4');
+                            await test.when('started update outside of txn in process 4');
                             txn.create(ref2, fs.writeData({ from: 'txn B' }));
                         });
-                        event('end txn B');
+                        test.event('end txn B');
                     },
                     // Process 4
                     async () => {
-                        await when('started update outside of txn in process 1');
+                        await test.when('started update outside of txn in process 1');
                         await time(15);
                         const promise = ref1.update({ log: fs.exported.FieldValue.arrayUnion('updated outside txn in process 4') });
-                        event('started update outside of txn in process 4');
+                        test.event('started update outside of txn in process 4');
 
                         await promise;
-                        expect(lastEvent$.get()).toBe('finished update outside of txn in process 1');
-                        event('finished update outside of txn in process 4');
+                        expect(test.lastEvent$.get()).toBe('finished update outside of txn in process 1');
+                        test.event('finished update outside of txn in process 4');
                     },
                 );
 
-                expect(log).toEqual([
+                expect(test.log).toEqual([
                     //<<1>> | <<2>> | <<3>> | <<4>> |
                     '       | <<2>> | WAITING UNTIL: create outside txn succeeded',
                     '       |       | <<3>> | WAITING UNTIL: in txn A: read doc 1',
@@ -505,6 +481,176 @@ describe('concurrent tests', () => {
                     ],
                 });
             });
+
+            describe('queries', () => {
+                // test.concurrent.each([
+                //     {testName: 'create',},
+                //     {testName: 'update',},
+                //     {testName: 'delete',},
+
+                // ])
+                test.concurrent('update after reading a query', async () => {
+                    const testName = 'update';
+
+                    const [docRef1, docRef2] = refs();
+
+                    await docRef1.create(fs.writeData({ testName }));
+                    await docRef2.create(fs.writeData({ testName }));
+
+                    const query = fs.collection.where('testName', '==', testName);
+
+                    const test = new ConcurrentTest();
+
+                    await test.run(
+                        async () => {
+                            await fs.firestore.runTransaction(async txn => {
+                                test.event('transaction started');
+
+                                const snaps = await txn.get(query);
+                                expect(snaps.size).toBe(2);
+                                test.event('transaction locked the query');
+                                await time(500);
+                                expect(test.lastEvent$.get()).toBe('transaction locked the query');
+
+                                txn.update(docRef1, { other: 'data' });
+                            });
+                            test.event('transaction completed');
+                        },
+                        async () => {
+                            await test.when('transaction locked the query');
+                            await docRef1.update({ simple: 'update' });
+                            test.event('docRef1 updated outside the query');
+                        },
+                        async () => {
+                            await test.when('transaction locked the query');
+                            await docRef2.update({ simple: 'update' });
+                            test.event('docRef2 updated outside the query');
+                        },
+                    );
+
+                    expect(test.log).toEqual([
+                        '       | <<2>> | WAITING UNTIL: transaction locked the query',
+                        '       |       | <<3>> | WAITING UNTIL: transaction locked the query',
+                        ' <<1>> | EVENT: transaction started',
+                        ' <<1>> | EVENT: transaction locked the query',
+                        ' <<1>> | EVENT: transaction completed',
+                        '       |       | <<3>> | EVENT: docRef2 updated outside the query',
+                        '       | <<2>> | EVENT: docRef1 updated outside the query',
+                    ]);
+                });
+
+                test.concurrent('delete after reading a query', async () => {
+                    const testName = 'delete';
+
+                    const [docRef1, docRef2] = refs();
+
+                    await docRef1.create(fs.writeData({ testName }));
+                    await docRef2.create(fs.writeData({ testName }));
+
+                    const query = fs.collection.where('testName', '==', testName);
+
+                    const test = new ConcurrentTest();
+
+                    await test.run(
+                        async () => {
+                            await fs.firestore.runTransaction(async txn => {
+                                test.event('transaction started');
+
+                                const snaps = await txn.get(query);
+                                expect(snaps.size).toBe(2);
+                                test.event('transaction locked the query');
+                                await time(500);
+                                expect(test.lastEvent$.get()).toBe('transaction locked the query');
+
+                                txn.update(docRef1, { other: 'data' });
+                            });
+                            test.event('transaction completed');
+                        },
+                        async () => {
+                            await test.when('transaction locked the query');
+                            await docRef1.delete();
+                            test.event('docRef1 deleted outside the query');
+                        },
+                    );
+
+                    expect(test.log).toEqual([
+                        '       | <<2>> | WAITING UNTIL: transaction locked the query',
+                        ' <<1>> | EVENT: transaction started',
+                        ' <<1>> | EVENT: transaction locked the query',
+                        ' <<1>> | EVENT: transaction completed',
+                        '       | <<2>> | EVENT: docRef1 deleted outside the query',
+                    ]);
+                });
+
+                test.concurrent('create after reading a query', async () => {
+                    const testName = 'create';
+
+                    const [docRef1, docRef2] = refs();
+
+                    await docRef1.create(fs.writeData({ testName }));
+                    // await docRef2.create(fs.writeData({ testName }));
+
+                    const query = fs.collection.where('testName', '==', testName);
+
+                    const test = new ConcurrentTest();
+
+                    await test.run(
+                        async () => {
+                            await fs.firestore.runTransaction(async txn => {
+                                test.event('transaction started');
+
+                                const snaps = await txn.get(query);
+                                expect(snaps.size).toBe(1);
+                                test.event('transaction locked the query');
+
+                                await test.when('docRef2 created outside the query');
+
+                                txn.update(docRef1, { other: 'data' });
+                                txn.update(docRef2, { other: 'data' });
+                            });
+                            test.event('transaction completed');
+                        },
+                        async () => {
+                            await test.when('transaction locked the query');
+                            await docRef2.create({ first: 'data' });
+                            test.event('docRef2 created outside the query');
+                        },
+                    );
+
+                    expect(test.log).toEqual([
+                        '       | <<2>> | WAITING UNTIL: transaction locked the query',
+                        ' <<1>> | EVENT: transaction started',
+                        ' <<1>> | EVENT: transaction locked the query',
+                        '       | <<2>> | EVENT: docRef2 created outside the query',
+                        ' <<1>> | EVENT: transaction completed',
+                    ]);
+                });
+            });
+
+            class ConcurrentTest {
+                readonly log: string[] = [];
+                readonly lastEvent$ = atom.unresolved<string>();
+                readonly processName = new AsyncLocalStorage<string>();
+
+                event(what: string) {
+                    this.log.push(`${this.processName.getStore()} EVENT: ${what}`);
+                    this.lastEvent$.set(what);
+                }
+
+                async when(what: string) {
+                    this.log.push(`${this.processName.getStore()} WAITING UNTIL: ${what}`);
+                    const errorAfterTime$ = fromPromise(time(10_000)).map((): MaybeFinalState<never> => {
+                        const msg = `${this.processName.getStore()} timeout, current log: ${this.log.map(m => '\n- ' + m).join('')}`;
+                        // console.log('Current lo')
+                        return final(error(msg));
+                    });
+                    await this.lastEvent$.toPromise({ when: d$ => d$.is(what).or(errorAfterTime$) });
+                }
+
+                async run(...processes: Array<() => Promise<unknown>>) {
+                    await Promise.all(processes.map(async (p, i) => this.processName.run(`${'       |'.repeat(i)} <<${i + 1}>> |`, p)));
+                }
+            }
         });
 
         type UsedRefs =
