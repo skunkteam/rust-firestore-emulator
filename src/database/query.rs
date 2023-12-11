@@ -1,6 +1,7 @@
 use self::filter::Filter;
 use super::{
-    document::StoredDocumentVersion, field_path::FieldReference, Database, ReadConsistency,
+    collection::Collection, document::StoredDocumentVersion, field_path::FieldReference, Database,
+    ReadConsistency,
 };
 use crate::{
     googleapis::google::firestore::v1::{structured_query::CollectionSelector, *},
@@ -176,19 +177,15 @@ impl Query {
             unimplemented!("offset in live queries");
         }
         unimplemented_option!(self.limit);
+        if self.from.iter().any(|sel| sel.all_descendants) {
+            unimplemented!("all_descendants in live queries");
+        }
         Ok(())
     }
 
     pub async fn once(&self, db: &Database) -> Result<Vec<Document>> {
         // First collect all Arc<Collection>s in a Vec to release the collection lock asap.
-        let collections = db
-            .collections
-            .read()
-            .await
-            .values()
-            .filter(|&col| self.includes_collection(&col.name))
-            .map(Arc::clone)
-            .collect_vec();
+        let collections = self.applicable_collections(db).await;
 
         let txn = db.get_txn_for_consistency(&self.consistency).await?;
 
@@ -242,7 +239,17 @@ impl Query {
             .try_collect()
     }
 
-    fn includes_collection(&self, path: &str) -> bool {
+    pub async fn applicable_collections(&self, db: &Database) -> Vec<Arc<Collection>> {
+        db.collections
+            .read()
+            .await
+            .values()
+            .filter(|&col| self.includes_collection(&col.name))
+            .map(Arc::clone)
+            .collect_vec()
+    }
+
+    pub fn includes_collection(&self, path: &str) -> bool {
         let Some(path) = path
             .strip_prefix(&self.parent)
             .and_then(|path| path.strip_prefix('/'))
@@ -258,7 +265,7 @@ impl Query {
         })
     }
 
-    fn includes_document(&self, doc: &StoredDocumentVersion) -> Result<bool> {
+    pub fn includes_document(&self, doc: &StoredDocumentVersion) -> Result<bool> {
         if let Some(filter) = &self.filter {
             if !filter.eval(doc)? {
                 return Ok(false);

@@ -260,7 +260,7 @@ impl DocumentVersion {
         }
     }
 
-    fn stored_document(&self) -> Option<&Arc<StoredDocumentVersion>> {
+    pub fn stored_document(&self) -> Option<&Arc<StoredDocumentVersion>> {
         match self {
             DocumentVersion::Deleted(_) => None,
             DocumentVersion::Stored(version) => Some(version),

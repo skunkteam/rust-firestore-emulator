@@ -21,7 +21,7 @@ use std::{
     ops::Deref,
     sync::{Arc, Weak},
 };
-use tokio::sync::RwLock;
+use tokio::sync::{broadcast, RwLock};
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Result, Status};
 use tracing::{info, instrument, Span};
@@ -37,6 +37,7 @@ mod value;
 pub struct Database {
     collections: RwLock<HashMap<String, Arc<Collection>>>,
     transactions: RunningTransactions,
+    pub new_collections: broadcast::Sender<Arc<Collection>>,
 }
 
 impl Database {
@@ -44,6 +45,7 @@ impl Database {
         Arc::new_cyclic(|database| Database {
             collections: Default::default(),
             transactions: RunningTransactions::new(Weak::clone(database)),
+            new_collections: broadcast::channel(16).0,
         })
     }
 }
@@ -78,7 +80,9 @@ impl Database {
             &*self
                 .collections
                 .get_or_insert(collection_name, || {
-                    Collection::new(collection_name.into()).into()
+                    let col = Arc::new(Collection::new(collection_name.into()));
+                    let _ = self.new_collections.send(Arc::clone(&col));
+                    col
                 })
                 .await,
         )

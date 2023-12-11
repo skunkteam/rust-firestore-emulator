@@ -3,160 +3,160 @@ import assert from 'assert';
 import { omit, range } from 'lodash';
 import { fs } from './utils';
 
-fs.notImplementedInRust
-    ? test.todo('not implemented yet')
-    : describe('listen to query updates', () => {
-          describe.each([
-              {
-                  description: 'full collection',
-                  createDoc: async (coll: FirebaseFirestore.CollectionReference, data: FirebaseFirestore.DocumentData) => {
-                      const included = coll.doc();
-                      // SubCollection with the same name as the main collection
-                      const notIncluded = subCollection(coll).doc();
-                      await included.create(fs.writeData({ included: true, ...data }));
-                      await notIncluded.create(fs.writeData({ included: false, ...data }));
+describe('listen to query updates', () => {
+    describe.each([
+        {
+            description: 'full collection',
+            createDoc: async (coll: FirebaseFirestore.CollectionReference, data: FirebaseFirestore.DocumentData) => {
+                const included = coll.doc();
+                // SubCollection with the same name as the main collection
+                const notIncluded = subCollection(coll).doc();
+                await included.create(fs.writeData({ included: true, ...data }));
+                await notIncluded.create(fs.writeData({ included: false, ...data }));
 
-                      return [included, notIncluded];
-                  },
-                  listen: (coll: FirebaseFirestore.CollectionReference) => baseListen(coll),
-              },
-              {
-                  description: 'equality query',
-                  createDoc: async (coll: FirebaseFirestore.CollectionReference, data: FirebaseFirestore.DocumentData) => {
-                      const included = coll.doc();
-                      const notIncluded = coll.doc();
-                      await included.create(fs.writeData({ included: true, ...data }));
-                      await notIncluded.create(fs.writeData({ included: false, ...data }));
-                      return [included, notIncluded];
-                  },
-                  listen: (coll: FirebaseFirestore.CollectionReference) => baseListen(coll.where('included', '==', true)),
-              },
-              {
-                  description: 'inequality query',
-                  createDoc: async (coll: FirebaseFirestore.CollectionReference, data: FirebaseFirestore.DocumentData) => {
-                      const included = coll.doc();
-                      const notIncluded = coll.doc();
-                      await included.create(fs.writeData({ included: true, ...data }));
-                      await notIncluded.create(fs.writeData({ included: false, ...data }));
-                      return [included, notIncluded];
-                  },
-                  listen: (coll: FirebaseFirestore.CollectionReference) => baseListen(coll.where('included', '!=', false)),
-              },
-              {
-                  description: 'greater than query',
-                  createDoc: async (coll: FirebaseFirestore.CollectionReference, data: FirebaseFirestore.DocumentData) => {
-                      const included = coll.doc();
-                      const notIncluded = coll.doc();
-                      await included.create(fs.writeData({ included: true, number: Math.random() * 1_000, ...data }));
-                      await notIncluded.create(fs.writeData({ included: false, number: -Math.random() * 1_000, ...data }));
-                      return [included, notIncluded];
-                  },
-                  listen: (coll: FirebaseFirestore.CollectionReference) => baseListen(coll.where('number', '>=', 0), 'number'),
-              },
-          ] as const)('$description', ({ createDoc, listen }) => {
-              describe('single (relevant) document', () => {
-                  test.concurrent('create, listen, stop', async () => {
-                      const coll = subCollection();
+                return [included, notIncluded];
+            },
+            listen: (coll: FirebaseFirestore.CollectionReference) => baseListen(coll),
+        },
+        {
+            description: 'equality query',
+            createDoc: async (coll: FirebaseFirestore.CollectionReference, data: FirebaseFirestore.DocumentData) => {
+                const included = coll.doc();
+                const notIncluded = coll.doc();
+                await included.create(fs.writeData({ included: true, ...data }));
+                await notIncluded.create(fs.writeData({ included: false, ...data }));
+                return [included, notIncluded];
+            },
+            listen: (coll: FirebaseFirestore.CollectionReference) => baseListen(coll.where('included', '==', true)),
+        },
+        {
+            description: 'inequality query',
+            createDoc: async (coll: FirebaseFirestore.CollectionReference, data: FirebaseFirestore.DocumentData) => {
+                const included = coll.doc();
+                const notIncluded = coll.doc();
+                await included.create(fs.writeData({ included: true, ...data }));
+                await notIncluded.create(fs.writeData({ included: false, ...data }));
+                return [included, notIncluded];
+            },
+            listen: (coll: FirebaseFirestore.CollectionReference) => baseListen(coll.where('included', '!=', false)),
+        },
+        {
+            description: 'greater than query',
+            createDoc: async (coll: FirebaseFirestore.CollectionReference, data: FirebaseFirestore.DocumentData) => {
+                const included = coll.doc();
+                const notIncluded = coll.doc();
+                await included.create(fs.writeData({ included: true, number: Math.random() * 1_000, ...data }));
+                await notIncluded.create(fs.writeData({ included: false, number: -Math.random() * 1_000, ...data }));
+                return [included, notIncluded];
+            },
+            listen: (coll: FirebaseFirestore.CollectionReference) => baseListen(coll.where('number', '>=', 0), 'number'),
+        },
+    ] as const)('$description', ({ createDoc, listen }) => {
+        describe('single (relevant) document', () => {
+            test.concurrent('create, listen, stop', async () => {
+                const coll = subCollection();
 
-                      await createDoc(coll, { some: 'data' });
-                      const { stop, getCurrent } = listen(coll);
+                await createDoc(coll, { some: 'data' });
+                const { stop, getCurrent } = listen(coll);
 
-                      expect(await getCurrent()).toEqual([{ some: 'data' }]);
+                expect(await getCurrent()).toEqual([{ some: 'data' }]);
 
-                      stop();
-                  });
+                stop();
+            });
 
-                  test.concurrent('create, listen, update, stop', async () => {
-                      const coll = subCollection();
+            test.concurrent('create, listen, update, stop', async () => {
+                const coll = subCollection();
 
-                      const docs = await createDoc(coll, { some: 'data' });
-                      const { stop, getCurrent, getNext } = listen(coll);
+                const docs = await createDoc(coll, { some: 'data' });
+                const { stop, getCurrent, getNext } = listen(coll);
 
-                      expect(await getCurrent()).toEqual([{ some: 'data' }]);
+                expect(await getCurrent()).toEqual([{ some: 'data' }]);
 
-                      const [secondData] = await Promise.all([getNext(), update(docs, { some: 'other data' })]);
+                const [secondData] = await Promise.all([getNext(), update(docs, { some: 'other data' })]);
 
-                      expect(secondData).toEqual([{ some: 'other data' }]);
+                expect(secondData).toEqual([{ some: 'other data' }]);
 
-                      stop();
-                  });
+                stop();
+            });
 
-                  test.concurrent('listen, create, update, stop', async () => {
-                      const coll = subCollection();
+            test.concurrent('listen, create, update, stop', async () => {
+                const coll = subCollection();
 
-                      const { stop, getCurrent, getNext } = listen(coll);
-                      expect(await getCurrent()).toEqual([]);
+                const { stop, getCurrent, getNext } = listen(coll);
+                expect(await getCurrent()).toEqual([]);
 
-                      const resultPromise = getNext();
-                      const docs = await createDoc(coll, { some: 'data' });
-                      expect(await resultPromise).toEqual([{ some: 'data' }]);
+                const resultPromise = getNext();
+                const docs = await createDoc(coll, { some: 'data' });
+                expect(await resultPromise).toEqual([{ some: 'data' }]);
 
-                      const [secondData] = await Promise.all([getNext(), update(docs, { some: 'other data' })]);
+                const [secondData] = await Promise.all([getNext(), update(docs, { some: 'other data' })]);
 
-                      expect(secondData).toEqual([{ some: 'other data' }]);
+                expect(secondData).toEqual([{ some: 'other data' }]);
 
-                      stop();
-                  });
-              });
+                stop();
+            });
+        });
 
-              test.concurrent('add/remove relevant documents', async () => {
-                  const coll = subCollection();
+        fs.notImplementedInRust ||
+            test.concurrent('add/remove relevant documents', async () => {
+                const coll = subCollection();
 
-                  const { stop, getCurrent, getNext } = listen(coll);
-                  expect(await getCurrent()).toEqual([]);
+                const { stop, getCurrent, getNext } = listen(coll);
+                expect(await getCurrent()).toEqual([]);
 
-                  const docPairs: FirebaseFirestore.DocumentReference[][] = [];
-                  for (let i = 1; i < 10; i++) {
-                      const [newData, docs] = await Promise.all([getNext(), createDoc(coll, { some: 'doc: ' + i })]);
-                      docPairs.push(docs);
-                      expect(newData).toBeArrayOfSize(i);
-                  }
+                const docPairs: FirebaseFirestore.DocumentReference[][] = [];
+                for (let i = 1; i < 10; i++) {
+                    const [newData, docs] = await Promise.all([getNext(), createDoc(coll, { some: 'doc: ' + i })]);
+                    docPairs.push(docs);
+                    expect(newData).toBeArrayOfSize(i);
+                }
 
-                  while (docPairs.length) {
-                      const docsToRemove = docPairs.pop();
-                      assert(docsToRemove);
-                      const [newData] = await Promise.all([getNext(), ...docsToRemove.map(doc => doc.delete())]);
-                      expect(newData).toBeArrayOfSize(docPairs.length);
-                  }
+                while (docPairs.length) {
+                    const docsToRemove = docPairs.pop();
+                    assert(docsToRemove);
+                    const [newData] = await Promise.all([getNext(), ...docsToRemove.map(doc => doc.delete())]);
+                    expect(newData).toBeArrayOfSize(docPairs.length);
+                }
 
-                  stop();
-              });
+                stop();
+            });
 
-              test.concurrent('batch write', async () => {
-                  const coll = subCollection();
+        fs.notImplementedInRust ||
+            test.concurrent('batch write', async () => {
+                const coll = subCollection();
 
-                  const refs = await Promise.all(range(5).map(i => createDoc(coll, { some: 'doc: ' + i }))).then(r => r.flat());
+                const refs = await Promise.all(range(5).map(i => createDoc(coll, { some: 'doc: ' + i }))).then(r => r.flat());
 
-                  const { stop, getCurrent, getNext, documentSnaps } = listen(coll);
-                  expect(await getCurrent()).toBeArrayOfSize(5);
+                const { stop, getCurrent, getNext, documentSnaps } = listen(coll);
+                expect(await getCurrent()).toBeArrayOfSize(5);
 
-                  const updateBatch = fs.firestore.batch();
-                  for (const ref of refs) {
-                      updateBatch.update(ref, { with: 'update' });
-                  }
-                  const [newData] = await Promise.all([getNext(), updateBatch.commit()]);
-                  expect(newData).toBeArrayOfSize(5);
-                  for (const data of newData) {
-                      expect(data).toEqual({ some: expect.stringMatching(/^doc: \d$/), with: 'update' });
-                  }
+                const updateBatch = fs.firestore.batch();
+                for (const ref of refs) {
+                    updateBatch.update(ref, { with: 'update' });
+                }
+                const [newData] = await Promise.all([getNext(), updateBatch.commit()]);
+                expect(newData).toBeArrayOfSize(5);
+                for (const data of newData) {
+                    expect(data).toEqual({ some: expect.stringMatching(/^doc: \d$/), with: 'update' });
+                }
 
-                  const deleteBatch = fs.firestore.batch();
-                  for (const ref of refs) {
-                      deleteBatch.delete(ref);
-                  }
-                  const [noData] = await Promise.all([getNext(), deleteBatch.commit()]);
-                  expect(noData).toBeArrayOfSize(0);
+                const deleteBatch = fs.firestore.batch();
+                for (const ref of refs) {
+                    deleteBatch.delete(ref);
+                }
+                const [noData] = await Promise.all([getNext(), deleteBatch.commit()]);
+                expect(noData).toBeArrayOfSize(0);
 
-                  // There should only be 3 updates:
-                  // 1. the initial update for the listen
-                  // 2. the update batch
-                  // 3. the delete batch
-                  expect(documentSnaps).toBeArrayOfSize(3);
+                // There should only be 3 updates:
+                // 1. the initial update for the listen
+                // 2. the update batch
+                // 3. the delete batch
+                expect(documentSnaps).toBeArrayOfSize(3);
 
-                  stop();
-              });
-          });
-      });
+                stop();
+            });
+    });
+});
 
 function subCollection(coll = fs.collection) {
     return coll.doc().collection('collection');
