@@ -6,31 +6,26 @@ import { writeData } from './utils/firestore';
 describe('listen to document updates', () => {
     test.concurrent('create, listen, stop', async () => {
         const doc = fs.collection.doc();
+
         const { writeTime: createTime } = await doc.create(writeData({ some: 'data' }));
-        const { stop, snapshot$ } = listen(doc);
-        const firstSnap = await snapshot$.toPromise();
-        expect(firstSnap.data()).toEqual({ some: 'data', ttl: expect.anything() });
-        expect(firstSnap.createTime).toEqual(createTime);
-        expect(firstSnap.updateTime).toEqual(createTime);
+        const { stop, getCurrent } = listen(doc);
+
+        checkSnap(await getCurrent(), { createTime, updateTime: createTime, data: { some: 'data' } });
 
         stop();
     });
 
     test.concurrent('create, listen, update, stop', async () => {
         const doc = fs.collection.doc();
-        const { writeTime: createTime } = await doc.create(writeData({ some: 'data' }));
-        const { stop, snapshot$ } = listen(doc);
-        const firstSnap = await snapshot$.toPromise();
-        expect(firstSnap.data()).toEqual({ some: 'data', ttl: expect.anything() });
-        expect(firstSnap.createTime).toEqual(createTime);
-        expect(firstSnap.updateTime).toEqual(createTime);
 
-        const secondPromise = snapshot$.toPromise({ skipFirst: true });
-        const { writeTime: updateTime } = await doc.update({ some: 'other data' });
-        const secondSnap = await secondPromise;
-        expect(secondSnap.data()).toEqual({ some: 'other data', ttl: expect.anything() });
-        expect(secondSnap.createTime).toEqual(createTime);
-        expect(secondSnap.updateTime).toEqual(updateTime);
+        const { writeTime: createTime } = await doc.create(writeData({ some: 'data' }));
+        const { stop, getCurrent, getNext } = listen(doc);
+
+        checkSnap(await getCurrent(), { createTime, updateTime: createTime, data: { some: 'data' } });
+
+        const [secondSnap, { writeTime: updateTime }] = await Promise.all([getNext(), doc.update({ some: 'other data' })]);
+
+        checkSnap(secondSnap, { createTime, updateTime, data: { some: 'other data' } });
 
         expect(updateTime).not.toBe(createTime);
 
@@ -39,23 +34,17 @@ describe('listen to document updates', () => {
 
     test.concurrent('listen, create, update, stop', async () => {
         const doc = fs.collection.doc();
-        const { stop, snapshot$ } = listen(doc);
-        const firstSnap = await snapshot$.toPromise();
+
+        const { stop, getCurrent, getNext } = listen(doc);
+
+        const firstSnap = await getCurrent();
         expect(firstSnap.exists).toBeFalse();
 
-        const secondPromise = snapshot$.toPromise({ skipFirst: true });
-        const { writeTime: createTime } = await doc.create(writeData({ some: 'data' }));
-        const secondSnap = await secondPromise;
-        expect(secondSnap.data()).toEqual({ some: 'data', ttl: expect.anything() });
-        expect(secondSnap.createTime).toEqual(createTime);
-        expect(secondSnap.updateTime).toEqual(createTime);
+        const [secondSnap, { writeTime: createTime }] = await Promise.all([getNext(), doc.create(writeData({ some: 'data' }))]);
+        checkSnap(secondSnap, { createTime, updateTime: createTime, data: { some: 'data' } });
 
-        const thirdPromise = snapshot$.toPromise({ skipFirst: true });
-        const { writeTime: updateTime } = await doc.update({ some: 'other data' });
-        const thirdSnap = await thirdPromise;
-        expect(thirdSnap.data()).toEqual({ some: 'other data', ttl: expect.anything() });
-        expect(thirdSnap.createTime).toEqual(createTime);
-        expect(thirdSnap.updateTime).toEqual(updateTime);
+        const [thirdSnap, { writeTime: updateTime }] = await Promise.all([getNext(), doc.update({ some: 'other data' })]);
+        checkSnap(thirdSnap, { createTime, updateTime, data: { some: 'other data' } });
 
         expect(updateTime).not.toBe(createTime);
 
@@ -69,14 +58,14 @@ describe('listen to document updates', () => {
 
         const listeners = refs.map(listen);
 
-        const firstVersions = await Promise.all(listeners.map(({ snapshot$ }) => snapshot$.toPromise()));
+        const firstVersions = await Promise.all(listeners.map(({ getCurrent }) => getCurrent()));
         expect(firstVersions.map(snap => snap.get('id') as unknown)).toEqual(range(450));
 
-        const secondVersionsPromise = Promise.all(listeners.map(({ snapshot$ }) => snapshot$.toPromise({ skipFirst: true })));
+        const [, ...secondVersions] = await Promise.all([
+            refs.reduce((batch, ref) => batch.update(ref, { add: 'data' }), fs.firestore.batch()).commit(),
+            ...listeners.map(({ getNext }) => getNext()),
+        ]);
 
-        await refs.reduce((batch, ref) => batch.update(ref, { add: 'data' }), fs.firestore.batch()).commit();
-
-        const secondVersions = await secondVersionsPromise;
         expect(secondVersions.map(snap => snap.get('add') as unknown)).toEqual(range(450).map(() => 'data'));
 
         for (const { stop } of listeners) stop();
@@ -93,6 +82,16 @@ function listen(doc: FirebaseFirestore.DocumentReference) {
     return {
         // Start listening:
         stop: snapshot$.react(noop),
-        snapshot$,
+        getCurrent: () => snapshot$.toPromise(),
+        getNext: () => snapshot$.toPromise({ skipFirst: true }),
     };
+}
+
+function checkSnap(
+    snap: FirebaseFirestore.DocumentSnapshot,
+    expected: { createTime: FirebaseFirestore.Timestamp; updateTime: FirebaseFirestore.Timestamp; data: FirebaseFirestore.DocumentData },
+) {
+    expect(fs.readData(snap.data())).toEqual(expected.data);
+    expect(snap.createTime).toEqual(expected.createTime);
+    expect(snap.updateTime).toEqual(expected.updateTime);
 }
