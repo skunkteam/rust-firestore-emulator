@@ -58,7 +58,7 @@ fn main() -> color_eyre::Result<()> {
 
 #[tokio::main]
 async fn run(Args { host_port }: Args) -> color_eyre::Result<()> {
-    let emulator = FirestoreEmulator::default();
+    let emulator = FirestoreEmulator::new();
     let firestore = FirestoreServer::new(emulator)
         .accept_compressed(CompressionEncoding::Gzip)
         .send_compressed(CompressionEncoding::Gzip)

@@ -184,7 +184,15 @@ impl Query {
         let mut buffer = vec![];
         for col in collections {
             for meta in col.docs().await {
-                let Some(version) = meta.current_version().await else {
+                let version = if let Some(txn) = &txn {
+                    txn.read_doc(&meta.name)
+                        .await?
+                        .current_version()
+                        .map(Arc::clone)
+                } else {
+                    meta.read().await?.current_version().map(Arc::clone)
+                };
+                let Some(version) = version else {
                     continue;
                 };
                 if !self.includes_document(&version)? {
@@ -201,9 +209,6 @@ impl Query {
                     if !include {
                         continue;
                     }
-                }
-                if let Some(txn) = &txn {
-                    txn.register_doc(&meta).await;
                 }
                 buffer.push(version);
             }

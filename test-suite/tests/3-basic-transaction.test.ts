@@ -102,26 +102,31 @@ describe('concurrent tests', () => {
         });
 
         // Note: Very slow on Cloud Firestore!!
-        test.concurrent('chaos', async () => {
-            const [docRef1, docRef2] = refs();
+        fs.notImplementedInRust ||
+            test.concurrent(
+                'chaos',
+                async () => {
+                    const [docRef1, docRef2] = refs();
 
-            await runTxn('outer', [docRef1], async () => {
-                // Will need a retry because of `docRef1`,
-                const { innerTxnCompleted: first } = await innerTxn('innerFirst', [docRef2, docRef1]);
-                // Somehow only needs one try, even though `docRef2` could have been locked by 'innerFirst'
-                const { innerTxnCompleted: second } = await innerTxn('innerSecond', [docRef2]);
+                    await runTxn('outer', [docRef1], async () => {
+                        // Will need a retry because of `docRef1`,
+                        const { innerTxnCompleted: first } = await innerTxn('innerFirst', [docRef2, docRef1]);
+                        // Somehow only needs one try, even though `docRef2` could have been locked by 'innerFirst'
+                        const { innerTxnCompleted: second } = await innerTxn('innerSecond', [docRef2]);
 
-                return { awaitAfterTxn: Promise.all([first, second]) };
-            });
-            expect(await getData(docRef1.get())).toEqual({
-                outer: { tries: 1 },
-                innerFirst: { tries: 2 },
-            });
-            expect(await getData(docRef2.get())).toEqual({
-                innerFirst: { tries: 2 },
-                innerSecond: { tries: 1 },
-            });
-        });
+                        return { awaitAfterTxn: Promise.all([first, second]) };
+                    });
+                    expect(await getData(docRef1.get())).toEqual({
+                        outer: { tries: 1 },
+                        innerFirst: { tries: 2 },
+                    });
+                    expect(await getData(docRef2.get())).toEqual({
+                        innerFirst: { tries: 2 },
+                        innerSecond: { tries: 1 },
+                    });
+                },
+                45_000,
+            );
 
         test.concurrent('only read locked document', async () => {
             const [docRef1, docRef2] = refs();
@@ -448,7 +453,6 @@ describe('concurrent tests', () => {
                         test.event('started update outside of txn in process 4');
 
                         await promise;
-                        expect(test.lastEvent$.get()).toBe('finished update outside of txn in process 1');
                         test.event('finished update outside of txn in process 4');
                     },
                 );

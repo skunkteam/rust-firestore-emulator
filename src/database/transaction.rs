@@ -1,24 +1,31 @@
-use super::document::{DocumentGuard, DocumentMeta};
-use crate::utils::timestamp;
-use prost_types::Timestamp;
+use super::{
+    document::{OwnedDocumentContentsReadGuard, OwnedDocumentContentsWriteGuard},
+    Database,
+};
 use std::{
     collections::{hash_map::Entry, HashMap},
-    mem,
     sync::{
         atomic::{self, AtomicUsize},
-        Arc,
+        Arc, Weak,
     },
 };
 use tokio::sync::{Mutex, RwLock};
 use tonic::{Result, Status};
-use tracing::{info, instrument};
+use tracing::instrument;
 
-#[derive(Default)]
 pub struct RunningTransactions {
-    map: RwLock<HashMap<TransactionId, Arc<Transaction>>>,
+    pub(super) database: Weak<Database>,
+    pub(super) map: RwLock<HashMap<TransactionId, Arc<Transaction>>>,
 }
 
 impl RunningTransactions {
+    pub fn new(database: Weak<Database>) -> Self {
+        Self {
+            database,
+            map: Default::default(),
+        }
+    }
+
     pub async fn get(&self, id: &TransactionId) -> Result<Arc<Transaction>> {
         self.map
             .read()
@@ -36,7 +43,7 @@ impl RunningTransactions {
                 break id;
             }
         };
-        let txn = Arc::new(Transaction::new(id));
+        let txn = Arc::new(Transaction::new(id, Weak::clone(&self.database)));
         lock.insert(id, Arc::clone(&txn));
         txn
     }
@@ -48,7 +55,7 @@ impl RunningTransactions {
                 "transaction_id already/still in use",
             )),
             Entry::Vacant(e) => {
-                let txn = Arc::new(Transaction::new(id));
+                let txn = Arc::new(Transaction::new(id, Weak::clone(&self.database)));
                 e.insert(Arc::clone(&txn));
                 Ok(txn)
             }
@@ -69,50 +76,50 @@ impl RunningTransactions {
     }
 }
 
-enum TransactionStatus {
-    Valid(HashMap<String, DocumentGuard>),
-    Invalid,
-}
-
 pub struct Transaction {
     pub id: TransactionId,
-    pub start_time: Timestamp,
-    status: Mutex<TransactionStatus>,
+    database: Weak<Database>,
+    guards: Mutex<HashMap<String, Arc<OwnedDocumentContentsReadGuard>>>,
 }
 
 impl Transaction {
-    fn new(id: TransactionId) -> Self {
+    fn new(id: TransactionId, database: Weak<Database>) -> Self {
         Transaction {
             id,
-            start_time: timestamp(),
-            status: TransactionStatus::Valid(Default::default()).into(),
+            database,
+            guards: Default::default(),
         }
     }
 
     #[instrument(skip_all)]
-    pub async fn register_doc(&self, doc: &Arc<DocumentMeta>) {
-        let mut status = self.status.lock().await;
-        let TransactionStatus::Valid(guards) = &mut *status else {
-            info!(?self.id, doc.name, "txn invalid");
-            return;
-        };
-        if guards.contains_key(&doc.name) {
-            info!(?self.id, doc.name, "lock already owned");
-        } else if let Ok(new_lock) = Arc::clone(doc).try_lock().await {
-            info!(?self.id, doc.name, "lock acquired");
-            guards.insert(doc.name.clone(), new_lock);
-        } else {
-            info!(?self.id, doc.name, "lock unavailable, txn becomes invalid");
-            *status = TransactionStatus::Invalid;
+    pub async fn read_doc(&self, name: &str) -> Result<Arc<OwnedDocumentContentsReadGuard>> {
+        let mut guards = self.guards.lock().await;
+        if let Some(guard) = guards.get(name) {
+            return Ok(Arc::clone(guard));
         }
+        let guard = self.new_read_guard(name).await?.into();
+        guards.insert(name.to_string(), Arc::clone(&guard));
+        Ok(guard)
     }
 
-    pub async fn take_guards(&self) -> Result<HashMap<String, DocumentGuard>> {
-        let status = mem::replace(&mut *self.status.lock().await, TransactionStatus::Invalid);
-        match status {
-            TransactionStatus::Valid(guards) => Ok(guards),
-            TransactionStatus::Invalid => Err(Status::aborted("contention")),
-        }
+    pub async fn take_write_guard(&self, name: &str) -> Result<OwnedDocumentContentsWriteGuard> {
+        let mut guards = self.guards.lock().await;
+        let read_guard = match guards.remove(name) {
+            Some(guard) => Arc::into_inner(guard)
+                .ok_or_else(|| Status::aborted("concurrent reads during txn commit in same txn"))?,
+            None => self.new_read_guard(name).await?,
+        };
+        read_guard.upgrade().await
+    }
+
+    async fn new_read_guard(&self, name: &str) -> Result<OwnedDocumentContentsReadGuard> {
+        self.database
+            .upgrade()
+            .ok_or_else(|| Status::aborted("database was dropped"))?
+            .get_doc_meta(name)
+            .await?
+            .read_owned()
+            .await
     }
 }
 

@@ -16,7 +16,6 @@ use tokio_stream::wrappers::ReceiverStream;
 use tonic::{async_trait, Code, Request, Response, Result, Status};
 use tracing::{info, info_span, instrument, Instrument};
 
-#[derive(Default)]
 pub struct FirestoreEmulator {
     pub database: Arc<Database>,
 }
@@ -28,6 +27,12 @@ impl std::fmt::Debug for FirestoreEmulator {
 }
 
 impl FirestoreEmulator {
+    pub fn new() -> Self {
+        Self {
+            database: Database::new(),
+        }
+    }
+
     async fn eval_command(&self, writes: &[Write]) -> Result<Option<WriteResult>> {
         let [Write {
             operation: Some(write::Operation::Update(update)),
@@ -423,7 +428,7 @@ impl firestore_server::Firestore for FirestoreEmulator {
             page_token,
             consistency_selector,
         } = request.into_inner();
-        let collection_ids = self.database.get_collection_ids(&parent).await;
+        let collection_ids = self.database.get_collection_ids(&parent).await?;
         unimplemented_bool!(collection_ids.len() as i32 > page_size);
         unimplemented_collection!(page_token);
         unimplemented_option!(consistency_selector);
@@ -460,10 +465,10 @@ impl firestore_server::Firestore for FirestoreEmulator {
 
         let (status, write_results) = try_join_all(writes.into_iter().map(|write| async {
             let name = get_doc_name_from_write(&write)?;
-            let guard = self.database.get_doc_meta_mut(name).await?;
+            let mut guard = self.database.get_doc_meta_mut_no_txn(name).await?;
             let result = self
                 .database
-                .perform_write(write, &guard, time.clone())
+                .perform_write(write, &mut guard, time.clone())
                 .await;
             use crate::googleapis::google::rpc;
             Ok(match result {
@@ -495,8 +500,10 @@ async fn perform_writes(
     let time: Timestamp = timestamp();
     let write_results = try_join_all(writes.into_iter().map(|write| async {
         let name = get_doc_name_from_write(&write)?;
-        let guard = database.get_doc_meta_mut(name).await?;
-        database.perform_write(write, &guard, time.clone()).await
+        let mut guard = database.get_doc_meta_mut_no_txn(name).await?;
+        database
+            .perform_write(write, &mut guard, time.clone())
+            .await
     }))
     .await?;
     Ok((time, write_results))

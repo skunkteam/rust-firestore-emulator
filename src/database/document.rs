@@ -1,106 +1,233 @@
-use super::collection::Collection;
+use super::{collection::Collection, ReadConsistency};
 use crate::{
     googleapis::google::firestore::v1::{precondition, Document, Value},
     utils::timestamp_nanos,
 };
+use futures::Future;
 use prost_types::Timestamp;
 use std::{
     collections::HashMap,
+    ops::Deref,
     sync::{Arc, Weak},
     time::Duration,
 };
 use tokio::{
-    sync::{Mutex, OwnedMutexGuard, RwLock},
+    sync::{
+        oneshot, OwnedRwLockReadGuard, OwnedRwLockWriteGuard, OwnedSemaphorePermit, RwLock,
+        RwLockReadGuard, Semaphore,
+    },
     time::{error::Elapsed, timeout},
 };
 use tonic::{Code, Result, Status};
 use tracing::{instrument, trace, Level};
 
 const WAIT_LOCK_TIMEOUT: Duration = Duration::from_secs(30);
-const TRY_LOCK_TIMEOUT: Duration = Duration::from_millis(10);
 
-#[derive(Debug)]
 pub struct DocumentMeta {
     /// The resource name of the document, for example
     /// `projects/{project_id}/databases/{database_id}/documents/{document_path}`.
     pub name: String,
-    versions: RwLock<Vec<DocumentVersion>>,
-    txn_lock: Arc<Mutex<()>>,
-    collection: Weak<Collection>,
+    contents: Arc<RwLock<DocumentContents>>,
+    write_permit_shop: Arc<Semaphore>,
+}
+
+impl std::fmt::Debug for DocumentMeta {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DocumentMeta")
+            .field("name", &self.name)
+            .finish_non_exhaustive()
+    }
 }
 
 impl DocumentMeta {
     pub fn new(name: String, collection: Weak<Collection>) -> Self {
         Self {
+            contents: Arc::new(RwLock::new(DocumentContents::new(name.clone(), collection))),
             name,
-            versions: Default::default(),
-            txn_lock: Default::default(),
-            collection,
+            write_permit_shop: Arc::new(Semaphore::new(1)),
         }
     }
 
-    pub async fn wait_lock(self: Arc<Self>) -> Result<DocumentGuard> {
-        self.lock_with_timeout(WAIT_LOCK_TIMEOUT).await
+    pub async fn read(&self) -> Result<DocumentContentsReadGuard> {
+        lock_timeout(self.contents.read()).await
     }
 
-    pub async fn try_lock(self: Arc<Self>) -> Result<DocumentGuard> {
-        self.lock_with_timeout(TRY_LOCK_TIMEOUT).await
-    }
+    pub async fn read_owned(self: &Arc<Self>) -> Result<OwnedDocumentContentsReadGuard> {
+        let (mut tx, rx) = oneshot::channel();
 
-    async fn lock_with_timeout(self: Arc<Self>, duration: Duration) -> Result<DocumentGuard> {
-        let guard = timeout(duration, Arc::clone(&self.txn_lock).lock_owned())
-            .await
-            .map_err(|_: Elapsed| Status::aborted("timeout waiting for lock on document"))?;
-        Ok(DocumentGuard {
-            doc: self,
-            _guard: guard,
+        let write_permit_shop = Arc::clone(&self.write_permit_shop);
+        tokio::spawn(async {
+            tokio::select! {
+                Ok(permit) = write_permit_shop.acquire_owned() => {
+                    let _: Result<_, _> = tx.send(permit);
+                }
+
+                _ = tx.closed() => ()
+            }
+        });
+
+        Ok(OwnedDocumentContentsReadGuard {
+            meta: Arc::clone(self),
+            guard: lock_timeout(Arc::clone(&self.contents).read_owned()).await?,
+            write_permit: rx,
         })
     }
 
-    pub async fn current_version(&self) -> Option<Arc<StoredDocumentVersion>> {
+    async fn owned_write(&self) -> Result<OwnedDocumentContentsWriteGuard> {
+        lock_timeout(Arc::clone(&self.contents).write_owned()).await
+    }
+}
+
+pub struct DocumentContents {
+    /// The resource name of the document, for example
+    /// `projects/{project_id}/databases/{database_id}/documents/{document_path}`.
+    pub name: String,
+    collection: Weak<Collection>,
+    versions: Vec<DocumentVersion>,
+}
+
+impl DocumentContents {
+    pub fn new(name: String, collection: Weak<Collection>) -> Self {
+        Self {
+            name,
+            collection,
+            versions: Default::default(),
+        }
+    }
+
+    pub fn current_version(&self) -> Option<&Arc<StoredDocumentVersion>> {
         self.versions
-            .read()
-            .await
             .last()
             .and_then(DocumentVersion::stored_document)
     }
 
-    pub async fn version_at_time(
-        &self,
-        read_time: &Timestamp,
-    ) -> Option<Arc<StoredDocumentVersion>> {
+    pub fn version_at_time(&self, read_time: &Timestamp) -> Option<&Arc<StoredDocumentVersion>> {
         self.versions
-            .read()
-            .await
             .iter()
             .rfind(|version| timestamp_nanos(version.update_time()) <= timestamp_nanos(read_time))
             .and_then(DocumentVersion::stored_document)
     }
 
-    pub async fn exists(&self) -> bool {
+    pub fn version_for_consistency(
+        &self,
+        consistency: &ReadConsistency,
+    ) -> Result<Option<&Arc<StoredDocumentVersion>>> {
+        Ok(match consistency {
+            ReadConsistency::Default => self.current_version(),
+            ReadConsistency::ReadTime(time) => self.version_at_time(time),
+            ReadConsistency::Transaction(_) => self.current_version(),
+        })
+    }
+
+    pub fn exists(&self) -> bool {
         self.versions
-            .read()
-            .await
             .last()
             .is_some_and(|version| matches!(version, DocumentVersion::Stored(_)))
     }
 
-    pub async fn create_time(&self) -> Option<Timestamp> {
+    pub fn create_time(&self) -> Option<Timestamp> {
         self.versions
-            .read()
-            .await
             .last()
             .and_then(DocumentVersion::create_time)
             .cloned()
     }
 
-    pub async fn last_updated(&self) -> Option<Timestamp> {
+    pub fn last_updated(&self) -> Option<Timestamp> {
         self.versions
-            .read()
-            .await
             .last()
             .map(DocumentVersion::update_time)
             .cloned()
+    }
+
+    pub fn check_precondition(&self, condition: DocumentPrecondition) -> Result<()> {
+        match condition {
+            DocumentPrecondition::Exists if !self.exists() => Err(Status::failed_precondition(
+                format!("document not found: {}", self.name),
+            )),
+            DocumentPrecondition::NotExists if self.exists() => {
+                Err(Status::already_exists(Code::AlreadyExists.description()))
+            }
+            DocumentPrecondition::UpdateTime(time)
+                if self.last_updated().as_ref() != Some(&time) =>
+            {
+                Err(Status::failed_precondition(format!(
+                    "document has different update_time: {}",
+                    self.name
+                )))
+            }
+            _ => Ok(()),
+        }
+    }
+
+    #[instrument(skip_all, fields(
+        doc_name = self.name,
+        time = display(&update_time),
+    ), level = Level::DEBUG)]
+    pub async fn add_version(&mut self, fields: HashMap<String, Value>, update_time: Timestamp) {
+        trace!(?fields);
+        let create_time = self.create_time().unwrap_or_else(|| update_time.clone());
+        let version = DocumentVersion::Stored(Arc::new(StoredDocumentVersion {
+            name: self.name.clone(),
+            create_time,
+            update_time,
+            fields,
+        }));
+        self.versions.push(version.clone());
+        self.broadcast_event(version);
+    }
+
+    pub async fn delete(&mut self, delete_time: Timestamp) {
+        let version = DocumentVersion::Deleted(Arc::new(DeletedDocumentVersion {
+            name: self.name.clone(),
+            delete_time,
+        }));
+        self.versions.push(version.clone());
+        self.broadcast_event(version);
+    }
+
+    fn broadcast_event(&self, update: DocumentVersion) {
+        if let Some(collection) = self.collection.upgrade() {
+            let _ = collection.events.send(update);
+        }
+    }
+}
+
+pub type DocumentContentsReadGuard<'a> = RwLockReadGuard<'a, DocumentContents>;
+
+pub struct OwnedDocumentContentsReadGuard {
+    meta: Arc<DocumentMeta>,
+    guard: OwnedRwLockReadGuard<DocumentContents>,
+    write_permit: oneshot::Receiver<OwnedSemaphorePermit>,
+}
+
+pub type OwnedDocumentContentsWriteGuard = OwnedRwLockWriteGuard<DocumentContents>;
+
+impl OwnedDocumentContentsReadGuard {
+    #[instrument(skip_all, err)]
+    pub async fn upgrade(self) -> Result<OwnedDocumentContentsWriteGuard> {
+        let check_time = self.guard.last_updated();
+        let OwnedDocumentContentsReadGuard {
+            meta,
+            guard,
+            write_permit,
+        } = self;
+        drop(guard);
+        let write_permit = lock_timeout(write_permit).await?.unwrap();
+        let owned_rw_lock_write_guard = lock_timeout(meta.owned_write()).await??;
+        drop(write_permit);
+        if check_time == owned_rw_lock_write_guard.last_updated() {
+            Ok(owned_rw_lock_write_guard)
+        } else {
+            Err(Status::aborted("contention"))
+        }
+    }
+}
+
+impl Deref for OwnedDocumentContentsReadGuard {
+    type Target = DocumentContents;
+
+    fn deref(&self) -> &Self::Target {
+        self.guard.deref()
     }
 }
 
@@ -132,10 +259,10 @@ impl DocumentVersion {
         }
     }
 
-    fn stored_document(&self) -> Option<Arc<StoredDocumentVersion>> {
+    fn stored_document(&self) -> Option<&Arc<StoredDocumentVersion>> {
         match self {
             DocumentVersion::Deleted(_) => None,
-            DocumentVersion::Stored(version) => Some(Arc::clone(version)),
+            DocumentVersion::Stored(version) => Some(version),
         }
     }
 
@@ -208,73 +335,6 @@ pub struct DeletedDocumentVersion {
     pub delete_time: Timestamp,
 }
 
-pub struct DocumentGuard {
-    doc: Arc<DocumentMeta>,
-    _guard: OwnedMutexGuard<()>,
-}
-
-impl DocumentGuard {
-    pub async fn check_precondition(&self, condition: DocumentPrecondition) -> Result<()> {
-        match condition {
-            DocumentPrecondition::Exists if !self.doc.exists().await => Err(
-                Status::failed_precondition(format!("document not found: {}", self.doc.name)),
-            ),
-            DocumentPrecondition::NotExists if self.doc.exists().await => {
-                Err(Status::already_exists(Code::AlreadyExists.description()))
-            }
-            DocumentPrecondition::UpdateTime(time)
-                if self.doc.last_updated().await.as_ref() != Some(&time) =>
-            {
-                Err(Status::failed_precondition(format!(
-                    "document has different update_time: {}",
-                    self.doc.name
-                )))
-            }
-            _ => Ok(()),
-        }
-    }
-
-    pub async fn current_version(&self) -> Option<Arc<StoredDocumentVersion>> {
-        self.doc.current_version().await
-    }
-
-    #[instrument(skip_all, fields(
-        doc_name = self.doc.name,
-        time = display(&update_time),
-    ), level = Level::DEBUG)]
-    pub async fn add_version(&self, fields: HashMap<String, Value>, update_time: Timestamp) {
-        trace!(?fields);
-        let create_time = self
-            .doc
-            .create_time()
-            .await
-            .unwrap_or_else(|| update_time.clone());
-        let version = DocumentVersion::Stored(Arc::new(StoredDocumentVersion {
-            name: self.doc.name.clone(),
-            create_time,
-            update_time,
-            fields,
-        }));
-        self.doc.versions.write().await.push(version.clone());
-        self.broadcast_event(DocumentUpdate::new(Arc::clone(&self.doc), version));
-    }
-
-    pub async fn delete(&self, delete_time: Timestamp) {
-        let version = DocumentVersion::Deleted(Arc::new(DeletedDocumentVersion {
-            name: self.doc.name.clone(),
-            delete_time,
-        }));
-        self.doc.versions.write().await.push(version.clone());
-        self.broadcast_event(DocumentUpdate::new(Arc::clone(&self.doc), version));
-    }
-
-    fn broadcast_event(&self, update: DocumentUpdate) {
-        if let Some(collection) = self.doc.collection.upgrade() {
-            let _ = collection.events.send(update);
-        }
-    }
-}
-
 pub enum DocumentPrecondition {
     NotExists,
     Exists,
@@ -291,17 +351,8 @@ impl From<precondition::ConditionType> for DocumentPrecondition {
     }
 }
 
-#[derive(Clone, Debug)]
-pub struct DocumentUpdate {
-    pub doc_meta: Arc<DocumentMeta>,
-    pub new_version: DocumentVersion,
-}
-
-impl DocumentUpdate {
-    pub fn new(doc_meta: Arc<DocumentMeta>, new_version: DocumentVersion) -> Self {
-        Self {
-            doc_meta,
-            new_version,
-        }
-    }
+async fn lock_timeout<F: Future>(future: F) -> Result<F::Output> {
+    timeout(WAIT_LOCK_TIMEOUT, future)
+        .await
+        .map_err(|_: Elapsed| Status::aborted("timeout waiting for lock on document"))
 }

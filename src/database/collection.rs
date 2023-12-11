@@ -1,13 +1,14 @@
-use super::document::{DocumentMeta, DocumentUpdate};
+use super::document::{DocumentMeta, DocumentVersion};
 use crate::utils::RwLockHashMapExt;
 use std::{collections::HashMap, ops::Deref, sync::Arc};
 use tokio::sync::{broadcast, RwLock};
+use tonic::Result;
 use tracing::instrument;
 
 pub struct Collection {
     pub name: String,
     documents: RwLock<HashMap<String, Arc<DocumentMeta>>>,
-    pub events: broadcast::Sender<DocumentUpdate>,
+    pub events: broadcast::Sender<DocumentVersion>,
 }
 
 impl Collection {
@@ -37,12 +38,12 @@ impl Collection {
     }
 
     /// Checks if this collection has a document with a current version.
-    pub async fn has_doc(&self) -> bool {
+    pub async fn has_doc(&self) -> Result<bool> {
         for doc in self.documents.read().await.values() {
-            if doc.exists().await {
-                return true;
+            if doc.read().await?.exists() {
+                return Ok(true);
             }
         }
-        false
+        Ok(false)
     }
 }

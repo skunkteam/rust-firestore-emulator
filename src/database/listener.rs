@@ -1,4 +1,4 @@
-use super::{collection_name, document::DocumentUpdate, Database};
+use super::{collection_name, document::DocumentVersion, Database};
 use crate::{
     database::ReadConsistency,
     googleapis::google::firestore::v1::{
@@ -40,7 +40,7 @@ pub struct Listener {
     id: usize,
     database: Arc<Database>,
     sender: mpsc::Sender<Result<ListenResponse>>,
-    events_by_collection: StreamMap<String, BroadcastStream<DocumentUpdate>>,
+    events_by_collection: StreamMap<String, BroadcastStream<DocumentVersion>>,
     targets_by_collection: HashMap<String, Vec<ListenerTarget>>,
 }
 
@@ -140,13 +140,13 @@ impl Listener {
     }
 
     #[instrument(skip_all, err)]
-    async fn process_event(&mut self, event: DocumentUpdate) -> Result<()> {
+    async fn process_event(&mut self, event: DocumentVersion) -> Result<()> {
         // We rely on the fact that this function will complete before any other events are processed. That's why we know for sure that
         // the output stream is not used for something else until we respond with our NO_CHANGE msg. That msg means that everything is up
         // to date until that point and this is (for now) the easiest way to make sure that is actually the case. This is probably okay,
         // but if it becomes a hotspot we might look into optimizing later.
-        let doc_name = event.new_version.name();
-        let update_time = event.new_version.update_time();
+        let doc_name = event.name();
+        let update_time = event.update_time();
         let target_ids = self
             .targets_for_doc_name_mut(doc_name)?
             .filter_map(|target| {
@@ -166,7 +166,7 @@ impl Listener {
             return Ok(());
         }
 
-        let msg = match event.new_version.to_document() {
+        let msg = match event.to_document() {
             Some(d) => ResponseType::DocumentChange(DocumentChange {
                 document: Some(d),
                 target_ids,

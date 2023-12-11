@@ -1,6 +1,6 @@
 use self::{
     collection::Collection,
-    document::{DocumentGuard, DocumentMeta, StoredDocumentVersion},
+    document::{DocumentContents, DocumentMeta, OwnedDocumentContentsWriteGuard},
     field_path::FieldPath,
     listener::Listener,
     query::Query,
@@ -14,14 +14,17 @@ use crate::{
     unimplemented, unimplemented_collection, unimplemented_option,
     utils::{timestamp, RwLockHashMapExt},
 };
-use futures::future::try_join_all;
 use itertools::Itertools;
 use prost_types::Timestamp;
-use std::{collections::HashMap, ops::Deref, sync::Arc};
+use std::{
+    collections::{hash_map::Entry, HashMap},
+    ops::Deref,
+    sync::{Arc, Weak},
+};
 use tokio::sync::RwLock;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Result, Status};
-use tracing::{info, instrument};
+use tracing::{info, instrument, Span};
 
 mod collection;
 mod document;
@@ -31,27 +34,43 @@ mod query;
 mod transaction;
 mod value;
 
-#[derive(Default)]
 pub struct Database {
     collections: RwLock<HashMap<String, Arc<Collection>>>,
     transactions: RunningTransactions,
 }
 
 impl Database {
-    #[instrument(skip_all, err, fields(in_txn = consistency.is_transaction()))]
+    pub fn new() -> Arc<Self> {
+        Arc::new_cyclic(|database| Database {
+            collections: Default::default(),
+            transactions: RunningTransactions::new(Weak::clone(database)),
+        })
+    }
+}
+
+impl Database {
+    #[instrument(skip_all, err, fields(in_txn = consistency.is_transaction(), found))]
     pub async fn get_doc(
         &self,
         name: &str,
         consistency: &ReadConsistency,
     ) -> Result<Option<Document>> {
         info!(name);
-        let meta = self.get_doc_meta(name).await?;
-        if let Some(txn) = self.get_txn_for_consistency(consistency).await? {
-            txn.register_doc(&meta).await;
-        }
-        let version = self.get_version(&meta, consistency).await?;
-        info!(found = version.is_some());
-        Ok(version.map(|version| version.to_document()))
+        let version = if let Some(txn) = self.get_txn_for_consistency(consistency).await? {
+            txn.read_doc(name)
+                .await?
+                .version_for_consistency(consistency)?
+                .map(|version| version.to_document())
+        } else {
+            self.get_doc_meta(name)
+                .await?
+                .read()
+                .await?
+                .version_for_consistency(consistency)?
+                .map(|version| version.to_document())
+        };
+        Span::current().record("found", version.is_some());
+        Ok(version)
     }
 
     pub async fn get_collection(&self, collection_name: &str) -> Arc<Collection> {
@@ -73,20 +92,16 @@ impl Database {
     }
 
     #[instrument(skip_all, err)]
-    pub async fn get_doc_meta_mut(&self, name: &str) -> Result<DocumentGuard> {
-        self.get_doc_meta(name).await?.wait_lock().await
-    }
-
-    async fn get_version(
+    pub async fn get_doc_meta_mut_no_txn(
         &self,
-        meta: &Arc<DocumentMeta>,
-        consistency: &ReadConsistency,
-    ) -> Result<Option<Arc<StoredDocumentVersion>>> {
-        Ok(match consistency {
-            ReadConsistency::Default => meta.current_version().await,
-            ReadConsistency::ReadTime(time) => meta.version_at_time(time).await,
-            ReadConsistency::Transaction(_) => meta.current_version().await,
-        })
+        name: &str,
+    ) -> Result<OwnedDocumentContentsWriteGuard> {
+        self.get_doc_meta(name)
+            .await?
+            .read_owned()
+            .await?
+            .upgrade()
+            .await
     }
 
     #[instrument(skip_all, err)]
@@ -135,7 +150,7 @@ impl Database {
     // }
 
     #[instrument(skip_all)]
-    pub async fn get_collection_ids(&self, parent: &str) -> Vec<String> {
+    pub async fn get_collection_ids(&self, parent: &str) -> Result<Vec<String>> {
         // Get all collections asap in order to keep the read lock time minimal.
         let all_collections = self
             .collections
@@ -154,11 +169,11 @@ impl Database {
             else {
                 continue;
             };
-            if col.has_doc().await {
+            if col.has_doc().await? {
                 result.push(path.to_string());
             }
         }
-        result
+        Ok(result)
     }
 
     #[instrument(skip_all, err)]
@@ -179,24 +194,34 @@ impl Database {
         writes: Vec<Write>,
         transaction: &TransactionId,
     ) -> Result<(Timestamp, Vec<WriteResult>)> {
-        let txn = self.get_txn(transaction).await?;
-        let metas = try_join_all(writes.into_iter().map(|write| async {
-            let meta = self.get_doc_meta(get_doc_name_from_write(&write)?).await?;
-            txn.register_doc(&meta).await;
-            Ok((write, meta)) as Result<_, Status>
-        }))
-        .await?;
-
-        let guards = txn.take_guards().await?;
+        let txn = &self.transactions.get(transaction).await?;
         let time = timestamp();
 
-        let write_results = try_join_all(metas.into_iter().map(
-            |(write, meta): (Write, Arc<DocumentMeta>)| {
-                let guard = &guards[&meta.name];
-                self.perform_write(write, guard, time.clone())
-            },
-        ))
-        .await?;
+        let mut write_results = vec![];
+        let mut write_guard_cache = HashMap::<String, OwnedDocumentContentsWriteGuard>::new();
+        for write in writes {
+            let name = get_doc_name_from_write(&write)?.to_string();
+            let entry = write_guard_cache.entry(name.to_string());
+            let write_guard = match entry {
+                Entry::Occupied(mut entry) => {
+                    self.perform_write(write, entry.get_mut(), time.clone())
+                        .await?
+                }
+                Entry::Vacant(entry) => {
+                    self.perform_write(
+                        write,
+                        entry.insert(txn.take_write_guard(&name).await?),
+                        time.clone(),
+                    )
+                    .await?
+                }
+            };
+
+            write_results.push(write_guard);
+        }
+
+        self.transactions.stop(transaction).await?;
+
         Ok((time, write_results))
     }
 
@@ -204,7 +229,7 @@ impl Database {
     pub async fn perform_write(
         &self,
         write: Write,
-        guard: &DocumentGuard,
+        contents: &mut DocumentContents,
         commit_time: Timestamp,
     ) -> Result<WriteResult> {
         let Write {
@@ -219,7 +244,7 @@ impl Database {
             .and_then(|cd| cd.condition_type)
             .map(Into::into);
         if let Some(condition) = condition {
-            guard.check_precondition(condition).await?;
+            contents.check_precondition(condition)?;
         }
         let mut transform_results = vec![];
 
@@ -227,7 +252,7 @@ impl Database {
         match operation {
             Update(doc) => {
                 let mut fields = if let Some(mask) = update_mask {
-                    apply_updates(guard, mask, &doc.fields).await?
+                    apply_updates(contents, mask, &doc.fields)?
                 } else {
                     doc.fields
                 };
@@ -241,12 +266,12 @@ impl Database {
                         &commit_time,
                     )?);
                 }
-                guard.add_version(fields, commit_time.clone()).await;
+                contents.add_version(fields, commit_time.clone()).await;
             }
             Delete(_) => {
                 unimplemented_option!(update_mask);
                 unimplemented_collection!(update_transforms);
-                guard.delete(commit_time.clone()).await;
+                contents.delete(commit_time.clone()).await;
             }
             Transform(_) => unimplemented!("transform"),
         }
@@ -269,7 +294,8 @@ impl Database {
 
     #[instrument(skip_all, err)]
     pub async fn rollback(&self, transaction: &TransactionId) -> Result<()> {
-        self.transactions.stop(transaction).await
+        self.transactions.stop(transaction).await?;
+        Ok(())
     }
 
     #[instrument(skip_all)]
@@ -286,14 +312,13 @@ impl Database {
     }
 }
 
-async fn apply_updates(
-    guard: &DocumentGuard,
+fn apply_updates(
+    contents: &mut DocumentContents,
     mask: DocumentMask,
     updated_values: &HashMap<String, Value>,
 ) -> Result<HashMap<String, Value>, Status> {
-    let mut fields = guard
+    let mut fields = contents
         .current_version()
-        .await
         .map(|v| v.fields.clone())
         .unwrap_or_default();
     for field_path in mask.field_paths {

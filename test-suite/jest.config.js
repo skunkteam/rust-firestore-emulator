@@ -6,5 +6,5 @@ module.exports = {
     testEnvironment: 'node',
     testMatch: ['<rootDir>/tests/**/*.test.ts'],
     setupFilesAfterEnv: ['jest-extended/all'],
-    testTimeout: 60_000,
+    testTimeout: 10_000,
 };
