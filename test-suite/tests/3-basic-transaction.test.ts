@@ -169,12 +169,12 @@ describe('concurrent tests', () => {
             });
 
             function event(what: string) {
-                log.push(`${processName.getStore()} | EVENT: ${what}`);
+                log.push(`${processName.getStore()} EVENT: ${what}`);
                 lastEvent$.set(what);
             }
 
             async function when(what: string) {
-                log.push(`${processName.getStore()} | WAITING UNTIL: ${what}`);
+                log.push(`${processName.getStore()} WAITING UNTIL: ${what}`);
                 const errorAfterTime$ = fromPromise(time(10_000)).map((): MaybeFinalState<never> => {
                     const msg = `${processName.getStore()} timeout, current log: ${log.map(m => '\n- ' + m).join('')}`;
                     // console.log('Current lo')
@@ -184,7 +184,7 @@ describe('concurrent tests', () => {
             }
 
             async function concurrently(...processes: Array<() => Promise<unknown>>) {
-                await Promise.all(processes.map(async (p, i) => processName.run(`Process ${i + 1}`, p)));
+                await Promise.all(processes.map(async (p, i) => processName.run(`${'       |'.repeat(i)} <<${i + 1}>> |`, p)));
             }
 
             test('reading the same doc from different txns', async () => {
@@ -237,17 +237,17 @@ describe('concurrent tests', () => {
                 );
 
                 expect(log).toEqual([
-                    'Process 2 | WAITING UNTIL: in txn A: doc read',
-                    'Process 1 | EVENT: doc created',
-                    'Process 1 | EVENT: txn A started',
-                    'Process 1 | EVENT: in txn A: doc read',
-                    'Process 1 | WAITING UNTIL: txn B ended',
-                    'Process 2 | EVENT: txn B started',
-                    'Process 2 | EVENT: in txn B: doc read',
-                    'Process 2 | EVENT: read: original value',
-                    'Process 2 | EVENT: txn B ended',
-                    'Process 1 | EVENT: read: original value',
-                    'Process 1 | EVENT: txn A ended',
+                    '       | <<2>> | WAITING UNTIL: in txn A: doc read',
+                    ' <<1>> | EVENT: doc created',
+                    ' <<1>> | EVENT: txn A started',
+                    ' <<1>> | EVENT: in txn A: doc read',
+                    ' <<1>> | WAITING UNTIL: txn B ended',
+                    '       | <<2>> | EVENT: txn B started',
+                    '       | <<2>> | EVENT: in txn B: doc read',
+                    '       | <<2>> | EVENT: read: original value',
+                    '       | <<2>> | EVENT: txn B ended',
+                    ' <<1>> | EVENT: read: original value',
+                    ' <<1>> | EVENT: txn A ended',
                 ]);
             });
 
@@ -308,19 +308,103 @@ describe('concurrent tests', () => {
                 );
 
                 expect(log).toEqual([
-                    'Process 2 | WAITING UNTIL: in txn A: doc read',
-                    'Process 1 | EVENT: doc created',
-                    'Process 1 | EVENT: txn A started',
-                    'Process 1 | EVENT: in txn A: doc read',
-                    'Process 1 | WAITING UNTIL: in txn B: update requested in txn',
-                    'Process 2 | EVENT: txn B started',
-                    'Process 2 | EVENT: in txn B: doc read',
-                    'Process 2 | EVENT: in txn B: update requested in txn',
-                    'Process 1 | EVENT: waited 500ms, txn B still pending',
-                    'Process 1 | EVENT: txn A ended',
-                    'Process 1 | EVENT: read: original value',
-                    'Process 2 | EVENT: txn B ended',
-                    'Process 2 | EVENT: read: original value',
+                    '       | <<2>> | WAITING UNTIL: in txn A: doc read',
+                    ' <<1>> | EVENT: doc created',
+                    ' <<1>> | EVENT: txn A started',
+                    ' <<1>> | EVENT: in txn A: doc read',
+                    ' <<1>> | WAITING UNTIL: in txn B: update requested in txn',
+                    '       | <<2>> | EVENT: txn B started',
+                    '       | <<2>> | EVENT: in txn B: doc read',
+                    '       | <<2>> | EVENT: in txn B: update requested in txn',
+                    ' <<1>> | EVENT: waited 500ms, txn B still pending',
+                    ' <<1>> | EVENT: txn A ended',
+                    ' <<1>> | EVENT: read: original value',
+                    '       | <<2>> | EVENT: txn B ended',
+                    '       | <<2>> | EVENT: read: original value',
+                ]);
+            });
+
+            test('reading the same doc from different txns, try to write in both txns', async () => {
+                // Scenario:
+                // Process 1 - create doc
+                // Process 1 - start txn A
+                // Process 1 - in txn A: read doc
+                // Process 2 - start txn B
+                // Process 2 - in txn B: read doc
+                // Process 2 - in txn B: try to write to doc
+                // Process 2 - try to end txn B, will stall until txn A is completed
+                // Process 1 - in txn A: try to write to doc    <<--- the only difference with the previous test
+                // Process 1 - end txn A
+                // Process 2 - txn B retries
+
+                // Apparently, even though txn B tries to write first, txn A gets priority (because it started first or because
+                // it read first?)
+
+                const [ref] = refs();
+
+                await concurrently(
+                    // Process 1
+                    async () => {
+                        await ref.create(fs.writeData({ value: 'original value' }));
+                        event('doc created');
+
+                        const result = await fs.firestore.runTransaction(async txn => {
+                            event('txn A started');
+
+                            const snap = await txn.get(ref);
+                            const value = snap.get('value') as unknown;
+                            event('in txn A: doc read');
+
+                            await when('in txn B: update requested in txn');
+                            await time(500);
+                            expect(lastEvent$.get()).toBe('in txn B: update requested in txn');
+                            event('waited 500ms, txn B still pending');
+                            txn.update(ref, { value: 'changed by txn A' });
+                            return value;
+                        });
+                        event('txn A ended');
+                        event('read: ' + result);
+                    },
+
+                    // Process 2
+                    async () => {
+                        await when('in txn A: doc read');
+                        const result = await fs.firestore.runTransaction(async txn => {
+                            event('txn B started');
+
+                            const snap = await txn.get(ref);
+                            const value = snap.get('value') as unknown;
+                            event('in txn B: doc read');
+
+                            txn.update(ref, { value: 'changed by txn B' });
+                            event('in txn B: update requested in txn');
+                            return value;
+                        });
+                        event('txn B ended');
+                        event('read: ' + result);
+                    },
+                );
+
+                expect(log).toEqual([
+                    '       | <<2>> | WAITING UNTIL: in txn A: doc read',
+                    ' <<1>> | EVENT: doc created',
+                    ' <<1>> | EVENT: txn A started',
+                    ' <<1>> | EVENT: in txn A: doc read',
+                    ' <<1>> | WAITING UNTIL: in txn B: update requested in txn',
+                    '       | <<2>> | EVENT: txn B started',
+                    '       | <<2>> | EVENT: in txn B: doc read',
+                    '       | <<2>> | EVENT: in txn B: update requested in txn',
+                    // Now txn B is stalled, waiting to get the verdict on the lock acquisition
+                    ' <<1>> | EVENT: waited 500ms, txn B still pending',
+                    ' <<1>> | EVENT: txn A ended',
+                    // txn A succeeded and was allowed to write to doc, it read the original value of doc:
+                    ' <<1>> | EVENT: read: original value',
+                    // Retry of txn B:
+                    '       | <<2>> | EVENT: txn B started',
+                    '       | <<2>> | EVENT: in txn B: doc read',
+                    '       | <<2>> | EVENT: in txn B: update requested in txn',
+                    '       | <<2>> | EVENT: txn B ended',
+                    '       | <<2>> | EVENT: read: changed by txn A',
                 ]);
             });
 
@@ -394,21 +478,22 @@ describe('concurrent tests', () => {
                 );
 
                 expect(log).toEqual([
-                    'Process 2 | WAITING UNTIL: create outside txn succeeded',
-                    'Process 3 | WAITING UNTIL: in txn A: read doc 1',
-                    'Process 4 | WAITING UNTIL: started update outside of txn in process 1',
-                    'Process 1 | EVENT: create outside txn succeeded',
-                    'Process 1 | WAITING UNTIL: in txn B: read doc 1',
-                    'Process 2 | EVENT: in txn A: read doc 1',
-                    'Process 2 | WAITING UNTIL: end txn B',
-                    'Process 3 | EVENT: in txn B: read doc 1',
-                    'Process 3 | WAITING UNTIL: started update outside of txn in process 4',
-                    'Process 1 | EVENT: started update outside of txn in process 1',
-                    'Process 4 | EVENT: started update outside of txn in process 4',
-                    'Process 3 | EVENT: end txn B',
-                    'Process 2 | EVENT: end txn A',
-                    'Process 1 | EVENT: finished update outside of txn in process 1',
-                    'Process 4 | EVENT: finished update outside of txn in process 4',
+                    //<<1>> | <<2>> | <<3>> | <<4>> |
+                    '       | <<2>> | WAITING UNTIL: create outside txn succeeded',
+                    '       |       | <<3>> | WAITING UNTIL: in txn A: read doc 1',
+                    '       |       |       | <<4>> | WAITING UNTIL: started update outside of txn in process 1',
+                    ' <<1>> | EVENT: create outside txn succeeded',
+                    ' <<1>> | WAITING UNTIL: in txn B: read doc 1',
+                    '       | <<2>> | EVENT: in txn A: read doc 1',
+                    '       | <<2>> | WAITING UNTIL: end txn B',
+                    '       |       | <<3>> | EVENT: in txn B: read doc 1',
+                    '       |       | <<3>> | WAITING UNTIL: started update outside of txn in process 4',
+                    ' <<1>> | EVENT: started update outside of txn in process 1',
+                    '       |       |       | <<4>> | EVENT: started update outside of txn in process 4',
+                    '       |       | <<3>> | EVENT: end txn B',
+                    '       | <<2>> | EVENT: end txn A',
+                    ' <<1>> | EVENT: finished update outside of txn in process 1',
+                    '       |       |       | <<4>> | EVENT: finished update outside of txn in process 4',
                 ]);
 
                 expect(fs.readData((await ref1.get()).data())).toEqual({
@@ -443,7 +528,7 @@ describe('concurrent tests', () => {
                     txn.set(ref, writeData({ [name]: { tries } }), { merge: true });
                 }
             });
-            awaitAfterTxn && (await awaitAfterTxn);
+            await awaitAfterTxn;
         }
         async function innerTxn(name: string, refs: UsedRefs) {
             const { resolver, waitForIt } = createResolver();
