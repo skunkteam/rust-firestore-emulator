@@ -317,6 +317,85 @@ describe('paginating results', () => {
     });
 });
 
+fs.notImplementedInRust ||
+    describe('aggregation queries', () => {
+        const cities = [
+            { city: 'Buren', population: 27_718, area: 142.92 },
+            { city: 'Tiel', population: 41_978, area: 35.51 },
+            { city: 'Woerden', population: 53_253, area: 92.92 },
+            { city: 'Zoetermeer', population: 127_047, area: 37.05 },
+        ];
+        const allCities = fs.collection.doc().collection('cityCollection');
+        const biggerCities = allCities.where('population', '>', 50_000);
+
+        beforeAll(async () => {
+            await Promise.all(cities.map(cityData => allCities.doc().create(fs.writeData(cityData))));
+        });
+
+        test('count method', async () => {
+            expect(await getAggregate(allCities.count())).toEqual({ count: 4 });
+            expect(await getAggregate(biggerCities.count())).toEqual({ count: 2 });
+        });
+
+        test('count Field', async () => {
+            const countField = fs.exported.AggregateField.count();
+            await expect(getAggregate(allCities.aggregate({ countField }))).resolves.toEqual({
+                countField: 4,
+            });
+            await expect(getAggregate(biggerCities.aggregate({ countField }))).resolves.toEqual({
+                countField: 2,
+            });
+        });
+
+        test('average', async () => {
+            const averagePopulation = fs.exported.AggregateField.average('population');
+            await expect(getAggregate(allCities.aggregate({ averagePopulation }))).resolves.toEqual({
+                averagePopulation: 62_499,
+            });
+
+            await expect(getAggregate(biggerCities.aggregate({ averagePopulation }))).resolves.toEqual({
+                averagePopulation: 90_150,
+            });
+        });
+
+        test('sum', async () => {
+            const sumArea = fs.exported.AggregateField.sum('area');
+            await expect(getAggregate(allCities.aggregate({ sumArea }))).resolves.toEqual({
+                sumArea: 308.4,
+            });
+
+            await expect(getAggregate(biggerCities.aggregate({ sumArea }))).resolves.toEqual({
+                sumArea: 129.97,
+            });
+        });
+
+        test('all together now', async () => {
+            const fields = {
+                count: fs.exported.AggregateField.count(),
+                sumArea: fs.exported.AggregateField.sum('area'),
+                averagePopulation: fs.exported.AggregateField.average('population'),
+            };
+            await expect(getAggregate(allCities.aggregate(fields))).resolves.toEqual({
+                count: 4,
+                sumArea: 308.4,
+                averagePopulation: 62_499,
+            });
+
+            await expect(getAggregate(biggerCities.aggregate(fields))).resolves.toEqual({
+                count: 2,
+                sumArea: 129.97,
+                averagePopulation: 90_150,
+            });
+        });
+
+        async function getAggregate(
+            aggregate: FirebaseFirestore.AggregateQuery<FirebaseFirestore.AggregateSpec, unknown, FirebaseFirestore.DocumentData>,
+        ) {
+            const snap = await aggregate.get();
+            return snap.data();
+        }
+    });
+
 async function getData(query: FirebaseFirestore.Query) {
     const snap = await query.get();
     return snap.docs.map(snap => sanitizeData(fs.readData<Data>(snap.data())));

@@ -15,8 +15,8 @@
         "@skunkteam/sherlock": "^8.0.0",
         "@skunkteam/sherlock-utils": "^8.0.0",
         "concurrently": "^8.2.2",
-        "firebase": "^10.7.0",
-        "firebase-admin": "^11.11.1",
+        "firebase": "^10.7.1",
+        "firebase-admin": "^12.0.0",
         "lodash": "^4.17.21",
         "ms": "^2.1.3"
     },
