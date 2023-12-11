@@ -483,12 +483,6 @@ describe('concurrent tests', () => {
             });
 
             describe('queries', () => {
-                // test.concurrent.each([
-                //     {testName: 'create',},
-                //     {testName: 'update',},
-                //     {testName: 'delete',},
-
-                // ])
                 test.concurrent('update after reading a query', async () => {
                     const testName = 'update';
 
@@ -518,24 +512,20 @@ describe('concurrent tests', () => {
                         },
                         async () => {
                             await test.when('transaction locked the query');
-                            await docRef1.update({ simple: 'update' });
-                            test.event('docRef1 updated outside the query');
-                        },
-                        async () => {
-                            await test.when('transaction locked the query');
-                            await docRef2.update({ simple: 'update' });
-                            test.event('docRef2 updated outside the query');
+                            await Promise.all([
+                                docRef1.update({ simple: 'also update docRef1' }),
+                                docRef2.update({ simple: 'this is the only update for docRef2' }),
+                            ]);
+                            test.event('both docs updated outside the query');
                         },
                     );
 
                     expect(test.log).toEqual([
                         '       | <<2>> | WAITING UNTIL: transaction locked the query',
-                        '       |       | <<3>> | WAITING UNTIL: transaction locked the query',
                         ' <<1>> | EVENT: transaction started',
                         ' <<1>> | EVENT: transaction locked the query',
                         ' <<1>> | EVENT: transaction completed',
-                        '       |       | <<3>> | EVENT: docRef2 updated outside the query',
-                        '       | <<2>> | EVENT: docRef1 updated outside the query',
+                        '       | <<2>> | EVENT: both docs updated outside the query',
                     ]);
                 });
 
@@ -621,6 +611,7 @@ describe('concurrent tests', () => {
                         '       | <<2>> | WAITING UNTIL: transaction locked the query',
                         ' <<1>> | EVENT: transaction started',
                         ' <<1>> | EVENT: transaction locked the query',
+                        ' <<1>> | WAITING UNTIL: docRef2 created outside the query',
                         '       | <<2>> | EVENT: docRef2 created outside the query',
                         ' <<1>> | EVENT: transaction completed',
                     ]);

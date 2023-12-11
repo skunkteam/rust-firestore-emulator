@@ -1,6 +1,6 @@
 import { fromEventPattern } from '@skunkteam/sherlock-utils';
 import assert from 'assert';
-import { noop, omit, range } from 'lodash';
+import { omit, range } from 'lodash';
 import { fs } from './utils';
 
 fs.notImplementedInRust
@@ -127,7 +127,7 @@ fs.notImplementedInRust
 
                   const refs = await Promise.all(range(5).map(i => createDoc(coll, { some: 'doc: ' + i }))).then(r => r.flat());
 
-                  const { stop, getCurrent, getNext } = listen(coll);
+                  const { stop, getCurrent, getNext, documentSnaps } = listen(coll);
                   expect(await getCurrent()).toBeArrayOfSize(5);
 
                   const updateBatch = fs.firestore.batch();
@@ -146,6 +146,12 @@ fs.notImplementedInRust
                   }
                   const [noData] = await Promise.all([getNext(), deleteBatch.commit()]);
                   expect(noData).toBeArrayOfSize(0);
+
+                  // There should only be 3 updates:
+                  // 1. the initial update for the listen
+                  // 2. the update batch
+                  // 3. the delete batch
+                  expect(documentSnaps).toBeArrayOfSize(3);
 
                   stop();
               });
@@ -175,10 +181,11 @@ function baseListen(query: FirebaseFirestore.Query, excludeProp?: string) {
                 return excludeProp ? omit(rest, [excludeProp]) : rest;
             });
         });
+    const documentSnaps: FirebaseFirestore.DocumentData[] = [];
     return {
         // Start listening:
-        stop: snapshot$.react(noop),
-        snapshot$,
+        stop: document$.react(docs => documentSnaps.push(docs)),
+        documentSnaps,
         getCurrent: () => document$.toPromise(),
         getNext: () => document$.toPromise({ skipFirst: true }),
     };
