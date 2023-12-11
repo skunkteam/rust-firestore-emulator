@@ -102,6 +102,10 @@ impl Transaction {
         Ok(guard)
     }
 
+    pub async fn drop_remaining_guards(&self) {
+        self.guards.lock().await.clear();
+    }
+
     pub async fn take_write_guard(&self, name: &str) -> Result<OwnedDocumentContentsWriteGuard> {
         let mut guards = self.guards.lock().await;
         let read_guard = match guards.remove(name) {

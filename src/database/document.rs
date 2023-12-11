@@ -7,6 +7,7 @@ use futures::Future;
 use prost_types::Timestamp;
 use std::{
     collections::HashMap,
+    fmt::{self, Debug},
     ops::Deref,
     sync::{Arc, Weak},
     time::Duration,
@@ -31,8 +32,8 @@ pub struct DocumentMeta {
     write_permit_shop: Arc<Semaphore>,
 }
 
-impl std::fmt::Debug for DocumentMeta {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl Debug for DocumentMeta {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("DocumentMeta")
             .field("name", &self.name)
             .finish_non_exhaustive()

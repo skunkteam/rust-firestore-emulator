@@ -199,25 +199,20 @@ impl Database {
 
         let mut write_results = vec![];
         let mut write_guard_cache = HashMap::<String, OwnedDocumentContentsWriteGuard>::new();
+        // This must be done in two phases. First acquire the lock on all docs, only then start to update them.
+        for write in &writes {
+            let name = get_doc_name_from_write(write)?.to_string();
+            if let Entry::Vacant(entry) = write_guard_cache.entry(name.to_string()) {
+                entry.insert(txn.take_write_guard(&name).await?);
+            }
+        }
+
+        txn.drop_remaining_guards().await;
+
         for write in writes {
             let name = get_doc_name_from_write(&write)?.to_string();
-            let entry = write_guard_cache.entry(name.to_string());
-            let write_guard = match entry {
-                Entry::Occupied(mut entry) => {
-                    self.perform_write(write, entry.get_mut(), time.clone())
-                        .await?
-                }
-                Entry::Vacant(entry) => {
-                    self.perform_write(
-                        write,
-                        entry.insert(txn.take_write_guard(&name).await?),
-                        time.clone(),
-                    )
-                    .await?
-                }
-            };
-
-            write_results.push(write_guard);
+            let guard = write_guard_cache.get_mut(&name).unwrap();
+            write_results.push(self.perform_write(write, guard, time.clone()).await?);
         }
 
         self.transactions.stop(transaction).await?;

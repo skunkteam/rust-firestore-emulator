@@ -2,7 +2,10 @@ use self::filter::Filter;
 use super::{
     document::StoredDocumentVersion, field_path::FieldReference, Database, ReadConsistency,
 };
-use crate::googleapis::google::firestore::v1::{structured_query::CollectionSelector, *};
+use crate::{
+    googleapis::google::firestore::v1::{structured_query::CollectionSelector, *},
+    unimplemented, unimplemented_option,
+};
 use itertools::Itertools;
 use std::{cmp, ops::Deref, sync::Arc};
 use tonic::{Result, Status};
@@ -97,7 +100,7 @@ pub struct Query {
     ///
     /// This applies after the constraints specified by the `WHERE`, `START AT`, &
     /// `END AT` but before the `LIMIT` clause.
-    pub offset: usize,
+    offset: usize,
 
     /// The maximum number of results to return.
     ///
@@ -166,6 +169,14 @@ impl Query {
             limit: limit.map(|v| v as usize),
             consistency,
         })
+    }
+
+    pub fn check_live_query_compat(&self) -> Result<()> {
+        if self.offset > 0 {
+            unimplemented!("offset in live queries");
+        }
+        unimplemented_option!(self.limit);
+        Ok(())
     }
 
     pub async fn once(&self, db: &Database) -> Result<Vec<Document>> {

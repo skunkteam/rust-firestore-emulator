@@ -1,8 +1,11 @@
-use super::{collection_name, document::DocumentVersion, Database};
+use super::{collection_name, document::DocumentVersion, query::Query, Database};
 use crate::{
     database::ReadConsistency,
     googleapis::google::firestore::v1::{
-        listen_request, listen_response::ResponseType, target, target_change::TargetChangeType,
+        listen_request,
+        listen_response::ResponseType,
+        target::{self, query_target},
+        target_change::TargetChangeType,
         DocumentChange, DocumentDelete, ListenRequest, ListenResponse, Target, TargetChange,
     },
     required_option, unimplemented, unimplemented_bool, unimplemented_collection,
@@ -125,7 +128,14 @@ impl Listener {
                 required_option!(target_type);
 
                 match target_type {
-                    target::TargetType::Query(_) => unimplemented!("TargetType::Query"),
+                    target::TargetType::Query(target::QueryTarget { parent, query_type }) => {
+                        required_option!(query_type);
+                        let query_target::QueryType::StructuredQuery(query) = query_type;
+                        let query =
+                            Query::from_structured(parent, query, ReadConsistency::Default)?;
+                        query.check_live_query_compat()?;
+                        self.add_query(target_id, query, resume_type).await?;
+                    }
                     target::TargetType::Documents(target::DocumentsTarget { documents }) => {
                         self.add_documents(target_id, documents, resume_type)
                             .await?;
@@ -213,6 +223,94 @@ impl Listener {
             debug!(name);
             // Make sure we get to receive all updates from now on..
             self.ensure_listening_to_doc(name).await?;
+            self.add_listener_target(ListenerTarget::Document {
+                target_id,
+                name: name.to_string(),
+                last_read_time: read_time.clone(),
+            })?;
+
+            // Now determine the latest version we can find...
+            let doc = self
+                .database
+                .get_doc(name, &ReadConsistency::Default)
+                .await?;
+
+            // Only send if newer than the resume_token
+            if let Some(previous_time) = &send_if_newer_than {
+                if doc.as_ref().is_some_and(|v| {
+                    timestamp_nanos(v.update_time.as_ref().unwrap())
+                        <= timestamp_nanos(previous_time)
+                }) {
+                    continue;
+                }
+            }
+            // Response: This is the current version, whether you like it or not.
+            let msg = match doc {
+                Some(d) => ResponseType::DocumentChange(DocumentChange {
+                    document: Some(d),
+                    target_ids: vec![target_id],
+                    removed_target_ids: vec![],
+                }),
+                None => ResponseType::DocumentDelete(DocumentDelete {
+                    document: name.to_string(),
+                    removed_target_ids: vec![target_id],
+                    read_time: Some(read_time.clone()),
+                }),
+            };
+            self.send(msg).await?;
+        }
+
+        // Response: I've sent you the state of all documents now
+        let resume_token = timestamp_nanos(&read_time).to_ne_bytes();
+        self.send(ResponseType::TargetChange(TargetChange {
+            target_change_type: TargetChangeType::Current as _,
+            target_ids: vec![target_id],
+            read_time: Some(read_time.clone()),
+            resume_token: resume_token.to_vec(),
+            ..TARGET_CHANGE_DEFAULT
+        }))
+        .await?;
+
+        // Response: Oh, by the way, everything is up to date. 🤷🏼‍♂️
+        self.send(ResponseType::TargetChange(TargetChange {
+            read_time: Some(read_time),
+            resume_token: resume_token.to_vec(),
+            ..TARGET_CHANGE_DEFAULT
+        }))
+        .await?;
+
+        Ok(())
+    }
+
+    async fn add_query(
+        &mut self,
+        target_id: i32,
+        query: Query,
+        resume_type: Option<target::ResumeType>,
+    ) -> Result<()> {
+        // We rely on the fact that this function will complete before any other events are processed. That's why we know for sure that
+        // the output stream is not used for something else until we respond with our NO_CHANGE msg. That msg means that everything is up
+        // to date until that point and this is (for now) the easiest way to make sure that is actually the case. This is probably okay,
+        // but if it becomes a hotspot we might look into optimizing later.
+        let send_if_newer_than = resume_type.map(Timestamp::try_from).transpose()?;
+
+        // Response: I'm on it!
+        self.send(ResponseType::TargetChange(TargetChange {
+            target_change_type: TargetChangeType::Add as _,
+            target_ids: vec![target_id],
+            ..TARGET_CHANGE_DEFAULT
+        }))
+        .await?;
+
+        let read_time = timestamp();
+
+        for doc in query.once(&self.database).await? {
+            let name = &doc.name;
+            debug!(name);
+            // Make sure we get to receive all updates from now on..
+            self.ensure_listening_to_doc(name).await?;
+
+            // TODO: This is temporary and completely wrong!!!:
             self.add_listener_target(ListenerTarget::Document {
                 target_id,
                 name: name.to_string(),
