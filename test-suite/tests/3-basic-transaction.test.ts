@@ -453,6 +453,7 @@ describe('concurrent tests', () => {
                         test.event('started update outside of txn in process 4');
 
                         await promise;
+                        expect(test.lastEvent$.get()).toBe('finished update outside of txn in process 1');
                         test.event('finished update outside of txn in process 4');
                     },
                 );
@@ -485,6 +486,55 @@ describe('concurrent tests', () => {
                     ],
                 });
             });
+
+            fs.notImplementedInRust ||
+                fs.notImplementedInJava ||
+                fs.notImplementedInCloud ||
+                test.concurrent('deadlock', async () => {
+                    const test = new ConcurrentTest(40_000);
+
+                    const [ref1, ref2] = refs();
+
+                    await test.run(
+                        async () => {
+                            await fs.firestore.runTransaction(
+                                async txn => {
+                                    await txn.get(ref1);
+                                    test.event('in txn A: read doc 1');
+
+                                    await test.when('in txn B: read doc 2');
+                                    await txn.get(ref2);
+                                    test.event('in txn A: read doc 2');
+
+                                    txn.set(ref1, fs.writeData({ txnA: 'written' }));
+                                    txn.set(ref2, fs.writeData({ txnA: 'written' }));
+                                },
+                                { maxAttempts: 1 },
+                            );
+                            test.event('end txn A');
+                        },
+                        async () => {
+                            await fs.firestore.runTransaction(
+                                async txn => {
+                                    await txn.get(ref2);
+                                    test.event('in txn B: read doc 2');
+
+                                    await test.when('in txn B: read doc 1');
+                                    await txn.get(ref1);
+                                    test.event('in txn A: read doc 1');
+
+                                    txn.set(ref1, fs.writeData({ txnB: 'written' }));
+                                    txn.set(ref2, fs.writeData({ txnB: 'written' }));
+                                },
+                                { maxAttempts: 1 },
+                            );
+                            test.event('end txn B');
+                        },
+                    );
+
+                    // Aangezien geen van de tests dit lukt, weten we niet wat we hier moeten verwachten.
+                    expect(test.log).toEqual([]);
+                });
 
             describe('queries', () => {
                 test.concurrent('update after reading a query', async () => {
@@ -627,6 +677,8 @@ describe('concurrent tests', () => {
                 readonly lastEvent$ = atom.unresolved<string>();
                 readonly processName = new AsyncLocalStorage<string>();
 
+                constructor(private readonly timeout = 10_000) {}
+
                 event(what: string) {
                     this.log.push(`${this.processName.getStore()} EVENT: ${what}`);
                     this.lastEvent$.set(what);
@@ -634,9 +686,10 @@ describe('concurrent tests', () => {
 
                 async when(what: string) {
                     this.log.push(`${this.processName.getStore()} WAITING UNTIL: ${what}`);
-                    const errorAfterTime$ = fromPromise(time(10_000)).map((): MaybeFinalState<never> => {
-                        const msg = `${this.processName.getStore()} timeout, current log: ${this.log.map(m => '\n- ' + m).join('')}`;
-                        // console.log('Current lo')
+                    const errorAfterTime$ = fromPromise(time(this.timeout)).map((): MaybeFinalState<never> => {
+                        const currentLog = this.log.map(m => '\n- ' + m).join('');
+                        const timeoutSeconds = this.timeout / 1_000;
+                        const msg = `${this.processName.getStore()} timeout after ${timeoutSeconds}s, current log: ${currentLog}`;
                         return final(error(msg));
                     });
                     await this.lastEvent$.toPromise({ when: d$ => d$.is(what).or(errorAfterTime$) });
