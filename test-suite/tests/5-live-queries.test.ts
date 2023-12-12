@@ -1,6 +1,7 @@
 import { fromEventPattern } from '@skunkteam/sherlock-utils';
 import assert from 'assert';
 import { omit, range } from 'lodash';
+import { setTimeout as time } from 'timers/promises';
 import { fs } from './utils';
 
 describe('listen to query updates', () => {
@@ -16,7 +17,7 @@ describe('listen to query updates', () => {
 
                 return [included, notIncluded];
             },
-            listen: (coll: FirebaseFirestore.CollectionReference) => baseListen(coll),
+            query: (coll: FirebaseFirestore.Query) => coll,
         },
         {
             description: 'equality query',
@@ -27,7 +28,7 @@ describe('listen to query updates', () => {
                 await notIncluded.create(fs.writeData({ included: false, ...data }));
                 return [included, notIncluded];
             },
-            listen: (coll: FirebaseFirestore.CollectionReference) => baseListen(coll.where('included', '==', true)),
+            query: (coll: FirebaseFirestore.Query) => coll.where('included', '==', true).orderBy('included'),
         },
         {
             description: 'inequality query',
@@ -38,26 +39,26 @@ describe('listen to query updates', () => {
                 await notIncluded.create(fs.writeData({ included: false, ...data }));
                 return [included, notIncluded];
             },
-            listen: (coll: FirebaseFirestore.CollectionReference) => baseListen(coll.where('included', '!=', false)),
+            query: (coll: FirebaseFirestore.Query) => coll.where('included', '!=', false).orderBy('included'),
         },
         {
             description: 'greater than query',
             createDoc: async (coll: FirebaseFirestore.CollectionReference, data: FirebaseFirestore.DocumentData) => {
                 const included = coll.doc();
                 const notIncluded = coll.doc();
-                await included.create(fs.writeData({ included: true, number: Math.random() * 1_000, ...data }));
-                await notIncluded.create(fs.writeData({ included: false, number: -Math.random() * 1_000, ...data }));
+                await included.create(fs.writeData({ included: true, number: 1_000, ...data }));
+                await notIncluded.create(fs.writeData({ included: false, number: -1_000, ...data }));
                 return [included, notIncluded];
             },
-            listen: (coll: FirebaseFirestore.CollectionReference) => baseListen(coll.where('number', '>=', 0), 'number'),
+            query: (coll: FirebaseFirestore.Query) => coll.where('number', '>=', 0).orderBy('number'),
         },
-    ] as const)('$description', ({ createDoc, listen }) => {
+    ] as const)('$description', ({ createDoc, query }) => {
         describe('single (relevant) document', () => {
             test.concurrent('create, listen, stop', async () => {
                 const coll = subCollection();
 
                 await createDoc(coll, { some: 'data' });
-                const { stop, getCurrent } = listen(coll);
+                const { stop, getCurrent } = listen(query(coll));
 
                 expect(await getCurrent()).toEqual([{ some: 'data' }]);
 
@@ -68,7 +69,7 @@ describe('listen to query updates', () => {
                 const coll = subCollection();
 
                 const docs = await createDoc(coll, { some: 'data' });
-                const { stop, getCurrent, getNext } = listen(coll);
+                const { stop, getCurrent, getNext } = listen(query(coll));
 
                 expect(await getCurrent()).toEqual([{ some: 'data' }]);
 
@@ -82,7 +83,7 @@ describe('listen to query updates', () => {
             test.concurrent('listen, create, update, stop', async () => {
                 const coll = subCollection();
 
-                const { stop, getCurrent, getNext } = listen(coll);
+                const { stop, getCurrent, getNext } = listen(query(coll));
                 expect(await getCurrent()).toEqual([]);
 
                 const resultPromise = getNext();
@@ -101,7 +102,7 @@ describe('listen to query updates', () => {
             test.concurrent('add/remove relevant documents', async () => {
                 const coll = subCollection();
 
-                const { stop, getCurrent, getNext } = listen(coll);
+                const { stop, getCurrent, getNext } = listen(query(coll));
                 expect(await getCurrent()).toEqual([]);
 
                 const docPairs: FirebaseFirestore.DocumentReference[][] = [];
@@ -127,7 +128,7 @@ describe('listen to query updates', () => {
 
                 const refs = await Promise.all(range(5).map(i => createDoc(coll, { some: 'doc: ' + i }))).then(r => r.flat());
 
-                const { stop, getCurrent, getNext, documentSnaps } = listen(coll);
+                const { stop, getCurrent, getNext, documentSnaps } = listen(query(coll));
                 expect(await getCurrent()).toBeArrayOfSize(5);
 
                 const updateBatch = fs.firestore.batch();
@@ -155,6 +156,33 @@ describe('listen to query updates', () => {
 
                 stop();
             });
+
+        test.concurrent('limit', async () => {
+            const coll = subCollection();
+
+            const { stop, getCurrent, getNext } = listen(query(coll).orderBy('ordered').limit(3));
+            expect(await getCurrent()).toEqual([]);
+
+            const [onlyOne, [refOne]] = await Promise.all([getNext(), createDoc(coll, { ordered: 1 })]);
+            expect(onlyOne).toEqual([{ ordered: 1 }]);
+
+            const [nowTwo] = await Promise.all([getNext(), createDoc(coll, { ordered: 5 })]);
+            expect(nowTwo).toEqual([{ ordered: 1 }, { ordered: 5 }]);
+
+            const [nowThree, [refThree]] = await Promise.all([getNext(), createDoc(coll, { ordered: 3 })]);
+            expect(nowThree).toEqual([{ ordered: 1 }, { ordered: 3 }, { ordered: 5 }]);
+
+            const [replacedOne] = await Promise.all([getNext(), createDoc(coll, { ordered: 4 })]);
+            expect(replacedOne).toEqual([{ ordered: 1 }, { ordered: 3 }, { ordered: 4 }]);
+
+            const [movedOne] = await Promise.all([getNext(), refThree.update({ ordered: 10 })]);
+            expect(movedOne).toEqual([{ ordered: 1 }, { ordered: 4 }, { ordered: 5 }]);
+
+            const [removed] = await Promise.all([getNext(), refOne.delete()]);
+            expect(removed).toEqual([{ ordered: 4 }, { ordered: 5 }, { ordered: 10 }]);
+
+            stop();
+        });
     });
 });
 
@@ -162,7 +190,7 @@ function subCollection(coll = fs.collection) {
     return coll.doc().collection('collection');
 }
 
-function baseListen(query: FirebaseFirestore.Query, excludeProp?: string) {
+function listen(query: FirebaseFirestore.Query) {
     const snapshot$ = fromEventPattern<FirebaseFirestore.QuerySnapshot>(value$ =>
         query.onSnapshot(
             snapshot => value$.set(snapshot),
@@ -175,10 +203,7 @@ function baseListen(query: FirebaseFirestore.Query, excludeProp?: string) {
         .map(data => {
             return data.map(({ included, ...rest }) => {
                 expect(included).toBeTrue();
-                if (excludeProp) {
-                    expect(rest).toHaveProperty(excludeProp);
-                }
-                return excludeProp ? omit(rest, [excludeProp]) : rest;
+                return omit(rest, ['number']);
             });
         });
     const documentSnaps: FirebaseFirestore.DocumentData[] = [];
@@ -187,7 +212,11 @@ function baseListen(query: FirebaseFirestore.Query, excludeProp?: string) {
         stop: document$.react(docs => documentSnaps.push(docs)),
         documentSnaps,
         getCurrent: () => document$.toPromise(),
-        getNext: () => document$.toPromise({ skipFirst: true }),
+        getNext: () =>
+            Promise.race([
+                document$.toPromise({ skipFirst: true }),
+                time(1000).then(() => Promise.reject(`Timeout after ${documentSnaps.length} total snapshots.`)),
+            ]),
     };
 }
 async function update(docs: FirebaseFirestore.DocumentReference[], data: FirebaseFirestore.DocumentData) {
