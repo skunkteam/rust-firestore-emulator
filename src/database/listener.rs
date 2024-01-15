@@ -170,6 +170,7 @@ impl Listener {
         let mut target_ids = HashSet::new();
         let mut removed_target_ids = HashSet::new();
         if let Some(targets) = self.targets_by_collection.get_mut(collection_name) {
+            // Need to process `targets` in reverse, because of the use of `swap_remove`
             for i in (0..targets.len()).rev() {
                 let target = &mut targets[i];
                 if target.doc_name() != doc_name {

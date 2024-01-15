@@ -128,7 +128,7 @@ describe('listen to query updates', () => {
 
                 const refs = await Promise.all(range(5).map(i => createDoc(coll, { some: 'doc: ' + i }))).then(r => r.flat());
 
-                const { stop, getCurrent, getNext, documentSnaps } = listen(query(coll));
+                const { stop, getCurrent, getNext, queryResults } = listen(query(coll));
                 expect(await getCurrent()).toBeArrayOfSize(5);
 
                 const updateBatch = fs.firestore.batch();
@@ -152,7 +152,7 @@ describe('listen to query updates', () => {
                 // 1. the initial update for the listen
                 // 2. the update batch
                 // 3. the delete batch
-                expect(documentSnaps).toBeArrayOfSize(3);
+                expect(queryResults).toBeArrayOfSize(3);
 
                 stop();
             });
@@ -207,16 +207,16 @@ function listen(query: FirebaseFirestore.Query) {
                 return omit(rest, ['number']);
             });
         });
-    const documentSnaps: FirebaseFirestore.DocumentData[] = [];
+    const queryResults: FirebaseFirestore.DocumentData[][] = [];
     return {
         // Start listening:
-        stop: document$.react(docs => documentSnaps.push(docs)),
-        documentSnaps,
+        stop: document$.react(docs => queryResults.push(docs)),
+        queryResults,
         getCurrent: () => document$.toPromise(),
         getNext: () =>
             Promise.race([
                 document$.toPromise({ skipFirst: true }),
-                time(1000).then(() => Promise.reject(`Timeout after ${documentSnaps.length} total snapshots.`)),
+                time(1000).then(() => Promise.reject(`Timeout after ${queryResults.length} total snapshots.`)),
             ]),
     };
 }

@@ -11,9 +11,7 @@ TODO:
 
 ## Important to know
 
-### DashMap
-
-Internally we use `DashMap` for easy and performant concurrent access to a single HashMap. Unfortunately, as of now, DashMap is not built with async in mind and can deadlock if a ref is kept across an await point. Take care
+This is highly experimental software.
 
 ## How to use
 
