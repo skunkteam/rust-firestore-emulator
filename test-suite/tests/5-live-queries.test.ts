@@ -98,29 +98,28 @@ describe('listen to query updates', () => {
             });
         });
 
-        fs.notImplementedInRust ||
-            test.concurrent('add/remove relevant documents', async () => {
-                const coll = subCollection();
+        test.concurrent('add/remove relevant documents', async () => {
+            const coll = subCollection();
 
-                const { stop, getCurrent, getNext } = listen(query(coll));
-                expect(await getCurrent()).toEqual([]);
+            const { stop, getCurrent, getNext } = listen(query(coll));
+            expect(await getCurrent()).toEqual([]);
 
-                const docPairs: FirebaseFirestore.DocumentReference[][] = [];
-                for (let i = 1; i < 10; i++) {
-                    const [newData, docs] = await Promise.all([getNext(), createDoc(coll, { some: 'doc: ' + i })]);
-                    docPairs.push(docs);
-                    expect(newData).toBeArrayOfSize(i);
-                }
+            const docPairs: FirebaseFirestore.DocumentReference[][] = [];
+            for (let i = 1; i < 10; i++) {
+                const [newData, docs] = await Promise.all([getNext(), createDoc(coll, { some: 'doc: ' + i })]);
+                docPairs.push(docs);
+                expect(newData).toBeArrayOfSize(i);
+            }
 
-                while (docPairs.length) {
-                    const docsToRemove = docPairs.pop();
-                    assert(docsToRemove);
-                    const [newData] = await Promise.all([getNext(), ...docsToRemove.map(doc => doc.delete())]);
-                    expect(newData).toBeArrayOfSize(docPairs.length);
-                }
+            while (docPairs.length) {
+                const docsToRemove = docPairs.pop();
+                assert(docsToRemove);
+                const [newData] = await Promise.all([getNext(), ...docsToRemove.map(doc => doc.delete())]);
+                expect(newData).toBeArrayOfSize(docPairs.length);
+            }
 
-                stop();
-            });
+            stop();
+        });
 
         fs.notImplementedInRust ||
             test.concurrent('batch write', async () => {
@@ -157,33 +156,32 @@ describe('listen to query updates', () => {
                 stop();
             });
 
-        fs.notImplementedInRust ||
-            test.concurrent('limit', async () => {
-                const coll = subCollection();
+        test.concurrent('limit', async () => {
+            const coll = subCollection();
 
-                const { stop, getCurrent, getNext } = listen(query(coll).orderBy('ordered').limit(3));
-                expect(await getCurrent()).toEqual([]);
+            const { stop, getCurrent, getNext } = listen(query(coll).orderBy('ordered').limit(3));
+            expect(await getCurrent()).toEqual([]);
 
-                const [onlyOne, [refOne]] = await Promise.all([getNext(), createDoc(coll, { ordered: 1 })]);
-                expect(onlyOne).toEqual([{ ordered: 1 }]);
+            const [onlyOne, [refOne]] = await Promise.all([getNext(), createDoc(coll, { ordered: 1 })]);
+            expect(onlyOne).toEqual([{ ordered: 1 }]);
 
-                const [nowTwo] = await Promise.all([getNext(), createDoc(coll, { ordered: 5 })]);
-                expect(nowTwo).toEqual([{ ordered: 1 }, { ordered: 5 }]);
+            const [nowTwo] = await Promise.all([getNext(), createDoc(coll, { ordered: 5 })]);
+            expect(nowTwo).toEqual([{ ordered: 1 }, { ordered: 5 }]);
 
-                const [nowThree, [refThree]] = await Promise.all([getNext(), createDoc(coll, { ordered: 3 })]);
-                expect(nowThree).toEqual([{ ordered: 1 }, { ordered: 3 }, { ordered: 5 }]);
+            const [nowThree, [refThree]] = await Promise.all([getNext(), createDoc(coll, { ordered: 3 })]);
+            expect(nowThree).toEqual([{ ordered: 1 }, { ordered: 3 }, { ordered: 5 }]);
 
-                const [replacedOne] = await Promise.all([getNext(), createDoc(coll, { ordered: 4 })]);
-                expect(replacedOne).toEqual([{ ordered: 1 }, { ordered: 3 }, { ordered: 4 }]);
+            const [replacedOne] = await Promise.all([getNext(), createDoc(coll, { ordered: 4 })]);
+            expect(replacedOne).toEqual([{ ordered: 1 }, { ordered: 3 }, { ordered: 4 }]);
 
-                const [movedOne] = await Promise.all([getNext(), refThree.update({ ordered: 10 })]);
-                expect(movedOne).toEqual([{ ordered: 1 }, { ordered: 4 }, { ordered: 5 }]);
+            const [movedOne] = await Promise.all([getNext(), refThree.update({ ordered: 10 })]);
+            expect(movedOne).toEqual([{ ordered: 1 }, { ordered: 4 }, { ordered: 5 }]);
 
-                const [removed] = await Promise.all([getNext(), refOne.delete()]);
-                expect(removed).toEqual([{ ordered: 4 }, { ordered: 5 }, { ordered: 10 }]);
+            const [removed] = await Promise.all([getNext(), refOne.delete()]);
+            expect(removed).toEqual([{ ordered: 4 }, { ordered: 5 }, { ordered: 10 }]);
 
-                stop();
-            });
+            stop();
+        });
     });
 });
 

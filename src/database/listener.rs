@@ -1,5 +1,5 @@
 use super::{
-    collection::Collection, collection_name, document::DocumentVersion, query::Query, Database,
+    document::DocumentVersion, event::DatabaseEvent, query::Query, target_change, Database,
 };
 use crate::{
     database::ReadConsistency,
@@ -8,29 +8,28 @@ use crate::{
         listen_response::ResponseType,
         target::{self, query_target},
         target_change::TargetChangeType,
-        DocumentChange, DocumentDelete, DocumentRemove, ListenRequest, ListenResponse, Target,
-        TargetChange,
+        DocumentChange, DocumentDelete, ListenRequest, ListenResponse, Target, TargetChange,
     },
     required_option, unimplemented, unimplemented_bool, unimplemented_collection,
     unimplemented_option,
     utils::{timestamp, timestamp_from_nanos, timestamp_nanos},
 };
+use itertools::Itertools;
 use prost_types::Timestamp;
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashMap,
     sync::{
         atomic::{self, AtomicUsize},
         Arc,
     },
-    vec,
 };
-use tokio::sync::mpsc;
-use tokio_stream::{
-    wrappers::{errors::BroadcastStreamRecvError, BroadcastStream, ReceiverStream},
-    StreamExt, StreamMap,
-};
+use string_cache::DefaultAtom;
+use tokio::sync::{broadcast::error::RecvError, mpsc};
+use tokio_stream::{wrappers::ReceiverStream, StreamExt};
 use tonic::{Result, Status};
 use tracing::{debug, error, instrument};
+
+const TARGET_ID: i32 = 1;
 
 const TARGET_CHANGE_DEFAULT: TargetChange = TargetChange {
     target_change_type: TargetChangeType::NoChange as _,
@@ -45,9 +44,7 @@ pub struct Listener {
     id: usize,
     database: Arc<Database>,
     sender: mpsc::Sender<Result<ListenResponse>>,
-    events_by_collection: StreamMap<String, BroadcastStream<DocumentVersion>>,
-    targets_by_collection: HashMap<String, Vec<ListenerTarget>>,
-    queries: Vec<QueryTarget>,
+    target: Option<ListenerTarget>,
 }
 
 impl Listener {
@@ -62,9 +59,8 @@ impl Listener {
             id: NEXT_ID.fetch_add(1, atomic::Ordering::Relaxed),
             database: Arc::clone(&database),
             sender,
-            events_by_collection: Default::default(),
-            targets_by_collection: Default::default(),
-            queries: Default::default(),
+            // No target yet, will be added by a message in the request stream.
+            target: None,
         };
 
         tokio::spawn(listener.go(request_stream));
@@ -74,7 +70,7 @@ impl Listener {
 
     #[instrument(name = "listener", skip_all, fields(id = self.id), err)]
     async fn go(mut self, mut request_stream: tonic::Streaming<ListenRequest>) -> Result<()> {
-        let mut new_collections = self.database.new_collections.subscribe();
+        let mut database_events = self.database.events.subscribe();
         // Every Listener has a single event-loop, this is it:
         loop {
             tokio::select! {
@@ -92,22 +88,20 @@ impl Listener {
                     }
                 }
 
-                Some((_, event)) = self.events_by_collection.next() => {
-                    match event {
+                database_event = database_events.recv() => {
+                    match database_event {
                         Ok(event) => self.process_event(event).await?,
-                        Err(BroadcastStreamRecvError::Lagged(count)) => {
+                        Err(RecvError::Lagged(count)) => {
                             error!(
                                 id = self.id,
                                 count = count,
                                 "listener missed {} events, because of buffer overflow",
                                 count
                             );
-                        }
+                        },
+                        // Database is dropped?
+                        Err(RecvError::Closed) => return Ok(())
                     }
-                }
-
-                Ok(new_collection) = new_collections.recv() => {
-                    self.process_new_collection(new_collection).await?;
                 }
             }
         }
@@ -136,6 +130,10 @@ impl Listener {
                 unimplemented_option!(expected_count);
                 required_option!(target_type);
 
+                if self.target.is_some() || target_id != TARGET_ID {
+                    unimplemented!("multiple targets inside a single listen stream")
+                }
+
                 match target_type {
                     target::TargetType::Query(target::QueryTarget { parent, query_type }) => {
                         required_option!(query_type);
@@ -143,13 +141,16 @@ impl Listener {
                         let query =
                             Query::from_structured(parent, query, ReadConsistency::Default)?;
                         query.check_live_query_compat()?;
-                        self.add_query(target_id, query, resume_type).await?;
+                        self.set_query(query, resume_type).await?;
                     }
-                    target::TargetType::Documents(target::DocumentsTarget { documents }) => {
-                        self.add_documents(target_id, documents, resume_type)
+                    target::TargetType::Documents(target::DocumentsTarget { mut documents }) => {
+                        if documents.len() != 1 {
+                            unimplemented!("multiple documents inside a single listen stream")
+                        }
+                        self.set_document(documents.pop().unwrap().into(), resume_type)
                             .await?;
                     }
-                }
+                };
             }
             listen_request::TargetChange::RemoveTarget(target_id) => {
                 unimplemented!(format!("RemoveTarget: {target_id}"));
@@ -159,133 +160,50 @@ impl Listener {
     }
 
     #[instrument(skip_all, err)]
-    async fn process_event(&mut self, event: DocumentVersion) -> Result<()> {
+    async fn process_event(&mut self, event: DatabaseEvent) -> Result<()> {
         // We rely on the fact that this function will complete before any other events are processed. That's why we know for sure that
         // the output stream is not used for something else until we respond with our NO_CHANGE msg. That msg means that everything is up
         // to date until that point and this is (for now) the easiest way to make sure that is actually the case. This is probably okay,
         // but if it becomes a hotspot we might look into optimizing later.
-        let doc_name = event.name();
-        let update_time = event.update_time();
-        let collection_name = collection_name(doc_name)?;
-        let mut target_ids = HashSet::new();
-        let mut removed_target_ids = HashSet::new();
-        if let Some(targets) = self.targets_by_collection.get_mut(collection_name) {
-            // Need to process `targets` in reverse, because of the use of `swap_remove`
-            for i in (0..targets.len()).rev() {
-                let target = &mut targets[i];
-                if target.doc_name() != doc_name {
-                    continue;
-                }
-                let last_read_time = target.last_read_time_mut();
-                if timestamp_nanos(last_read_time) >= timestamp_nanos(update_time) {
-                    continue;
-                }
-                *last_read_time = update_time.clone();
-                if target.needs_removal(&event)? {
-                    removed_target_ids.insert(target.target_id());
-                    targets.swap_remove(i);
-                } else {
-                    target_ids.insert(target.target_id());
-                }
-            }
-        }
+        let Some(target) = &mut self.target else {
+            return Ok(());
+        };
 
-        if !removed_target_ids.is_empty() {
-            self.send(ResponseType::DocumentRemove(DocumentRemove {
-                document: doc_name.to_string(),
-                removed_target_ids: removed_target_ids.into_iter().collect(),
-                read_time: Some(update_time.clone()),
-            }))
-            .await?;
-        }
+        let update_time = event.update_time.clone();
+        let msgs = target.process_event(&self.database, event).await?;
 
-        if let Some(version) = event.stored_document() {
-            for target in &self.queries {
-                if target_ids.contains(&target.target_id) {
-                    continue;
-                }
-                if !target.query.includes_collection(collection_name) {
-                    continue;
-                }
-                if target.query.includes_document(version)? {
-                    target_ids.insert(target.target_id);
-                    self.targets_by_collection
-                        .entry(collection_name.to_string())
-                        .or_default()
-                        .push(ListenerTarget::DocumentInQuery {
-                            target_id: target.target_id,
-                            name: doc_name.to_string(),
-                            query: Arc::clone(&target.query),
-                            last_read_time: update_time.clone(),
-                        });
-                    self.send(ResponseType::TargetChange(TargetChange {
-                        target_change_type: TargetChangeType::Add as _,
-                        target_ids: vec![target.target_id],
-                        cause: None,
-                        resume_token: vec![],
-                        read_time: Some(update_time.clone()),
-                    }))
-                    .await?
-                }
-            }
-        }
-
-        if target_ids.is_empty() {
+        if msgs.is_empty() {
             return Ok(());
         }
 
-        let target_ids = target_ids.into_iter().collect();
+        for msg in msgs {
+            self.send(msg).await?;
+        }
 
-        let msg = match event.to_document() {
-            Some(d) => ResponseType::DocumentChange(DocumentChange {
-                document: Some(d),
-                target_ids,
-                removed_target_ids: vec![],
-            }),
-            None => ResponseType::DocumentDelete(DocumentDelete {
-                document: doc_name.to_string(),
-                removed_target_ids: target_ids,
-                read_time: Some(update_time.clone()),
-            }),
-        };
-        self.send(msg).await?;
+        // Response: I've sent you the state of all documents now
+        let resume_token = timestamp_nanos(&update_time).to_ne_bytes();
         self.send(ResponseType::TargetChange(TargetChange {
-            resume_token: timestamp_nanos(update_time).to_ne_bytes().to_vec(),
+            target_change_type: TargetChangeType::Current as _,
+            target_ids: vec![TARGET_ID],
             read_time: Some(update_time.clone()),
+            resume_token: resume_token.to_vec(),
+            ..TARGET_CHANGE_DEFAULT
+        }))
+        .await?;
+
+        // Response: Oh, by the way, everything is up to date. 🤷🏼‍♂️
+        self.send(ResponseType::TargetChange(TargetChange {
+            resume_token: timestamp_nanos(&update_time).to_ne_bytes().to_vec(),
+            read_time: Some(update_time),
             ..TARGET_CHANGE_DEFAULT
         }))
         .await
     }
 
-    #[instrument(skip_all, err)]
-    async fn process_new_collection(&mut self, new_collection: Arc<Collection>) -> Result<()> {
-        // We rely on the fact that this function will complete before any other events are processed. That's why we know for sure that
-        // the output stream is not used for something else until we respond with our NO_CHANGE msg. That msg means that everything is up
-        // to date until that point and this is (for now) the easiest way to make sure that is actually the case. This is probably okay,
-        // but if it becomes a hotspot we might look into optimizing later.
-        if self
-            .queries
-            .iter()
-            .any(|target| target.query.includes_collection(&new_collection.name))
-        {
-            self.ensure_listening_to_collection(&new_collection.name)
-                .await;
-        }
-        for doc in new_collection.docs().await {
-            let Some(latest_version) = doc.read().await?.current_version().map(Arc::clone) else {
-                continue;
-            };
-            self.process_event(DocumentVersion::Stored(latest_version))
-                .await?;
-        }
-        Ok(())
-    }
-
-    #[instrument(skip_all, fields(target_id = target_id, count = documents.len()), err)]
-    async fn add_documents(
+    #[instrument(skip_all, fields(document = &*name), err)]
+    async fn set_document(
         &mut self,
-        target_id: i32,
-        documents: Vec<String>,
+        name: DefaultAtom,
         resume_type: Option<target::ResumeType>,
     ) -> Result<()> {
         // We rely on the fact that this function will complete before any other events are processed. That's why we know for sure that
@@ -297,48 +215,43 @@ impl Listener {
         // Response: I'm on it!
         self.send(ResponseType::TargetChange(TargetChange {
             target_change_type: TargetChangeType::Add as _,
-            target_ids: vec![target_id],
+            target_ids: vec![TARGET_ID],
             ..TARGET_CHANGE_DEFAULT
         }))
         .await?;
 
         let read_time = timestamp();
-        for name in &documents {
-            let collection_name = collection_name(name)?;
-            debug!(name);
-            // Make sure we get to receive all updates from now on..
-            self.ensure_listening_to_collection(collection_name).await;
-            self.add_listener_target(ListenerTarget::Document {
-                target_id,
-                name: name.to_string(),
-                last_read_time: read_time.clone(),
-            })?;
+        debug!(name = &*name);
+        self.target = Some(ListenerTarget::DocumentTarget(DocumentTarget {
+            name: name.clone(),
+            last_read_time: read_time.clone(),
+        }));
 
-            // Now determine the latest version we can find...
-            let doc = self
-                .database
-                .get_doc(name, &ReadConsistency::Default)
-                .await?;
+        // Now determine the latest version we can find...
+        let doc = self
+            .database
+            .get_doc(&name, &ReadConsistency::Default)
+            .await?;
 
-            // Only send if newer than the resume_token
-            if let Some(previous_time) = &send_if_newer_than {
-                if doc.as_ref().is_some_and(|v| {
-                    timestamp_nanos(v.update_time.as_ref().unwrap())
-                        <= timestamp_nanos(previous_time)
-                }) {
-                    continue;
-                }
-            }
+        // Only send if newer than the resume_token
+        let send_initial = match &send_if_newer_than {
+            Some(previous_time) => !doc.as_ref().is_some_and(|v| {
+                timestamp_nanos(v.update_time.as_ref().unwrap()) <= timestamp_nanos(previous_time)
+            }),
+            _ => true,
+        };
+
+        if send_initial {
             // Response: This is the current version, whether you like it or not.
             let msg = match doc {
                 Some(d) => ResponseType::DocumentChange(DocumentChange {
                     document: Some(d),
-                    target_ids: vec![target_id],
+                    target_ids: vec![TARGET_ID],
                     removed_target_ids: vec![],
                 }),
                 None => ResponseType::DocumentDelete(DocumentDelete {
                     document: name.to_string(),
-                    removed_target_ids: vec![target_id],
+                    removed_target_ids: vec![TARGET_ID],
                     read_time: Some(read_time.clone()),
                 }),
             };
@@ -349,7 +262,7 @@ impl Listener {
         let resume_token = timestamp_nanos(&read_time).to_ne_bytes();
         self.send(ResponseType::TargetChange(TargetChange {
             target_change_type: TargetChangeType::Current as _,
-            target_ids: vec![target_id],
+            target_ids: vec![TARGET_ID],
             read_time: Some(read_time.clone()),
             resume_token: resume_token.to_vec(),
             ..TARGET_CHANGE_DEFAULT
@@ -367,9 +280,8 @@ impl Listener {
         Ok(())
     }
 
-    async fn add_query(
+    async fn set_query(
         &mut self,
-        target_id: i32,
         query: Query,
         resume_type: Option<target::ResumeType>,
     ) -> Result<()> {
@@ -382,56 +294,47 @@ impl Listener {
         // Response: I'm on it!
         self.send(ResponseType::TargetChange(TargetChange {
             target_change_type: TargetChangeType::Add as _,
-            target_ids: vec![target_id],
+            target_ids: vec![TARGET_ID],
             ..TARGET_CHANGE_DEFAULT
         }))
         .await?;
 
         let read_time = timestamp();
         let query = Arc::new(query);
-        self.queries.push(QueryTarget {
-            target_id,
+        self.target = Some(ListenerTarget::QueryTarget(QueryTarget {
             query: Arc::clone(&query),
-        });
+            doctargets_by_name: Default::default(),
+        }));
 
+        // TODO: Verplaats naar QueryTarget
         for doc in query.once(&self.database).await? {
-            let name = &doc.name;
-            let collection_name = collection_name(name)?;
-            debug!(name);
-            // Make sure we get to receive all updates from now on..
-            self.ensure_listening_to_collection(collection_name).await;
-
-            self.add_listener_target(ListenerTarget::DocumentInQuery {
-                target_id,
-                name: name.to_string(),
-                query: Arc::clone(&query),
-                last_read_time: read_time.clone(),
-            })?;
+            debug!(name = &*doc.name);
 
             // Only send if newer than the resume_token
-            if let Some(previous_time) = &send_if_newer_than {
-                if doc
+            let send_initial = match &send_if_newer_than {
+                Some(previous_time) => !doc
                     .update_time
                     .as_ref()
-                    .is_some_and(|v| timestamp_nanos(v) <= timestamp_nanos(previous_time))
-                {
-                    continue;
-                }
+                    .is_some_and(|v| timestamp_nanos(v) <= timestamp_nanos(previous_time)),
+                _ => true,
+            };
+
+            if send_initial {
+                // Response: This is the current version, whether you like it or not.
+                let msg = ResponseType::DocumentChange(DocumentChange {
+                    document: Some(doc),
+                    target_ids: vec![TARGET_ID],
+                    removed_target_ids: vec![],
+                });
+                self.send(msg).await?;
             }
-            // Response: This is the current version, whether you like it or not.
-            let msg = ResponseType::DocumentChange(DocumentChange {
-                document: Some(doc),
-                target_ids: vec![target_id],
-                removed_target_ids: vec![],
-            });
-            self.send(msg).await?;
         }
 
         // Response: I've sent you the state of all documents now
         let resume_token = timestamp_nanos(&read_time).to_ne_bytes();
         self.send(ResponseType::TargetChange(TargetChange {
             target_change_type: TargetChangeType::Current as _,
-            target_ids: vec![target_id],
+            target_ids: vec![TARGET_ID],
             read_time: Some(read_time.clone()),
             resume_token: resume_token.to_vec(),
             ..TARGET_CHANGE_DEFAULT
@@ -466,89 +369,136 @@ impl Listener {
             .await
             .map_err(|_| Status::cancelled("stream closed"))
     }
-
-    #[instrument(skip(self))]
-    async fn ensure_listening_to_collection(&mut self, collection_name: &str) {
-        if !self.events_by_collection.contains_key(collection_name) {
-            let collection_events = self
-                .database
-                .get_collection(collection_name)
-                .await
-                .events
-                .subscribe();
-            self.events_by_collection.insert(
-                collection_name.to_string(),
-                BroadcastStream::new(collection_events),
-            );
-        }
-    }
-
-    fn add_listener_target(&mut self, target: ListenerTarget) -> Result<()> {
-        self.targets_by_collection
-            .entry(target.collection_name()?.to_string())
-            .or_default()
-            .push(target);
-        Ok(())
-    }
 }
 
 enum ListenerTarget {
-    Document {
-        target_id: i32,
-        name: String,
-        last_read_time: Timestamp,
-    },
-    DocumentInQuery {
-        target_id: i32,
-        name: String,
-        query: Arc<Query>,
-        last_read_time: Timestamp,
-    },
+    DocumentTarget(DocumentTarget),
+    QueryTarget(QueryTarget),
 }
 
 impl ListenerTarget {
-    fn doc_name(&self) -> &str {
+    async fn process_event(
+        &mut self,
+        database: &Arc<Database>,
+        event: DatabaseEvent,
+    ) -> Result<Vec<ResponseType>> {
         match self {
-            ListenerTarget::Document { name, .. } => name,
-            ListenerTarget::DocumentInQuery { name, .. } => name,
+            ListenerTarget::DocumentTarget(target) => target.process_event(event),
+            ListenerTarget::QueryTarget(target) => target.process_event(database, event).await,
         }
     }
+}
 
-    fn collection_name(&self) -> Result<&str> {
-        collection_name(self.doc_name())
-    }
+struct DocumentTarget {
+    name: DefaultAtom,
+    last_read_time: Timestamp,
+}
 
-    fn last_read_time_mut(&mut self) -> &mut Timestamp {
-        match self {
-            ListenerTarget::Document { last_read_time, .. } => last_read_time,
-            ListenerTarget::DocumentInQuery { last_read_time, .. } => last_read_time,
-        }
-    }
-
-    fn target_id(&self) -> i32 {
-        match self {
-            ListenerTarget::Document { target_id, .. } => *target_id,
-            ListenerTarget::DocumentInQuery { target_id, .. } => *target_id,
-        }
-    }
-
-    fn needs_removal(&self, event: &DocumentVersion) -> Result<bool> {
-        let Self::DocumentInQuery { query, .. } = self else {
-            return Ok(false);
+impl DocumentTarget {
+    fn process_event(&mut self, event: DatabaseEvent) -> Result<Vec<ResponseType>> {
+        let Ok(update) = event
+            .updates
+            .into_iter()
+            .filter(|update| update.name() == &self.name)
+            .at_most_one()
+        else {
+            unimplemented!("multiple updates to a single document in one txn")
         };
-        let Some(stored) = event.stored_document() else {
-            return Ok(true);
+        let Some(update) = update else {
+            return Ok(vec![]);
         };
-        Ok(!query.includes_document(stored)?)
+        if timestamp_nanos(&self.last_read_time) >= timestamp_nanos(&event.update_time) {
+            return Ok(vec![]);
+        }
+        self.last_read_time = event.update_time.clone();
+
+        let msg = match update.to_document() {
+            Some(d) => ResponseType::DocumentChange(DocumentChange {
+                document: Some(d),
+                target_ids: vec![TARGET_ID],
+                removed_target_ids: vec![],
+            }),
+            None => ResponseType::DocumentDelete(DocumentDelete {
+                document: update.name().to_string(),
+                removed_target_ids: vec![TARGET_ID],
+                read_time: Some(event.update_time.clone()),
+            }),
+        };
+        Ok(vec![msg])
     }
 }
 
 struct QueryTarget {
-    target_id: i32,
     query: Arc<Query>,
+    doctargets_by_name: HashMap<DefaultAtom, DocumentTarget>,
+}
+impl QueryTarget {
+    async fn process_event(
+        &mut self,
+        database: &Arc<Database>,
+        event: DatabaseEvent,
+    ) -> Result<Vec<ResponseType>> {
+        // TODO: do not reset if not needed (which is very often)
+        let reset = 'reset: {
+            for update in &event.updates {
+                match update {
+                    DocumentVersion::Deleted(deleted) => {
+                        if self.doctargets_by_name.contains_key(&deleted.name) {
+                            break 'reset true;
+                        }
+                    }
+                    DocumentVersion::Stored(stored) => {
+                        if self.query.includes_document(stored)? {
+                            break 'reset true;
+                        }
+                    }
+                }
+            }
+            false
+        };
+
+        if !reset {
+            return Ok(vec![]);
+        }
+
+        self.reset(database, &event.update_time).await
+    }
+
+    async fn reset(
+        &mut self,
+        database: &Arc<Database>,
+        time: &Timestamp,
+    ) -> Result<Vec<ResponseType>> {
+        let mut msgs = vec![ResponseType::TargetChange(TargetChange {
+            target_change_type: target_change::TargetChangeType::Reset as _,
+            target_ids: vec![TARGET_ID],
+            cause: None,
+            resume_token: vec![],
+            read_time: None,
+        })];
+
+        self.doctargets_by_name.clear();
+        for doc in self.query.once(database).await? {
+            let name = DefaultAtom::from(&*doc.name);
+            self.doctargets_by_name.insert(
+                name.clone(),
+                DocumentTarget {
+                    name,
+                    last_read_time: time.clone(),
+                },
+            );
+            msgs.push(ResponseType::DocumentChange(DocumentChange {
+                document: Some(doc),
+                target_ids: vec![TARGET_ID],
+                removed_target_ids: vec![],
+            }))
+        }
+
+        Ok(msgs)
+    }
 }
 
-fn show_response_type(rt: &ResponseType) -> &str {
+fn show_response_type(rt: &ResponseType) -> &'static str {
     match rt {
         ResponseType::TargetChange(_) => "TargetChange",
         ResponseType::DocumentChange(_) => "DocumentChange",

@@ -1,4 +1,4 @@
-use super::{collection::Collection, ReadConsistency};
+use super::ReadConsistency;
 use crate::{
     googleapis::google::firestore::v1::{precondition, Document, Value},
     utils::timestamp_nanos,
@@ -9,9 +9,10 @@ use std::{
     collections::HashMap,
     fmt::{self, Debug},
     ops::Deref,
-    sync::{Arc, Weak},
+    sync::Arc,
     time::Duration,
 };
+use string_cache::DefaultAtom;
 use tokio::{
     sync::{
         oneshot, OwnedRwLockReadGuard, OwnedRwLockWriteGuard, OwnedSemaphorePermit, RwLock,
@@ -27,7 +28,9 @@ const WAIT_LOCK_TIMEOUT: Duration = Duration::from_secs(30);
 pub struct DocumentMeta {
     /// The resource name of the document, for example
     /// `projects/{project_id}/databases/{database_id}/documents/{document_path}`.
-    pub name: String,
+    pub name: DefaultAtom,
+    /// The collection name of the document, i.e. the full name of the document minus the last component.
+    pub collection_name: DefaultAtom,
     contents: Arc<RwLock<DocumentContents>>,
     write_permit_shop: Arc<Semaphore>,
 }
@@ -41,10 +44,14 @@ impl Debug for DocumentMeta {
 }
 
 impl DocumentMeta {
-    pub fn new(name: String, collection: Weak<Collection>) -> Self {
+    pub fn new(name: DefaultAtom, collection_name: DefaultAtom) -> Self {
         Self {
-            contents: Arc::new(RwLock::new(DocumentContents::new(name.clone(), collection))),
+            contents: Arc::new(RwLock::new(DocumentContents::new(
+                name.clone(),
+                collection_name.clone(),
+            ))),
             name,
+            collection_name,
             write_permit_shop: Arc::new(Semaphore::new(1)),
         }
     }
@@ -82,16 +89,17 @@ impl DocumentMeta {
 pub struct DocumentContents {
     /// The resource name of the document, for example
     /// `projects/{project_id}/databases/{database_id}/documents/{document_path}`.
-    pub name: String,
-    collection: Weak<Collection>,
+    pub name: DefaultAtom,
+    /// The collection name of the document, i.e. the full name of the document minus the last component.
+    pub collection_name: DefaultAtom,
     versions: Vec<DocumentVersion>,
 }
 
 impl DocumentContents {
-    pub fn new(name: String, collection: Weak<Collection>) -> Self {
+    pub fn new(name: DefaultAtom, collection_name: DefaultAtom) -> Self {
         Self {
             name,
-            collection,
+            collection_name,
             versions: Default::default(),
         }
     }
@@ -161,35 +169,35 @@ impl DocumentContents {
     }
 
     #[instrument(skip_all, fields(
-        doc_name = self.name,
+        doc_name = self.name.deref(),
         time = display(&update_time),
     ), level = Level::DEBUG)]
-    pub async fn add_version(&mut self, fields: HashMap<String, Value>, update_time: Timestamp) {
+    pub async fn add_version(
+        &mut self,
+        fields: HashMap<String, Value>,
+        update_time: Timestamp,
+    ) -> DocumentVersion {
         trace!(?fields);
         let create_time = self.create_time().unwrap_or_else(|| update_time.clone());
         let version = DocumentVersion::Stored(Arc::new(StoredDocumentVersion {
             name: self.name.clone(),
+            collection_name: self.collection_name.clone(),
             create_time,
             update_time,
             fields,
         }));
         self.versions.push(version.clone());
-        self.broadcast_event(version);
+        version
     }
 
-    pub async fn delete(&mut self, delete_time: Timestamp) {
+    pub async fn delete(&mut self, delete_time: Timestamp) -> DocumentVersion {
         let version = DocumentVersion::Deleted(Arc::new(DeletedDocumentVersion {
             name: self.name.clone(),
+            collection_name: self.collection_name.clone(),
             delete_time,
         }));
         self.versions.push(version.clone());
-        self.broadcast_event(version);
-    }
-
-    fn broadcast_event(&self, update: DocumentVersion) {
-        if let Some(collection) = self.collection.upgrade() {
-            let _ = collection.events.send(update);
-        }
+        version
     }
 }
 
@@ -239,7 +247,7 @@ pub enum DocumentVersion {
 }
 
 impl DocumentVersion {
-    pub fn name(&self) -> &str {
+    pub fn name(&self) -> &DefaultAtom {
         match self {
             DocumentVersion::Deleted(ver) => &ver.name,
             DocumentVersion::Stored(ver) => &ver.name,
@@ -276,7 +284,9 @@ impl DocumentVersion {
 pub struct StoredDocumentVersion {
     /// The resource name of the document, for example
     /// `projects/{project_id}/databases/{database_id}/documents/{document_path}`.
-    pub name: String,
+    pub name: DefaultAtom,
+    /// The collection name of the document, i.e. the full name of the document minus the last component.
+    pub collection_name: DefaultAtom,
     /// The time at which the document was created.
     ///
     /// This value increases monotonically when a document is deleted then
@@ -319,7 +329,7 @@ pub struct StoredDocumentVersion {
 impl StoredDocumentVersion {
     pub fn to_document(&self) -> Document {
         Document {
-            name: self.name.clone(),
+            name: self.name.to_string(),
             fields: self.fields.clone(),
             create_time: Some(self.create_time.clone()),
             update_time: Some(self.update_time.clone()),
@@ -331,7 +341,9 @@ impl StoredDocumentVersion {
 pub struct DeletedDocumentVersion {
     /// The resource name of the document, for example
     /// `projects/{project_id}/databases/{database_id}/documents/{document_path}`.
-    pub name: String,
+    pub name: DefaultAtom,
+    /// The collection name of the document, i.e. the full name of the document minus the last component.
+    pub collection_name: DefaultAtom,
     /// The time at which the document was deleted.
     pub delete_time: Timestamp,
 }

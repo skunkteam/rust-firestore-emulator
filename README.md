@@ -1,5 +1,8 @@
 TODO:
 
+- eval use of `string_cache` for collection-names, document-names and map-keys
+- eval use of `cachemap2` instead of `Arc<_>` at certain points
+
 ## Missing features
 
 - [ ] Mimic transaction behaviour from cloud Firestore (mixed pessimistic and optimistic)

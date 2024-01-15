@@ -1,5 +1,5 @@
 use crate::{
-    database::{get_doc_name_from_write, Database, ReadConsistency},
+    database::{event::DatabaseEvent, get_doc_name_from_write, Database, ReadConsistency},
     googleapis::google::firestore::v1::{
         structured_query::{CollectionSelector, FieldReference},
         transaction_options::ReadWrite,
@@ -9,8 +9,10 @@ use crate::{
     utils::timestamp,
 };
 use futures::{future::try_join_all, stream::BoxStream, StreamExt};
+use itertools::Itertools;
 use prost_types::Timestamp;
 use std::sync::Arc;
+use string_cache::DefaultAtom;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{async_trait, Code, Request, Response, Result, Status};
@@ -84,7 +86,7 @@ impl firestore_server::Firestore for FirestoreEmulator {
 
         let doc = self
             .database
-            .get_doc(&name, &consistency_selector.try_into()?)
+            .get_doc(&name.into(), &consistency_selector.try_into()?)
             .await?
             .ok_or_else(|| Status::not_found(Code::NotFound.description()))?;
         Ok(Response::new(doc))
@@ -133,7 +135,10 @@ impl firestore_server::Firestore for FirestoreEmulator {
             async move {
                 for name in documents {
                     use batch_get_documents_response::Result::*;
-                    let msg = match database.get_doc(&name, &read_consistency).await {
+                    let msg = match database
+                        .get_doc(&DefaultAtom::from(&*name), &read_consistency)
+                        .await
+                    {
                         Ok(doc) => Ok(BatchGetDocumentsResponse {
                             result: Some(match doc {
                                 None => Missing(name),
@@ -433,7 +438,13 @@ impl firestore_server::Firestore for FirestoreEmulator {
             page_token,
             consistency_selector,
         } = request.into_inner();
-        let collection_ids = self.database.get_collection_ids(&parent).await?;
+        let collection_ids = self
+            .database
+            .get_collection_ids(&parent.into())
+            .await?
+            .into_iter()
+            .map(|name| name.to_string())
+            .collect_vec();
         unimplemented_bool!(collection_ids.len() as i32 > page_size);
         unimplemented_collection!(page_token);
         unimplemented_option!(consistency_selector);
@@ -468,29 +479,37 @@ impl firestore_server::Firestore for FirestoreEmulator {
 
         let time: Timestamp = timestamp();
 
-        let (status, write_results) = try_join_all(writes.into_iter().map(|write| async {
-            let name = get_doc_name_from_write(&write)?;
-            let mut guard = self.database.get_doc_meta_mut_no_txn(name).await?;
-            let result = self
-                .database
-                .perform_write(write, &mut guard, time.clone())
-                .await;
-            use crate::googleapis::google::rpc;
-            Ok(match result {
-                Ok(wr) => (Default::default(), wr),
-                Err(err) => (
-                    rpc::Status {
-                        code: err.code() as _,
-                        message: err.message().to_string(),
-                        details: vec![],
-                    },
-                    Default::default(),
-                ),
-            }) as Result<_, Status>
-        }))
-        .await?
-        .into_iter()
-        .unzip();
+        let (status, write_results, updates): (Vec<_>, Vec<_>, Vec<_>) =
+            try_join_all(writes.into_iter().map(|write| async {
+                let name = get_doc_name_from_write(&write)?;
+                let mut guard = self.database.get_doc_meta_mut_no_txn(&name).await?;
+                let result = self
+                    .database
+                    .perform_write(write, &mut guard, time.clone())
+                    .await;
+                use crate::googleapis::google::rpc;
+                Ok(match result {
+                    Ok((wr, update)) => (Default::default(), wr, Some(update)),
+                    Err(err) => (
+                        rpc::Status {
+                            code: err.code() as _,
+                            message: err.message().to_string(),
+                            details: vec![],
+                        },
+                        Default::default(),
+                        None,
+                    ),
+                }) as Result<_, Status>
+            }))
+            .await?
+            .into_iter()
+            .multiunzip();
+
+        let _ = self.database.events.send(DatabaseEvent {
+            update_time: time.clone(),
+            updates: updates.into_iter().flatten().collect(),
+        });
+
         Ok(Response::new(BatchWriteResponse {
             write_results,
             status,
@@ -503,14 +522,20 @@ async fn perform_writes(
     writes: Vec<Write>,
 ) -> Result<(Timestamp, Vec<WriteResult>)> {
     let time: Timestamp = timestamp();
-    let write_results = try_join_all(writes.into_iter().map(|write| async {
+    let (write_results, updates) = try_join_all(writes.into_iter().map(|write| async {
         let name = get_doc_name_from_write(&write)?;
-        let mut guard = database.get_doc_meta_mut_no_txn(name).await?;
+        let mut guard = database.get_doc_meta_mut_no_txn(&name).await?;
         database
             .perform_write(write, &mut guard, time.clone())
             .await
     }))
-    .await?;
+    .await?
+    .into_iter()
+    .unzip();
+    let _ = database.events.send(DatabaseEvent {
+        update_time: time.clone(),
+        updates,
+    });
     Ok((time, write_results))
 }
 

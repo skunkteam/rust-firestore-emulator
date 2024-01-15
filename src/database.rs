@@ -1,6 +1,7 @@
 use self::{
     collection::Collection,
-    document::{DocumentContents, DocumentMeta, OwnedDocumentContentsWriteGuard},
+    document::{DocumentContents, DocumentMeta, DocumentVersion, OwnedDocumentContentsWriteGuard},
+    event::DatabaseEvent,
     field_path::FieldPath,
     listener::Listener,
     query::Query,
@@ -21,6 +22,7 @@ use std::{
     ops::Deref,
     sync::{Arc, Weak},
 };
+use string_cache::DefaultAtom;
 use tokio::sync::{broadcast, RwLock};
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Result, Status};
@@ -28,16 +30,19 @@ use tracing::{info, instrument, Span};
 
 mod collection;
 mod document;
+pub mod event;
 mod field_path;
 mod listener;
 mod query;
 mod transaction;
 mod value;
 
+const MAX_EVENT_BACKLOG: usize = 1024;
+
 pub struct Database {
-    collections: RwLock<HashMap<String, Arc<Collection>>>,
+    collections: RwLock<HashMap<DefaultAtom, Arc<Collection>>>,
     transactions: RunningTransactions,
-    pub new_collections: broadcast::Sender<Arc<Collection>>,
+    pub events: broadcast::Sender<DatabaseEvent>,
 }
 
 impl Database {
@@ -45,7 +50,7 @@ impl Database {
         Arc::new_cyclic(|database| Database {
             collections: Default::default(),
             transactions: RunningTransactions::new(Weak::clone(database)),
-            new_collections: broadcast::channel(16).0,
+            events: broadcast::channel(MAX_EVENT_BACKLOG).0,
         })
     }
 }
@@ -54,10 +59,10 @@ impl Database {
     #[instrument(skip_all, err, fields(in_txn = consistency.is_transaction(), found))]
     pub async fn get_doc(
         &self,
-        name: &str,
+        name: &DefaultAtom,
         consistency: &ReadConsistency,
     ) -> Result<Option<Document>> {
-        info!(name);
+        info!(name = name.deref());
         let version = if let Some(txn) = self.get_txn_for_consistency(consistency).await? {
             txn.read_doc(name)
                 .await?
@@ -75,30 +80,28 @@ impl Database {
         Ok(version)
     }
 
-    pub async fn get_collection(&self, collection_name: &str) -> Arc<Collection> {
+    pub async fn get_collection(&self, collection_name: &DefaultAtom) -> Arc<Collection> {
         Arc::clone(
             &*self
                 .collections
                 .get_or_insert(collection_name, || {
-                    let col = Arc::new(Collection::new(collection_name.into()));
-                    let _ = self.new_collections.send(Arc::clone(&col));
-                    col
+                    Arc::new(Collection::new(collection_name.into()))
                 })
                 .await,
         )
     }
 
     #[instrument(skip_all, err)]
-    pub async fn get_doc_meta(&self, name: &str) -> Result<Arc<DocumentMeta>> {
+    pub async fn get_doc_meta(&self, name: &DefaultAtom) -> Result<Arc<DocumentMeta>> {
         let collection = collection_name(name)?;
-        let meta = self.get_collection(collection).await.get_doc(name).await;
+        let meta = self.get_collection(&collection).await.get_doc(name).await;
         Ok(meta)
     }
 
     #[instrument(skip_all, err)]
     pub async fn get_doc_meta_mut_no_txn(
         &self,
-        name: &str,
+        name: &DefaultAtom,
     ) -> Result<OwnedDocumentContentsWriteGuard> {
         self.get_doc_meta(name)
             .await?
@@ -127,7 +130,7 @@ impl Database {
 
     // pub async fn set(
     //     &self,
-    //     name: &str,
+    //     name: &DefaultAtom,
     //     fields: HashMap<String, Value>,
     //     time: Timestamp,
     //     condition: Option<DocumentPrecondition>,
@@ -142,7 +145,7 @@ impl Database {
 
     // pub async fn delete(
     //     &self,
-    //     name: &str,
+    //     name: &DefaultAtom,
     //     time: Timestamp,
     //     condition: Option<DocumentPrecondition>,
     // ) -> Result<()> {
@@ -154,7 +157,7 @@ impl Database {
     // }
 
     #[instrument(skip_all)]
-    pub async fn get_collection_ids(&self, parent: &str) -> Result<Vec<String>> {
+    pub async fn get_collection_ids(&self, parent: &DefaultAtom) -> Result<Vec<DefaultAtom>> {
         // Get all collections asap in order to keep the read lock time minimal.
         let all_collections = self
             .collections
@@ -168,13 +171,13 @@ impl Database {
         for col in all_collections {
             let Some(path) = col
                 .name
-                .strip_prefix(parent)
+                .strip_prefix(parent.deref())
                 .and_then(|p| p.strip_prefix('/'))
             else {
                 continue;
             };
             if col.has_doc().await? {
-                result.push(path.to_string());
+                result.push(path.into());
             }
         }
         Ok(result)
@@ -202,11 +205,12 @@ impl Database {
         let time = timestamp();
 
         let mut write_results = vec![];
-        let mut write_guard_cache = HashMap::<String, OwnedDocumentContentsWriteGuard>::new();
+        let mut updates = vec![];
+        let mut write_guard_cache = HashMap::<DefaultAtom, OwnedDocumentContentsWriteGuard>::new();
         // This must be done in two phases. First acquire the lock on all docs, only then start to update them.
         for write in &writes {
-            let name = get_doc_name_from_write(write)?.to_string();
-            if let Entry::Vacant(entry) = write_guard_cache.entry(name.to_string()) {
+            let name = get_doc_name_from_write(write)?;
+            if let Entry::Vacant(entry) = write_guard_cache.entry(name.clone()) {
                 entry.insert(txn.take_write_guard(&name).await?);
             }
         }
@@ -214,12 +218,19 @@ impl Database {
         txn.drop_remaining_guards().await;
 
         for write in writes {
-            let name = get_doc_name_from_write(&write)?.to_string();
+            let name = get_doc_name_from_write(&write)?;
             let guard = write_guard_cache.get_mut(&name).unwrap();
-            write_results.push(self.perform_write(write, guard, time.clone()).await?);
+            let (write_result, version) = self.perform_write(write, guard, time.clone()).await?;
+            write_results.push(write_result);
+            updates.push(version);
         }
 
         self.transactions.stop(transaction).await?;
+
+        let _ = self.events.send(DatabaseEvent {
+            update_time: time.clone(),
+            updates,
+        });
 
         Ok((time, write_results))
     }
@@ -230,7 +241,7 @@ impl Database {
         write: Write,
         contents: &mut DocumentContents,
         commit_time: Timestamp,
-    ) -> Result<WriteResult> {
+    ) -> Result<(WriteResult, DocumentVersion)> {
         let Write {
             update_mask,
             update_transforms,
@@ -248,7 +259,7 @@ impl Database {
         let mut transform_results = vec![];
 
         use write::Operation::*;
-        match operation {
+        let document_version = match operation {
             Update(doc) => {
                 let mut fields = if let Some(mask) = update_mask {
                     apply_updates(contents, mask, &doc.fields)?
@@ -265,19 +276,22 @@ impl Database {
                         &commit_time,
                     )?);
                 }
-                contents.add_version(fields, commit_time.clone()).await;
+                contents.add_version(fields, commit_time.clone()).await
             }
             Delete(_) => {
                 unimplemented_option!(update_mask);
                 unimplemented_collection!(update_transforms);
-                contents.delete(commit_time.clone()).await;
+                contents.delete(commit_time.clone()).await
             }
             Transform(_) => unimplemented!("transform"),
-        }
-        Ok(WriteResult {
-            update_time: Some(commit_time),
-            transform_results,
-        })
+        };
+        Ok((
+            WriteResult {
+                update_time: Some(commit_time),
+                transform_results,
+            },
+            document_version,
+        ))
     }
 
     #[instrument(skip_all, err)]
@@ -389,24 +403,26 @@ fn apply_transform(
     Ok(result)
 }
 
-fn collection_name(name: &str) -> Result<&str> {
+fn collection_name(name: &DefaultAtom) -> Result<DefaultAtom> {
     Ok(name
         .rsplit_once('/')
         .ok_or_else(|| Status::invalid_argument("invalid document path, missing collection-name"))?
-        .0)
+        .0
+        .into())
 }
 
-pub fn get_doc_name_from_write(write: &Write) -> Result<&str> {
+pub fn get_doc_name_from_write(write: &Write) -> Result<DefaultAtom> {
     let operation = write
         .operation
         .as_ref()
         .ok_or(Status::unimplemented("missing operation in write"))?;
     use write::Operation::*;
-    Ok(match operation {
+    let name: &str = match operation {
         Update(doc) => &doc.name,
         Delete(name) => name,
         Transform(trans) => &trans.document,
-    })
+    };
+    Ok(DefaultAtom::from(name))
 }
 
 #[derive(Clone, Debug)]

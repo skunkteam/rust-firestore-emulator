@@ -5,7 +5,7 @@ use super::{
 };
 use crate::{
     googleapis::google::firestore::v1::{structured_query::CollectionSelector, *},
-    unimplemented, unimplemented_option,
+    unimplemented,
 };
 use itertools::Itertools;
 use std::{cmp, ops::Deref, sync::Arc};
@@ -173,10 +173,6 @@ impl Query {
     }
 
     pub fn check_live_query_compat(&self) -> Result<()> {
-        if self.offset > 0 {
-            unimplemented!("offset in live queries");
-        }
-        unimplemented_option!(self.limit);
         if self.from.iter().any(|sel| sel.all_descendants) {
             unimplemented!("all_descendants in live queries");
         }
@@ -290,14 +286,14 @@ impl Query {
                 fields: Default::default(),
                 create_time: Some(version.create_time.clone()),
                 update_time: Some(version.update_time.clone()),
-                name: version.name.clone(),
+                name: version.name.to_string(),
             }),
             fields => {
                 let mut doc = Document {
                     fields: Default::default(),
                     create_time: Some(version.create_time.clone()),
                     update_time: Some(version.update_time.clone()),
-                    name: version.name.clone(),
+                    name: version.name.to_string(),
                 };
                 for field in fields {
                     let FieldReference::FieldPath(path) = field else {

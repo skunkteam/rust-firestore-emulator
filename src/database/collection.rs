@@ -1,31 +1,30 @@
-use super::document::{DocumentMeta, DocumentVersion};
+use super::document::DocumentMeta;
 use crate::utils::RwLockHashMapExt;
 use std::{collections::HashMap, ops::Deref, sync::Arc};
-use tokio::sync::{broadcast, RwLock};
+use string_cache::DefaultAtom;
+use tokio::sync::RwLock;
 use tonic::Result;
 use tracing::instrument;
 
 pub struct Collection {
-    pub name: String,
-    documents: RwLock<HashMap<String, Arc<DocumentMeta>>>,
-    pub events: broadcast::Sender<DocumentVersion>,
+    pub name: DefaultAtom,
+    documents: RwLock<HashMap<DefaultAtom, Arc<DocumentMeta>>>,
 }
 
 impl Collection {
     #[instrument(skip_all)]
-    pub fn new(name: String) -> Self {
+    pub fn new(name: DefaultAtom) -> Self {
         Self {
             name,
             documents: Default::default(),
-            events: broadcast::channel(512).0,
         }
     }
 
-    pub async fn get_doc(self: &Arc<Self>, name: &str) -> Arc<DocumentMeta> {
+    pub async fn get_doc(self: &Arc<Self>, name: &DefaultAtom) -> Arc<DocumentMeta> {
         Arc::clone(
             self.documents
                 .get_or_insert(name, || {
-                    DocumentMeta::new(name.into(), Arc::downgrade(self)).into()
+                    Arc::new(DocumentMeta::new(name.clone(), self.name.clone()))
                 })
                 .await
                 .deref(),

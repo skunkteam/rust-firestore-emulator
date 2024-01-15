@@ -9,6 +9,7 @@ use std::{
         Arc, Weak,
     },
 };
+use string_cache::DefaultAtom;
 use tokio::sync::{Mutex, RwLock};
 use tonic::{Result, Status};
 use tracing::instrument;
@@ -79,7 +80,7 @@ impl RunningTransactions {
 pub struct Transaction {
     pub id: TransactionId,
     database: Weak<Database>,
-    guards: Mutex<HashMap<String, Arc<OwnedDocumentContentsReadGuard>>>,
+    guards: Mutex<HashMap<DefaultAtom, Arc<OwnedDocumentContentsReadGuard>>>,
 }
 
 impl Transaction {
@@ -92,13 +93,16 @@ impl Transaction {
     }
 
     #[instrument(skip_all)]
-    pub async fn read_doc(&self, name: &str) -> Result<Arc<OwnedDocumentContentsReadGuard>> {
+    pub async fn read_doc(
+        &self,
+        name: &DefaultAtom,
+    ) -> Result<Arc<OwnedDocumentContentsReadGuard>> {
         let mut guards = self.guards.lock().await;
         if let Some(guard) = guards.get(name) {
             return Ok(Arc::clone(guard));
         }
         let guard = self.new_read_guard(name).await?.into();
-        guards.insert(name.to_string(), Arc::clone(&guard));
+        guards.insert(name.clone(), Arc::clone(&guard));
         Ok(guard)
     }
 
@@ -106,7 +110,10 @@ impl Transaction {
         self.guards.lock().await.clear();
     }
 
-    pub async fn take_write_guard(&self, name: &str) -> Result<OwnedDocumentContentsWriteGuard> {
+    pub async fn take_write_guard(
+        &self,
+        name: &DefaultAtom,
+    ) -> Result<OwnedDocumentContentsWriteGuard> {
         let mut guards = self.guards.lock().await;
         let read_guard = match guards.remove(name) {
             Some(guard) => Arc::into_inner(guard)
@@ -116,7 +123,7 @@ impl Transaction {
         read_guard.upgrade().await
     }
 
-    async fn new_read_guard(&self, name: &str) -> Result<OwnedDocumentContentsReadGuard> {
+    async fn new_read_guard(&self, name: &DefaultAtom) -> Result<OwnedDocumentContentsReadGuard> {
         self.database
             .upgrade()
             .ok_or_else(|| Status::aborted("database was dropped"))?
