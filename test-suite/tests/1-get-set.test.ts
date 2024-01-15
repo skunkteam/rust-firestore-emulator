@@ -165,10 +165,8 @@ describe('updating', () => {
                 await updateFn({ counter: fs.exported.FieldValue.increment(15) });
                 expect(await getDoc()).toEqual({ counter: setOperation ? 15 : 16 });
 
-                if (!fs.notImplementedInRust) {
-                    await updateFn({ counter: fs.exported.FieldValue.increment(-32.1) });
-                    expect(await getDoc()).toEqual({ counter: setOperation ? -32.1 : -16.1 });
-                }
+                await updateFn({ counter: fs.exported.FieldValue.increment(-32.1) });
+                expect(await getDoc()).toEqual({ counter: setOperation ? -32.1 : -16.1 });
             });
 
             test('arrayUnion', async () => {
@@ -184,17 +182,15 @@ describe('updating', () => {
                 }
             });
 
-            if (!fs.notImplementedInRust) {
-                test('arrayRemove', async () => {
-                    await updateFn({ arr: [{ first: 'foo' }, { second: 'bar' }, 'third', 'third'] });
+            test('arrayRemove', async () => {
+                await updateFn({ arr: [{ first: 'foo' }, { second: 'bar' }, 'third', 'third'] });
 
-                    await updateFn({ arr: fs.exported.FieldValue.arrayRemove({ doesNot: 'exist' }) });
-                    expect(await getDoc()).toEqual({ arr: setOperation ? [] : [{ first: 'foo' }, { second: 'bar' }, 'third', 'third'] });
+                await updateFn({ arr: fs.exported.FieldValue.arrayRemove({ doesNot: 'exist' }) });
+                expect(await getDoc()).toEqual({ arr: setOperation ? [] : [{ first: 'foo' }, { second: 'bar' }, 'third', 'third'] });
 
-                    await updateFn({ arr: fs.exported.FieldValue.arrayRemove('third', { first: 'foo' }, 'nope') });
-                    expect(await getDoc()).toEqual({ arr: setOperation ? [] : [{ second: 'bar' }] });
-                });
-            }
+                await updateFn({ arr: fs.exported.FieldValue.arrayRemove('third', { first: 'foo' }, 'nope') });
+                expect(await getDoc()).toEqual({ arr: setOperation ? [] : [{ second: 'bar' }] });
+            });
         });
     });
 });
