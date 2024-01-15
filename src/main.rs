@@ -2,6 +2,7 @@ use clap::Parser;
 use emulator::FirestoreEmulator;
 use googleapis::google::firestore::v1::firestore_server::FirestoreServer;
 use std::net::SocketAddr;
+use tikv_jemallocator::Jemalloc;
 use tonic::{codec::CompressionEncoding, transport::Server};
 use tracing::info;
 
@@ -15,6 +16,9 @@ mod emulator;
 mod utils;
 
 const MAX_MESSAGE_SIZE: usize = 50 * 1024 * 1024;
+
+#[global_allocator]
+static GLOBAL_ALLOC: Jemalloc = Jemalloc;
 
 #[derive(Parser, Debug)]
 struct Args {
