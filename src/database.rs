@@ -23,7 +23,10 @@ use std::{
     sync::{Arc, Weak},
 };
 use string_cache::DefaultAtom;
-use tokio::sync::{broadcast, RwLock};
+use tokio::sync::{
+    broadcast::{self, Receiver},
+    RwLock,
+};
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Result, Status};
 use tracing::{info, instrument, Span};
@@ -42,7 +45,7 @@ const MAX_EVENT_BACKLOG: usize = 1024;
 pub struct Database {
     collections: RwLock<HashMap<DefaultAtom, Arc<Collection>>>,
     transactions: RunningTransactions,
-    pub events: broadcast::Sender<DatabaseEvent>,
+    events: broadcast::Sender<Arc<DatabaseEvent>>,
 }
 
 impl Database {
@@ -205,7 +208,7 @@ impl Database {
         let time = timestamp();
 
         let mut write_results = vec![];
-        let mut updates = vec![];
+        let mut updates = HashMap::new();
         let mut write_guard_cache = HashMap::<DefaultAtom, OwnedDocumentContentsWriteGuard>::new();
         // This must be done in two phases. First acquire the lock on all docs, only then start to update them.
         for write in &writes {
@@ -222,12 +225,12 @@ impl Database {
             let guard = write_guard_cache.get_mut(&name).unwrap();
             let (write_result, version) = self.perform_write(write, guard, time.clone()).await?;
             write_results.push(write_result);
-            updates.push(version);
+            updates.insert(name.clone(), version);
         }
 
         self.transactions.stop(transaction).await?;
 
-        let _ = self.events.send(DatabaseEvent {
+        self.send_event(DatabaseEvent {
             update_time: time.clone(),
             updates,
         });
@@ -322,6 +325,16 @@ impl Database {
         request_stream: tonic::Streaming<ListenRequest>,
     ) -> ReceiverStream<Result<ListenResponse>> {
         Listener::start(Arc::downgrade(self), request_stream)
+    }
+
+    pub fn send_event(&self, event: DatabaseEvent) {
+        // A send operation can only fail if there are no active receivers,
+        // which is ok by me.
+        let _ = self.events.send(event.into());
+    }
+
+    pub fn subscribe(&self) -> Receiver<Arc<DatabaseEvent>> {
+        self.events.subscribe()
     }
 }
 

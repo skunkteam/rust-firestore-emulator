@@ -179,6 +179,10 @@ impl Query {
         Ok(())
     }
 
+    pub fn reset_on_update(&self) -> bool {
+        self.order_by.iter().any(|o| !o.field.is_document_name())
+    }
+
     pub async fn once(&self, db: &Database) -> Result<Vec<Document>> {
         // First collect all Arc<Collection>s in a Vec to release the collection lock asap.
         let collections = self.applicable_collections(db).await;

@@ -489,7 +489,7 @@ impl firestore_server::Firestore for FirestoreEmulator {
                     .await;
                 use crate::googleapis::google::rpc;
                 Ok(match result {
-                    Ok((wr, update)) => (Default::default(), wr, Some(update)),
+                    Ok((wr, update)) => (Default::default(), wr, Some((name.clone(), update))),
                     Err(err) => (
                         rpc::Status {
                             code: err.code() as _,
@@ -505,7 +505,7 @@ impl firestore_server::Firestore for FirestoreEmulator {
             .into_iter()
             .multiunzip();
 
-        let _ = self.database.events.send(DatabaseEvent {
+        self.database.send_event(DatabaseEvent {
             update_time: time.clone(),
             updates: updates.into_iter().flatten().collect(),
         });
@@ -522,19 +522,20 @@ async fn perform_writes(
     writes: Vec<Write>,
 ) -> Result<(Timestamp, Vec<WriteResult>)> {
     let time: Timestamp = timestamp();
-    let (write_results, updates) = try_join_all(writes.into_iter().map(|write| async {
-        let name = get_doc_name_from_write(&write)?;
-        let mut guard = database.get_doc_meta_mut_no_txn(&name).await?;
-        database
-            .perform_write(write, &mut guard, time.clone())
-            .await
-    }))
-    .await?
-    .into_iter()
-    .unzip();
-    let _ = database.events.send(DatabaseEvent {
+    let (write_results, updates): (Vec<_>, Vec<_>) =
+        try_join_all(writes.into_iter().map(|write| async {
+            let name = get_doc_name_from_write(&write)?;
+            let mut guard = database.get_doc_meta_mut_no_txn(&name).await?;
+            database
+                .perform_write(write, &mut guard, time.clone())
+                .await
+        }))
+        .await?
+        .into_iter()
+        .unzip();
+    database.send_event(DatabaseEvent {
         update_time: time.clone(),
-        updates,
+        updates: updates.into_iter().map(|u| (u.name().clone(), u)).collect(),
     });
     Ok((time, write_results))
 }

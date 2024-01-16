@@ -1,8 +1,9 @@
 use super::document::DocumentVersion;
 use prost_types::Timestamp;
+use std::collections::HashMap;
+use string_cache::DefaultAtom;
 
-#[derive(Clone)]
 pub struct DatabaseEvent {
     pub update_time: Timestamp,
-    pub updates: Vec<DocumentVersion>,
+    pub updates: HashMap<DefaultAtom, DocumentVersion>,
 }

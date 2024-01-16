@@ -74,7 +74,7 @@ impl Listener {
             let Some(database) = self.database.upgrade() else {
                 return Ok(());
             };
-            database.events.subscribe()
+            database.subscribe()
         };
         // Every Listener has a single event-loop, this is it:
         loop {
@@ -95,7 +95,7 @@ impl Listener {
 
                 database_event = database_events.recv() => {
                     match database_event {
-                        Ok(event) => self.process_event(event).await?,
+                        Ok(event) => self.process_event(&event).await?,
                         Err(RecvError::Lagged(count)) => {
                             error!(
                                 id = self.id,
@@ -164,7 +164,7 @@ impl Listener {
     }
 
     #[instrument(skip_all, err)]
-    async fn process_event(&mut self, event: DatabaseEvent) -> Result<()> {
+    async fn process_event(&mut self, event: &DatabaseEvent) -> Result<()> {
         // We rely on the fact that this function will complete before any other events are processed. That's why we know for sure that
         // the output stream is not used for something else until we respond with our NO_CHANGE msg. That msg means that everything is up
         // to date until that point and this is (for now) the easiest way to make sure that is actually the case. This is probably okay,
@@ -271,10 +271,7 @@ impl Listener {
         .await?;
 
         let read_time = timestamp();
-        let mut target = QueryTarget {
-            query,
-            doctargets_by_name: Default::default(),
-        };
+        let mut target = QueryTarget::new(query);
         let msgs = target.reset(&database, &read_time).await?;
         self.send_all(msgs).await?;
         self.send_complete(read_time).await?;
@@ -340,7 +337,7 @@ impl ListenerTarget {
     async fn process_event(
         &mut self,
         database: &Database,
-        event: DatabaseEvent,
+        event: &DatabaseEvent,
     ) -> Result<Vec<ResponseType>> {
         match self {
             ListenerTarget::DocumentTarget(target) => target.process_event(event),
@@ -355,22 +352,21 @@ struct DocumentTarget {
 }
 
 impl DocumentTarget {
-    fn process_event(&mut self, event: DatabaseEvent) -> Result<Vec<ResponseType>> {
-        let Ok(update) = event
-            .updates
-            .into_iter()
-            .filter(|update| update.name() == &self.name)
-            .at_most_one()
-        else {
-            unimplemented!("multiple updates to a single document in one txn")
-        };
-        let Some(update) = update else {
-            return Ok(vec![]);
-        };
-        if timestamp_nanos(&self.last_read_time) >= timestamp_nanos(&event.update_time) {
+    fn process_event(&mut self, event: &DatabaseEvent) -> Result<Vec<ResponseType>> {
+        if let Some(update) = event.updates.get(&self.name) {
+            self.process_update(update)
+        } else {
+            Ok(vec![])
+        }
+    }
+
+    fn process_update(&mut self, update: &DocumentVersion) -> Result<Vec<ResponseType>> {
+        debug_assert_eq!(update.name(), &self.name);
+        let update_time = update.update_time().clone();
+        if timestamp_nanos(&self.last_read_time) >= timestamp_nanos(&update_time) {
             return Ok(vec![]);
         }
-        self.last_read_time = event.update_time.clone();
+        self.last_read_time = update_time.clone();
 
         let msg = match update.to_document() {
             Some(d) => ResponseType::DocumentChange(DocumentChange {
@@ -381,7 +377,7 @@ impl DocumentTarget {
             None => ResponseType::DocumentDelete(DocumentDelete {
                 document: update.name().to_string(),
                 removed_target_ids: vec![TARGET_ID],
-                read_time: Some(event.update_time.clone()),
+                read_time: Some(update_time),
             }),
         };
         Ok(vec![msg])
@@ -390,38 +386,51 @@ impl DocumentTarget {
 
 struct QueryTarget {
     query: Query,
+    reset_on_update: bool,
     doctargets_by_name: HashMap<DefaultAtom, DocumentTarget>,
 }
 impl QueryTarget {
+    fn new(query: Query) -> Self {
+        let reset_on_update = query.reset_on_update();
+        Self {
+            query,
+            reset_on_update,
+            doctargets_by_name: Default::default(),
+        }
+    }
+
     async fn process_event(
         &mut self,
         database: &Database,
-        event: DatabaseEvent,
+        event: &DatabaseEvent,
     ) -> Result<Vec<ResponseType>> {
-        // TODO: do not reset if not needed (which is very often)
+        let mut updates_to_apply = vec![];
         let reset = 'reset: {
-            for update in &event.updates {
-                match update {
-                    DocumentVersion::Deleted(deleted) => {
-                        if self.doctargets_by_name.contains_key(&deleted.name) {
-                            break 'reset true;
-                        }
-                    }
-                    DocumentVersion::Stored(stored) => {
-                        if self.query.includes_document(stored)? {
-                            break 'reset true;
-                        }
-                    }
+            for update in event.updates.values() {
+                let name = update.name();
+                let doc = update.stored_document();
+                let target = self.doctargets_by_name.get_mut(name);
+                let should_be_included =
+                    matches!(doc, Some(doc) if self.query.includes_document(doc)?);
+                if should_be_included != target.is_some() {
+                    break 'reset true;
                 }
+                let Some(target) = target else {
+                    continue;
+                };
+                if self.reset_on_update {
+                    break 'reset true;
+                }
+                updates_to_apply.extend(target.process_update(update)?);
             }
             false
         };
 
-        if !reset {
-            return Ok(vec![]);
+        if reset {
+            self.reset(database, &event.update_time).await
+        } else {
+            Ok(updates_to_apply)
         }
-
-        self.reset(database, &event.update_time).await
     }
 
     async fn reset(&mut self, database: &Database, time: &Timestamp) -> Result<Vec<ResponseType>> {

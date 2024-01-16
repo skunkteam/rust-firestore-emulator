@@ -18,6 +18,7 @@ describe('listen to query updates', () => {
                 return [included, notIncluded];
             },
             query: (coll: FirebaseFirestore.Query) => coll,
+            removeDoc: (doc: FirebaseFirestore.DocumentReference) => doc.delete(),
         },
         {
             description: 'equality query',
@@ -29,6 +30,7 @@ describe('listen to query updates', () => {
                 return [included, notIncluded];
             },
             query: (coll: FirebaseFirestore.Query) => coll.where('included', '==', true).orderBy('included'),
+            removeDoc: (doc: FirebaseFirestore.DocumentReference) => doc.update({ included: false }),
         },
         {
             description: 'inequality query',
@@ -40,6 +42,7 @@ describe('listen to query updates', () => {
                 return [included, notIncluded];
             },
             query: (coll: FirebaseFirestore.Query) => coll.where('included', '!=', false).orderBy('included'),
+            removeDoc: (doc: FirebaseFirestore.DocumentReference) => doc.update({ included: false }),
         },
         {
             description: 'greater than query',
@@ -51,8 +54,9 @@ describe('listen to query updates', () => {
                 return [included, notIncluded];
             },
             query: (coll: FirebaseFirestore.Query) => coll.where('number', '>=', 0).orderBy('number'),
+            removeDoc: (doc: FirebaseFirestore.DocumentReference) => doc.update({ number: -0.1 }),
         },
-    ] as const)('$description', ({ createDoc, query }) => {
+    ] as const)('$description', ({ createDoc, query, removeDoc }) => {
         describe('single (relevant) document', () => {
             test.concurrent('create, listen, stop', async () => {
                 const coll = subCollection();
@@ -114,7 +118,7 @@ describe('listen to query updates', () => {
             while (docPairs.length) {
                 const docsToRemove = docPairs.pop();
                 assert(docsToRemove);
-                const [newData] = await Promise.all([getNext(), ...docsToRemove.map(doc => doc.delete())]);
+                const [newData] = await Promise.all([getNext(), ...docsToRemove.map(removeDoc)]);
                 expect(newData).toBeArrayOfSize(docPairs.length);
             }
 
@@ -177,7 +181,7 @@ describe('listen to query updates', () => {
             const [movedOne] = await Promise.all([getNext(), refThree.update({ ordered: 10 })]);
             expect(movedOne).toEqual([{ ordered: 1 }, { ordered: 4 }, { ordered: 5 }]);
 
-            const [removed] = await Promise.all([getNext(), refOne.delete()]);
+            const [removed] = await Promise.all([getNext(), removeDoc(refOne)]);
             expect(removed).toEqual([{ ordered: 4 }, { ordered: 5 }, { ordered: 10 }]);
 
             stop();
