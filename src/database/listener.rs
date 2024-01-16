@@ -135,8 +135,11 @@ impl Listener {
                 unimplemented_option!(expected_count);
                 required_option!(target_type);
 
-                if self.target.is_some() || target_id != TARGET_ID {
-                    unimplemented!("multiple targets inside a single listen stream")
+                if self.target.is_some() {
+                    unimplemented!("target already set inside this listen stream")
+                }
+                if target_id != TARGET_ID {
+                    unimplemented!("target_id should always be 1")
                 }
 
                 match target_type {

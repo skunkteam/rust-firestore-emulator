@@ -146,7 +146,7 @@ fn parse_field_path(path: &str) -> Result<Vec<String>> {
             match ch {
                 '`' => {
                     inside_backticks = false;
-                    if !matches!(iter.next(), Some('.')) {
+                    if !matches!(iter.next(), Some('.') | None) {
                         return Err(Status::invalid_argument(format!(
                             "invalid field path: {path}"
                         )));
@@ -170,4 +170,24 @@ fn parse_field_path(path: &str) -> Result<Vec<String>> {
         elements.push(cur_element);
     }
     Ok(elements)
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::database::field_path::parse_field_path;
+
+    #[test]
+    fn test_parse_field_path() {
+        assert_eq!(parse_field_path("a.b.c").unwrap(), ["a", "b", "c"]);
+        assert_eq!(parse_field_path("foo.x&y").unwrap(), ["foo", "x&y"]);
+        assert_eq!(parse_field_path("foo.`x&y`").unwrap(), ["foo", "x&y"]);
+        assert_eq!(
+            parse_field_path(r"`bak\`tik`.`x&y`").unwrap(),
+            ["bak`tik", "x&y"]
+        );
+        assert_eq!(
+            parse_field_path(r"`bak.\`.tik`.`x&y`").unwrap(),
+            ["bak.`.tik", "x&y"]
+        );
+    }
 }
