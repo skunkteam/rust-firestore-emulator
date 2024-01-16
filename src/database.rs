@@ -131,34 +131,6 @@ impl Database {
         self.transactions.get(id).await
     }
 
-    // pub async fn set(
-    //     &self,
-    //     name: &DefaultAtom,
-    //     fields: HashMap<String, Value>,
-    //     time: Timestamp,
-    //     condition: Option<DocumentPrecondition>,
-    // ) -> Result<()> {
-    //     let meta = self.get_doc_meta_mut(name).await?;
-    //     if let Some(condition) = condition {
-    //         meta.check_precondition(condition).await?;
-    //     }
-    //     meta.add_version(fields, time).await;
-    //     Ok(())
-    // }
-
-    // pub async fn delete(
-    //     &self,
-    //     name: &DefaultAtom,
-    //     time: Timestamp,
-    //     condition: Option<DocumentPrecondition>,
-    // ) -> Result<()> {
-    //     let meta = self.get_doc_meta_mut(name).await?;
-    //     meta.check_precondition(condition.unwrap_or(DocumentPrecondition::Exists))
-    //         .await?;
-    //     meta.delete(time).await;
-    //     Ok(())
-    // }
-
     #[instrument(skip_all)]
     pub async fn get_collection_ids(&self, parent: &DefaultAtom) -> Result<Vec<DefaultAtom>> {
         // Get all collections asap in order to keep the read lock time minimal.
@@ -193,7 +165,7 @@ impl Database {
         query: StructuredQuery,
         consistency: ReadConsistency,
     ) -> Result<Vec<Document>> {
-        let query = Query::from_structured(parent, query, consistency)?;
+        let mut query = Query::from_structured(parent, query, consistency)?;
         info!(?query);
         query.once(self).await
     }

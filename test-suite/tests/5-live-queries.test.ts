@@ -104,15 +104,19 @@ describe('listen to query updates', () => {
 
         test.concurrent('add/remove relevant documents', async () => {
             const coll = subCollection();
+            const otherColl = subCollection();
 
-            const { stop, getCurrent, getNext } = listen(query(coll));
+            const { stop, getCurrent, getNext, queryResults } = listen(query(coll));
             expect(await getCurrent()).toEqual([]);
 
             const docPairs: FirebaseFirestore.DocumentReference[][] = [];
             for (let i = 1; i < 10; i++) {
-                const [newData, docs] = await Promise.all([getNext(), createDoc(coll, { some: 'doc: ' + i })]);
+                const data = { some: 'doc: ' + i };
+                const [newData, docs] = await Promise.all([getNext(), createDoc(coll, data)]);
                 docPairs.push(docs);
                 expect(newData).toBeArrayOfSize(i);
+                // Also add same data in unrelated collection, which should not be included in query.
+                await createDoc(otherColl, data);
             }
 
             while (docPairs.length) {
@@ -123,42 +127,43 @@ describe('listen to query updates', () => {
             }
 
             stop();
+
+            expect(queryResults).toHaveLength(19);
         });
 
-        fs.notImplementedInRust ||
-            test.concurrent('batch write', async () => {
-                const coll = subCollection();
+        test.concurrent('batch write', async () => {
+            const coll = subCollection();
 
-                const refs = await Promise.all(range(5).map(i => createDoc(coll, { some: 'doc: ' + i }))).then(r => r.flat());
+            const refs = await Promise.all(range(5).map(i => createDoc(coll, { some: 'doc: ' + i }))).then(r => r.flat());
 
-                const { stop, getCurrent, getNext, queryResults } = listen(query(coll));
-                expect(await getCurrent()).toBeArrayOfSize(5);
+            const { stop, getCurrent, getNext, queryResults } = listen(query(coll));
+            expect(await getCurrent()).toBeArrayOfSize(5);
 
-                const updateBatch = fs.firestore.batch();
-                for (const ref of refs) {
-                    updateBatch.update(ref, { with: 'update' });
-                }
-                const [newData] = await Promise.all([getNext(), updateBatch.commit()]);
-                expect(newData).toBeArrayOfSize(5);
-                for (const data of newData) {
-                    expect(data).toEqual({ some: expect.stringMatching(/^doc: \d$/), with: 'update' });
-                }
+            const updateBatch = fs.firestore.batch();
+            for (const ref of refs) {
+                updateBatch.update(ref, { with: 'update' });
+            }
+            const [newData] = await Promise.all([getNext(), updateBatch.commit()]);
+            expect(newData).toBeArrayOfSize(5);
+            for (const data of newData) {
+                expect(data).toEqual({ some: expect.stringMatching(/^doc: \d$/), with: 'update' });
+            }
 
-                const deleteBatch = fs.firestore.batch();
-                for (const ref of refs) {
-                    deleteBatch.delete(ref);
-                }
-                const [noData] = await Promise.all([getNext(), deleteBatch.commit()]);
-                expect(noData).toBeArrayOfSize(0);
+            const deleteBatch = fs.firestore.batch();
+            for (const ref of refs) {
+                deleteBatch.delete(ref);
+            }
+            const [noData] = await Promise.all([getNext(), deleteBatch.commit()]);
+            expect(noData).toBeArrayOfSize(0);
 
-                // There should only be 3 updates:
-                // 1. the initial update for the listen
-                // 2. the update batch
-                // 3. the delete batch
-                expect(queryResults).toBeArrayOfSize(3);
+            // There should only be 3 updates:
+            // 1. the initial update for the listen
+            // 2. the update batch
+            // 3. the delete batch
+            expect(queryResults).toBeArrayOfSize(3);
 
-                stop();
-            });
+            stop();
+        });
 
         test.concurrent('limit', async () => {
             const coll = subCollection();

@@ -145,7 +145,6 @@ impl Listener {
                         let query_target::QueryType::StructuredQuery(query) = query_type;
                         let query =
                             Query::from_structured(parent, query, ReadConsistency::Default)?;
-                        query.check_live_query_compat()?;
                         self.set_query(query).await?;
                     }
                     target::TargetType::Documents(target::DocumentsTarget { documents }) => {
@@ -405,7 +404,7 @@ impl QueryTarget {
         event: &DatabaseEvent,
     ) -> Result<Vec<ResponseType>> {
         let mut updates_to_apply = vec![];
-        let reset = 'reset: {
+        let needs_reset = 'reset: {
             for update in event.updates.values() {
                 let name = update.name();
                 let doc = update.stored_document();
@@ -426,7 +425,7 @@ impl QueryTarget {
             false
         };
 
-        if reset {
+        if needs_reset {
             self.reset(database, &event.update_time).await
         } else {
             Ok(updates_to_apply)

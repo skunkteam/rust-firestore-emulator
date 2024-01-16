@@ -3,12 +3,10 @@ use super::{
     collection::Collection, document::StoredDocumentVersion, field_path::FieldReference, Database,
     ReadConsistency,
 };
-use crate::{
-    googleapis::google::firestore::v1::{structured_query::CollectionSelector, *},
-    unimplemented,
-};
+use crate::googleapis::google::firestore::v1::{structured_query::CollectionSelector, *};
 use itertools::Itertools;
-use std::{cmp, ops::Deref, sync::Arc};
+use std::{cmp, collections::HashMap, ops::Deref, sync::Arc};
+use string_cache::DefaultAtom;
 use tonic::{Result, Status};
 
 mod filter;
@@ -109,6 +107,8 @@ pub struct Query {
     limit: Option<usize>,
 
     consistency: ReadConsistency,
+
+    collection_cache: HashMap<DefaultAtom, bool>,
 }
 
 impl Query {
@@ -169,21 +169,15 @@ impl Query {
             offset: offset as usize,
             limit: limit.map(|v| v as usize),
             consistency,
+            collection_cache: Default::default(),
         })
-    }
-
-    pub fn check_live_query_compat(&self) -> Result<()> {
-        if self.from.iter().any(|sel| sel.all_descendants) {
-            unimplemented!("all_descendants in live queries");
-        }
-        Ok(())
     }
 
     pub fn reset_on_update(&self) -> bool {
         self.order_by.iter().any(|o| !o.field.is_document_name())
     }
 
-    pub async fn once(&self, db: &Database) -> Result<Vec<Document>> {
+    pub async fn once(&mut self, db: &Database) -> Result<Vec<Document>> {
         // First collect all Arc<Collection>s in a Vec to release the collection lock asap.
         let collections = self.applicable_collections(db).await;
 
@@ -239,7 +233,7 @@ impl Query {
             .try_collect()
     }
 
-    pub async fn applicable_collections(&self, db: &Database) -> Vec<Arc<Collection>> {
+    async fn applicable_collections(&mut self, db: &Database) -> Vec<Arc<Collection>> {
         db.collections
             .read()
             .await
@@ -249,23 +243,31 @@ impl Query {
             .collect_vec()
     }
 
-    pub fn includes_collection(&self, path: &str) -> bool {
-        let Some(path) = path
+    fn includes_collection(&mut self, path: &DefaultAtom) -> bool {
+        if let Some(&r) = self.collection_cache.get(path) {
+            return r;
+        }
+        let included = match path
             .strip_prefix(&self.parent)
             .and_then(|path| path.strip_prefix('/'))
-        else {
-            return false;
+        {
+            Some(path) => self.from.iter().any(|selector| {
+                if selector.all_descendants {
+                    path.starts_with(&selector.collection_id)
+                } else {
+                    path == selector.collection_id
+                }
+            }),
+            None => false,
         };
-        self.from.iter().any(|selector| {
-            if selector.all_descendants {
-                path.starts_with(&selector.collection_id)
-            } else {
-                path == selector.collection_id
-            }
-        })
+        self.collection_cache.insert(path.clone(), included);
+        included
     }
 
-    pub fn includes_document(&self, doc: &StoredDocumentVersion) -> Result<bool> {
+    pub fn includes_document(&mut self, doc: &StoredDocumentVersion) -> Result<bool> {
+        if !self.includes_collection(&doc.collection_name) {
+            return Ok(false);
+        }
         if let Some(filter) = &self.filter {
             if !filter.eval(doc)? {
                 return Ok(false);
