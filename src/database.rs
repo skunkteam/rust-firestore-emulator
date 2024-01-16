@@ -321,7 +321,7 @@ impl Database {
         self: &Arc<Database>,
         request_stream: tonic::Streaming<ListenRequest>,
     ) -> ReceiverStream<Result<ListenResponse>> {
-        Listener::start(Arc::clone(self), request_stream)
+        Listener::start(Arc::downgrade(self), request_stream)
     }
 }
 

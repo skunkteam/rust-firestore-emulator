@@ -20,7 +20,7 @@ use std::{
     collections::HashMap,
     sync::{
         atomic::{self, AtomicUsize},
-        Arc,
+        Weak,
     },
 };
 use string_cache::DefaultAtom;
@@ -42,14 +42,14 @@ const TARGET_CHANGE_DEFAULT: TargetChange = TargetChange {
 pub struct Listener {
     /// For debug purposes.
     id: usize,
-    database: Arc<Database>,
+    database: Weak<Database>,
     sender: mpsc::Sender<Result<ListenResponse>>,
     target: Option<ListenerTarget>,
 }
 
 impl Listener {
     pub fn start(
-        database: Arc<Database>,
+        database: Weak<Database>,
         request_stream: tonic::Streaming<ListenRequest>,
     ) -> ReceiverStream<Result<ListenResponse>> {
         static NEXT_ID: AtomicUsize = AtomicUsize::new(1);
@@ -57,7 +57,7 @@ impl Listener {
         let (sender, rx) = mpsc::channel(16);
         let listener = Self {
             id: NEXT_ID.fetch_add(1, atomic::Ordering::Relaxed),
-            database: Arc::clone(&database),
+            database,
             sender,
             // No target yet, will be added by a message in the request stream.
             target: None,
@@ -70,7 +70,12 @@ impl Listener {
 
     #[instrument(name = "listener", skip_all, fields(id = self.id), err)]
     async fn go(mut self, mut request_stream: tonic::Streaming<ListenRequest>) -> Result<()> {
-        let mut database_events = self.database.events.subscribe();
+        let mut database_events = {
+            let Some(database) = self.database.upgrade() else {
+                return Ok(());
+            };
+            database.events.subscribe()
+        };
         // Every Listener has a single event-loop, this is it:
         loop {
             tokio::select! {
@@ -141,14 +146,13 @@ impl Listener {
                         let query =
                             Query::from_structured(parent, query, ReadConsistency::Default)?;
                         query.check_live_query_compat()?;
-                        self.set_query(query, resume_type).await?;
+                        self.set_query(query).await?;
                     }
-                    target::TargetType::Documents(target::DocumentsTarget { mut documents }) => {
-                        if documents.len() != 1 {
+                    target::TargetType::Documents(target::DocumentsTarget { documents }) => {
+                        let Ok(document) = documents.into_iter().exactly_one() else {
                             unimplemented!("multiple documents inside a single listen stream")
-                        }
-                        self.set_document(documents.pop().unwrap().into(), resume_type)
-                            .await?;
+                        };
+                        self.set_document(document.into(), resume_type).await?;
                     }
                 };
             }
@@ -168,36 +172,19 @@ impl Listener {
         let Some(target) = &mut self.target else {
             return Ok(());
         };
+        let Some(database) = self.database.upgrade() else {
+            return Ok(());
+        };
 
         let update_time = event.update_time.clone();
-        let msgs = target.process_event(&self.database, event).await?;
+        let msgs = target.process_event(&database, event).await?;
 
         if msgs.is_empty() {
             return Ok(());
         }
 
-        for msg in msgs {
-            self.send(msg).await?;
-        }
-
-        // Response: I've sent you the state of all documents now
-        let resume_token = timestamp_nanos(&update_time).to_ne_bytes();
-        self.send(ResponseType::TargetChange(TargetChange {
-            target_change_type: TargetChangeType::Current as _,
-            target_ids: vec![TARGET_ID],
-            read_time: Some(update_time.clone()),
-            resume_token: resume_token.to_vec(),
-            ..TARGET_CHANGE_DEFAULT
-        }))
-        .await?;
-
-        // Response: Oh, by the way, everything is up to date. 🤷🏼‍♂️
-        self.send(ResponseType::TargetChange(TargetChange {
-            resume_token: timestamp_nanos(&update_time).to_ne_bytes().to_vec(),
-            read_time: Some(update_time),
-            ..TARGET_CHANGE_DEFAULT
-        }))
-        .await
+        self.send_all(msgs).await?;
+        self.send_complete(update_time).await
     }
 
     #[instrument(skip_all, fields(document = &*name), err)]
@@ -210,6 +197,10 @@ impl Listener {
         // the output stream is not used for something else until we respond with our NO_CHANGE msg. That msg means that everything is up
         // to date until that point and this is (for now) the easiest way to make sure that is actually the case. This is probably okay,
         // but if it becomes a hotspot we might look into optimizing later.
+        let Some(database) = self.database.upgrade() else {
+            return Ok(());
+        };
+
         let send_if_newer_than = resume_type.map(Timestamp::try_from).transpose()?;
 
         // Response: I'm on it!
@@ -222,16 +213,9 @@ impl Listener {
 
         let read_time = timestamp();
         debug!(name = &*name);
-        self.target = Some(ListenerTarget::DocumentTarget(DocumentTarget {
-            name: name.clone(),
-            last_read_time: read_time.clone(),
-        }));
 
         // Now determine the latest version we can find...
-        let doc = self
-            .database
-            .get_doc(&name, &ReadConsistency::Default)
-            .await?;
+        let doc = database.get_doc(&name, &ReadConsistency::Default).await?;
 
         // Only send if newer than the resume_token
         let send_initial = match &send_if_newer_than {
@@ -258,38 +242,25 @@ impl Listener {
             self.send(msg).await?;
         }
 
-        // Response: I've sent you the state of all documents now
-        let resume_token = timestamp_nanos(&read_time).to_ne_bytes();
-        self.send(ResponseType::TargetChange(TargetChange {
-            target_change_type: TargetChangeType::Current as _,
-            target_ids: vec![TARGET_ID],
-            read_time: Some(read_time.clone()),
-            resume_token: resume_token.to_vec(),
-            ..TARGET_CHANGE_DEFAULT
-        }))
-        .await?;
+        self.send_complete(read_time.clone()).await?;
 
-        // Response: Oh, by the way, everything is up to date. 🤷🏼‍♂️
-        self.send(ResponseType::TargetChange(TargetChange {
-            read_time: Some(read_time),
-            resume_token: resume_token.to_vec(),
-            ..TARGET_CHANGE_DEFAULT
-        }))
-        .await?;
+        self.target = Some(ListenerTarget::DocumentTarget(DocumentTarget {
+            name,
+            last_read_time: read_time,
+        }));
 
         Ok(())
     }
 
-    async fn set_query(
-        &mut self,
-        query: Query,
-        resume_type: Option<target::ResumeType>,
-    ) -> Result<()> {
+    async fn set_query(&mut self, query: Query) -> Result<()> {
         // We rely on the fact that this function will complete before any other events are processed. That's why we know for sure that
         // the output stream is not used for something else until we respond with our NO_CHANGE msg. That msg means that everything is up
         // to date until that point and this is (for now) the easiest way to make sure that is actually the case. This is probably okay,
         // but if it becomes a hotspot we might look into optimizing later.
-        let send_if_newer_than = resume_type.map(Timestamp::try_from).transpose()?;
+        // let send_if_newer_than = resume_type.map(Timestamp::try_from).transpose()?;
+        let Some(database) = self.database.upgrade() else {
+            return Ok(());
+        };
 
         // Response: I'm on it!
         self.send(ResponseType::TargetChange(TargetChange {
@@ -300,55 +271,44 @@ impl Listener {
         .await?;
 
         let read_time = timestamp();
-        let query = Arc::new(query);
-        self.target = Some(ListenerTarget::QueryTarget(QueryTarget {
-            query: Arc::clone(&query),
+        let mut target = QueryTarget {
+            query,
             doctargets_by_name: Default::default(),
-        }));
+        };
+        let msgs = target.reset(&database, &read_time).await?;
+        self.send_all(msgs).await?;
+        self.send_complete(read_time).await?;
 
-        // TODO: Verplaats naar QueryTarget
-        for doc in query.once(&self.database).await? {
-            debug!(name = &*doc.name);
+        self.target = Some(ListenerTarget::QueryTarget(target));
 
-            // Only send if newer than the resume_token
-            let send_initial = match &send_if_newer_than {
-                Some(previous_time) => !doc
-                    .update_time
-                    .as_ref()
-                    .is_some_and(|v| timestamp_nanos(v) <= timestamp_nanos(previous_time)),
-                _ => true,
-            };
+        Ok(())
+    }
 
-            if send_initial {
-                // Response: This is the current version, whether you like it or not.
-                let msg = ResponseType::DocumentChange(DocumentChange {
-                    document: Some(doc),
-                    target_ids: vec![TARGET_ID],
-                    removed_target_ids: vec![],
-                });
-                self.send(msg).await?;
-            }
-        }
-
-        // Response: I've sent you the state of all documents now
+    async fn send_complete(&self, read_time: Timestamp) -> Result<()> {
         let resume_token = timestamp_nanos(&read_time).to_ne_bytes();
-        self.send(ResponseType::TargetChange(TargetChange {
-            target_change_type: TargetChangeType::Current as _,
-            target_ids: vec![TARGET_ID],
-            read_time: Some(read_time.clone()),
-            resume_token: resume_token.to_vec(),
-            ..TARGET_CHANGE_DEFAULT
-        }))
-        .await?;
+        self.send_all([
+            // Response: I've sent you the state of all documents now
+            ResponseType::TargetChange(TargetChange {
+                target_change_type: TargetChangeType::Current as _,
+                target_ids: vec![TARGET_ID],
+                read_time: Some(read_time.clone()),
+                resume_token: resume_token.to_vec(),
+                ..TARGET_CHANGE_DEFAULT
+            }),
+            // Response: Oh, by the way, everything is up to date. 🤷🏼‍♂️
+            ResponseType::TargetChange(TargetChange {
+                read_time: Some(read_time),
+                resume_token: resume_token.to_vec(),
+                ..TARGET_CHANGE_DEFAULT
+            }),
+        ])
+        .await
+    }
 
-        // Response: Oh, by the way, everything is up to date. 🤷🏼‍♂️
-        self.send(ResponseType::TargetChange(TargetChange {
-            read_time: Some(read_time),
-            resume_token: resume_token.to_vec(),
-            ..TARGET_CHANGE_DEFAULT
-        }))
-        .await?;
-
+    async fn send_all(&self, msgs: impl IntoIterator<Item = ResponseType>) -> Result<()> {
+        for msg in msgs {
+            self.send(msg).await?;
+        }
         Ok(())
     }
 
@@ -379,7 +339,7 @@ enum ListenerTarget {
 impl ListenerTarget {
     async fn process_event(
         &mut self,
-        database: &Arc<Database>,
+        database: &Database,
         event: DatabaseEvent,
     ) -> Result<Vec<ResponseType>> {
         match self {
@@ -429,13 +389,13 @@ impl DocumentTarget {
 }
 
 struct QueryTarget {
-    query: Arc<Query>,
+    query: Query,
     doctargets_by_name: HashMap<DefaultAtom, DocumentTarget>,
 }
 impl QueryTarget {
     async fn process_event(
         &mut self,
-        database: &Arc<Database>,
+        database: &Database,
         event: DatabaseEvent,
     ) -> Result<Vec<ResponseType>> {
         // TODO: do not reset if not needed (which is very often)
@@ -464,11 +424,7 @@ impl QueryTarget {
         self.reset(database, &event.update_time).await
     }
 
-    async fn reset(
-        &mut self,
-        database: &Arc<Database>,
-        time: &Timestamp,
-    ) -> Result<Vec<ResponseType>> {
+    async fn reset(&mut self, database: &Database, time: &Timestamp) -> Result<Vec<ResponseType>> {
         let mut msgs = vec![ResponseType::TargetChange(TargetChange {
             target_change_type: target_change::TargetChangeType::Reset as _,
             target_ids: vec![TARGET_ID],
