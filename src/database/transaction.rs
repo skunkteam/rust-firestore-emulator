@@ -1,7 +1,3 @@
-use super::{
-    document::{OwnedDocumentContentsReadGuard, OwnedDocumentContentsWriteGuard},
-    Database,
-};
 use std::{
     collections::{hash_map::Entry, HashMap},
     sync::{
@@ -9,10 +5,16 @@ use std::{
         Arc, Weak,
     },
 };
+
 use string_cache::DefaultAtom;
 use tokio::sync::{Mutex, RwLock};
 use tonic::{Result, Status};
 use tracing::instrument;
+
+use super::{
+    document::{OwnedDocumentContentsReadGuard, OwnedDocumentContentsWriteGuard},
+    Database,
+};
 
 pub struct RunningTransactions {
     pub(super) database: Weak<Database>,

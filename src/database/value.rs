@@ -1,3 +1,8 @@
+use std::{borrow::Cow, cmp, collections::HashMap, ops::Add};
+
+use prost_types::Timestamp;
+
+pub use crate::googleapis::google::firestore::v1::Value;
 use crate::{
     googleapis::google::{
         firestore::v1::{value::ValueType, ArrayValue, MapValue},
@@ -5,10 +10,6 @@ use crate::{
     },
     utils::timestamp_nanos,
 };
-use prost_types::Timestamp;
-use std::{borrow::Cow, cmp, collections::HashMap, ops::Add};
-
-pub use crate::googleapis::google::firestore::v1::Value;
 
 impl Value {
     pub fn reference(reference: String) -> Self {

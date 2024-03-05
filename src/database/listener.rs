@@ -1,3 +1,19 @@
+use std::{
+    collections::HashMap,
+    sync::{
+        atomic::{self, AtomicUsize},
+        Weak,
+    },
+};
+
+use itertools::Itertools;
+use prost_types::Timestamp;
+use string_cache::DefaultAtom;
+use tokio::sync::{broadcast::error::RecvError, mpsc};
+use tokio_stream::{wrappers::ReceiverStream, StreamExt};
+use tonic::{Result, Status};
+use tracing::{debug, error, instrument};
+
 use super::{
     document::DocumentVersion, event::DatabaseEvent, query::Query, target_change, Database,
 };
@@ -14,20 +30,6 @@ use crate::{
     unimplemented_option,
     utils::{timestamp, timestamp_from_nanos, timestamp_nanos},
 };
-use itertools::Itertools;
-use prost_types::Timestamp;
-use std::{
-    collections::HashMap,
-    sync::{
-        atomic::{self, AtomicUsize},
-        Weak,
-    },
-};
-use string_cache::DefaultAtom;
-use tokio::sync::{broadcast::error::RecvError, mpsc};
-use tokio_stream::{wrappers::ReceiverStream, StreamExt};
-use tonic::{Result, Status};
-use tracing::{debug, error, instrument};
 
 const TARGET_ID: i32 = 1;
 

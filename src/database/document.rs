@@ -1,10 +1,3 @@
-use super::ReadConsistency;
-use crate::{
-    googleapis::google::firestore::v1::{precondition, Document, Value},
-    utils::timestamp_nanos,
-};
-use futures::Future;
-use prost_types::Timestamp;
 use std::{
     collections::HashMap,
     fmt::{self, Debug},
@@ -12,6 +5,9 @@ use std::{
     sync::Arc,
     time::Duration,
 };
+
+use futures::Future;
+use prost_types::Timestamp;
 use string_cache::DefaultAtom;
 use tokio::{
     sync::{
@@ -22,6 +18,12 @@ use tokio::{
 };
 use tonic::{Code, Result, Status};
 use tracing::{instrument, trace, Level};
+
+use super::ReadConsistency;
+use crate::{
+    googleapis::google::firestore::v1::{precondition, Document, Value},
+    utils::timestamp_nanos,
+};
 
 const WAIT_LOCK_TIMEOUT: Duration = Duration::from_secs(30);
 

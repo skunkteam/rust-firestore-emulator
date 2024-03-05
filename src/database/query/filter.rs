@@ -1,11 +1,13 @@
+use std::ops::Deref;
+
+use itertools::Itertools;
+use tonic::{Result, Status};
+
 use crate::{
     database::{document::StoredDocumentVersion, field_path::FieldReference, value::Value},
     googleapis::google::firestore::v1::structured_query,
     unimplemented,
 };
-use itertools::Itertools;
-use std::ops::Deref;
-use tonic::{Result, Status};
 
 #[derive(Debug)]
 pub enum Filter {

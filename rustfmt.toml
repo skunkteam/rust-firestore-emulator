@@ -13,6 +13,9 @@ use_field_init_shorthand = true
 enum_discrim_align_threshold = 5
 struct_field_align_threshold = 5
 
+# Organize all imports
+group_imports = "StdExternalCrate"
+imports_granularity = "Crate"
 
 # max_width = 100
 # use_small_heuristics = "Max"
@@ -20,5 +23,3 @@ struct_field_align_threshold = 5
 
 # format_macro_matchers = true
 # format_strings = true
-# group_imports = "StdExternalCrate"
-# imports_granularity = "Crate"

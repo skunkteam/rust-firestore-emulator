@@ -1,3 +1,14 @@
+use std::sync::Arc;
+
+use futures::{future::try_join_all, stream::BoxStream, StreamExt};
+use itertools::Itertools;
+use prost_types::Timestamp;
+use string_cache::DefaultAtom;
+use tokio::sync::mpsc;
+use tokio_stream::wrappers::ReceiverStream;
+use tonic::{async_trait, Code, Request, Response, Result, Status};
+use tracing::{info, info_span, instrument, Instrument};
+
 use crate::{
     database::{event::DatabaseEvent, get_doc_name_from_write, Database, ReadConsistency},
     googleapis::google::firestore::v1::{
@@ -8,15 +19,6 @@ use crate::{
     unimplemented, unimplemented_bool, unimplemented_collection, unimplemented_option,
     utils::timestamp,
 };
-use futures::{future::try_join_all, stream::BoxStream, StreamExt};
-use itertools::Itertools;
-use prost_types::Timestamp;
-use std::sync::Arc;
-use string_cache::DefaultAtom;
-use tokio::sync::mpsc;
-use tokio_stream::wrappers::ReceiverStream;
-use tonic::{async_trait, Code, Request, Response, Result, Status};
-use tracing::{info, info_span, instrument, Instrument};
 
 pub struct FirestoreEmulator {
     pub database: Arc<Database>,
