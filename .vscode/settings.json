@@ -10,5 +10,6 @@
       "source.organizeImports": "explicit",
       "source.fixAll": "explicit"
     }
-  }
+  },
+  "rust-analyzer.rustfmt.extraArgs": ["+nightly"]
 }

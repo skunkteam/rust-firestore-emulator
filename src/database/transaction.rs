@@ -16,7 +16,7 @@ use tracing::instrument;
 
 pub struct RunningTransactions {
     pub(super) database: Weak<Database>,
-    pub(super) map: RwLock<HashMap<TransactionId, Arc<Transaction>>>,
+    pub(super) map:      RwLock<HashMap<TransactionId, Arc<Transaction>>>,
 }
 
 impl RunningTransactions {
@@ -78,9 +78,9 @@ impl RunningTransactions {
 }
 
 pub struct Transaction {
-    pub id: TransactionId,
+    pub id:   TransactionId,
     database: Weak<Database>,
-    guards: Mutex<HashMap<DefaultAtom, Arc<OwnedDocumentContentsReadGuard>>>,
+    guards:   Mutex<HashMap<DefaultAtom, Arc<OwnedDocumentContentsReadGuard>>>,
 }
 
 impl Transaction {

@@ -36,10 +36,12 @@ impl FirestoreEmulator {
     }
 
     async fn eval_command(&self, writes: &[Write]) -> Result<Option<WriteResult>> {
-        let [Write {
-            operation: Some(write::Operation::Update(update)),
-            ..
-        }] = writes
+        let [
+            Write {
+                operation: Some(write::Operation::Update(update)),
+                ..
+            },
+        ] = writes
         else {
             return Ok(None);
         };
@@ -140,11 +142,11 @@ impl firestore_server::Firestore for FirestoreEmulator {
                         .await
                     {
                         Ok(doc) => Ok(BatchGetDocumentsResponse {
-                            result: Some(match doc {
+                            result:      Some(match doc {
                                 None => Missing(name),
                                 Some(doc) => Found(Document::clone(&doc)),
                             }),
-                            read_time: Some(timestamp()),
+                            read_time:   Some(timestamp()),
                             transaction: new_transaction.take().unwrap_or_default(),
                         }),
                         Err(err) => Err(err),
@@ -175,7 +177,7 @@ impl firestore_server::Firestore for FirestoreEmulator {
         if let Some(write_result) = self.eval_command(&writes).await? {
             return Ok(Response::new(CommitResponse {
                 write_results: vec![write_result],
-                commit_time: Some(timestamp()),
+                commit_time:   Some(timestamp()),
             }));
         }
 
@@ -232,23 +234,23 @@ impl firestore_server::Firestore for FirestoreEmulator {
             .run_query(
                 parent,
                 StructuredQuery {
-                    select: mask.map(|v| structured_query::Projection {
+                    select:   mask.map(|v| structured_query::Projection {
                         fields: v
                             .field_paths
                             .into_iter()
                             .map(|field_path| FieldReference { field_path })
                             .collect(),
                     }),
-                    from: vec![CollectionSelector {
+                    from:     vec![CollectionSelector {
                         collection_id,
                         all_descendants: false,
                     }],
-                    r#where: None,
+                    r#where:  None,
                     order_by: vec![],
                     start_at: None,
-                    end_at: None,
-                    offset: 0,
-                    limit: None,
+                    end_at:   None,
+                    offset:   0,
+                    limit:    None,
                 },
                 consistency_selector.try_into()?,
             )
@@ -492,7 +494,7 @@ impl firestore_server::Firestore for FirestoreEmulator {
                     Ok((wr, update)) => (Default::default(), wr, Some((name.clone(), update))),
                     Err(err) => (
                         rpc::Status {
-                            code: err.code() as _,
+                            code:    err.code() as _,
                             message: err.message().to_string(),
                             details: vec![],
                         },
@@ -507,7 +509,7 @@ impl firestore_server::Firestore for FirestoreEmulator {
 
         self.database.send_event(DatabaseEvent {
             update_time: time.clone(),
-            updates: updates.into_iter().flatten().collect(),
+            updates:     updates.into_iter().flatten().collect(),
         });
 
         Ok(Response::new(BatchWriteResponse {
@@ -535,7 +537,7 @@ async fn perform_writes(
         .unzip();
     database.send_event(DatabaseEvent {
         update_time: time.clone(),
-        updates: updates.into_iter().map(|u| (u.name().clone(), u)).collect(),
+        updates:     updates.into_iter().map(|u| (u.name().clone(), u)).collect(),
     });
     Ok((time, write_results))
 }

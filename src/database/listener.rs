@@ -167,10 +167,12 @@ impl Listener {
 
     #[instrument(skip_all, err)]
     async fn process_event(&mut self, event: &DatabaseEvent) -> Result<()> {
-        // We rely on the fact that this function will complete before any other events are processed. That's why we know for sure that
-        // the output stream is not used for something else until we respond with our NO_CHANGE msg. That msg means that everything is up
-        // to date until that point and this is (for now) the easiest way to make sure that is actually the case. This is probably okay,
-        // but if it becomes a hotspot we might look into optimizing later.
+        // We rely on the fact that this function will complete before any other events are
+        // processed. That's why we know for sure that the output stream is not used for
+        // something else until we respond with our NO_CHANGE msg. That msg means that everything is
+        // up to date until that point and this is (for now) the easiest way to make sure
+        // that is actually the case. This is probably okay, but if it becomes a hotspot we
+        // might look into optimizing later.
         let Some(target) = &mut self.target else {
             return Ok(());
         };
@@ -195,10 +197,12 @@ impl Listener {
         name: DefaultAtom,
         resume_type: Option<target::ResumeType>,
     ) -> Result<()> {
-        // We rely on the fact that this function will complete before any other events are processed. That's why we know for sure that
-        // the output stream is not used for something else until we respond with our NO_CHANGE msg. That msg means that everything is up
-        // to date until that point and this is (for now) the easiest way to make sure that is actually the case. This is probably okay,
-        // but if it becomes a hotspot we might look into optimizing later.
+        // We rely on the fact that this function will complete before any other events are
+        // processed. That's why we know for sure that the output stream is not used for
+        // something else until we respond with our NO_CHANGE msg. That msg means that everything is
+        // up to date until that point and this is (for now) the easiest way to make sure
+        // that is actually the case. This is probably okay, but if it becomes a hotspot we
+        // might look into optimizing later.
         let Some(database) = self.database.upgrade() else {
             return Ok(());
         };
@@ -255,11 +259,12 @@ impl Listener {
     }
 
     async fn set_query(&mut self, query: Query) -> Result<()> {
-        // We rely on the fact that this function will complete before any other events are processed. That's why we know for sure that
-        // the output stream is not used for something else until we respond with our NO_CHANGE msg. That msg means that everything is up
-        // to date until that point and this is (for now) the easiest way to make sure that is actually the case. This is probably okay,
-        // but if it becomes a hotspot we might look into optimizing later.
-        // let send_if_newer_than = resume_type.map(Timestamp::try_from).transpose()?;
+        // We rely on the fact that this function will complete before any other events are
+        // processed. That's why we know for sure that the output stream is not used for
+        // something else until we respond with our NO_CHANGE msg. That msg means that everything is
+        // up to date until that point and this is (for now) the easiest way to make sure
+        // that is actually the case. This is probably okay, but if it becomes a hotspot we
+        // might look into optimizing later.
         let Some(database) = self.database.upgrade() else {
             return Ok(());
         };

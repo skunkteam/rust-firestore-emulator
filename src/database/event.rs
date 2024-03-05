@@ -5,5 +5,5 @@ use string_cache::DefaultAtom;
 
 pub struct DatabaseEvent {
     pub update_time: Timestamp,
-    pub updates: HashMap<DefaultAtom, DocumentVersion>,
+    pub updates:     HashMap<DefaultAtom, DocumentVersion>,
 }

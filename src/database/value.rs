@@ -160,7 +160,8 @@ impl Ord for Value {
             (ValueType::GeoPointValue(a), ValueType::GeoPointValue(b)) => a.cmp(b),
             (ValueType::ArrayValue(a), ValueType::ArrayValue(b)) => a.values.cmp(&b.values),
             (ValueType::MapValue(_a), ValueType::MapValue(_b)) => todo!("ordering for MapValues"),
-            // Only the above types should need to be compared here, because of the type ordering above.
+            // Only the above types should need to be compared here, because of the type ordering
+            // above.
             _ => unreachable!("logic error in Ord implementation of Value"),
         }
     }

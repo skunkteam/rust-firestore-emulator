@@ -47,7 +47,7 @@ impl TryFrom<structured_query::Filter> for Filter {
 
 #[derive(Debug)]
 pub struct CompositeFilter {
-    op: CompositeOperator,
+    op:      CompositeOperator,
     filters: Vec<Filter>,
 }
 
@@ -76,7 +76,7 @@ impl TryFrom<structured_query::CompositeFilter> for CompositeFilter {
 
     fn try_from(value: structured_query::CompositeFilter) -> Result<Self, Self::Error> {
         Ok(Self {
-            op: value.op().try_into()?,
+            op:      value.op().try_into()?,
             filters: value
                 .filters
                 .into_iter()
@@ -120,7 +120,7 @@ impl TryFrom<structured_query::composite_filter::Operator> for CompositeOperator
 #[derive(Debug)]
 pub struct FieldFilter {
     field: FieldReference,
-    op: FieldOperator,
+    op:    FieldOperator,
     value: Value,
 }
 
@@ -175,7 +175,7 @@ impl TryFrom<structured_query::FieldFilter> for FieldFilter {
                 .field_path
                 .deref()
                 .try_into()?,
-            op: value.op().try_into()?,
+            op:    value.op().try_into()?,
             value: value.value.expect("missing value in FieldFilter"),
         })
     }
@@ -222,8 +222,7 @@ enum FieldOperator {
     ///
     /// Requires:
     ///
-    /// * That `value` is a non-empty `ArrayValue`, subject to disjunction
-    ///    limits.
+    /// * That `value` is a non-empty `ArrayValue`, subject to disjunction limits.
     /// * No `NOT_IN` filters in the same query.
     In,
     /// The given `field` is an array that contains any of the values in the
@@ -231,8 +230,7 @@ enum FieldOperator {
     ///
     /// Requires:
     ///
-    /// * That `value` is a non-empty `ArrayValue`, subject to disjunction
-    ///    limits.
+    /// * That `value` is a non-empty `ArrayValue`, subject to disjunction limits.
     /// * No other `ARRAY_CONTAINS_ANY` filters within the same disjunction.
     /// * No `NOT_IN` filters in the same query.
     ArrayContainsAny,
@@ -241,8 +239,8 @@ enum FieldOperator {
     /// Requires:
     ///
     /// * That `value` is a non-empty `ArrayValue` with at most 10 values.
-    /// * No other `OR`, `IN`, `ARRAY_CONTAINS_ANY`, `NOT_IN`, `NOT_EQUAL`,
-    ///    `IS_NOT_NULL`, or `IS_NOT_NAN`.
+    /// * No other `OR`, `IN`, `ARRAY_CONTAINS_ANY`, `NOT_IN`, `NOT_EQUAL`, `IS_NOT_NULL`, or
+    ///   `IS_NOT_NAN`.
     /// * That `field` comes first in the `order_by`.
     NotIn,
 }
@@ -301,7 +299,7 @@ impl TryFrom<structured_query::field_filter::Operator> for FieldOperator {
 #[derive(Debug)]
 pub struct UnaryFilter {
     field: FieldReference,
-    op: UnaryOperator,
+    op:    UnaryOperator,
 }
 
 impl UnaryFilter {
@@ -337,7 +335,7 @@ impl TryFrom<structured_query::UnaryFilter> for UnaryFilter {
             .expect("missing operand_type in UnaryFilter");
         Ok(Self {
             field: field.field_path.deref().try_into()?,
-            op: value.op().try_into()?,
+            op:    value.op().try_into()?,
         })
     }
 }

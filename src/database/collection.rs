@@ -7,7 +7,7 @@ use tonic::Result;
 use tracing::instrument;
 
 pub struct Collection {
-    pub name: DefaultAtom,
+    pub name:  DefaultAtom,
     documents: RwLock<HashMap<DefaultAtom, Arc<DocumentMeta>>>,
 }
 

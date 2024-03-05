@@ -29,7 +29,8 @@ pub struct DocumentMeta {
     /// The resource name of the document, for example
     /// `projects/{project_id}/databases/{database_id}/documents/{document_path}`.
     pub name: DefaultAtom,
-    /// The collection name of the document, i.e. the full name of the document minus the last component.
+    /// The collection name of the document, i.e. the full name of the document minus the last
+    /// component.
     pub collection_name: DefaultAtom,
     contents: Arc<RwLock<DocumentContents>>,
     write_permit_shop: Arc<Semaphore>,
@@ -90,7 +91,8 @@ pub struct DocumentContents {
     /// The resource name of the document, for example
     /// `projects/{project_id}/databases/{database_id}/documents/{document_path}`.
     pub name: DefaultAtom,
-    /// The collection name of the document, i.e. the full name of the document minus the last component.
+    /// The collection name of the document, i.e. the full name of the document minus the last
+    /// component.
     pub collection_name: DefaultAtom,
     versions: Vec<DocumentVersion>,
 }
@@ -285,7 +287,8 @@ pub struct StoredDocumentVersion {
     /// The resource name of the document, for example
     /// `projects/{project_id}/databases/{database_id}/documents/{document_path}`.
     pub name: DefaultAtom,
-    /// The collection name of the document, i.e. the full name of the document minus the last component.
+    /// The collection name of the document, i.e. the full name of the document minus the last
+    /// component.
     pub collection_name: DefaultAtom,
     /// The time at which the document was created.
     ///
@@ -342,7 +345,8 @@ pub struct DeletedDocumentVersion {
     /// The resource name of the document, for example
     /// `projects/{project_id}/databases/{database_id}/documents/{document_path}`.
     pub name: DefaultAtom,
-    /// The collection name of the document, i.e. the full name of the document minus the last component.
+    /// The collection name of the document, i.e. the full name of the document minus the last
+    /// component.
     pub collection_name: DefaultAtom,
     /// The time at which the document was deleted.
     pub delete_time: Timestamp,

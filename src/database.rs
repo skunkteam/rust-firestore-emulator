@@ -182,7 +182,8 @@ impl Database {
         let mut write_results = vec![];
         let mut updates = HashMap::new();
         let mut write_guard_cache = HashMap::<DefaultAtom, OwnedDocumentContentsWriteGuard>::new();
-        // This must be done in two phases. First acquire the lock on all docs, only then start to update them.
+        // This must be done in two phases. First acquire the lock on all docs, only then start to
+        // update them.
         for write in &writes {
             let name = get_doc_name_from_write(write)?;
             if let Entry::Vacant(entry) = write_guard_cache.entry(name.clone()) {
@@ -446,7 +447,7 @@ macro_rules! impl_try_from_consistency_selector {
                         return Err(Status::internal(concat!(
                             stringify!($lib),
                             "::ConsistencySelector::NewTransaction should be handled by caller"
-                        )))
+                        )));
                     }
                 };
                 Ok(result)
