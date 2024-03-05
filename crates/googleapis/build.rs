@@ -3,8 +3,8 @@ fn main() {
         .build_client(false)
         .include_file("googleapis.rs")
         .compile(
-            &["googleapis/google/firestore/v1/firestore.proto"],
-            &["googleapis"],
+            &["include/google/firestore/v1/firestore.proto"],
+            &["include"],
         )
         .unwrap()
 }

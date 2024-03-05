@@ -430,16 +430,14 @@ dependencies = [
  "console",
  "console-subscriber",
  "futures",
+ "googleapis",
  "itertools 0.12.1",
- "prost",
- "prost-types",
  "string_cache",
  "tikv-jemallocator",
  "time",
  "tokio",
  "tokio-stream",
  "tonic 0.11.0",
- "tonic-build",
  "tracing",
  "tracing-subscriber",
 ]
@@ -571,6 +569,17 @@ name = "gimli"
 version = "0.28.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4271d37baee1b8c7e4b708028c57d816cf9d2434acb33a549475f78c181f6253"
+
+[[package]]
+name = "googleapis"
+version = "0.0.0"
+dependencies = [
+ "prost",
+ "prost-types",
+ "tokio",
+ "tonic 0.11.0",
+ "tonic-build",
+]
 
 [[package]]
 name = "h2"
@@ -841,9 +850,9 @@ dependencies = [
 
 [[package]]
 name = "mio"
-version = "0.8.9"
+version = "0.8.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3dce281c5e46beae905d4de1870d8b1509a9142b62eedf18b443b011ca8343d0"
+checksum = "a4a650543ca06a924e8b371db273b2756685faae30f8487da1b56505a8f78b0c"
 dependencies = [
  "libc",
  "wasi",

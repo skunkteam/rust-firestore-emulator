@@ -1,8 +1,15 @@
 use std::sync::Arc;
 
 use futures::{future::try_join_all, stream::BoxStream, StreamExt};
+use googleapis::{
+    google::firestore::v1::{
+        structured_query::{CollectionSelector, FieldReference},
+        transaction_options::ReadWrite,
+        *,
+    },
+    timestamp, Timestamp,
+};
 use itertools::Itertools;
-use prost_types::Timestamp;
 use string_cache::DefaultAtom;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
@@ -11,13 +18,7 @@ use tracing::{info, info_span, instrument, Instrument};
 
 use crate::{
     database::{event::DatabaseEvent, get_doc_name_from_write, Database, ReadConsistency},
-    googleapis::google::firestore::v1::{
-        structured_query::{CollectionSelector, FieldReference},
-        transaction_options::ReadWrite,
-        *,
-    },
     unimplemented, unimplemented_bool, unimplemented_collection, unimplemented_option,
-    utils::timestamp,
 };
 
 pub struct FirestoreEmulator {
@@ -339,13 +340,13 @@ impl firestore_server::Firestore for FirestoreEmulator {
     ) -> Result<Response<Self::RunQueryStream>> {
         let RunQueryRequest {
             parent,
-            mode,
+            // mode,
             query_type,
             consistency_selector,
         } = request.into_inner();
-        if mode != 0 {
-            unimplemented!("QueryMode")
-        }
+        // if mode != 0 {
+        //     unimplemented!("QueryMode")
+        // }
         let Some(run_query_request::QueryType::StructuredQuery(query)) = query_type else {
             unimplemented!("query without query")
         };
@@ -361,7 +362,7 @@ impl firestore_server::Firestore for FirestoreEmulator {
                 document: Some(doc),
                 read_time: Some(timestamp()),
                 skipped_results: 0,
-                stats: None,
+                // stats: None,
                 continuation_selector: None,
             })
         });
@@ -491,7 +492,7 @@ impl firestore_server::Firestore for FirestoreEmulator {
                     .database
                     .perform_write(write, &mut guard, time.clone())
                     .await;
-                use crate::googleapis::google::rpc;
+                use googleapis::google::rpc;
                 Ok(match result {
                     Ok((wr, update)) => (Default::default(), wr, Some((name.clone(), update))),
                     Err(err) => (

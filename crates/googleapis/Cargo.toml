@@ -1,0 +1,12 @@
+[package]
+name = "googleapis"
+edition = "2021"
+
+[dependencies]
+prost = "0.12"
+prost-types = "0.12"
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+tonic = { workspace = true, features = ["gzip"] }
+
+[build-dependencies]
+tonic-build = "0.11"
