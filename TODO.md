@@ -1,0 +1,6 @@
+- common-document-store-backend
+  - UNIMPLEMENTED: run_aggregation_query is not supported yet
+- wao-claim-appengine-backend
+  - UNIMPLEMENTED: mask is not supported yet
+  - UNIMPLEMENTED: target_id should always be 1 is not supported yet
+- polis-soc-reg-backend - ???

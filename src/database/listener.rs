@@ -6,8 +6,17 @@ use std::{
     },
 };
 
+use googleapis::{
+    google::firestore::v1::{
+        listen_request,
+        listen_response::ResponseType,
+        target::{self, query_target},
+        target_change::TargetChangeType,
+        DocumentChange, DocumentDelete, ListenRequest, ListenResponse, Target, TargetChange,
+    },
+    timestamp, timestamp_nanos, Timestamp,
+};
 use itertools::Itertools;
-use prost_types::Timestamp;
 use string_cache::DefaultAtom;
 use tokio::sync::{broadcast::error::RecvError, mpsc};
 use tokio_stream::{wrappers::ReceiverStream, StreamExt};
@@ -18,17 +27,8 @@ use super::{
     document::DocumentVersion, event::DatabaseEvent, query::Query, target_change, Database,
 };
 use crate::{
-    database::ReadConsistency,
-    googleapis::google::firestore::v1::{
-        listen_request,
-        listen_response::ResponseType,
-        target::{self, query_target},
-        target_change::TargetChangeType,
-        DocumentChange, DocumentDelete, ListenRequest, ListenResponse, Target, TargetChange,
-    },
-    required_option, unimplemented, unimplemented_bool, unimplemented_collection,
-    unimplemented_option,
-    utils::{timestamp, timestamp_from_nanos, timestamp_nanos},
+    database::ReadConsistency, required_option, unimplemented, unimplemented_bool,
+    unimplemented_collection, unimplemented_option,
 };
 
 const TARGET_ID: i32 = 1;
@@ -479,21 +479,5 @@ fn show_response_type(rt: &ResponseType) -> &'static str {
         ResponseType::DocumentDelete(_) => "DocumentDelete",
         ResponseType::DocumentRemove(_) => "DocumentRemove",
         ResponseType::Filter(_) => "Filter",
-    }
-}
-
-impl TryFrom<target::ResumeType> for Timestamp {
-    type Error = Status;
-
-    fn try_from(value: target::ResumeType) -> Result<Self, Self::Error> {
-        match value {
-            target::ResumeType::ResumeToken(token) => {
-                let token = token
-                    .try_into()
-                    .map_err(|_| Status::invalid_argument("invalid resume token"))?;
-                Ok(timestamp_from_nanos(i128::from_ne_bytes(token)))
-            }
-            target::ResumeType::ReadTime(time) => Ok(time),
-        }
     }
 }

@@ -7,10 +7,6 @@ use tikv_jemallocator::Jemalloc;
 use tonic::{codec::CompressionEncoding, transport::Server};
 use tracing::info;
 
-mod googleapis {
-    tonic::include_proto!("googleapis");
-}
-
 mod database;
 mod emulator;
 #[macro_use]

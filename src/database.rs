@@ -4,8 +4,14 @@ use std::{
     sync::{Arc, Weak},
 };
 
+use googleapis::{
+    google::firestore::v1::{
+        document_transform::field_transform::{ServerValue, TransformType},
+        *,
+    },
+    timestamp, Timestamp,
+};
 use itertools::Itertools;
-use prost_types::Timestamp;
 use string_cache::DefaultAtom;
 use tokio::sync::{
     broadcast::{self, Receiver},
@@ -25,12 +31,7 @@ use self::{
     transaction::{RunningTransactions, Transaction, TransactionId},
 };
 use crate::{
-    googleapis::google::firestore::v1::{
-        document_transform::field_transform::{ServerValue, TransformType},
-        *,
-    },
-    unimplemented, unimplemented_collection, unimplemented_option,
-    utils::{timestamp, RwLockHashMapExt},
+    unimplemented, unimplemented_collection, unimplemented_option, utils::RwLockHashMapExt,
 };
 
 mod collection;
@@ -40,7 +41,6 @@ mod field_path;
 mod listener;
 mod query;
 mod transaction;
-mod value;
 
 const MAX_EVENT_BACKLOG: usize = 1024;
 
