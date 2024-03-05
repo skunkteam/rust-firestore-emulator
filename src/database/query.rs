@@ -1,13 +1,15 @@
+use std::{cmp, collections::HashMap, ops::Deref, sync::Arc};
+
+use itertools::Itertools;
+use string_cache::DefaultAtom;
+use tonic::{Result, Status};
+
 use self::filter::Filter;
 use super::{
     collection::Collection, document::StoredDocumentVersion, field_path::FieldReference, Database,
     ReadConsistency,
 };
 use crate::googleapis::google::firestore::v1::{structured_query::CollectionSelector, *};
-use itertools::Itertools;
-use std::{cmp, collections::HashMap, ops::Deref, sync::Arc};
-use string_cache::DefaultAtom;
-use tonic::{Result, Status};
 
 mod filter;
 
@@ -35,10 +37,9 @@ pub struct Query {
     /// no ordering at all. In all cases, Firestore guarantees a stable ordering
     /// through the following rules:
     ///
-    ///   * The `order_by` is required to reference all fields used with an
-    ///     inequality filter.
-    ///   * All fields that are required to be in the `order_by` but are not already
-    ///     present are appended in lexicographical ordering of the field name.
+    ///   * The `order_by` is required to reference all fields used with an inequality filter.
+    ///   * All fields that are required to be in the `order_by` but are not already present are
+    ///     appended in lexicographical ordering of the field name.
     ///   * If an order on `__name__` is not specified, it is appended by default.
     ///
     /// Fields are appended with the same sort direction as the last order
@@ -47,8 +48,8 @@ pub struct Query {
     ///   * `ORDER BY a` becomes `ORDER BY a ASC, __name__ ASC`
     ///   * `ORDER BY a DESC` becomes `ORDER BY a DESC, __name__ DESC`
     ///   * `WHERE a > 1` becomes `WHERE a > 1 ORDER BY a ASC, __name__ ASC`
-    ///   * `WHERE __name__ > ... AND a > 1` becomes
-    ///      `WHERE __name__ > ... AND a > 1 ORDER BY a ASC, __name__ ASC`
+    ///   * `WHERE __name__ > ... AND a > 1` becomes `WHERE __name__ > ... AND a > 1 ORDER BY a
+    ///     ASC, __name__ ASC`
     order_by: Vec<Order>,
 
     /// A potential prefix of a position in the result set to start the query at.
@@ -69,8 +70,8 @@ pub struct Query {
     /// Continuing off the example above, attaching the following start cursors
     /// will have varying impact:
     ///
-    /// - `START BEFORE (2, /k/123)`: start the query right before `a = 1 AND
-    ///     b > 2 AND __name__ > /k/123`.
+    /// - `START BEFORE (2, /k/123)`: start the query right before `a = 1 AND b > 2 AND __name__ >
+    ///   /k/123`.
     /// - `START AFTER (10)`: start the query right after `a = 1 AND b > 10`.
     ///
     /// Unlike `OFFSET` which requires scanning over the first N results to skip,
@@ -80,8 +81,8 @@ pub struct Query {
     ///
     /// Requires:
     ///
-    /// * The number of values cannot be greater than the number of fields
-    ///    specified in the `ORDER BY` clause.
+    /// * The number of values cannot be greater than the number of fields specified in the `ORDER
+    ///   BY` clause.
     start_at: Option<Cursor>,
 
     /// A potential prefix of a position in the result set to end the query at.
@@ -91,8 +92,8 @@ pub struct Query {
     ///
     /// Requires:
     ///
-    /// * The number of values cannot be greater than the number of fields
-    ///    specified in the `ORDER BY` clause.
+    /// * The number of values cannot be greater than the number of fields specified in the `ORDER
+    ///   BY` clause.
     end_at: Option<Cursor>,
 
     /// The number of documents to skip before returning the first result.
@@ -146,7 +147,7 @@ impl Query {
                         .get_inequality_fields()
                         .into_iter()
                         .map(|field| Order {
-                            field: field.clone(),
+                            field:     field.clone(),
                             direction: Direction::Ascending,
                         }),
                 );
@@ -154,7 +155,7 @@ impl Query {
         }
         if !order_by.iter().any(|o| o.field.is_document_name()) {
             order_by.push(Order {
-                field: FieldReference::DocumentName,
+                field:     FieldReference::DocumentName,
                 direction: Direction::Ascending,
             })
         }
@@ -353,15 +354,16 @@ impl Query {
                 (_, Equal) => (),
             };
         }
-        // When we get here, the doc is equal to the values of the cursor. If the cursur wants to be "before" equal documents
-        // we must consider them not to be part of the left partition.
+        // When we get here, the doc is equal to the values of the cursor. If the cursur wants to be
+        // "before" equal documents we must consider them not to be part of the left
+        // partition.
         !cursor.before
     }
 }
 
 #[derive(Debug)]
 struct Order {
-    field: FieldReference,
+    field:     FieldReference,
     direction: Direction,
 }
 
@@ -370,7 +372,7 @@ impl TryFrom<structured_query::Order> for Order {
 
     fn try_from(value: structured_query::Order) -> Result<Self, Self::Error> {
         Ok(Self {
-            field: value
+            field:     value
                 .field
                 .as_ref()
                 .ok_or_else(|| Status::invalid_argument("order_by without field"))?

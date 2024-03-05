@@ -1,7 +1,8 @@
+use std::net::SocketAddr;
+
 use clap::Parser;
 use emulator::FirestoreEmulator;
 use googleapis::google::firestore::v1::firestore_server::FirestoreServer;
-use std::net::SocketAddr;
 use tikv_jemallocator::Jemalloc;
 use tonic::{codec::CompressionEncoding, transport::Server};
 use tracing::info;

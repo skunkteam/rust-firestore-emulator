@@ -1,13 +1,15 @@
-use super::document::DocumentMeta;
-use crate::utils::RwLockHashMapExt;
 use std::{collections::HashMap, ops::Deref, sync::Arc};
+
 use string_cache::DefaultAtom;
 use tokio::sync::RwLock;
 use tonic::Result;
 use tracing::instrument;
 
+use super::document::DocumentMeta;
+use crate::utils::RwLockHashMapExt;
+
 pub struct Collection {
-    pub name: DefaultAtom,
+    pub name:  DefaultAtom,
     documents: RwLock<HashMap<DefaultAtom, Arc<DocumentMeta>>>,
 }
 

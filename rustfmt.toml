@@ -1,0 +1,21 @@
+edition = "2021"
+version = "Two"
+
+# Allow rustfmt to format our doc comments, such an awesome feature 😍
+wrap_comments = true
+comment_width = 100
+format_code_in_doc_comments = true
+
+# Prefer to use field init shorthands, e.g. `Struct { field }` instead of `Struct { field: field }`
+use_field_init_shorthand = true
+
+# Align enum and their "value" and struct fields and their types in a table (max extra padding of 5 spaces)
+enum_discrim_align_threshold = 5
+struct_field_align_threshold = 5
+
+# Organize all imports
+group_imports = "StdExternalCrate"
+imports_granularity = "Crate"
+
+format_macro_matchers = true
+format_strings = true

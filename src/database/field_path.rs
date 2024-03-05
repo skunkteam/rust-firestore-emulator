@@ -1,10 +1,9 @@
+use std::{borrow::Cow, collections::HashMap, convert::Infallible, mem::take, ops::Deref};
+
+use tonic::{Result, Status};
+
 use super::document::StoredDocumentVersion;
 use crate::googleapis::google::firestore::v1::*;
-use std::borrow::Cow;
-use std::mem::take;
-use std::ops::Deref;
-use std::{collections::HashMap, convert::Infallible};
-use tonic::{Result, Status};
 
 /// The virtual field-name that represents the document-name.
 pub const DOC_NAME: &str = "__name__";

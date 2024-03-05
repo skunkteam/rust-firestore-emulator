@@ -1,10 +1,3 @@
-use super::ReadConsistency;
-use crate::{
-    googleapis::google::firestore::v1::{precondition, Document, Value},
-    utils::timestamp_nanos,
-};
-use futures::Future;
-use prost_types::Timestamp;
 use std::{
     collections::HashMap,
     fmt::{self, Debug},
@@ -12,6 +5,9 @@ use std::{
     sync::Arc,
     time::Duration,
 };
+
+use futures::Future;
+use prost_types::Timestamp;
 use string_cache::DefaultAtom;
 use tokio::{
     sync::{
@@ -23,13 +19,20 @@ use tokio::{
 use tonic::{Code, Result, Status};
 use tracing::{instrument, trace, Level};
 
+use super::ReadConsistency;
+use crate::{
+    googleapis::google::firestore::v1::{precondition, Document, Value},
+    utils::timestamp_nanos,
+};
+
 const WAIT_LOCK_TIMEOUT: Duration = Duration::from_secs(30);
 
 pub struct DocumentMeta {
     /// The resource name of the document, for example
     /// `projects/{project_id}/databases/{database_id}/documents/{document_path}`.
     pub name: DefaultAtom,
-    /// The collection name of the document, i.e. the full name of the document minus the last component.
+    /// The collection name of the document, i.e. the full name of the document minus the last
+    /// component.
     pub collection_name: DefaultAtom,
     contents: Arc<RwLock<DocumentContents>>,
     write_permit_shop: Arc<Semaphore>,
@@ -90,7 +93,8 @@ pub struct DocumentContents {
     /// The resource name of the document, for example
     /// `projects/{project_id}/databases/{database_id}/documents/{document_path}`.
     pub name: DefaultAtom,
-    /// The collection name of the document, i.e. the full name of the document minus the last component.
+    /// The collection name of the document, i.e. the full name of the document minus the last
+    /// component.
     pub collection_name: DefaultAtom,
     versions: Vec<DocumentVersion>,
 }
@@ -285,7 +289,8 @@ pub struct StoredDocumentVersion {
     /// The resource name of the document, for example
     /// `projects/{project_id}/databases/{database_id}/documents/{document_path}`.
     pub name: DefaultAtom,
-    /// The collection name of the document, i.e. the full name of the document minus the last component.
+    /// The collection name of the document, i.e. the full name of the document minus the last
+    /// component.
     pub collection_name: DefaultAtom,
     /// The time at which the document was created.
     ///
@@ -342,7 +347,8 @@ pub struct DeletedDocumentVersion {
     /// The resource name of the document, for example
     /// `projects/{project_id}/databases/{database_id}/documents/{document_path}`.
     pub name: DefaultAtom,
-    /// The collection name of the document, i.e. the full name of the document minus the last component.
+    /// The collection name of the document, i.e. the full name of the document minus the last
+    /// component.
     pub collection_name: DefaultAtom,
     /// The time at which the document was deleted.
     pub delete_time: Timestamp,

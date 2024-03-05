@@ -41,3 +41,7 @@ tonic-build = "0.10"
 # [profile.release]
 # opt-level = 3
 # lto = true
+
+[lints.clippy]
+# Until this is resolved: https://github.com/rust-lang/rust-clippy/issues/12281
+blocks_in_conditions = "allow"

@@ -1,3 +1,8 @@
+use std::{borrow::Cow, cmp, collections::HashMap, ops::Add};
+
+use prost_types::Timestamp;
+
+pub use crate::googleapis::google::firestore::v1::Value;
 use crate::{
     googleapis::google::{
         firestore::v1::{value::ValueType, ArrayValue, MapValue},
@@ -5,10 +10,6 @@ use crate::{
     },
     utils::timestamp_nanos,
 };
-use prost_types::Timestamp;
-use std::{borrow::Cow, cmp, collections::HashMap, ops::Add};
-
-pub use crate::googleapis::google::firestore::v1::Value;
 
 impl Value {
     pub fn reference(reference: String) -> Self {
@@ -160,7 +161,8 @@ impl Ord for Value {
             (ValueType::GeoPointValue(a), ValueType::GeoPointValue(b)) => a.cmp(b),
             (ValueType::ArrayValue(a), ValueType::ArrayValue(b)) => a.values.cmp(&b.values),
             (ValueType::MapValue(_a), ValueType::MapValue(_b)) => todo!("ordering for MapValues"),
-            // Only the above types should need to be compared here, because of the type ordering above.
+            // Only the above types should need to be compared here, because of the type ordering
+            // above.
             _ => unreachable!("logic error in Ord implementation of Value"),
         }
     }
