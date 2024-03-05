@@ -8,7 +8,7 @@ use crate::{
         firestore::v1::{value::ValueType, ArrayValue, MapValue},
         r#type::LatLng,
     },
-    utils::timestamp_nanos,
+    timestamp_nanos,
 };
 
 impl Value {

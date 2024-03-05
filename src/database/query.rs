@@ -1,5 +1,6 @@
 use std::{cmp, collections::HashMap, ops::Deref, sync::Arc};
 
+use googleapis::google::firestore::v1::{structured_query::CollectionSelector, *};
 use itertools::Itertools;
 use string_cache::DefaultAtom;
 use tonic::{Result, Status};
@@ -9,7 +10,6 @@ use super::{
     collection::Collection, document::StoredDocumentVersion, field_path::FieldReference, Database,
     ReadConsistency,
 };
-use crate::googleapis::google::firestore::v1::{structured_query::CollectionSelector, *};
 
 mod filter;
 
