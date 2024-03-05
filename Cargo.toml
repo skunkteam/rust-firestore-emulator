@@ -38,9 +38,10 @@ tracing-subscriber = { version = "0.3.18", optional = true }
 [build-dependencies]
 tonic-build = "0.10"
 
-# [profile.release]
-# opt-level = 3
-# lto = true
+[profile.release]
+codegen-unit = 1
+lto = "fat"
+panic = "abort"
 
 [lints.clippy]
 # Until this is resolved: https://github.com/rust-lang/rust-clippy/issues/12281
