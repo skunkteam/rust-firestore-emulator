@@ -1,8 +1,7 @@
 use std::{borrow::Cow, cmp, collections::HashMap, ops::Add};
 
-pub use crate::google::firestore::v1::Value;
 use crate::google::{
-    firestore::v1::{value::ValueType, ArrayValue, MapValue},
+    firestore::v1::{value::ValueType, ArrayValue, MapValue, Value},
     protobuf::Timestamp,
     r#type::LatLng,
 };
@@ -136,7 +135,7 @@ impl PartialOrd for Value {
 impl Ord for Value {
     fn cmp(&self, other: &Self) -> cmp::Ordering {
         let type_order = self.value_type_order().cmp(&other.value_type_order());
-        if matches!(type_order, cmp::Ordering::Less | cmp::Ordering::Greater) {
+        if type_order != cmp::Ordering::Equal {
             return type_order;
         }
         match (self.value_type(), other.value_type()) {
