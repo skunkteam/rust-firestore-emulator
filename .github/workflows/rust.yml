@@ -17,6 +17,8 @@ jobs:
       - name: Install Protoc
         uses: arduino/setup-protoc@v2
       - uses: actions/checkout@v3
+        with:
+          submodules: "true"
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Run tests
@@ -29,11 +31,11 @@ jobs:
       - name: Install Protoc
         uses: arduino/setup-protoc@v2
       - uses: actions/checkout@v3
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@nightly
         with:
           components: rustfmt
       - name: Enforce formatting
-        run: cargo fmt --workspace --check
+        run: cargo +nightly fmt --all --check
 
   clippy:
     name: Clippy
@@ -42,6 +44,8 @@ jobs:
       - name: Install Protoc
         uses: arduino/setup-protoc@v2
       - uses: actions/checkout@v3
+        with:
+          submodules: "true"
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
@@ -55,8 +59,9 @@ jobs:
     steps:
       - name: Install Protoc
         uses: arduino/setup-protoc@v2
-      - name: Checkout repository
-        uses: actions/checkout@v3
+      - uses: actions/checkout@v3
+        with:
+          submodules: "true"
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Install tarpaulin
