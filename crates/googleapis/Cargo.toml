@@ -2,6 +2,9 @@
 name = "googleapis"
 edition = "2021"
 
+[lib]
+doctest = false
+
 [dependencies]
 prost = "0.12"
 prost-types = "0.12"

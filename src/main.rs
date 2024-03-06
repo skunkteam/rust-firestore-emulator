@@ -1,18 +1,8 @@
 use std::net::SocketAddr;
 
 use clap::Parser;
-use emulator::FirestoreEmulator;
-use googleapis::google::firestore::v1::firestore_server::FirestoreServer;
+use firestore_emulator::run;
 use tikv_jemallocator::Jemalloc;
-use tonic::{codec::CompressionEncoding, transport::Server};
-use tracing::info;
-
-mod database;
-mod emulator;
-#[macro_use]
-mod utils;
-
-const MAX_MESSAGE_SIZE: usize = 50 * 1024 * 1024;
 
 #[global_allocator]
 static GLOBAL_ALLOC: Jemalloc = Jemalloc;
@@ -54,22 +44,5 @@ fn main() -> color_eyre::Result<()> {
         registry.init();
     }
 
-    run(Args::parse())
-}
-
-#[tokio::main]
-async fn run(Args { host_port }: Args) -> color_eyre::Result<()> {
-    let emulator = FirestoreEmulator::new();
-    let firestore = FirestoreServer::new(emulator)
-        .accept_compressed(CompressionEncoding::Gzip)
-        .send_compressed(CompressionEncoding::Gzip)
-        .max_decoding_message_size(MAX_MESSAGE_SIZE);
-
-    let server = Server::builder().add_service(firestore).serve(host_port);
-
-    info!("Firestore listening on {}", host_port);
-
-    server.await?;
-
-    Ok(())
+    run(Args::parse().host_port)
 }

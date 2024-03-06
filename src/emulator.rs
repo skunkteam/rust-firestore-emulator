@@ -382,7 +382,7 @@ impl firestore_server::Firestore for FirestoreEmulator {
     ///
     /// High-Level Example:
     ///
-    /// ```
+    /// ```sql
     /// -- Return the number of documents in table given a filter.
     /// SELECT COUNT(*) FROM ( SELECT * FROM k where a = true );
     /// ```
