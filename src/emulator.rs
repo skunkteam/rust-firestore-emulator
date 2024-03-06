@@ -1,13 +1,13 @@
 use std::sync::Arc;
 
 use futures::{future::try_join_all, stream::BoxStream, StreamExt};
-use googleapis::{
-    google::firestore::v1::{
+use googleapis::google::{
+    firestore::v1::{
         structured_query::{CollectionSelector, FieldReference},
         transaction_options::ReadWrite,
         *,
     },
-    timestamp, Timestamp,
+    protobuf::{Empty, Timestamp},
 };
 use itertools::Itertools;
 use string_cache::DefaultAtom;
@@ -56,7 +56,7 @@ impl FirestoreEmulator {
             "CLEAR_EMULATOR" => {
                 self.database.clear().await;
                 Ok(Some(WriteResult {
-                    update_time: Some(timestamp()),
+                    update_time: Some(Timestamp::now()),
                     transform_results: vec![],
                 }))
             }
@@ -149,7 +149,7 @@ impl firestore_server::Firestore for FirestoreEmulator {
                                 None => Missing(name),
                                 Some(doc) => Found(Document::clone(&doc)),
                             }),
-                            read_time:   Some(timestamp()),
+                            read_time:   Some(Timestamp::now()),
                             transaction: new_transaction.take().unwrap_or_default(),
                         }),
                         Err(err) => Err(err),
@@ -180,7 +180,7 @@ impl firestore_server::Firestore for FirestoreEmulator {
         if let Some(write_result) = self.eval_command(&writes).await? {
             return Ok(Response::new(CommitResponse {
                 write_results: vec![write_result],
-                commit_time:   Some(timestamp()),
+                commit_time:   Some(Timestamp::now()),
             }));
         }
 
@@ -279,7 +279,7 @@ impl firestore_server::Firestore for FirestoreEmulator {
     async fn delete_document(
         &self,
         _request: Request<DeleteDocumentRequest>,
-    ) -> Result<Response<()>> {
+    ) -> Result<Response<Empty>> {
         unimplemented!("delete_document")
     }
 
@@ -318,15 +318,13 @@ impl firestore_server::Firestore for FirestoreEmulator {
 
     /// Rolls back a transaction.
     #[instrument(skip_all, err)]
-    async fn rollback(&self, request: Request<RollbackRequest>) -> Result<Response<()>> {
+    async fn rollback(&self, request: Request<RollbackRequest>) -> Result<Response<Empty>> {
         let RollbackRequest {
             database: _,
             transaction,
         } = request.into_inner();
-        self.database
-            .rollback(&transaction.try_into()?)
-            .await
-            .map(Response::new)
+        self.database.rollback(&transaction.try_into()?).await?;
+        Ok(Response::new(Empty {}))
     }
 
     /// Server streaming response type for the RunQuery method.
@@ -360,7 +358,7 @@ impl firestore_server::Firestore for FirestoreEmulator {
             Ok(RunQueryResponse {
                 transaction: vec![],
                 document: Some(doc),
-                read_time: Some(timestamp()),
+                read_time: Some(Timestamp::now()),
                 skipped_results: 0,
                 // stats: None,
                 continuation_selector: None,
@@ -482,7 +480,7 @@ impl firestore_server::Firestore for FirestoreEmulator {
         } = request.into_inner();
         unimplemented_collection!(labels);
 
-        let time: Timestamp = timestamp();
+        let time: Timestamp = Timestamp::now();
 
         let (status, write_results, updates): (Vec<_>, Vec<_>, Vec<_>) =
             try_join_all(writes.into_iter().map(|write| async {
@@ -526,7 +524,7 @@ async fn perform_writes(
     database: &Database,
     writes: Vec<Write>,
 ) -> Result<(Timestamp, Vec<WriteResult>)> {
-    let time: Timestamp = timestamp();
+    let time: Timestamp = Timestamp::now();
     let (write_results, updates): (Vec<_>, Vec<_>) =
         try_join_all(writes.into_iter().map(|write| async {
             let name = get_doc_name_from_write(&write)?;

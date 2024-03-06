@@ -6,10 +6,13 @@ edition = "2021"
 doctest = false
 
 [dependencies]
+chrono = { version = "0.4.34", default-features = false, features = ["now"] }
 prost = "0.12"
-prost-types = "0.12"
-tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
-tonic = { workspace = true, features = ["gzip"] }
+thiserror = "1.0.57"
+tonic = { workspace = true }
 
 [build-dependencies]
 tonic-build = "0.11"
+
+[dev-dependencies]
+itertools = "0.12.1"

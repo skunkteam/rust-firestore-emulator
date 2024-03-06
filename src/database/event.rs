@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use googleapis::Timestamp;
+use googleapis::google::protobuf::Timestamp;
 use string_cache::DefaultAtom;
 
 use super::document::DocumentVersion;

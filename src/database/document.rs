@@ -7,9 +7,9 @@ use std::{
 };
 
 use futures::Future;
-use googleapis::{
-    google::firestore::v1::{precondition, Document, Value},
-    timestamp_nanos, Timestamp,
+use googleapis::google::{
+    firestore::v1::{precondition, Document, Value},
+    protobuf::Timestamp,
 };
 use string_cache::DefaultAtom;
 use tokio::{
@@ -116,7 +116,7 @@ impl DocumentContents {
     pub fn version_at_time(&self, read_time: &Timestamp) -> Option<&Arc<StoredDocumentVersion>> {
         self.versions
             .iter()
-            .rfind(|version| timestamp_nanos(version.update_time()) <= timestamp_nanos(read_time))
+            .rfind(|version| (version.update_time()) <= (read_time))
             .and_then(DocumentVersion::stored_document)
     }
 
