@@ -1,14 +1,10 @@
 use std::{borrow::Cow, cmp, collections::HashMap, ops::Add};
 
-use prost_types::Timestamp;
-
-pub use crate::googleapis::google::firestore::v1::Value;
-use crate::{
-    googleapis::google::{
-        firestore::v1::{value::ValueType, ArrayValue, MapValue},
-        r#type::LatLng,
-    },
-    timestamp_nanos,
+pub use crate::google::firestore::v1::Value;
+use crate::google::{
+    firestore::v1::{value::ValueType, ArrayValue, MapValue},
+    protobuf::Timestamp,
+    r#type::LatLng,
 };
 
 impl Value {
@@ -150,9 +146,7 @@ impl Ord for Value {
             (ValueType::DoubleValue(a), ValueType::IntegerValue(b)) => a.total_cmp(&(*b as f64)),
             (ValueType::IntegerValue(a), ValueType::DoubleValue(b)) => (*a as f64).total_cmp(b),
             (ValueType::IntegerValue(a), ValueType::IntegerValue(b)) => a.cmp(b),
-            (ValueType::TimestampValue(a), ValueType::TimestampValue(b)) => {
-                timestamp_nanos(a).cmp(&timestamp_nanos(b))
-            }
+            (ValueType::TimestampValue(a), ValueType::TimestampValue(b)) => a.cmp(b),
             (ValueType::StringValue(a), ValueType::StringValue(b)) => a.cmp(b),
             (ValueType::BytesValue(a), ValueType::BytesValue(b)) => a.cmp(b),
             (ValueType::ReferenceValue(a), ValueType::ReferenceValue(b)) => {

@@ -4,12 +4,12 @@ use std::{
     sync::{Arc, Weak},
 };
 
-use googleapis::{
-    google::firestore::v1::{
+use googleapis::google::{
+    firestore::v1::{
         document_transform::field_transform::{ServerValue, TransformType},
         *,
     },
-    timestamp, Timestamp,
+    protobuf::Timestamp,
 };
 use itertools::Itertools;
 use string_cache::DefaultAtom;
@@ -179,7 +179,7 @@ impl Database {
         transaction: &TransactionId,
     ) -> Result<(Timestamp, Vec<WriteResult>)> {
         let txn = &self.transactions.get(transaction).await?;
-        let time = timestamp();
+        let time = Timestamp::now();
 
         let mut write_results = vec![];
         let mut updates = HashMap::new();

@@ -168,7 +168,7 @@ impl Query {
             start_at,
             end_at,
             offset: offset as usize,
-            limit: limit.map(|v| v as usize),
+            limit: limit.map(|v| v.value as usize),
             consistency,
             collection_cache: Default::default(),
         })

@@ -6,15 +6,15 @@ use std::{
     },
 };
 
-use googleapis::{
-    google::firestore::v1::{
+use googleapis::google::{
+    firestore::v1::{
         listen_request,
         listen_response::ResponseType,
         target::{self, query_target},
         target_change::TargetChangeType,
         DocumentChange, DocumentDelete, ListenRequest, ListenResponse, Target, TargetChange,
     },
-    timestamp, timestamp_nanos, Timestamp,
+    protobuf::Timestamp,
 };
 use itertools::Itertools;
 use string_cache::DefaultAtom;
@@ -209,7 +209,14 @@ impl Listener {
             return Ok(());
         };
 
-        let send_if_newer_than = resume_type.map(Timestamp::try_from).transpose()?;
+        let send_if_newer_than = resume_type
+            .map(|rt| match rt {
+                target::ResumeType::ResumeToken(token) => {
+                    Timestamp::from_token(token).map_err(Status::invalid_argument)
+                }
+                target::ResumeType::ReadTime(time) => Ok(time),
+            })
+            .transpose()?;
 
         // Response: I'm on it!
         self.send(ResponseType::TargetChange(TargetChange {
@@ -219,7 +226,7 @@ impl Listener {
         }))
         .await?;
 
-        let read_time = timestamp();
+        let read_time = Timestamp::now();
         debug!(name = &*name);
 
         // Now determine the latest version we can find...
@@ -227,9 +234,9 @@ impl Listener {
 
         // Only send if newer than the resume_token
         let send_initial = match &send_if_newer_than {
-            Some(previous_time) => !doc.as_ref().is_some_and(|v| {
-                timestamp_nanos(v.update_time.as_ref().unwrap()) <= timestamp_nanos(previous_time)
-            }),
+            Some(previous_time) => !doc
+                .as_ref()
+                .is_some_and(|v| (v.update_time.as_ref().unwrap()) <= (previous_time)),
             _ => true,
         };
 
@@ -279,7 +286,7 @@ impl Listener {
         }))
         .await?;
 
-        let read_time = timestamp();
+        let read_time = Timestamp::now();
         let mut target = QueryTarget::new(query);
         let msgs = target.reset(&database, &read_time).await?;
         self.send_all(msgs).await?;
@@ -291,20 +298,22 @@ impl Listener {
     }
 
     async fn send_complete(&self, read_time: Timestamp) -> Result<()> {
-        let resume_token = timestamp_nanos(&read_time).to_ne_bytes();
+        let resume_token = (read_time)
+            .get_token()
+            .expect("Timestamp should not be outside of common era");
         self.send_all([
             // Response: I've sent you the state of all documents now
             ResponseType::TargetChange(TargetChange {
                 target_change_type: TargetChangeType::Current as _,
                 target_ids: vec![TARGET_ID],
                 read_time: Some(read_time.clone()),
-                resume_token: resume_token.to_vec(),
+                resume_token: resume_token.clone(),
                 ..TARGET_CHANGE_DEFAULT
             }),
             // Response: Oh, by the way, everything is up to date. 🤷🏼‍♂️
             ResponseType::TargetChange(TargetChange {
                 read_time: Some(read_time),
-                resume_token: resume_token.to_vec(),
+                resume_token,
                 ..TARGET_CHANGE_DEFAULT
             }),
         ])
@@ -372,7 +381,7 @@ impl DocumentTarget {
     fn process_update(&mut self, update: &DocumentVersion) -> Result<Vec<ResponseType>> {
         debug_assert_eq!(update.name(), &self.name);
         let update_time = update.update_time().clone();
-        if timestamp_nanos(&self.last_read_time) >= timestamp_nanos(&update_time) {
+        if self.last_read_time >= update_time {
             return Ok(vec![]);
         }
         self.last_read_time = update_time.clone();
