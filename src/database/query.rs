@@ -57,7 +57,7 @@ pub struct Query {
     /// The ordering of the result set is based on the `ORDER BY` clause of the
     /// original query.
     ///
-    /// ```
+    /// ```sql
     /// SELECT * FROM k WHERE a = 1 AND b > 2 ORDER BY b ASC, __name__ ASC;
     /// ```
     ///
