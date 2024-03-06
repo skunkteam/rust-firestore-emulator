@@ -14,13 +14,13 @@ jobs:
     name: Test
     runs-on: ubuntu-latest
     steps:
-      - uses: Swatinem/rust-cache@v2
-      - name: Install Protoc
-        uses: arduino/setup-protoc@v2
       - uses: actions/checkout@v3
         with:
           submodules: "true"
       - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install Protoc
+        uses: arduino/setup-protoc@v2
       - name: Run tests
         run: cargo test --workspace
 
@@ -28,8 +28,6 @@ jobs:
     name: Rustfmt
     runs-on: ubuntu-latest
     steps:
-      - name: Install Protoc
-        uses: arduino/setup-protoc@v2
       - uses: actions/checkout@v3
       - uses: dtolnay/rust-toolchain@nightly
         with:
@@ -41,15 +39,15 @@ jobs:
     name: Clippy
     runs-on: ubuntu-latest
     steps:
-      - uses: Swatinem/rust-cache@v2
-      - name: Install Protoc
-        uses: arduino/setup-protoc@v2
       - uses: actions/checkout@v3
         with:
           submodules: "true"
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Install Protoc
+        uses: arduino/setup-protoc@v2
       - name: Linting
         run: cargo clippy --workspace -- -D warnings
 
@@ -57,13 +55,13 @@ jobs:
     name: Code coverage
     runs-on: ubuntu-latest
     steps:
-      - uses: Swatinem/rust-cache@v2
-      - name: Install Protoc
-        uses: arduino/setup-protoc@v2
       - uses: actions/checkout@v3
         with:
           submodules: "true"
       - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install Protoc
+        uses: arduino/setup-protoc@v2
       - name: Install tarpaulin
         run: cargo install cargo-tarpaulin
       - name: Generate code coverage
