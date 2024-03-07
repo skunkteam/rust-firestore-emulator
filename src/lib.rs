@@ -1,4 +1,4 @@
-use std::{net::SocketAddr, sync::Arc};
+use std::net::SocketAddr;
 
 use axum::{routing::get, Router};
 use emulator::FirestoreEmulator;
@@ -16,8 +16,8 @@ const MAX_MESSAGE_SIZE: usize = 50 * 1024 * 1024;
 
 #[tokio::main]
 pub async fn run(host_port: SocketAddr) -> color_eyre::Result<()> {
-    let emulator = Arc::new(FirestoreEmulator::new());
-    let firestore = FirestoreServer::from_arc(emulator)
+    let emulator = FirestoreEmulator::new();
+    let firestore = FirestoreServer::new(emulator)
         .accept_compressed(CompressionEncoding::Gzip)
         .send_compressed(CompressionEncoding::Gzip)
         .max_decoding_message_size(MAX_MESSAGE_SIZE);

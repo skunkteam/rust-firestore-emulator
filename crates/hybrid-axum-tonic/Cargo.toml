@@ -1,5 +1,5 @@
 [package]
-name = "hybrid_axum_tonic"
+name = "hybrid-axum-tonic"
 version = "0.1.0"
 edition = "2021"
 

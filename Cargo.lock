@@ -445,7 +445,7 @@ dependencies = [
  "console-subscriber",
  "futures",
  "googleapis",
- "hybrid_axum_tonic",
+ "hybrid-axum-tonic",
  "itertools 0.12.1",
  "string_cache",
  "tikv-jemallocator",
@@ -712,7 +712,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9a3a5bfb195931eeb336b2a7b4d761daec841b97f947d34394601737a7bba5e4"
 
 [[package]]
-name = "hybrid_axum_tonic"
+name = "hybrid-axum-tonic"
 version = "0.1.0"
 dependencies = [
  "axum",
