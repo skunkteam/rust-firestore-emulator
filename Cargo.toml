@@ -37,7 +37,7 @@ console = { version = "0.15.8", optional = true }
 console-subscriber = { version = "0.2.0", optional = true }
 futures.workspace = true
 googleapis = { path = "crates/googleapis" }
-hybrid_axum_tonic = { path = "crates/hybrid_axum_tonic" }
+hybrid-axum-tonic = { path = "crates/hybrid-axum-tonic" }
 itertools = "0.12.1"
 string_cache = "0.8.7"
 tikv-jemallocator = "0.5.4"

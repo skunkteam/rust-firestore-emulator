@@ -1,3 +1,3 @@
-# hybrid_axum_tonic
+# hybrid-axum-tonic
 
 Vendored from: https://github.com/jvdwrf/axum-tonic
