@@ -11,5 +11,5 @@ fn main() {
             &["include/google/firestore/v1/firestore.proto"],
             &["include"],
         )
-        .unwrap()
+        .unwrap();
 }

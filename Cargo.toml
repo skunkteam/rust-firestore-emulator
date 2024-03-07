@@ -17,17 +17,27 @@ tracing = [
 ]
 
 [workspace]
+members = ["crates/*"]
 
 [workspace.dependencies]
+axum = "0.6.20"
+futures = "0.3.30"
+hyper = "0.14"
+pin-project = "1.1.5"
+prost = "0.12"
+tokio = { version = "1.36.0" }
 tonic = { version = "0.11" }
+tower = "0.4.13"
 
 [dependencies]
+axum.workspace = true
 clap = { version = "4.5.1", features = ["derive", "env"] }
 color-eyre = "0.6.2"
 console = { version = "0.15.8", optional = true }
 console-subscriber = { version = "0.2.0", optional = true }
-futures = "0.3.30"
+futures.workspace = true
 googleapis = { path = "crates/googleapis" }
+hybrid_axum_tonic = { path = "crates/hybrid_axum_tonic" }
 itertools = "0.12.1"
 string_cache = "0.8.7"
 tikv-jemallocator = "0.5.4"
@@ -35,7 +45,7 @@ time = { version = "0.3.34", features = [
     "formatting",
     "macros",
 ], optional = true }
-tokio = { version = "1.36.0", features = ["macros", "rt-multi-thread"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 tokio-stream = { version = "0.1.14" }
 tonic = { workspace = true, features = ["gzip"] }
 tracing = "0.1.40"
