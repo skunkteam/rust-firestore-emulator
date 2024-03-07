@@ -7,9 +7,9 @@ doctest = false
 
 [dependencies]
 chrono = { version = "0.4.34", default-features = false, features = ["now"] }
-prost = "0.12"
+prost.workspace = true
 thiserror = "1.0.57"
-tonic = { workspace = true }
+tonic.workspace = true
 
 [build-dependencies]
 tonic-build = "0.11"
