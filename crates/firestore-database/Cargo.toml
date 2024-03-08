@@ -1,16 +1,13 @@
 [package]
 name = "firestore-database"
-version = "0.1.0"
 edition = "2021"
 
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
-
 [dependencies]
-futures.workspace = true
-googleapis.workspace = true
-itertools.workspace = true
-string_cache.workspace = true
-tokio.workspace = true
-tokio-stream.workspace = true
-tonic.workspace = true
-tracing.workspace = true
+futures = { workspace = true }
+googleapis = { workspace = true }
+itertools = { workspace = true }
+string_cache = { workspace = true }
+tokio = { workspace = true }
+tokio-stream = { workspace = true }
+tonic = { workspace = true }
+tracing = { workspace = true }

@@ -226,15 +226,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "baf1de4339761588bc0619e3cbc0120ee582ebb74b53b4efbf79117bd2da40fd"
 
 [[package]]
-name = "chrono"
-version = "0.4.34"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5bc015644b92d5890fab7489e49d21f879d5c990186827d42ec511919404f38b"
-dependencies = [
- "num-traits",
-]
-
-[[package]]
 name = "clap"
 version = "4.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -436,7 +427,7 @@ checksum = "25cbce373ec4653f1a01a31e8a5e5ec0c622dc27ff9c4e6606eefef5cbbed4a5"
 
 [[package]]
 name = "firestore-database"
-version = "0.1.0"
+version = "0.0.0"
 dependencies = [
  "futures",
  "googleapis",
@@ -613,10 +604,10 @@ checksum = "4271d37baee1b8c7e4b708028c57d816cf9d2434acb33a549475f78c181f6253"
 name = "googleapis"
 version = "0.0.0"
 dependencies = [
- "chrono",
  "itertools 0.12.1",
  "prost",
  "thiserror",
+ "time",
  "tonic 0.11.0",
  "tonic-build",
 ]
