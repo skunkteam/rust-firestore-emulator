@@ -51,6 +51,27 @@ jobs:
       - name: Linting
         run: cargo clippy --workspace -- -D warnings
 
+  compat-test:
+    name: Compatibility test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+        with:
+          submodules: "true"
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install Protoc
+        uses: arduino/setup-protoc@v2
+      - run: cargo build
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: test-suite/package-lock.json
+      - name: Run compatibility test suite
+        run: npm ci && npm run test:rust-emulator
+        working-directory: test-suite
+
   # coverage:
   #   name: Code coverage
   #   runs-on: ubuntu-latest
