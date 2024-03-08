@@ -1,5 +1,8 @@
 use std::sync::Arc;
 
+use firestore_database::{
+    event::DatabaseEvent, get_doc_name_from_write, Database, ReadConsistency,
+};
 use futures::{future::try_join_all, stream::BoxStream, StreamExt};
 use googleapis::google::{
     firestore::v1::{
@@ -16,10 +19,7 @@ use tokio_stream::wrappers::ReceiverStream;
 use tonic::{async_trait, Code, Request, Response, Result, Status};
 use tracing::{info, info_span, instrument, Instrument};
 
-use crate::{
-    database::{event::DatabaseEvent, get_doc_name_from_write, Database, ReadConsistency},
-    unimplemented, unimplemented_bool, unimplemented_collection, unimplemented_option,
-};
+use crate::{unimplemented, unimplemented_bool, unimplemented_collection, unimplemented_option};
 
 pub struct FirestoreEmulator {
     pub database: Arc<Database>,
