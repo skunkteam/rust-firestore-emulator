@@ -7,7 +7,11 @@ futures = { workspace = true }
 googleapis = { workspace = true }
 itertools = { workspace = true }
 string_cache = { workspace = true }
+thiserror = { workspace = true }
 tokio = { workspace = true }
 tokio-stream = { workspace = true }
 tonic = { workspace = true }
 tracing = { workspace = true }
+
+[dev-dependencies]
+rstest = "0.18.2"

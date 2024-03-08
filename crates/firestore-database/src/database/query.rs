@@ -7,8 +7,11 @@ use tonic::{Result, Status};
 
 use self::filter::Filter;
 use super::{
-    collection::Collection, document::StoredDocumentVersion, field_path::FieldReference, Database,
-    ReadConsistency,
+    collection::Collection,
+    document::StoredDocumentVersion,
+    field_path::FieldReference,
+    reference::{CollectionRef, DocumentRef, Ref},
+    Database, ReadConsistency,
 };
 
 mod filter;
@@ -16,7 +19,7 @@ mod filter;
 /// A Firestore query.
 #[derive(Debug)]
 pub struct Query {
-    parent: String,
+    parent: Ref,
 
     /// Optional sub-set of the fields to return.
     ///
@@ -114,7 +117,7 @@ pub struct Query {
 
 impl Query {
     pub fn from_structured(
-        parent: String,
+        parent: Ref,
         query: StructuredQuery,
         consistency: ReadConsistency,
     ) -> Result<Self> {
@@ -178,7 +181,7 @@ impl Query {
         self.order_by.iter().any(|o| !o.field.is_document_name())
     }
 
-    pub async fn once(&mut self, db: &Database) -> Result<Vec<Document>> {
+    pub async fn once(&mut self, db: &Database) -> Result<Vec<(DocumentRef, Document)>> {
         // First collect all Arc<Collection>s in a Vec to release the collection lock asap.
         let collections = self.applicable_collections(db).await;
 
@@ -230,7 +233,7 @@ impl Query {
         buffer
             .into_iter()
             .skip(self.offset)
-            .map(|version| self.project(&version))
+            .map(|version| Ok((version.name.clone(), self.project(&version)?)))
             .try_collect()
     }
 
@@ -244,29 +247,26 @@ impl Query {
             .collect_vec()
     }
 
-    fn includes_collection(&mut self, path: &DefaultAtom) -> bool {
-        if let Some(&r) = self.collection_cache.get(path) {
+    fn includes_collection(&mut self, collection: &CollectionRef) -> bool {
+        if let Some(&r) = self.collection_cache.get(&collection.collection_id) {
             return r;
         }
-        let included = match path
-            .strip_prefix(&self.parent)
-            .and_then(|path| path.strip_prefix('/'))
-        {
-            Some(path) => self.from.iter().any(|selector| {
-                if selector.all_descendants {
-                    path.starts_with(&selector.collection_id)
-                } else {
-                    path == selector.collection_id
-                }
-            }),
-            None => false,
-        };
-        self.collection_cache.insert(path.clone(), included);
+        let included = collection.strip_prefix(&self.parent).is_some_and(|path| {
+            self.from.iter().any(|selector| {
+                path == selector.collection_id
+                    || selector.all_descendants
+                        && path
+                            .strip_prefix(&selector.collection_id)
+                            .is_some_and(|rest| rest.starts_with('/'))
+            })
+        });
+        self.collection_cache
+            .insert(collection.collection_id.clone(), included);
         included
     }
 
     pub fn includes_document(&mut self, doc: &StoredDocumentVersion) -> Result<bool> {
-        if !self.includes_collection(&doc.collection_name) {
+        if !self.includes_collection(&doc.name.collection_ref) {
             return Ok(false);
         }
         if let Some(filter) = &self.filter {

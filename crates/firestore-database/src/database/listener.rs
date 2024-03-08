@@ -17,18 +17,19 @@ use googleapis::google::{
     protobuf::Timestamp,
 };
 use itertools::Itertools;
-use string_cache::DefaultAtom;
 use tokio::sync::{broadcast::error::RecvError, mpsc};
 use tokio_stream::{wrappers::ReceiverStream, StreamExt};
 use tonic::{Result, Status};
 use tracing::{debug, error, instrument};
 
 use super::{
-    document::DocumentVersion, event::DatabaseEvent, query::Query, target_change, Database,
+    document::DocumentVersion, event::DatabaseEvent, query::Query, reference::DocumentRef,
+    target_change, Database,
 };
 use crate::{
-    database::ReadConsistency, required_option, unimplemented, unimplemented_bool,
-    unimplemented_collection, unimplemented_option,
+    database::{reference::Ref, ReadConsistency},
+    required_option, unimplemented, unimplemented_bool, unimplemented_collection,
+    unimplemented_option,
 };
 
 const TARGET_ID: i32 = 1;
@@ -148,6 +149,7 @@ impl Listener {
                     target::TargetType::Query(target::QueryTarget { parent, query_type }) => {
                         required_option!(query_type);
                         let query_target::QueryType::StructuredQuery(query) = query_type;
+                        let parent: Ref = parent.parse()?;
                         let query =
                             Query::from_structured(parent, query, ReadConsistency::Default)?;
                         self.set_query(query).await?;
@@ -156,7 +158,7 @@ impl Listener {
                         let Ok(document) = documents.into_iter().exactly_one() else {
                             unimplemented!("multiple documents inside a single listen stream")
                         };
-                        self.set_document(document.into(), resume_type).await?;
+                        self.set_document(document.parse()?, resume_type).await?;
                     }
                 };
             }
@@ -193,10 +195,10 @@ impl Listener {
         self.send_complete(update_time).await
     }
 
-    #[instrument(skip_all, fields(document = &*name), err)]
+    #[instrument(skip_all, fields(document = %name), err)]
     async fn set_document(
         &mut self,
-        name: DefaultAtom,
+        name: DocumentRef,
         resume_type: Option<target::ResumeType>,
     ) -> Result<()> {
         // We rely on the fact that this function will complete before any other events are
@@ -227,7 +229,7 @@ impl Listener {
         .await?;
 
         let read_time = Timestamp::now();
-        debug!(name = &*name);
+        debug!(name = %name);
 
         // Now determine the latest version we can find...
         let doc = database.get_doc(&name, &ReadConsistency::Default).await?;
@@ -365,7 +367,7 @@ impl ListenerTarget {
 }
 
 struct DocumentTarget {
-    name: DefaultAtom,
+    name: DocumentRef,
     last_read_time: Timestamp,
 }
 
@@ -405,7 +407,7 @@ impl DocumentTarget {
 struct QueryTarget {
     query: Query,
     reset_on_update: bool,
-    doctargets_by_name: HashMap<DefaultAtom, DocumentTarget>,
+    doctargets_by_name: HashMap<DocumentRef, DocumentTarget>,
 }
 impl QueryTarget {
     fn new(query: Query) -> Self {
@@ -461,8 +463,7 @@ impl QueryTarget {
         })];
 
         self.doctargets_by_name.clear();
-        for doc in self.query.once(database).await? {
-            let name = DefaultAtom::from(&*doc.name);
+        for (name, doc) in self.query.once(database).await? {
             self.doctargets_by_name.insert(
                 name.clone(),
                 DocumentTarget {

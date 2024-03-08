@@ -1,11 +1,10 @@
 use std::collections::HashMap;
 
 use googleapis::google::protobuf::Timestamp;
-use string_cache::DefaultAtom;
 
-use super::document::DocumentVersion;
+use super::{document::DocumentVersion, reference::DocumentRef};
 
 pub struct DatabaseEvent {
     pub update_time: Timestamp,
-    pub updates:     HashMap<DefaultAtom, DocumentVersion>,
+    pub updates:     HashMap<DocumentRef, DocumentVersion>,
 }
