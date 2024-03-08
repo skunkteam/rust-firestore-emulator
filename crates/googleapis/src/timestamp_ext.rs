@@ -106,33 +106,46 @@ mod tests {
     use std::array;
 
     use itertools::Itertools;
+    use rstest::rstest;
     use time::macros::datetime;
-    use tonic::Status;
 
     use super::*;
 
     const TOKEN_LEN: usize = 16;
 
+    #[rstest]
+    #[case(vec![])]
+    // Using 127 to get a high number because the token is signed (0 would mean 1970-01-01,
+    // 255 results in a -1_i128 which would mean end of 1769-12-31)
+    #[case(vec![127; TOKEN_LEN])]
+    fn invalid_tokens(#[case] token: Vec<u8>) {
+        assert!(matches!(
+            Timestamp::from_token(token),
+            Err(InvalidTokenError)
+        ));
+    }
+
+    #[rstest]
+    #[case(Timestamp { seconds: i64::MAX, nanos: 0 })]
+    #[case(Timestamp { seconds: i64::MIN, nanos: 0 })]
+    fn out_of_range_timestamps(#[case] timestamp: Timestamp) {
+        println!("{:?}", OffsetDateTime::try_from(&timestamp));
+        assert!(matches!(
+            OffsetDateTime::try_from(&timestamp),
+            Err(TimestampOutOfRangeError(_))
+        ));
+    }
+
     #[test]
     fn tonic_status_compat() {
-        let invalid_tokens = [
-            Timestamp::from_token(vec![]).unwrap_err(), // Invalid length
-            // Using 127 to get a high number because the token is signed (0 would mean 1970-01-01,
-            // 255 results in a -1_i128 which would mean end of 1769-12-31)
-            Timestamp::from_token(vec![127; TOKEN_LEN]).unwrap_err(), // Out of range contents
-        ];
-        for invalid_token in invalid_tokens {
-            Status::invalid_argument(invalid_token.clone());
-            assert_eq!(invalid_token.to_string(), "Invalid token");
-        }
+        assert_eq!(String::from(InvalidTokenError), "Invalid token");
 
         let out_of_range = OffsetDateTime::try_from(&Timestamp {
             seconds: i64::MAX,
             nanos:   0,
         })
         .unwrap_err();
-        Status::invalid_argument(out_of_range.clone());
-        assert_eq!(out_of_range.to_string(), "Timestamp out of range");
+        assert_eq!(String::from(out_of_range), "Timestamp out of range");
     }
 
     #[test]

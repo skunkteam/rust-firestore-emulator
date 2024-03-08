@@ -13,6 +13,7 @@ use tracing::instrument;
 
 use super::{
     document::{OwnedDocumentContentsReadGuard, OwnedDocumentContentsWriteGuard},
+    reference::DocumentRef,
     Database,
 };
 
@@ -97,14 +98,14 @@ impl Transaction {
     #[instrument(skip_all)]
     pub async fn read_doc(
         &self,
-        name: &DefaultAtom,
+        name: &DocumentRef,
     ) -> Result<Arc<OwnedDocumentContentsReadGuard>> {
         let mut guards = self.guards.lock().await;
-        if let Some(guard) = guards.get(name) {
+        if let Some(guard) = guards.get(&name.document_id) {
             return Ok(Arc::clone(guard));
         }
         let guard = self.new_read_guard(name).await?.into();
-        guards.insert(name.clone(), Arc::clone(&guard));
+        guards.insert(name.document_id.clone(), Arc::clone(&guard));
         Ok(guard)
     }
 
@@ -114,10 +115,10 @@ impl Transaction {
 
     pub async fn take_write_guard(
         &self,
-        name: &DefaultAtom,
+        name: &DocumentRef,
     ) -> Result<OwnedDocumentContentsWriteGuard> {
         let mut guards = self.guards.lock().await;
-        let read_guard = match guards.remove(name) {
+        let read_guard = match guards.remove(&name.document_id) {
             Some(guard) => Arc::into_inner(guard)
                 .ok_or_else(|| Status::aborted("concurrent reads during txn commit in same txn"))?,
             None => self.new_read_guard(name).await?,
@@ -125,7 +126,7 @@ impl Transaction {
         read_guard.upgrade().await
     }
 
-    async fn new_read_guard(&self, name: &DefaultAtom) -> Result<OwnedDocumentContentsReadGuard> {
+    async fn new_read_guard(&self, name: &DocumentRef) -> Result<OwnedDocumentContentsReadGuard> {
         self.database
             .upgrade()
             .ok_or_else(|| Status::aborted("database was dropped"))?
