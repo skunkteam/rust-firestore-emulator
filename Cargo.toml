@@ -22,13 +22,14 @@ members = ["crates/*"]
 [workspace.dependencies]
 axum = "0.6.20"
 futures = "0.3.30"
-googleapis.path = "crates/googleapis"
+googleapis = { path = "crates/googleapis" }
 hyper = "0.14"
 itertools = "0.12.1"
 pin-project = "1.1.5"
 prost = "0.12"
 string_cache = "0.8.7"
 thiserror = "1.0.57"
+time = "0.3.34"
 tokio = "1.36.0"
 tokio-stream = "0.1.14"
 tonic = "0.11"
@@ -36,26 +37,23 @@ tower = "0.4.13"
 tracing = "0.1.40"
 
 [dependencies]
-axum.workspace = true
+axum = { workspace = true }
 clap = { version = "4.5.1", features = ["derive", "env"] }
 color-eyre = "0.6.2"
 console = { version = "0.15.8", optional = true }
 console-subscriber = { version = "0.2.0", optional = true }
-firestore-database.path = "crates/firestore-database"
-futures.workspace = true
-googleapis.workspace = true
-itertools.workspace = true
-hybrid-axum-tonic.path = "crates/hybrid-axum-tonic"
-string_cache.workspace = true
+firestore-database = { path = "crates/firestore-database" }
+futures = { workspace = true }
+googleapis = { workspace = true }
+itertools = { workspace = true }
+hybrid-axum-tonic = { path = "crates/hybrid-axum-tonic" }
+string_cache = { workspace = true }
 tikv-jemallocator = "0.5.4"
-time = { version = "0.3.34", features = [
-    "formatting",
-    "macros",
-], optional = true }
+time = { workspace = true, optional = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
-tokio-stream.workspace = true
+tokio-stream = { workspace = true }
 tonic = { workspace = true, features = ["gzip"] }
-tracing.workspace = true
+tracing = { workspace = true }
 tracing-subscriber = { version = "0.3.18", optional = true }
 
 [profile.release]

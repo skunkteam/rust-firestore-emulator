@@ -1,13 +1,13 @@
 use std::{fmt, sync::Mutex};
 
-use chrono::{DateTime, NaiveDateTime, TimeZone, Utc};
 use thiserror::Error;
+use time::{format_description::well_known::Iso8601, Duration, OffsetDateTime};
 
 use crate::google::protobuf::Timestamp;
 
-#[derive(Debug, Error)]
-#[error("Invalid token: {0:?}")]
-pub struct InvalidTokenError(Vec<u8>);
+#[derive(Clone, Debug, Error)]
+#[error("Invalid token")]
+pub struct InvalidTokenError;
 
 // Convenience to be able to use tonic's `Status::invalid_argument()``.
 impl From<InvalidTokenError> for String {
@@ -16,9 +16,9 @@ impl From<InvalidTokenError> for String {
     }
 }
 
-#[derive(Debug, Error)]
+#[derive(Clone, Debug, Error)]
 #[error("Timestamp out of range")]
-pub struct TimestampOutOfRangeError;
+pub struct TimestampOutOfRangeError(#[from] time::error::ComponentRange);
 
 // Convenience to be able to use tonic's `Status::invalid_argument()``.
 impl From<TimestampOutOfRangeError> for String {
@@ -37,7 +37,7 @@ impl Timestamp {
             nanos:   0,
         });
         let mut last = LAST.lock().unwrap();
-        let mut timestamp = Utc::now().into();
+        let mut timestamp = OffsetDateTime::now_utc().into();
         if timestamp <= *last {
             timestamp = Timestamp {
                 seconds: last.seconds,
@@ -49,61 +49,55 @@ impl Timestamp {
     }
 
     pub fn from_token(token: Vec<u8>) -> Result<Self, InvalidTokenError> {
-        let nanos = i64::from_ne_bytes(token.try_into().map_err(InvalidTokenError)?);
-        Ok(NaiveDateTime::from_timestamp_nanos(nanos).unwrap().into())
+        let nanos = i128::from_ne_bytes(token.try_into().map_err(|_| InvalidTokenError)?);
+        Ok(OffsetDateTime::from_unix_timestamp_nanos(nanos)
+            .map_err(|_| InvalidTokenError)?
+            .into())
     }
 
     pub fn get_token(&self) -> Result<Vec<u8>, TimestampOutOfRangeError> {
-        Ok(NaiveDateTime::try_from(self)?
-            .timestamp_nanos_opt()
-            .ok_or(TimestampOutOfRangeError)?
+        Ok(OffsetDateTime::try_from(self)?
+            .unix_timestamp_nanos()
             .to_ne_bytes()
-            .into())
+            .to_vec())
     }
 }
 
 impl fmt::Display for Timestamp {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match NaiveDateTime::try_from(self) {
-            Ok(dt) => dt.and_utc().format("%+").fmt(f),
-            Err(TimestampOutOfRangeError) => f.write_str("<Timestamp outside common era>"),
-        }
+        // TODO: Change to non allocating after: https://github.com/time-rs/time/issues/375
+        let formatted_str = OffsetDateTime::try_from(self)
+            .ok()
+            .and_then(|dt| dt.format(&Iso8601::DEFAULT).ok());
+        let formatted_str = formatted_str
+            .as_deref()
+            .unwrap_or("<Timestamp outside common era>");
+        f.write_str(formatted_str)
     }
 }
 
-impl From<&NaiveDateTime> for Timestamp {
-    fn from(dt: &NaiveDateTime) -> Self {
+impl From<&OffsetDateTime> for Timestamp {
+    fn from(dt: &OffsetDateTime) -> Self {
         Timestamp {
-            seconds: dt.timestamp(),
-            nanos:   dt.timestamp_subsec_nanos() as i32,
+            seconds: dt.unix_timestamp(),
+            nanos:   dt.nanosecond() as i32,
         }
     }
 }
 
-impl From<NaiveDateTime> for Timestamp {
-    fn from(dt: NaiveDateTime) -> Self {
+impl From<OffsetDateTime> for Timestamp {
+    fn from(dt: OffsetDateTime) -> Self {
         (&dt).into()
     }
 }
 
-impl<Tz: TimeZone> From<&DateTime<Tz>> for Timestamp {
-    fn from(dt: &DateTime<Tz>) -> Self {
-        dt.naive_utc().into()
-    }
-}
-
-impl<Tz: TimeZone> From<DateTime<Tz>> for Timestamp {
-    fn from(dt: DateTime<Tz>) -> Self {
-        (&dt).into()
-    }
-}
-
-impl TryFrom<&Timestamp> for NaiveDateTime {
+impl TryFrom<&Timestamp> for OffsetDateTime {
     type Error = TimestampOutOfRangeError;
 
     fn try_from(value: &Timestamp) -> Result<Self, Self::Error> {
-        let nanos = u32::try_from(value.nanos).map_err(|_| TimestampOutOfRangeError)?;
-        NaiveDateTime::from_timestamp_opt(value.seconds, nanos).ok_or(TimestampOutOfRangeError)
+        let date_time = OffsetDateTime::from_unix_timestamp(value.seconds)?
+            + Duration::nanoseconds(value.nanos as i64);
+        Ok(date_time)
     }
 }
 
@@ -111,24 +105,34 @@ impl TryFrom<&Timestamp> for NaiveDateTime {
 mod tests {
     use std::array;
 
-    use chrono::NaiveDate;
     use itertools::Itertools;
+    use time::macros::datetime;
     use tonic::Status;
 
     use super::*;
 
+    const TOKEN_LEN: usize = 16;
+
     #[test]
     fn tonic_status_compat() {
-        Status::invalid_argument(InvalidTokenError(vec![1, 2, 3]));
-        Status::invalid_argument(TimestampOutOfRangeError);
-        assert_eq!(
-            InvalidTokenError(vec![1, 2, 3]).to_string(),
-            "Invalid token: [1, 2, 3]"
-        );
-        assert_eq!(
-            TimestampOutOfRangeError.to_string(),
-            "Timestamp out of range"
-        );
+        let invalid_tokens = [
+            Timestamp::from_token(vec![]).unwrap_err(), // Invalid length
+            // Using 127 to get a high number because the token is signed (0 would mean 1970-01-01,
+            // 255 results in a -1_i128 which would mean end of 1769-12-31)
+            Timestamp::from_token(vec![127; TOKEN_LEN]).unwrap_err(), // Out of range contents
+        ];
+        for invalid_token in invalid_tokens {
+            Status::invalid_argument(invalid_token.clone());
+            assert_eq!(invalid_token.to_string(), "Invalid token");
+        }
+
+        let out_of_range = OffsetDateTime::try_from(&Timestamp {
+            seconds: i64::MAX,
+            nanos:   0,
+        })
+        .unwrap_err();
+        Status::invalid_argument(out_of_range.clone());
+        assert_eq!(out_of_range.to_string(), "Timestamp out of range");
     }
 
     #[test]
@@ -141,25 +145,18 @@ mod tests {
 
     #[test]
     fn to_from_token() {
-        let ndt = NaiveDate::from_ymd_opt(2001, 2, 3)
-            .unwrap()
-            .and_hms_milli_opt(4, 5, 6, 789)
-            .unwrap();
+        let ndt = datetime!(2001-02-03 04:05:06.123456789 UTC);
         let timestamp: Timestamp = ndt.into();
         let token = timestamp.get_token().unwrap();
-        assert_eq!(token.len(), 8);
+        assert_eq!(token.len(), TOKEN_LEN);
         let timestamp2 = Timestamp::from_token(token).unwrap();
         assert_eq!(timestamp, timestamp2);
     }
 
     #[test]
     fn timestamp_display() {
-        let timestamp: Timestamp = NaiveDate::from_ymd_opt(2001, 2, 3)
-            .unwrap()
-            .and_hms_milli_opt(4, 5, 6, 789)
-            .unwrap()
-            .into();
-        assert_eq!(timestamp.to_string(), "2001-02-03T04:05:06.789+00:00");
+        let timestamp: Timestamp = datetime!(2001-02-03 04:05:06.123456789 UTC).into();
+        assert_eq!(timestamp.to_string(), "2001-02-03T04:05:06.123456789Z");
 
         let timestamp = Timestamp {
             seconds: i64::MAX,
