@@ -7,11 +7,13 @@ default: test lint
 clean:
     cargo clean
 
-test target="workspace": && (_doctest target)
+# Test the given crate or the entire workspace if target is omitted
+test target="workspace": && (doctest target)
     echo Running tests for target '"{{ target }}"'
     cargo nextest run {{ if target == "workspace" { "--workspace" } else { "--package " + target } }}
 
-_doctest target: (
+[private]
+doctest target: (
     exec if target == "workspace" {
         "cargo test --doc --workspace --exclude googleapis"
     } else if target == "googleapis" {
@@ -25,13 +27,15 @@ _doctest target: (
 exec +cmd:
     {{ cmd }}
 
+# Test the given crate with coverage info or the entire workspace if target is omitted
 cov target="workspace":
     cargo tarpaulin --out lcov --out html {{ if target == "workspace" { "--workspace" } else { "--packages " + target } }}
 
+# Lint the given crate or the entire workspace if target is omitted
 lint target="workspace":
     echo Running lint for target '"{{ target }}"'
     cargo clippy {{ if target == "workspace" { "--workspace" } else { "--package " + target } }}
 
-# Watch code and execute just command on change
-watch +cmd="lint":
+# Watch code and execute just command on change, e.g. `just watch test googleapis`
+watch *cmd:
     cargo watch --ignore '*.{info,html,profraw}' --clear --shell 'just {{ cmd }}'
