@@ -7,7 +7,6 @@ use hybrid_axum_tonic::{NestTonic, RestGrpcService};
 use tonic::codec::CompressionEncoding;
 use tracing::info;
 
-mod database;
 mod emulator;
 #[macro_use]
 mod utils;
