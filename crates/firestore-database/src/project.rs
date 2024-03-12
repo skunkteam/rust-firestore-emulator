@@ -1,12 +1,18 @@
 use std::{
     collections::HashMap,
+    fmt::Debug,
     ops::Deref,
     sync::{Arc, OnceLock},
 };
 
+use googleapis::google::firestore::v1::{ListenRequest, ListenResponse};
 use tokio::sync::RwLock;
+use tokio_stream::Stream;
 
-use crate::{reference::RootRef, utils::RwLockHashMapExt, FirestoreDatabase};
+use crate::{
+    error::Result, listener::Listener, reference::RootRef, utils::RwLockHashMapExt,
+    FirestoreDatabase,
+};
 
 pub struct FirestoreProject {
     databases: RwLock<HashMap<RootRef, Arc<FirestoreDatabase>>>,
@@ -40,5 +46,12 @@ impl FirestoreProject {
             .values()
             .map(|db| db.name.to_string())
             .collect()
+    }
+
+    pub fn listen(
+        &'static self,
+        request_stream: impl Stream<Item = ListenRequest> + Send + Unpin + 'static,
+    ) -> impl Stream<Item = Result<ListenResponse>> {
+        Listener::start(self, request_stream)
     }
 }

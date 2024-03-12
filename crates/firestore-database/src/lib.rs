@@ -4,6 +4,7 @@ pub use project::FirestoreProject;
 
 mod database;
 mod error;
+mod listener;
 mod project;
 
 #[macro_use]

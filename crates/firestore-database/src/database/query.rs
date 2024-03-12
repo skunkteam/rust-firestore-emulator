@@ -18,7 +18,7 @@ mod filter;
 
 /// A Firestore query.
 #[derive(Debug)]
-pub struct Query {
+pub(crate) struct Query {
     parent: Ref,
 
     /// Optional sub-set of the fields to return.

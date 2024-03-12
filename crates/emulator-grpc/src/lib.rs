@@ -1,10 +1,12 @@
+use std::sync::Arc;
+
 use firestore_database::{
     event::DatabaseEvent,
     get_doc_name_from_write,
     reference::{DocumentRef, Ref},
     FirestoreDatabase, FirestoreProject, ReadConsistency,
 };
-use futures::{future::try_join_all, stream::BoxStream, StreamExt};
+use futures::{future::try_join_all, stream::BoxStream, TryStreamExt};
 use googleapis::google::{
     firestore::v1::{
         firestore_server::FirestoreServer,
@@ -16,7 +18,7 @@ use googleapis::google::{
 };
 use itertools::Itertools;
 use tokio::sync::mpsc;
-use tokio_stream::wrappers::ReceiverStream;
+use tokio_stream::{wrappers::ReceiverStream, StreamExt};
 use tonic::{async_trait, codec::CompressionEncoding, Code, Request, Response, Result, Status};
 use tracing::{info, info_span, instrument, Instrument};
 
@@ -156,7 +158,7 @@ impl firestore_server::Firestore for FirestoreEmulator {
         let database = self.project.database(&database.parse()?).await;
 
         let (commit_time, write_results) = if transaction.is_empty() {
-            perform_writes(database.as_ref(), writes).await?
+            perform_writes(&database, writes).await?
         } else {
             let txn_id = transaction.try_into()?;
             info!(?txn_id);
@@ -344,7 +346,7 @@ impl firestore_server::Firestore for FirestoreEmulator {
             })
         });
 
-        Ok(Response::new(stream.boxed()))
+        Ok(Response::new(Box::pin(stream)))
     }
 
     /// Server streaming response type for the RunAggregationQuery method.
@@ -396,23 +398,20 @@ impl firestore_server::Firestore for FirestoreEmulator {
     }
 
     /// Server streaming response type for the Listen method.
-    type ListenStream = ReceiverStream<Result<ListenResponse>>;
+    type ListenStream = BoxStream<'static, Result<ListenResponse>>;
 
     /// Listens to changes. This method is only available via gRPC or WebChannel
     /// (not REST).
     #[instrument(skip_all, err)]
     async fn listen(
         &self,
-        _request: Request<tonic::Streaming<ListenRequest>>,
+        request: Request<tonic::Streaming<ListenRequest>>,
     ) -> Result<Response<Self::ListenStream>> {
-        Err(Status::unimplemented("listening is disabled currently"))
-        // TODO: refactor to be able to use database properly
-        // Ok(Response::new(
-        //     self.project
-        //         .database(&"projects/whatever/databases/(default)".parse()?)
-        //         .await
-        //         .listen(request.into_inner()),
-        // ))
+        let stream = self
+            .project
+            .listen(request.into_inner().filter_map(Result::ok))
+            .map_err(Into::into);
+        Ok(Response::new(Box::pin(stream)))
     }
 
     /// Lists all the collection IDs underneath a document.
@@ -502,6 +501,7 @@ impl firestore_server::Firestore for FirestoreEmulator {
             .multiunzip();
 
         database.send_event(DatabaseEvent {
+            database:    Arc::downgrade(&database),
             update_time: time.clone(),
             updates:     updates.into_iter().flatten().collect(),
         });
@@ -514,7 +514,7 @@ impl firestore_server::Firestore for FirestoreEmulator {
 }
 
 async fn perform_writes(
-    database: &FirestoreDatabase,
+    database: &Arc<FirestoreDatabase>,
     writes: Vec<Write>,
 ) -> Result<(Timestamp, Vec<WriteResult>)> {
     let time: Timestamp = Timestamp::now();
@@ -530,6 +530,7 @@ async fn perform_writes(
         .into_iter()
         .unzip();
     database.send_event(DatabaseEvent {
+        database:    Arc::downgrade(database),
         update_time: time.clone(),
         updates:     updates.into_iter().map(|u| (u.name().clone(), u)).collect(),
     });

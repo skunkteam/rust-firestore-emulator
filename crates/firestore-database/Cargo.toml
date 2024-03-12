@@ -13,7 +13,7 @@ serde_with = { workspace = true }
 string_cache = "0.8.7"
 thiserror = { workspace = true }
 tokio = { workspace = true }
-tokio-stream = { workspace = true }
+tokio-stream = { workspace = true, features = ["sync"] }
 tonic = { workspace = true }
 tracing = { workspace = true }
 

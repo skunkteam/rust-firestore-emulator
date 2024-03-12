@@ -1,11 +1,9 @@
 use std::{
     collections::{hash_map::Entry, HashMap, HashSet},
-    marker::{Send, Unpin},
     ops::Deref,
     sync::{Arc, Weak},
 };
 
-use futures::{join, Stream};
 use googleapis::google::{
     firestore::v1::{
         document_transform::field_transform::{ServerValue, TransformType},
@@ -15,11 +13,13 @@ use googleapis::google::{
 };
 use itertools::Itertools;
 use string_cache::DefaultAtom;
-use tokio::sync::{
-    broadcast::{self, Receiver},
-    RwLock,
+use tokio::{
+    join,
+    sync::{
+        broadcast::{self, Receiver},
+        RwLock,
+    },
 };
-use tokio_stream::once;
 use tracing::{info, instrument, Span};
 
 use self::{
@@ -37,12 +37,10 @@ use crate::{
 };
 
 mod collection;
-mod document;
+pub(crate) mod document;
 pub mod event;
 mod field_path;
-// TODO: fix listeners
-// mod listener;
-mod query;
+pub(crate) mod query;
 pub mod reference;
 mod transaction;
 
@@ -236,7 +234,7 @@ impl FirestoreDatabase {
 
     #[instrument(skip_all, err)]
     pub async fn commit(
-        &self,
+        self: &Arc<Self>,
         writes: Vec<Write>,
         transaction: &TransactionId,
     ) -> Result<(Timestamp, Vec<WriteResult>)> {
@@ -268,6 +266,7 @@ impl FirestoreDatabase {
         self.transactions.stop(transaction).await?;
 
         self.send_event(DatabaseEvent {
+            database: Arc::downgrade(self),
             update_time: time.clone(),
             updates,
         });
@@ -353,16 +352,6 @@ impl FirestoreDatabase {
     pub async fn rollback(&self, transaction: &TransactionId) -> Result<()> {
         self.transactions.stop(transaction).await?;
         Ok(())
-    }
-
-    pub fn listen(
-        self: &Arc<FirestoreDatabase>,
-        _request_stream: impl tokio_stream::Stream<Item = ListenRequest> + Unpin + Send,
-    ) -> impl Stream<Item = Result<ListenResponse>> {
-        once(Err(GenericDatabaseError::not_implemented(
-            "listen streams are not implemented yet",
-        )))
-        // Listener::start(Arc::downgrade(self), request_stream)
     }
 
     pub fn send_event(&self, event: DatabaseEvent) {
