@@ -106,8 +106,7 @@ impl FirestoreDatabase {
         )
     }
 
-    #[instrument(skip_all, err)]
-    pub async fn get_doc_meta(&self, name: &DocumentRef) -> Result<Arc<DocumentMeta>> {
+    pub(crate) async fn get_doc_meta(&self, name: &DocumentRef) -> Result<Arc<DocumentMeta>> {
         let meta = self
             .get_collection(&name.collection_ref)
             .await
@@ -116,7 +115,6 @@ impl FirestoreDatabase {
         Ok(meta)
     }
 
-    #[instrument(skip_all, err)]
     pub async fn get_doc_meta_mut_no_txn(
         &self,
         name: &DocumentRef,
@@ -129,8 +127,7 @@ impl FirestoreDatabase {
             .await
     }
 
-    #[instrument(skip_all, err)]
-    pub async fn get_txn_for_consistency(
+    pub(crate) async fn get_txn_for_consistency(
         &self,
         consistency: &ReadConsistency,
     ) -> Result<Option<Arc<Transaction>>> {
@@ -141,7 +138,6 @@ impl FirestoreDatabase {
         }
     }
 
-    #[instrument(skip_all, err)]
     pub async fn get_txn(
         &self,
         id: &TransactionId,
@@ -339,18 +335,15 @@ impl FirestoreDatabase {
         ))
     }
 
-    #[instrument(skip_all, err)]
     pub async fn new_txn(&self) -> Result<TransactionId> {
         Ok(self.transactions.start().await.id)
     }
 
-    #[instrument(skip_all, err)]
     pub async fn new_txn_with_id(&self, id: TransactionId) -> Result<()> {
         self.transactions.start_with_id(id).await?;
         Ok(())
     }
 
-    #[instrument(skip_all, err)]
     pub async fn rollback(&self, transaction: &TransactionId) -> Result<()> {
         self.transactions.stop(transaction).await?;
         Ok(())
