@@ -1,9 +1,9 @@
 use std::{borrow::Cow, collections::HashMap, convert::Infallible, mem::take, ops::Deref};
 
 use googleapis::google::firestore::v1::*;
-use tonic::{Result, Status};
 
 use super::document::StoredDocumentVersion;
+use crate::{error::Result, GenericDatabaseError};
 
 /// The virtual field-name that represents the document-name.
 pub const DOC_NAME: &str = "__name__";
@@ -32,7 +32,7 @@ impl FieldReference {
 }
 
 impl TryFrom<&structured_query::FieldReference> for FieldReference {
-    type Error = Status;
+    type Error = GenericDatabaseError;
 
     fn try_from(value: &structured_query::FieldReference) -> Result<Self, Self::Error> {
         value.field_path.deref().try_into()
@@ -40,7 +40,7 @@ impl TryFrom<&structured_query::FieldReference> for FieldReference {
 }
 
 impl TryFrom<&str> for FieldReference {
-    type Error = Status;
+    type Error = GenericDatabaseError;
 
     fn try_from(path: &str) -> Result<Self, Self::Error> {
         match path {
@@ -125,11 +125,13 @@ impl FieldPath {
 }
 
 impl TryFrom<&str> for FieldPath {
-    type Error = Status;
+    type Error = GenericDatabaseError;
 
     fn try_from(path: &str) -> Result<Self, Self::Error> {
         if path.is_empty() {
-            return Err(Status::invalid_argument("invalid empty field path"));
+            return Err(GenericDatabaseError::invalid_argument(
+                "invalid empty field path",
+            ));
         }
         Ok(Self(parse_field_path(path)?))
     }
@@ -146,14 +148,14 @@ fn parse_field_path(path: &str) -> Result<Vec<String>> {
                 '`' => {
                     inside_backticks = false;
                     if !matches!(iter.next(), Some('.') | None) {
-                        return Err(Status::invalid_argument(format!(
+                        return Err(GenericDatabaseError::invalid_argument(format!(
                             "invalid field path: {path}"
                         )));
                     }
                     elements.push(take(&mut cur_element));
                 }
                 '\\' => cur_element.push(iter.next().ok_or_else(|| {
-                    Status::invalid_argument(format!("invalid field path: {path}"))
+                    GenericDatabaseError::invalid_argument(format!("invalid field path: {path}"))
                 })?),
                 ch => cur_element.push(ch),
             }

@@ -18,10 +18,10 @@ use tokio::{
     },
     time::{error::Elapsed, timeout},
 };
-use tonic::{Code, Result, Status};
 use tracing::{instrument, trace, Level};
 
 use super::{reference::DocumentRef, ReadConsistency};
+use crate::{error::Result, GenericDatabaseError};
 
 const WAIT_LOCK_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -141,16 +141,22 @@ impl DocumentContents {
 
     pub fn check_precondition(&self, condition: DocumentPrecondition) -> Result<()> {
         match condition {
-            DocumentPrecondition::Exists if !self.exists() => Err(Status::failed_precondition(
-                format!("document not found: {}", self.name),
-            )),
+            DocumentPrecondition::Exists if !self.exists() => {
+                Err(GenericDatabaseError::failed_precondition(format!(
+                    "document not found: {}",
+                    self.name
+                )))
+            }
             DocumentPrecondition::NotExists if self.exists() => {
-                Err(Status::already_exists(Code::AlreadyExists.description()))
+                Err(GenericDatabaseError::already_exists(format!(
+                    "document already exists: {}",
+                    self.name
+                )))
             }
             DocumentPrecondition::UpdateTime(time)
                 if self.last_updated().as_ref() != Some(&time) =>
             {
-                Err(Status::failed_precondition(format!(
+                Err(GenericDatabaseError::failed_precondition(format!(
                     "document has different update_time: {}",
                     self.name
                 )))
@@ -216,7 +222,7 @@ impl OwnedDocumentContentsReadGuard {
         if check_time == owned_rw_lock_write_guard.last_updated() {
             Ok(owned_rw_lock_write_guard)
         } else {
-            Err(Status::aborted("contention"))
+            Err(GenericDatabaseError::aborted("contention"))
         }
     }
 }
@@ -352,5 +358,5 @@ impl From<precondition::ConditionType> for DocumentPrecondition {
 async fn lock_timeout<F: Future>(future: F) -> Result<F::Output> {
     timeout(WAIT_LOCK_TIMEOUT, future)
         .await
-        .map_err(|_: Elapsed| Status::aborted("timeout waiting for lock on document"))
+        .map_err(|_: Elapsed| GenericDatabaseError::aborted("timeout waiting for lock on document"))
 }

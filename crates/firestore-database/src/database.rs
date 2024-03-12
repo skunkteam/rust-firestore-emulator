@@ -1,5 +1,5 @@
 use std::{
-    collections::{hash_map::Entry, HashMap},
+    collections::{hash_map::Entry, HashMap, HashSet},
     ops::Deref,
     sync::{Arc, Weak},
 };
@@ -13,12 +13,13 @@ use googleapis::google::{
 };
 use itertools::Itertools;
 use string_cache::DefaultAtom;
-use tokio::sync::{
-    broadcast::{self, Receiver},
-    RwLock,
+use tokio::{
+    join,
+    sync::{
+        broadcast::{self, Receiver},
+        RwLock,
+    },
 };
-use tokio_stream::wrappers::ReceiverStream;
-use tonic::{Result, Status};
 use tracing::{info, instrument, Span};
 
 use self::{
@@ -26,45 +27,49 @@ use self::{
     document::{DocumentContents, DocumentMeta, DocumentVersion, OwnedDocumentContentsWriteGuard},
     event::DatabaseEvent,
     field_path::FieldPath,
-    listener::Listener,
     query::Query,
     reference::{CollectionRef, DocumentRef, Ref, RootRef},
     transaction::{RunningTransactions, Transaction, TransactionId},
 };
 use crate::{
-    unimplemented, unimplemented_collection, unimplemented_option, utils::RwLockHashMapExt,
+    error::Result, unimplemented, unimplemented_collection, unimplemented_option,
+    utils::RwLockHashMapExt, GenericDatabaseError,
 };
 
 mod collection;
-mod document;
+pub(crate) mod document;
 pub mod event;
 mod field_path;
-mod listener;
-mod query;
+pub(crate) mod query;
 pub mod reference;
 mod transaction;
 
 const MAX_EVENT_BACKLOG: usize = 1024;
 
-pub struct Database {
+pub struct FirestoreDatabase {
     pub name: RootRef,
     collections: RwLock<HashMap<DefaultAtom, Arc<Collection>>>,
     transactions: RunningTransactions,
     events: broadcast::Sender<Arc<DatabaseEvent>>,
 }
 
-impl Database {
+impl FirestoreDatabase {
     pub fn new(name: RootRef) -> Arc<Self> {
-        Arc::new_cyclic(|database| Database {
+        Arc::new_cyclic(|database| FirestoreDatabase {
             name,
             collections: Default::default(),
             transactions: RunningTransactions::new(Weak::clone(database)),
             events: broadcast::channel(MAX_EVENT_BACKLOG).0,
         })
     }
-}
 
-impl Database {
+    pub async fn clear(&self) {
+        join!(
+            async { self.collections.write().await.clear() },
+            self.transactions.clear(),
+        );
+    }
+
     #[instrument(skip_all, err, fields(in_txn = consistency.is_transaction(), found))]
     pub async fn get_doc(
         &self,
@@ -137,31 +142,81 @@ impl Database {
     }
 
     #[instrument(skip_all, err)]
-    pub async fn get_txn(&self, id: &TransactionId) -> Result<Arc<Transaction>, Status> {
+    pub async fn get_txn(
+        &self,
+        id: &TransactionId,
+    ) -> Result<Arc<Transaction>, GenericDatabaseError> {
         self.transactions.get(id).await
     }
 
+    /// Get all the (deeply nested) collections that reside under the given parent.
     #[instrument(skip_all)]
-    pub async fn get_collection_ids(&self, parent_doc: &DocumentRef) -> Result<Vec<DefaultAtom>> {
-        // Get all collections asap in order to keep the read lock time minimal.
-        let all_collections = self
-            .collections
+    pub async fn get_collection_ids_deep(&self, parent: &Ref) -> Result<Vec<String>> {
+        // Cannot use `filter_map` because of the `await`.
+        let mut result = vec![];
+        for col in self.get_all_collections().await {
+            let Some(path) = col.name.strip_prefix(parent) else {
+                continue;
+            };
+            if col.has_doc().await? {
+                result.push(path.to_string());
+            }
+        }
+        Ok(result)
+    }
+
+    /// Get all the collections that reside directly under the given parent. This means that:
+    /// - the IDs will not contain a `/`
+    /// - the result will be empty if `parent` is a [`Ref::Collection`].
+    #[instrument(skip_all)]
+    pub async fn get_collection_ids(&self, parent: &Ref) -> Result<HashSet<String>> {
+        // Cannot use `filter_map` because of the `await`.
+        let mut result = HashSet::new();
+        for col in self.get_all_collections().await {
+            let Some(path) = col.name.strip_prefix(parent) else {
+                continue;
+            };
+            let id = path.split_once('/').unwrap_or((path, "")).0;
+            if !result.contains(id) && col.has_doc().await? {
+                result.insert(id.to_string());
+            }
+        }
+        Ok(result)
+    }
+
+    /// Get all the document IDs that reside directly under the given parent. This differs from
+    /// [`Collection::docs`] in that this also includes empty documents with nested collections.
+    /// This means that:
+    /// - the IDs will not contain a `/`
+    /// - IDs may point to documents that do not exist.
+    #[instrument(skip_all)]
+    pub async fn get_document_ids(&self, parent: &CollectionRef) -> Result<HashSet<String>> {
+        // Cannot use `filter_map` because of the `await`.
+        let mut result = HashSet::new();
+        for doc in self.get_collection(parent).await.docs().await {
+            result.insert(doc.name.document_id.to_string());
+        }
+        for col in self.get_all_collections().await {
+            let Some(path) = col.name.strip_collection_prefix(parent) else {
+                continue;
+            };
+            let id = path.split_once('/').unwrap_or((path, "")).0;
+            if !result.contains(id) && col.has_doc().await? {
+                result.insert(id.to_string());
+            }
+        }
+        Ok(result)
+    }
+
+    /// Get all collections asap collected into a [`Vec`] in order to keep the read lock time
+    /// minimal.
+    async fn get_all_collections(&self) -> Vec<Arc<Collection>> {
+        self.collections
             .read()
             .await
             .values()
             .cloned()
-            .collect_vec();
-        // Cannot use `filter_map` because of the `await`.
-        let mut result = vec![];
-        for col in all_collections {
-            let Some(path) = col.name.strip_document_prefix(parent_doc) else {
-                continue;
-            };
-            if col.has_doc().await? {
-                result.push(path.into());
-            }
-        }
-        Ok(result)
+            .collect_vec()
     }
 
     #[instrument(skip_all, err)]
@@ -179,7 +234,7 @@ impl Database {
 
     #[instrument(skip_all, err)]
     pub async fn commit(
-        &self,
+        self: &Arc<Self>,
         writes: Vec<Write>,
         transaction: &TransactionId,
     ) -> Result<(Timestamp, Vec<WriteResult>)> {
@@ -211,6 +266,7 @@ impl Database {
         self.transactions.stop(transaction).await?;
 
         self.send_event(DatabaseEvent {
+            database: Arc::downgrade(self),
             update_time: time.clone(),
             updates,
         });
@@ -232,7 +288,9 @@ impl Database {
             operation,
         } = write;
 
-        let operation = operation.ok_or(Status::unimplemented("missing operation in write"))?;
+        let operation = operation.ok_or(GenericDatabaseError::not_implemented(
+            "missing operation in write",
+        ))?;
         let condition = current_document
             .and_then(|cd| cd.condition_type)
             .map(Into::into);
@@ -254,7 +312,9 @@ impl Database {
                         &mut fields,
                         tf.field_path,
                         tf.transform_type.ok_or_else(|| {
-                            Status::invalid_argument("empty transform_type in field_transform")
+                            GenericDatabaseError::invalid_argument(
+                                "empty transform_type in field_transform",
+                            )
                         })?,
                         &commit_time,
                     )?);
@@ -294,19 +354,6 @@ impl Database {
         Ok(())
     }
 
-    #[instrument(skip_all)]
-    pub async fn clear(&self) {
-        self.transactions.clear().await;
-        self.collections.write().await.clear();
-    }
-
-    pub fn listen(
-        self: &Arc<Database>,
-        request_stream: tonic::Streaming<ListenRequest>,
-    ) -> ReceiverStream<Result<ListenResponse>> {
-        Listener::start(Arc::downgrade(self), request_stream)
-    }
-
     pub fn send_event(&self, event: DatabaseEvent) {
         // A send operation can only fail if there are no active receivers,
         // which is ok by me.
@@ -322,7 +369,7 @@ fn apply_updates(
     contents: &mut DocumentContents,
     mask: DocumentMask,
     updated_values: &HashMap<String, Value>,
-) -> Result<HashMap<String, Value>, Status> {
+) -> Result<HashMap<String, Value>, GenericDatabaseError> {
     let mut fields = contents
         .current_version()
         .map(|v| v.fields.clone())
@@ -348,9 +395,9 @@ fn apply_transform(
     let field_path: FieldPath = path.deref().try_into()?;
     let result = match transform {
         TransformType::SetToServerValue(code) => {
-            match ServerValue::try_from(code)
-                .map_err(|_| Status::invalid_argument(format!("invalid server_value: {code}")))?
-            {
+            match ServerValue::try_from(code).map_err(|_| {
+                GenericDatabaseError::invalid_argument(format!("invalid server_value: {code}"))
+            })? {
                 ServerValue::RequestTime => {
                     let new_value = Value::timestamp(commit_time.clone());
                     field_path.set_value(fields, new_value.clone());
@@ -400,14 +447,16 @@ pub fn get_doc_name_from_write(write: &Write) -> Result<DocumentRef> {
     let operation = write
         .operation
         .as_ref()
-        .ok_or(Status::unimplemented("missing operation in write"))?;
+        .ok_or(GenericDatabaseError::not_implemented(
+            "missing operation in write",
+        ))?;
     use write::Operation::*;
     let name: &str = match operation {
         Update(doc) => &doc.name,
         Delete(name) => name,
         Transform(trans) => &trans.document,
     };
-    Ok(name.parse()?)
+    name.parse()
 }
 
 #[derive(Clone, Debug)]
@@ -430,7 +479,7 @@ impl ReadConsistency {
 macro_rules! impl_try_from_consistency_selector {
     ($lib:ident) => {
         impl TryFrom<Option<$lib::ConsistencySelector>> for ReadConsistency {
-            type Error = Status;
+            type Error = GenericDatabaseError;
 
             fn try_from(value: Option<$lib::ConsistencySelector>) -> Result<Self, Self::Error> {
                 let result = match value {
@@ -443,7 +492,7 @@ macro_rules! impl_try_from_consistency_selector {
                     }
                     #[allow(unreachable_patterns)]
                     _ => {
-                        return Err(Status::internal(concat!(
+                        return Err(GenericDatabaseError::internal(concat!(
                             stringify!($lib),
                             "::ConsistencySelector::NewTransaction should be handled by caller"
                         )));

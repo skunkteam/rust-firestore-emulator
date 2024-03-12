@@ -8,22 +8,22 @@ use std::{
 
 use string_cache::DefaultAtom;
 use tokio::sync::{Mutex, RwLock};
-use tonic::{Result, Status};
 use tracing::instrument;
 
 use super::{
     document::{OwnedDocumentContentsReadGuard, OwnedDocumentContentsWriteGuard},
     reference::DocumentRef,
-    Database,
+    FirestoreDatabase,
 };
+use crate::{error::Result, GenericDatabaseError};
 
 pub struct RunningTransactions {
-    pub(super) database: Weak<Database>,
-    pub(super) map:      RwLock<HashMap<TransactionId, Arc<Transaction>>>,
+    database: Weak<FirestoreDatabase>,
+    map:      RwLock<HashMap<TransactionId, Arc<Transaction>>>,
 }
 
 impl RunningTransactions {
-    pub fn new(database: Weak<Database>) -> Self {
+    pub fn new(database: Weak<FirestoreDatabase>) -> Self {
         Self {
             database,
             map: Default::default(),
@@ -31,12 +31,9 @@ impl RunningTransactions {
     }
 
     pub async fn get(&self, id: &TransactionId) -> Result<Arc<Transaction>> {
-        self.map
-            .read()
-            .await
-            .get(id)
-            .cloned()
-            .ok_or_else(|| Status::invalid_argument(format!("invalid transaction ID: {}", id.0)))
+        self.map.read().await.get(id).cloned().ok_or_else(|| {
+            GenericDatabaseError::invalid_argument(format!("invalid transaction ID: {}", id.0))
+        })
     }
 
     pub async fn start(&self) -> Arc<Transaction> {
@@ -55,7 +52,7 @@ impl RunningTransactions {
     pub async fn start_with_id(&self, id: TransactionId) -> Result<Arc<Transaction>> {
         let mut lock = self.map.write().await;
         match lock.entry(id) {
-            Entry::Occupied(_) => Err(Status::failed_precondition(
+            Entry::Occupied(_) => Err(GenericDatabaseError::failed_precondition(
                 "transaction_id already/still in use",
             )),
             Entry::Vacant(e) => {
@@ -67,11 +64,9 @@ impl RunningTransactions {
     }
 
     pub async fn stop(&self, id: &TransactionId) -> Result<()> {
-        self.map
-            .write()
-            .await
-            .remove(id)
-            .ok_or_else(|| Status::invalid_argument(format!("invalid transaction ID: {}", id.0)))?;
+        self.map.write().await.remove(id).ok_or_else(|| {
+            GenericDatabaseError::invalid_argument(format!("invalid transaction ID: {}", id.0))
+        })?;
         Ok(())
     }
 
@@ -82,12 +77,12 @@ impl RunningTransactions {
 
 pub struct Transaction {
     pub id:   TransactionId,
-    database: Weak<Database>,
+    database: Weak<FirestoreDatabase>,
     guards:   Mutex<HashMap<DefaultAtom, Arc<OwnedDocumentContentsReadGuard>>>,
 }
 
 impl Transaction {
-    fn new(id: TransactionId, database: Weak<Database>) -> Self {
+    fn new(id: TransactionId, database: Weak<FirestoreDatabase>) -> Self {
         Transaction {
             id,
             database,
@@ -119,8 +114,9 @@ impl Transaction {
     ) -> Result<OwnedDocumentContentsWriteGuard> {
         let mut guards = self.guards.lock().await;
         let read_guard = match guards.remove(&name.document_id) {
-            Some(guard) => Arc::into_inner(guard)
-                .ok_or_else(|| Status::aborted("concurrent reads during txn commit in same txn"))?,
+            Some(guard) => Arc::into_inner(guard).ok_or_else(|| {
+                GenericDatabaseError::aborted("concurrent reads during txn commit in same txn")
+            })?,
             None => self.new_read_guard(name).await?,
         };
         read_guard.upgrade().await
@@ -129,7 +125,7 @@ impl Transaction {
     async fn new_read_guard(&self, name: &DocumentRef) -> Result<OwnedDocumentContentsReadGuard> {
         self.database
             .upgrade()
-            .ok_or_else(|| Status::aborted("database was dropped"))?
+            .ok_or_else(|| GenericDatabaseError::aborted("database was dropped"))?
             .get_doc_meta(name)
             .await?
             .read_owned()
@@ -148,11 +144,11 @@ impl TransactionId {
 }
 
 impl TryFrom<Vec<u8>> for TransactionId {
-    type Error = Status;
+    type Error = GenericDatabaseError;
 
     fn try_from(value: Vec<u8>) -> Result<Self, Self::Error> {
         let arr = value.try_into().map_err(|value| {
-            Status::invalid_argument(format!("invalid transaction ID: {value:?}"))
+            GenericDatabaseError::invalid_argument(format!("invalid transaction ID: {value:?}"))
         })?;
         Ok(TransactionId(usize::from_ne_bytes(arr)))
     }

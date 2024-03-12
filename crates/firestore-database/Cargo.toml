@@ -1,15 +1,19 @@
 [package]
 name = "firestore-database"
+version = { workspace = true }
 edition = "2021"
 
 [dependencies]
+async-trait = { workspace = true }
 futures = { workspace = true }
 googleapis = { workspace = true }
 itertools = { workspace = true }
-string_cache = { workspace = true }
+serde = { workspace = true, features = ["serde_derive"] }
+serde_with = { workspace = true }
+string_cache = "0.8.7"
 thiserror = { workspace = true }
 tokio = { workspace = true }
-tokio-stream = { workspace = true }
+tokio-stream = { workspace = true, features = ["sync"] }
 tonic = { workspace = true }
 tracing = { workspace = true }
 

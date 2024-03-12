@@ -1,7 +1,10 @@
 use std::{fmt::Display, str::FromStr};
 
+use serde::Deserialize;
+use serde_with::{DeserializeFromStr, SerializeDisplay};
 use string_cache::DefaultAtom;
-use thiserror::Error;
+
+use crate::GenericDatabaseError;
 
 /// A reference to either the database root (including project name and database name), a single
 /// collection or a single document.
@@ -10,7 +13,8 @@ use thiserror::Error;
 ///
 /// ```
 /// # use firestore_database::reference::*;
-/// # fn main() -> Result<(), InvalidReference> {
+/// # use firestore_database::*;
+/// # fn main() -> Result<(), GenericDatabaseError> {
 /// assert_eq!(
 ///     "projects/my-project/databases/my-database".parse::<Ref>()?,
 ///     Ref::Root(RootRef::new("my-project", "my-database")),
@@ -33,7 +37,7 @@ use thiserror::Error;
 /// # Ok(())
 /// # }
 /// ```
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, DeserializeFromStr, SerializeDisplay)]
 pub enum Ref {
     Root(RootRef),
     Collection(CollectionRef),
@@ -79,7 +83,8 @@ impl Ref {
     ///
     /// ```
     /// # use firestore_database::reference::*;
-    /// # fn main() -> Result<(), InvalidReference> {
+    /// # use firestore_database::*;
+    /// # fn main() -> Result<(), GenericDatabaseError> {
     /// let root: Ref = "projects/p/databases/d/documents".parse()?;
     /// let collection: Ref = "projects/p/databases/d/documents/collection".parse()?;
     /// let document: Ref = "projects/p/databases/d/documents/collection/document".parse()?;
@@ -130,43 +135,42 @@ impl Display for Ref {
     }
 }
 
-#[derive(Debug, Error)]
-#[error("Invalid {0} reference: {1}")]
-pub struct InvalidReference(&'static str, String);
-
-impl From<InvalidReference> for tonic::Status {
-    fn from(value: InvalidReference) -> Self {
-        tonic::Status::invalid_argument(value.to_string())
-    }
-}
-
 impl FromStr for Ref {
-    type Err = InvalidReference;
+    type Err = GenericDatabaseError;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         fn parse_ref(s: &str) -> Option<Ref> {
+            // Fixed prefix "projects/"
             let s = s.strip_prefix("projects/")?;
+            // Next is the project_id until the next "/"
             let (project_id, s) = s.split_once('/')?;
+            // Fixed token "databases/".
             let s = s.strip_prefix("databases/")?;
-            let Some((database_id, s)) = s.split_once('/') else {
-                return Some(Ref::Root(RootRef::new(project_id, s)));
+            // Next is the database_id until the next "/" or the end of the string
+            let (database_id, s) = s.split_once('/').unwrap_or((s, ""));
+            // If not the end of the string, then the token "documents" is mandatory
+            let s = if s.is_empty() {
+                s
+            } else {
+                s.strip_prefix("documents")?
             };
-            let s = s.strip_prefix("documents")?;
             let root_ref = RootRef::new(project_id, database_id);
             if s.is_empty() {
                 return Some(Ref::Root(root_ref));
             }
+            // Next up is an alternating path of collection name and document name, we can
+            // determine whether this is a collection or a document by counting the slashes.
             let s = s.strip_prefix('/')?;
             let slashes = s.chars().filter(|ch| *ch == '/').count();
-            let rf = if slashes % 2 == 0 {
-                Ref::Collection(CollectionRef::new(root_ref, s))
+            if slashes % 2 == 0 {
+                Some(Ref::Collection(CollectionRef::new(root_ref, s)))
             } else {
                 let (collection_id, document_id) = s.rsplit_once('/')?;
-                Ref::Document(DocumentRef::new(
+                Some(Ref::Document(DocumentRef::new(
                     CollectionRef::new(root_ref, collection_id),
                     document_id,
-                ))
-            };
+                )))
+            }
 
             // TODO: add checks:
             // - Maximum depth of subcollections    100
@@ -185,11 +189,11 @@ impl FromStr for Ref {
             //    - Cannot match the regular expression __.*__
             //    - (If you import Datastore entities into a Firestore database, numeric entity IDs
             //      are exposed as __id[0-9]+__)
-
-            Some(rf)
         }
 
-        parse_ref(s).ok_or_else(|| InvalidReference("database/collection/document", s.to_string()))
+        parse_ref(s).ok_or_else(|| {
+            GenericDatabaseError::InvalidReference("database/collection/document", s.to_string())
+        })
     }
 }
 
@@ -211,20 +215,20 @@ impl From<CollectionRef> for Ref {
     }
 }
 
-#[derive(Clone, Debug, Hash, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Debug, Hash, PartialEq, Eq, PartialOrd, Ord, Deserialize)]
 pub struct RootRef {
     pub project_id:  DefaultAtom,
     pub database_id: DefaultAtom,
 }
 
 impl FromStr for RootRef {
-    type Err = InvalidReference;
+    type Err = GenericDatabaseError;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         let rf: Ref = s.parse()?;
         rf.as_root()
             .cloned()
-            .ok_or_else(|| InvalidReference("database", s.to_string()))
+            .ok_or_else(|| GenericDatabaseError::InvalidReference("database", s.to_string()))
     }
 }
 
@@ -254,13 +258,13 @@ pub struct CollectionRef {
 }
 
 impl FromStr for CollectionRef {
-    type Err = InvalidReference;
+    type Err = GenericDatabaseError;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         let rf: Ref = s.parse()?;
         rf.as_collection()
             .cloned()
-            .ok_or_else(|| InvalidReference("collection", s.to_string()))
+            .ok_or_else(|| GenericDatabaseError::InvalidReference("collection", s.to_string()))
     }
 }
 
@@ -286,7 +290,8 @@ impl CollectionRef {
     ///
     /// ```
     /// # use firestore_database::reference::*;
-    /// # fn main() -> Result<(), InvalidReference> {
+    /// # use firestore_database::*;
+    /// # fn main() -> Result<(), GenericDatabaseError> {
     /// let parent: Ref = "projects/p/databases/d/documents/parent".parse()?;
     /// let child: CollectionRef = "projects/p/databases/d/documents/parent/doc/child".parse()?;
     /// assert_eq!(child.strip_prefix(&parent), Some("doc/child"));
@@ -309,7 +314,8 @@ impl CollectionRef {
     ///
     /// ```
     /// # use firestore_database::reference::*;
-    /// # fn main() -> Result<(), InvalidReference> {
+    /// # use firestore_database::*;
+    /// # fn main() -> Result<(), GenericDatabaseError> {
     /// let parent: RootRef = "projects/p/databases/d/documents".parse()?;
     /// let child: CollectionRef = "projects/p/databases/d/documents/parent/doc/child".parse()?;
     /// assert_eq!(child.strip_root_prefix(&parent), "parent/doc/child");
@@ -329,7 +335,8 @@ impl CollectionRef {
     ///
     /// ```
     /// # use firestore_database::reference::*;
-    /// # fn main() -> Result<(), InvalidReference> {
+    /// # use firestore_database::*;
+    /// # fn main() -> Result<(), GenericDatabaseError> {
     /// let parent: CollectionRef = "projects/p/databases/d/documents/parent".parse()?;
     /// let child: CollectionRef = "projects/p/databases/d/documents/parent/doc/child".parse()?;
     /// assert_eq!(child.strip_collection_prefix(&parent), Some("doc/child"));
@@ -352,7 +359,8 @@ impl CollectionRef {
     ///
     /// ```
     /// # use firestore_database::reference::*;
-    /// # fn main() -> Result<(), InvalidReference> {
+    /// # use firestore_database::*;
+    /// # fn main() -> Result<(), GenericDatabaseError> {
     /// let parent: DocumentRef = "projects/p/databases/d/documents/parent/doc".parse()?;
     /// let child: CollectionRef = "projects/p/databases/d/documents/parent/doc/child".parse()?;
     /// assert_eq!(child.strip_document_prefix(&parent), Some("child"));
@@ -375,13 +383,13 @@ pub struct DocumentRef {
 }
 
 impl FromStr for DocumentRef {
-    type Err = InvalidReference;
+    type Err = GenericDatabaseError;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         let rf: Ref = s.parse()?;
         rf.as_document()
             .cloned()
-            .ok_or_else(|| InvalidReference("document", s.to_string()))
+            .ok_or_else(|| GenericDatabaseError::InvalidReference("document", s.to_string()))
     }
 }
 impl Display for DocumentRef {

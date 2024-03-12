@@ -1,15 +1,18 @@
-use std::{borrow::Borrow, collections::HashMap, hash::Hash};
+use std::{
+    collections::HashMap,
+    hash::{BuildHasher, Hash},
+};
 
+use async_trait::async_trait;
 use tokio::sync::{RwLock, RwLockReadGuard};
-use tonic::async_trait;
 
 #[macro_export]
 macro_rules! unimplemented {
     ($name:expr) => {{
-        use tonic::Status;
+        use $crate::GenericDatabaseError;
         let msg = format!("{} is not supported yet ({}:{})", $name, file!(), line!());
         eprintln!("{msg}");
-        return Err(Status::unimplemented(msg));
+        return Err(GenericDatabaseError::not_implemented(msg));
     }};
 }
 
@@ -17,7 +20,7 @@ macro_rules! unimplemented {
 macro_rules! required_option {
     ($var:ident) => {
         let Some($var) = $var else {
-            return Err(Status::invalid_argument(concat!(
+            return Err($crate::GenericDatabaseError::invalid_argument(concat!(
                 "missing ",
                 stringify!($var)
             )));
@@ -62,16 +65,15 @@ pub trait RwLockHashMapExt<Q: ?Sized, V> {
 }
 
 #[async_trait]
-impl<K, V, Q> RwLockHashMapExt<Q, V> for RwLock<HashMap<K, V>>
+impl<K, V, S> RwLockHashMapExt<K, V> for RwLock<HashMap<K, V, S>>
 where
-    K: Borrow<Q> + Eq + Hash + Sync + Send,
-    Q: Eq + Hash + Sync + ?Sized,
-    for<'a> &'a Q: Into<K>,
+    K: Clone + Eq + Hash + Sync + Send,
     V: Clone + Sync + Send,
+    S: BuildHasher + Sync + Send,
 {
     async fn get_or_insert(
         &self,
-        key: &Q,
+        key: &K,
         default: impl FnOnce() -> V + Send,
     ) -> RwLockReadGuard<V> {
         let lock = self.read().await;
@@ -79,7 +81,7 @@ where
             return guard;
         };
         let mut lock = self.write().await;
-        lock.entry(key.into()).or_insert_with(default);
+        lock.entry(key.clone()).or_insert_with(default);
         RwLockReadGuard::map(lock.downgrade(), |lock| &lock[key])
     }
 }

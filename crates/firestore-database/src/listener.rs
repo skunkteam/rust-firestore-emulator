@@ -1,8 +1,9 @@
 use std::{
     collections::HashMap,
+    marker::Unpin,
     sync::{
         atomic::{self, AtomicUsize},
-        Weak,
+        Arc,
     },
 };
 
@@ -11,25 +12,28 @@ use googleapis::google::{
         listen_request,
         listen_response::ResponseType,
         target::{self, query_target},
-        target_change::TargetChangeType,
+        target_change::{self, TargetChangeType},
         DocumentChange, DocumentDelete, ListenRequest, ListenResponse, Target, TargetChange,
     },
     protobuf::Timestamp,
 };
 use itertools::Itertools;
-use tokio::sync::{broadcast::error::RecvError, mpsc};
-use tokio_stream::{wrappers::ReceiverStream, StreamExt};
-use tonic::{Result, Status};
-use tracing::{debug, error, instrument};
-
-use super::{
-    document::DocumentVersion, event::DatabaseEvent, query::Query, reference::DocumentRef,
-    target_change, Database,
+use tokio::sync::mpsc;
+use tokio_stream::{
+    wrappers::{errors::BroadcastStreamRecvError, BroadcastStream, ReceiverStream},
+    StreamExt, StreamMap,
 };
+use tracing::{debug, error, info, instrument};
+
 use crate::{
     database::{reference::Ref, ReadConsistency},
+    document::DocumentVersion,
+    error::Result,
+    event::DatabaseEvent,
+    query::Query,
+    reference::{DocumentRef, RootRef},
     required_option, unimplemented, unimplemented_bool, unimplemented_collection,
-    unimplemented_option,
+    unimplemented_option, FirestoreDatabase, FirestoreProject, GenericDatabaseError,
 };
 
 const TARGET_ID: i32 = 1;
@@ -45,22 +49,26 @@ const TARGET_CHANGE_DEFAULT: TargetChange = TargetChange {
 pub struct Listener {
     /// For debug purposes.
     id: usize,
-    database: Weak<Database>,
+    project: &'static FirestoreProject,
+    // databases: HashMap<RootRef, Weak<FirestoreDatabase>>,
+    database_events: StreamMap<RootRef, BroadcastStream<Arc<DatabaseEvent>>>,
     sender: mpsc::Sender<Result<ListenResponse>>,
     target: Option<ListenerTarget>,
 }
 
 impl Listener {
     pub fn start(
-        database: Weak<Database>,
-        request_stream: tonic::Streaming<ListenRequest>,
+        project: &'static FirestoreProject,
+        request_stream: impl tokio_stream::Stream<Item = ListenRequest> + Send + Unpin + 'static,
     ) -> ReceiverStream<Result<ListenResponse>> {
         static NEXT_ID: AtomicUsize = AtomicUsize::new(1);
 
         let (sender, rx) = mpsc::channel(16);
         let listener = Self {
             id: NEXT_ID.fetch_add(1, atomic::Ordering::Relaxed),
-            database,
+            project,
+            // databases: Default::default(),
+            database_events: Default::default(),
             sender,
             // No target yet, will be added by a message in the request stream.
             target: None,
@@ -72,43 +80,39 @@ impl Listener {
     }
 
     #[instrument(name = "listener", skip_all, fields(id = self.id), err)]
-    async fn go(mut self, mut request_stream: tonic::Streaming<ListenRequest>) -> Result<()> {
-        let mut database_events = {
-            let Some(database) = self.database.upgrade() else {
-                return Ok(());
-            };
-            database.subscribe()
-        };
+    async fn go(
+        mut self,
+        mut request_stream: impl tokio_stream::Stream<Item = ListenRequest> + Send + Unpin,
+    ) -> Result<()> {
         // Every Listener has a single event-loop, this is it:
         loop {
             tokio::select! {
                 req = request_stream.next() => {
                     match req {
-                        Some(Ok(msg)) => {
+                        Some(msg) => {
                             if let Err(err) = self.process_request(msg).await {
                                 self.send_err(err).await?;
                             };
                         }
-                        // For now, echo errors in our request stream.
-                        Some(Err(err)) => self.send_err(err).await?,
                         // We're done, drop the listener.
-                        None => return Ok(())
+                        None => {
+                            info!("request stream finished");
+                            return Ok(());
+                        }
                     }
                 }
 
-                database_event = database_events.recv() => {
+                Some(database_event) = self.database_events.next() => {
                     match database_event {
-                        Ok(event) => self.process_event(&event).await?,
-                        Err(RecvError::Lagged(count)) => {
+                        (_, Ok(event)) => self.process_event(&event).await?,
+                        (_, Err(BroadcastStreamRecvError::Lagged(count))) => {
                             error!(
                                 id = self.id,
                                 count = count,
                                 "listener missed {} events, because of buffer overflow",
                                 count
                             );
-                        },
-                        // Database is dropped?
-                        Err(RecvError::Closed) => return Ok(())
+                        }
                     }
                 }
             }
@@ -118,12 +122,14 @@ impl Listener {
     #[instrument(skip_all, err)]
     async fn process_request(&mut self, msg: ListenRequest) -> Result<()> {
         let ListenRequest {
-            database: _,
+            database,
             labels,
             target_change,
         } = msg;
         unimplemented_collection!(labels);
         required_option!(target_change);
+
+        let database = self.project.database(&database.parse()?).await;
 
         match target_change {
             listen_request::TargetChange::AddTarget(target) => {
@@ -152,13 +158,14 @@ impl Listener {
                         let parent: Ref = parent.parse()?;
                         let query =
                             Query::from_structured(parent, query, ReadConsistency::Default)?;
-                        self.set_query(query).await?;
+                        self.set_query(&database, query).await?;
                     }
                     target::TargetType::Documents(target::DocumentsTarget { documents }) => {
                         let Ok(document) = documents.into_iter().exactly_one() else {
                             unimplemented!("multiple documents inside a single listen stream")
                         };
-                        self.set_document(document.parse()?, resume_type).await?;
+                        self.set_document(&database, document.parse()?, resume_type)
+                            .await?;
                     }
                 };
             }
@@ -180,7 +187,7 @@ impl Listener {
         let Some(target) = &mut self.target else {
             return Ok(());
         };
-        let Some(database) = self.database.upgrade() else {
+        let Some(database) = event.database.upgrade() else {
             return Ok(());
         };
 
@@ -198,6 +205,7 @@ impl Listener {
     #[instrument(skip_all, fields(document = %name), err)]
     async fn set_document(
         &mut self,
+        database: &FirestoreDatabase,
         name: DocumentRef,
         resume_type: Option<target::ResumeType>,
     ) -> Result<()> {
@@ -207,14 +215,12 @@ impl Listener {
         // up to date until that point and this is (for now) the easiest way to make sure
         // that is actually the case. This is probably okay, but if it becomes a hotspot we
         // might look into optimizing later.
-        let Some(database) = self.database.upgrade() else {
-            return Ok(());
-        };
+        self.ensure_subscribed_to(database);
 
         let send_if_newer_than = resume_type
             .map(|rt| match rt {
                 target::ResumeType::ResumeToken(token) => {
-                    Timestamp::from_token(token).map_err(Status::invalid_argument)
+                    Timestamp::from_token(token).map_err(GenericDatabaseError::invalid_argument)
                 }
                 target::ResumeType::ReadTime(time) => Ok(time),
             })
@@ -269,16 +275,14 @@ impl Listener {
         Ok(())
     }
 
-    async fn set_query(&mut self, query: Query) -> Result<()> {
+    async fn set_query(&mut self, database: &FirestoreDatabase, query: Query) -> Result<()> {
         // We rely on the fact that this function will complete before any other events are
         // processed. That's why we know for sure that the output stream is not used for
         // something else until we respond with our NO_CHANGE msg. That msg means that everything is
         // up to date until that point and this is (for now) the easiest way to make sure
         // that is actually the case. This is probably okay, but if it becomes a hotspot we
         // might look into optimizing later.
-        let Some(database) = self.database.upgrade() else {
-            return Ok(());
-        };
+        self.ensure_subscribed_to(database);
 
         // Response: I'm on it!
         self.send(ResponseType::TargetChange(TargetChange {
@@ -290,13 +294,22 @@ impl Listener {
 
         let read_time = Timestamp::now();
         let mut target = QueryTarget::new(query);
-        let msgs = target.reset(&database, &read_time).await?;
+        let msgs = target.reset(database, &read_time).await?;
         self.send_all(msgs).await?;
         self.send_complete(read_time).await?;
 
         self.target = Some(ListenerTarget::QueryTarget(target));
 
         Ok(())
+    }
+
+    fn ensure_subscribed_to(&mut self, database: &FirestoreDatabase) {
+        if !self.database_events.contains_key(&database.name) {
+            self.database_events.insert(
+                database.name.clone(),
+                BroadcastStream::new(database.subscribe()),
+            );
+        }
     }
 
     async fn send_complete(&self, read_time: Timestamp) -> Result<()> {
@@ -336,15 +349,15 @@ impl Listener {
                 response_type: Some(response_type),
             }))
             .await
-            .map_err(|_| Status::cancelled("stream closed"))
+            .map_err(|_| GenericDatabaseError::cancelled("stream closed"))
     }
 
     #[instrument(skip(self), err)]
-    async fn send_err(&self, err: Status) -> Result<()> {
+    async fn send_err(&self, err: GenericDatabaseError) -> Result<()> {
         self.sender
             .send(Err(err))
             .await
-            .map_err(|_| Status::cancelled("stream closed"))
+            .map_err(|_| GenericDatabaseError::cancelled("stream closed"))
     }
 }
 
@@ -356,7 +369,7 @@ enum ListenerTarget {
 impl ListenerTarget {
     async fn process_event(
         &mut self,
-        database: &Database,
+        database: &FirestoreDatabase,
         event: &DatabaseEvent,
     ) -> Result<Vec<ResponseType>> {
         match self {
@@ -421,7 +434,7 @@ impl QueryTarget {
 
     async fn process_event(
         &mut self,
-        database: &Database,
+        database: &FirestoreDatabase,
         event: &DatabaseEvent,
     ) -> Result<Vec<ResponseType>> {
         let mut updates_to_apply = vec![];
@@ -453,7 +466,11 @@ impl QueryTarget {
         }
     }
 
-    async fn reset(&mut self, database: &Database, time: &Timestamp) -> Result<Vec<ResponseType>> {
+    async fn reset(
+        &mut self,
+        database: &FirestoreDatabase,
+        time: &Timestamp,
+    ) -> Result<Vec<ResponseType>> {
         let mut msgs = vec![ResponseType::TargetChange(TargetChange {
             target_change_type: target_change::TargetChangeType::Reset as _,
             target_ids: vec![TARGET_ID],

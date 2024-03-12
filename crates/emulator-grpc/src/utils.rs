@@ -1,4 +1,3 @@
-#[macro_export]
 macro_rules! unimplemented {
     ($name:expr) => {{
         use tonic::Status;
@@ -8,29 +7,26 @@ macro_rules! unimplemented {
     }};
 }
 
-#[macro_export]
 macro_rules! unimplemented_option {
     ($val:expr) => {
         if $val.is_some() {
-            $crate::unimplemented!(stringify!($val))
+            unimplemented!(stringify!($val))
         }
     };
 }
 
-#[macro_export]
 macro_rules! unimplemented_collection {
     ($val:expr) => {
         if !$val.is_empty() {
-            $crate::unimplemented!(stringify!($val))
+            unimplemented!(stringify!($val))
         }
     };
 }
 
-#[macro_export]
 macro_rules! unimplemented_bool {
     ($val:expr) => {
         if $val {
-            $crate::unimplemented!(stringify!($val))
+            unimplemented!(stringify!($val))
         }
     };
 }
