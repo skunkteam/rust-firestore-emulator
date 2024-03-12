@@ -40,6 +40,10 @@ lint target="workspace":
 run *cmd:
     cargo run {{ cmd }}
 
+# Build the application, simple alias for cargo build
+build *cmd:
+    cargo build {{ cmd }}
+
 # Watch code and execute just command on change, e.g. `just watch test googleapis`
 watch *cmd:
     cargo watch --ignore '/*.{info,profraw}' --ignore tarpaulin-report.html --clear --shell 'just {{ cmd }}'

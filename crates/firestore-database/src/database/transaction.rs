@@ -6,7 +6,6 @@ use std::{
     },
 };
 
-use string_cache::DefaultAtom;
 use tokio::sync::{Mutex, RwLock};
 use tracing::instrument;
 
@@ -78,7 +77,7 @@ impl RunningTransactions {
 pub struct Transaction {
     pub id:   TransactionId,
     database: Weak<FirestoreDatabase>,
-    guards:   Mutex<HashMap<DefaultAtom, Arc<OwnedDocumentContentsReadGuard>>>,
+    guards:   Mutex<HashMap<DocumentRef, Arc<OwnedDocumentContentsReadGuard>>>,
 }
 
 impl Transaction {
@@ -96,11 +95,11 @@ impl Transaction {
         name: &DocumentRef,
     ) -> Result<Arc<OwnedDocumentContentsReadGuard>> {
         let mut guards = self.guards.lock().await;
-        if let Some(guard) = guards.get(&name.document_id) {
+        if let Some(guard) = guards.get(name) {
             return Ok(Arc::clone(guard));
         }
         let guard = self.new_read_guard(name).await?.into();
-        guards.insert(name.document_id.clone(), Arc::clone(&guard));
+        guards.insert(name.clone(), Arc::clone(&guard));
         Ok(guard)
     }
 
@@ -113,7 +112,7 @@ impl Transaction {
         name: &DocumentRef,
     ) -> Result<OwnedDocumentContentsWriteGuard> {
         let mut guards = self.guards.lock().await;
-        let read_guard = match guards.remove(&name.document_id) {
+        let read_guard = match guards.remove(name) {
             Some(guard) => Arc::into_inner(guard).ok_or_else(|| {
                 GenericDatabaseError::aborted("concurrent reads during txn commit in same txn")
             })?,

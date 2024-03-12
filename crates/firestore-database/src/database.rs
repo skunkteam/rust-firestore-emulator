@@ -145,21 +145,21 @@ impl FirestoreDatabase {
         self.transactions.get(id).await
     }
 
-    /// Get all the (deeply nested) collections that reside under the given parent.
-    #[instrument(skip_all)]
-    pub async fn get_collection_ids_deep(&self, parent: &Ref) -> Result<Vec<String>> {
-        // Cannot use `filter_map` because of the `await`.
-        let mut result = vec![];
-        for col in self.get_all_collections().await {
-            let Some(path) = col.name.strip_prefix(parent) else {
-                continue;
-            };
-            if col.has_doc().await? {
-                result.push(path.to_string());
-            }
-        }
-        Ok(result)
-    }
+    // /// Get all the (deeply nested) collections that reside under the given parent.
+    // #[instrument(skip_all)]
+    // pub async fn get_collection_ids_deep(&self, parent: &Ref) -> Result<Vec<String>> {
+    //     // Cannot use `filter_map` because of the `await`.
+    //     let mut result = vec![];
+    //     for col in self.get_all_collections().await {
+    //         let Some(path) = col.name.strip_prefix(parent) else {
+    //             continue;
+    //         };
+    //         if col.has_doc().await? {
+    //             result.push(path.to_string());
+    //         }
+    //     }
+    //     Ok(result)
+    // }
 
     /// Get all the collections that reside directly under the given parent. This means that:
     /// - the IDs will not contain a `/`
@@ -177,6 +177,7 @@ impl FirestoreDatabase {
                 result.insert(id.to_string());
             }
         }
+        info!(result_count = result.len());
         Ok(result)
     }
 
@@ -225,6 +226,7 @@ impl FirestoreDatabase {
         let mut query = Query::from_structured(parent, query, consistency)?;
         info!(?query);
         let result = query.once(self).await?;
+        info!(result_count = result.len());
         Ok(result.into_iter().map(|t| t.1).collect())
     }
 
