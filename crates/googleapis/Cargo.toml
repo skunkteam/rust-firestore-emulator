@@ -1,5 +1,6 @@
 [package]
 name = "googleapis"
+version = { workspace = true }
 edition = "2021"
 
 [lib]
@@ -8,6 +9,7 @@ doctest = false
 [dependencies]
 time = { workspace = true, features = ["formatting", "macros"] }
 prost = { workspace = true }
+serde = { workspace = true }
 thiserror = { workspace = true }
 tonic = { workspace = true }
 

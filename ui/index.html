@@ -1,0 +1,151 @@
+<!DOCTYPE html>
+<html>
+  <body>
+    <h1>Firestore Emulator <span id="version"></span></h1>
+    <div id="canvas"></div>
+  </body>
+  <script type="module">
+    import { html, render } from "/lit-html.js";
+
+    const page = (() => {
+      const { pathname } = location;
+      const stripped = pathname.endsWith("/")
+        ? pathname.slice(0, -1)
+        : pathname;
+      if (!stripped) return dashboard;
+      const parsed =
+        /^\/projects\/(?<project>[^/]+)\/databases\/(?<database>[^/]+)\/documents(\/(?<ref>.*))?$/.exec(
+          decodeURI(stripped)
+        );
+      if (!parsed) {
+        location.pathname = "";
+        return async () => "redirecting...";
+      }
+
+      const { project, database, ref } = parsed.groups;
+      return ref
+        ? () => ref_root(project, database, ref, stripped)
+        : () => database_root(project, database, stripped);
+    })();
+
+    function refresh() {
+      page().then((tmpl) => render(tmpl, canvas), showError);
+    }
+
+    function showError(err) {
+      const stack = (typeof err === "object" && err && err.stack) || "";
+      const msg = html`<pre style="color: red">${err + "\n" + stack}</pre>`;
+      render(msg, canvas);
+    }
+
+    refresh();
+
+    async function dashboard() {
+      /** @type {string[]} */
+      const databases = await api("/emulator/v1");
+      if (!databases.length) {
+        return html`<p>No databases created (yet)</p>`;
+      }
+      return html`<ul>
+        ${databases.map(
+          (database) => html`<li><a href=${`/${database}`}>${database}</a></li>`
+        )}
+      </ul>`;
+    }
+
+    async function database_root(
+      /** @type {string} */ project,
+      /** @type {string} */ database,
+      /** @type {string} */ pathname
+    ) {
+      const apiPath = `/emulator/v1${pathname}`;
+      const collections = await api(apiPath);
+      return html`<h2>
+          Database: <b>${project} ${database}</b> <a href="/">(back)</a>
+          <a href @click=${clear}>(clear)</a>
+        </h2>
+        ${!collections.length
+          ? html`<p>No collections created (yet)</p>`
+          : html`<ul>
+              ${collections.map(
+                (collection) =>
+                  html`<li>
+                    <a href=${`${pathname}/${encodeURIComponent(collection)}`}>
+                      ${collection}
+                    </a>
+                  </li>`
+              )}
+            </ul>`}`;
+
+      function clear(/**@type {MouseEvent}*/ evt) {
+        evt.preventDefault();
+        api(apiPath, { method: "delete", json: false }).then(
+          refresh,
+          showError
+        );
+      }
+    }
+
+    async function ref_root(
+      /** @type {string} */ project,
+      /** @type {string} */ database,
+      /** @type {string} */ ref,
+      /** @type {string} */ pathname
+    ) {
+      const apiPath = `/emulator/v1${pathname}`;
+      /** @type {{ type: 'document'|'collection', documents?: string[], collections?: string[], document?: unknown }} */
+      const { type, documents, collections, document } = await api(apiPath);
+      const base = html`<h2>
+        Database: <b>${project} ${database}</b> <a href="..">(back)</a>
+      </h2>`;
+      switch (type) {
+        case "collection":
+          return html`${base}
+            <h3>Collection <b>${ref}</b></h3>
+            <p>Documents:</p>
+            <ul>
+              ${documents.map(
+                (document) =>
+                  html`<li>
+                    <a href="${pathname}/${encodeURIComponent(document)}">
+                      ${document}
+                    </a>
+                  </li>`
+              )}
+            </ul>`;
+        case "document":
+          return html`${base}
+            <h3>Document <b>${ref}</b></h3>
+            <pre>${JSON.stringify(document, undefined, 2)}</pre>
+            <p>Collections:</p>
+            ${!collections.length
+              ? html`<p>No collections created (yet)</p>`
+              : html`<ul>
+                  ${collections.map(
+                    (collection) =>
+                      html`<li>
+                        <a
+                          href=${`${pathname}/${encodeURIComponent(
+                            collection
+                          )}`}
+                        >
+                          ${collection}
+                        </a>
+                      </li>`
+                  )}
+                </ul>`}`;
+      }
+    }
+
+    async function api(
+      /** @type {string} */ url,
+      { method = "get", json = true } = {}
+    ) {
+      const response = await fetch(url, { method });
+      if (!response.ok) {
+        throw await response.text();
+      }
+      return json ? await response.json() : await response.text();
+    }
+  </script>
+</html>

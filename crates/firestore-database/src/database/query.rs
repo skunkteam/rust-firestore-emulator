@@ -3,7 +3,6 @@ use std::{cmp, collections::HashMap, ops::Deref, sync::Arc};
 use googleapis::google::firestore::v1::{structured_query::CollectionSelector, *};
 use itertools::Itertools;
 use string_cache::DefaultAtom;
-use tonic::{Result, Status};
 
 use self::filter::Filter;
 use super::{
@@ -11,8 +10,9 @@ use super::{
     document::StoredDocumentVersion,
     field_path::FieldReference,
     reference::{CollectionRef, DocumentRef, Ref},
-    Database, ReadConsistency,
+    FirestoreDatabase, ReadConsistency,
 };
+use crate::{error::Result, GenericDatabaseError};
 
 mod filter;
 
@@ -181,7 +181,7 @@ impl Query {
         self.order_by.iter().any(|o| !o.field.is_document_name())
     }
 
-    pub async fn once(&mut self, db: &Database) -> Result<Vec<(DocumentRef, Document)>> {
+    pub async fn once(&mut self, db: &FirestoreDatabase) -> Result<Vec<(DocumentRef, Document)>> {
         // First collect all Arc<Collection>s in a Vec to release the collection lock asap.
         let collections = self.applicable_collections(db).await;
 
@@ -237,7 +237,7 @@ impl Query {
             .try_collect()
     }
 
-    async fn applicable_collections(&mut self, db: &Database) -> Vec<Arc<Collection>> {
+    async fn applicable_collections(&mut self, db: &FirestoreDatabase) -> Vec<Arc<Collection>> {
         db.collections
             .read()
             .await
@@ -368,14 +368,14 @@ struct Order {
 }
 
 impl TryFrom<structured_query::Order> for Order {
-    type Error = Status;
+    type Error = GenericDatabaseError;
 
     fn try_from(value: structured_query::Order) -> Result<Self, Self::Error> {
         Ok(Self {
             field:     value
                 .field
                 .as_ref()
-                .ok_or_else(|| Status::invalid_argument("order_by without field"))?
+                .ok_or_else(|| GenericDatabaseError::invalid_argument("order_by without field"))?
                 .field_path
                 .deref()
                 .try_into()?,
@@ -391,13 +391,13 @@ enum Direction {
 }
 
 impl TryFrom<structured_query::Direction> for Direction {
-    type Error = Status;
+    type Error = GenericDatabaseError;
 
     fn try_from(value: structured_query::Direction) -> std::prelude::v1::Result<Self, Self::Error> {
         match value {
-            structured_query::Direction::Unspecified => Err(Status::invalid_argument(
-                "Invalid structured_query::Direction",
-            )),
+            structured_query::Direction::Unspecified => Err(
+                GenericDatabaseError::invalid_argument("Invalid structured_query::Direction"),
+            ),
             structured_query::Direction::Ascending => Ok(Direction::Ascending),
             structured_query::Direction::Descending => Ok(Direction::Descending),
         }

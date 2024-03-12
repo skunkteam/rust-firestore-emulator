@@ -1,6 +1,6 @@
 [package]
 name = "firestore-emulator"
-version = "0.1.0"
+version = { workspace = true }
 edition = "2021"
 
 [features]
@@ -19,15 +19,21 @@ tracing = [
 [workspace]
 members = ["crates/*"]
 
+[workspace.package]
+version = "0.1.0"
+
 [workspace.dependencies]
+async-trait = "0.1.77"
 axum = "0.6.20"
+firestore-database = { path = "crates/firestore-database" }
 futures = "0.3.30"
 googleapis = { path = "crates/googleapis" }
 hyper = "0.14"
 itertools = "0.12.1"
 pin-project = "1.1.5"
 prost = "0.12"
-string_cache = "0.8.7"
+serde = "1.0.197"
+serde_with = "3.6.1"
 thiserror = "1.0.57"
 time = "0.3.34"
 tokio = "1.36.0"
@@ -42,17 +48,12 @@ clap = { version = "4.5.1", features = ["derive", "env"] }
 color-eyre = "0.6.2"
 console = { version = "0.15.8", optional = true }
 console-subscriber = { version = "0.2.0", optional = true }
-firestore-database = { path = "crates/firestore-database" }
-futures = { workspace = true }
-googleapis = { workspace = true }
-itertools = { workspace = true }
+emulator-grpc = { path = "crates/emulator-grpc" }
+emulator-ui = { path = "crates/emulator-ui" }
 hybrid-axum-tonic = { path = "crates/hybrid-axum-tonic" }
-string_cache = { workspace = true }
 tikv-jemallocator = "0.5.4"
 time = { workspace = true, optional = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
-tokio-stream = { workspace = true }
-tonic = { workspace = true, features = ["gzip"] }
 tracing = { workspace = true }
 tracing-subscriber = { version = "0.3.18", optional = true }
 
@@ -60,7 +61,3 @@ tracing-subscriber = { version = "0.3.18", optional = true }
 codegen-units = 1
 lto = "fat"
 panic = "abort"
-
-[lints.clippy]
-# Until this is resolved: https://github.com/rust-lang/rust-clippy/issues/12281
-blocks_in_conditions = "allow"

@@ -1,15 +1,13 @@
-use std::{collections::HashMap, ops::Deref, sync::Arc};
-
 use firestore_database::{
     event::DatabaseEvent,
     get_doc_name_from_write,
-    reference::{DocumentRef, Ref, RootRef},
-    utils::RwLockHashMapExt,
-    Database, ReadConsistency,
+    reference::{DocumentRef, Ref},
+    FirestoreDatabase, FirestoreProject, ReadConsistency,
 };
 use futures::{future::try_join_all, stream::BoxStream, StreamExt};
 use googleapis::google::{
     firestore::v1::{
+        firestore_server::FirestoreServer,
         structured_query::{CollectionSelector, FieldReference},
         transaction_options::ReadWrite,
         *,
@@ -17,42 +15,32 @@ use googleapis::google::{
     protobuf::{Empty, Timestamp},
 };
 use itertools::Itertools;
-use string_cache::DefaultAtom;
-use tokio::sync::{mpsc, RwLock};
+use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
-use tonic::{async_trait, Code, Request, Response, Result, Status};
+use tonic::{async_trait, codec::CompressionEncoding, Code, Request, Response, Result, Status};
 use tracing::{info, info_span, instrument, Instrument};
 
-use crate::{unimplemented, unimplemented_bool, unimplemented_collection, unimplemented_option};
+#[macro_use]
+mod utils;
+
+const MAX_MESSAGE_SIZE: usize = 50 * 1024 * 1024;
+
+pub fn service() -> FirestoreServer<FirestoreEmulator> {
+    FirestoreServer::new(FirestoreEmulator::default())
+        .accept_compressed(CompressionEncoding::Gzip)
+        .send_compressed(CompressionEncoding::Gzip)
+        .max_decoding_message_size(MAX_MESSAGE_SIZE)
+}
 
 pub struct FirestoreEmulator {
-    databases: RwLock<HashMap<DefaultAtom, Arc<Database>>>,
+    project: &'static FirestoreProject,
 }
 
-impl std::fmt::Debug for FirestoreEmulator {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("FirestoreEmulator").finish_non_exhaustive()
-    }
-}
-
-impl FirestoreEmulator {
-    pub fn new() -> Self {
+impl Default for FirestoreEmulator {
+    fn default() -> Self {
         Self {
-            databases: Default::default(),
+            project: FirestoreProject::get(),
         }
-    }
-
-    // pub async fn clear(&mut self) {
-    //     self.databases.write().await.clear();
-    // }
-
-    pub async fn database(&self, name: &RootRef) -> Arc<Database> {
-        Arc::clone(
-            self.databases
-                .get_or_insert(&name.database_id, || Database::new(name.clone()))
-                .await
-                .deref(),
-        )
     }
 }
 
@@ -74,6 +62,7 @@ impl firestore_server::Firestore for FirestoreEmulator {
         let name: DocumentRef = name.parse()?;
 
         let doc = self
+            .project
             .database(&name.collection_ref.root_ref)
             .await
             .get_doc(&name, &consistency_selector.try_into()?)
@@ -105,7 +94,7 @@ impl firestore_server::Firestore for FirestoreEmulator {
         } = request.into_inner();
         unimplemented_option!(mask);
 
-        let database = self.database(&database.parse()?).await;
+        let database = self.project.database(&database.parse()?).await;
         let documents: Vec<_> = documents
             .into_iter()
             .map(|name| name.parse::<DocumentRef>())
@@ -139,7 +128,7 @@ impl firestore_server::Firestore for FirestoreEmulator {
                             read_time:   Some(Timestamp::now()),
                             transaction: new_transaction.take().unwrap_or_default(),
                         }),
-                        Err(err) => Err(err),
+                        Err(err) => Err(Status::from(err)),
                     };
                     if tx.send(msg).await.is_err() {
                         break;
@@ -164,7 +153,7 @@ impl firestore_server::Firestore for FirestoreEmulator {
             transaction,
         } = request.into_inner();
 
-        let database = self.database(&database.parse()?).await;
+        let database = self.project.database(&database.parse()?).await;
 
         let (commit_time, write_results) = if transaction.is_empty() {
             perform_writes(database.as_ref(), writes).await?
@@ -215,7 +204,7 @@ impl firestore_server::Firestore for FirestoreEmulator {
         }
 
         let parent: Ref = parent.parse()?;
-        let database = self.database(parent.root()).await;
+        let database = self.project.database(parent.root()).await;
 
         let documents = database
             .run_query(
@@ -275,7 +264,7 @@ impl firestore_server::Firestore for FirestoreEmulator {
     ) -> Result<Response<BeginTransactionResponse>> {
         let BeginTransactionRequest { database, options } = request.into_inner();
 
-        let database = self.database(&database.parse()?).await;
+        let database = self.project.database(&database.parse()?).await;
 
         use transaction_options::Mode;
 
@@ -308,7 +297,7 @@ impl firestore_server::Firestore for FirestoreEmulator {
             database,
             transaction,
         } = request.into_inner();
-        let database = self.database(&database.parse()?).await;
+        let database = self.project.database(&database.parse()?).await;
         database.rollback(&transaction.try_into()?).await?;
         Ok(Response::new(Empty {}))
     }
@@ -338,6 +327,7 @@ impl firestore_server::Firestore for FirestoreEmulator {
         let parent: Ref = parent.parse()?;
 
         let docs = self
+            .project
             .database(parent.root())
             .await
             .run_query(parent, query, consistency_selector.try_into()?)
@@ -413,17 +403,22 @@ impl firestore_server::Firestore for FirestoreEmulator {
     #[instrument(skip_all, err)]
     async fn listen(
         &self,
-        request: Request<tonic::Streaming<ListenRequest>>,
+        _request: Request<tonic::Streaming<ListenRequest>>,
     ) -> Result<Response<Self::ListenStream>> {
+        Err(Status::unimplemented("listening is disabled currently"))
         // TODO: refactor to be able to use database properly
-        Ok(Response::new(
-            self.database(&"projects/whatever/databases/(default)".parse()?)
-                .await
-                .listen(request.into_inner()),
-        ))
+        // Ok(Response::new(
+        //     self.project
+        //         .database(&"projects/whatever/databases/(default)".parse()?)
+        //         .await
+        //         .listen(request.into_inner()),
+        // ))
     }
 
     /// Lists all the collection IDs underneath a document.
+    ///
+    /// TODO: Check that this indeed needs to be a list of deeply nested collection IDs or only the
+    /// direct children of the given document.
     #[instrument(skip_all, err)]
     async fn list_collection_ids(
         &self,
@@ -437,9 +432,10 @@ impl firestore_server::Firestore for FirestoreEmulator {
         } = request.into_inner();
         let parent: DocumentRef = parent.parse()?;
         let collection_ids = self
+            .project
             .database(&parent.collection_ref.root_ref)
             .await
-            .get_collection_ids(&parent)
+            .get_collection_ids_deep(&Ref::Document(parent))
             .await?
             .into_iter()
             .map(|name| name.to_string())
@@ -478,7 +474,7 @@ impl firestore_server::Firestore for FirestoreEmulator {
 
         let time: Timestamp = Timestamp::now();
 
-        let database = self.database(&database.parse()?).await;
+        let database = self.project.database(&database.parse()?).await;
 
         let (status, write_results, updates): (Vec<_>, Vec<_>, Vec<_>) =
             try_join_all(writes.into_iter().map(|write| async {
@@ -492,8 +488,8 @@ impl firestore_server::Firestore for FirestoreEmulator {
                     Ok((wr, update)) => (Default::default(), wr, Some((name.clone(), update))),
                     Err(err) => (
                         rpc::Status {
-                            code:    err.code() as _,
-                            message: err.message().to_string(),
+                            code:    err.grpc_code() as _,
+                            message: err.to_string(),
                             details: vec![],
                         },
                         Default::default(),
@@ -518,7 +514,7 @@ impl firestore_server::Firestore for FirestoreEmulator {
 }
 
 async fn perform_writes(
-    database: &Database,
+    database: &FirestoreDatabase,
     writes: Vec<Write>,
 ) -> Result<(Timestamp, Vec<WriteResult>)> {
     let time: Timestamp = Timestamp::now();

@@ -1,5 +1,6 @@
 use std::{
     collections::HashMap,
+    marker::Unpin,
     sync::{
         atomic::{self, AtomicUsize},
         Weak,
@@ -19,7 +20,6 @@ use googleapis::google::{
 use itertools::Itertools;
 use tokio::sync::{broadcast::error::RecvError, mpsc};
 use tokio_stream::{wrappers::ReceiverStream, StreamExt};
-use tonic::{Result, Status};
 use tracing::{debug, error, instrument};
 
 use super::{
@@ -28,8 +28,9 @@ use super::{
 };
 use crate::{
     database::{reference::Ref, ReadConsistency},
+    error::Result,
     required_option, unimplemented, unimplemented_bool, unimplemented_collection,
-    unimplemented_option,
+    unimplemented_option, GenericDatabaseError,
 };
 
 const TARGET_ID: i32 = 1;
@@ -53,7 +54,7 @@ pub struct Listener {
 impl Listener {
     pub fn start(
         database: Weak<Database>,
-        request_stream: tonic::Streaming<ListenRequest>,
+        request_stream: impl tokio_stream::Stream<Item = ListenRequest> + Send + Unpin,
     ) -> ReceiverStream<Result<ListenResponse>> {
         static NEXT_ID: AtomicUsize = AtomicUsize::new(1);
 
@@ -72,7 +73,10 @@ impl Listener {
     }
 
     #[instrument(name = "listener", skip_all, fields(id = self.id), err)]
-    async fn go(mut self, mut request_stream: tonic::Streaming<ListenRequest>) -> Result<()> {
+    async fn go(
+        mut self,
+        mut request_stream: impl tokio_stream::Stream<Item = ListenRequest> + Send + Unpin,
+    ) -> Result<()> {
         let mut database_events = {
             let Some(database) = self.database.upgrade() else {
                 return Ok(());
@@ -84,13 +88,11 @@ impl Listener {
             tokio::select! {
                 req = request_stream.next() => {
                     match req {
-                        Some(Ok(msg)) => {
+                        Some(msg) => {
                             if let Err(err) = self.process_request(msg).await {
                                 self.send_err(err).await?;
                             };
                         }
-                        // For now, echo errors in our request stream.
-                        Some(Err(err)) => self.send_err(err).await?,
                         // We're done, drop the listener.
                         None => return Ok(())
                     }
@@ -214,7 +216,7 @@ impl Listener {
         let send_if_newer_than = resume_type
             .map(|rt| match rt {
                 target::ResumeType::ResumeToken(token) => {
-                    Timestamp::from_token(token).map_err(Status::invalid_argument)
+                    Timestamp::from_token(token).map_err(GenericDatabaseError::invalid_argument)
                 }
                 target::ResumeType::ReadTime(time) => Ok(time),
             })
@@ -336,15 +338,15 @@ impl Listener {
                 response_type: Some(response_type),
             }))
             .await
-            .map_err(|_| Status::cancelled("stream closed"))
+            .map_err(|_| GenericDatabaseError::cancelled("stream closed"))
     }
 
     #[instrument(skip(self), err)]
-    async fn send_err(&self, err: Status) -> Result<()> {
+    async fn send_err(&self, err: GenericDatabaseError) -> Result<()> {
         self.sender
             .send(Err(err))
             .await
-            .map_err(|_| Status::cancelled("stream closed"))
+            .map_err(|_| GenericDatabaseError::cancelled("stream closed"))
     }
 }
 

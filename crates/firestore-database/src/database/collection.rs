@@ -2,14 +2,13 @@ use std::{collections::HashMap, ops::Deref, sync::Arc};
 
 use string_cache::DefaultAtom;
 use tokio::sync::RwLock;
-use tonic::Result;
 use tracing::instrument;
 
 use super::{
     document::DocumentMeta,
     reference::{CollectionRef, DocumentRef},
 };
-use crate::utils::RwLockHashMapExt;
+use crate::{error::Result, utils::RwLockHashMapExt};
 
 pub struct Collection {
     pub name:  CollectionRef,

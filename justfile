@@ -36,6 +36,10 @@ lint target="workspace":
     echo Running lint for target '"{{ target }}"'
     cargo clippy {{ if target == "workspace" { "--workspace" } else { "--package " + target } }}
 
+# Run the application, simple alias for cargo run
+run *cmd:
+    cargo run {{ cmd }}
+
 # Watch code and execute just command on change, e.g. `just watch test googleapis`
 watch *cmd:
-    cargo watch --ignore '*.{info,html,profraw}' --clear --shell 'just {{ cmd }}'
+    cargo watch --ignore '/*.{info,profraw}' --ignore tarpaulin-report.html --clear --shell 'just {{ cmd }}'
