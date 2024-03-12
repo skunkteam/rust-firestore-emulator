@@ -253,11 +253,15 @@ impl Query {
         }
         let included = collection.strip_prefix(&self.parent).is_some_and(|path| {
             self.from.iter().any(|selector| {
-                path == selector.collection_id
-                    || selector.all_descendants
-                        && path
+                if selector.all_descendants {
+                    selector.collection_id.is_empty()
+                        || path == selector.collection_id
+                        || path
                             .strip_prefix(&selector.collection_id)
                             .is_some_and(|rest| rest.starts_with('/'))
+                } else {
+                    path == selector.collection_id
+                }
             })
         });
         self.collection_cache

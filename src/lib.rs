@@ -7,11 +7,9 @@ use tracing::info;
 #[tokio::main]
 pub async fn run(host_port: SocketAddr) -> color_eyre::Result<()> {
     let rest_router = emulator_ui::router();
-
     let grpc_router = Router::new().nest_tonic(emulator_grpc::service());
-
-    let server = axum::Server::bind(&host_port)
-        .serve(RestGrpcService::new(rest_router, grpc_router).into_make_service());
+    let combined = RestGrpcService::new(rest_router, grpc_router).into_make_service();
+    let server = axum::Server::bind(&host_port).serve(combined);
 
     info!("Firestore listening on {}", host_port);
 

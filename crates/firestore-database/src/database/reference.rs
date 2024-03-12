@@ -101,7 +101,9 @@ impl Ref {
     /// # }
     /// ```
     pub fn is_parent_of(&self, other: &Ref) -> bool {
-        debug_assert_eq!(self.root(), other.root());
+        if self.root() != other.root() {
+            return false;
+        }
         match (self, other) {
             (_, Ref::Root(_)) => false,
             (Ref::Root(_), _) => true,
@@ -300,7 +302,7 @@ impl CollectionRef {
     /// ```
     pub fn strip_prefix(&self, r: &Ref) -> Option<&str> {
         match r {
-            Ref::Root(root) => Some(self.strip_root_prefix(root)),
+            Ref::Root(root) => self.strip_root_prefix(root),
             Ref::Collection(col) => self.strip_collection_prefix(col),
             Ref::Document(doc) => self.strip_document_prefix(doc),
         }
@@ -318,13 +320,12 @@ impl CollectionRef {
     /// # fn main() -> Result<(), GenericDatabaseError> {
     /// let parent: RootRef = "projects/p/databases/d/documents".parse()?;
     /// let child: CollectionRef = "projects/p/databases/d/documents/parent/doc/child".parse()?;
-    /// assert_eq!(child.strip_root_prefix(&parent), "parent/doc/child");
+    /// assert_eq!(child.strip_root_prefix(&parent), Some("parent/doc/child"));
     /// # Ok(())
     /// # }
     /// ```
-    pub fn strip_root_prefix(&self, root: &RootRef) -> &str {
-        debug_assert_eq!(&self.root_ref, root);
-        &self.collection_id
+    pub fn strip_root_prefix(&self, root: &RootRef) -> Option<&str> {
+        (&self.root_ref == root).then_some(&self.collection_id)
     }
 
     /// Returns the remaining canonical reference string when the given `col` has been removed as
@@ -345,7 +346,7 @@ impl CollectionRef {
     /// ```
     pub fn strip_collection_prefix(&self, col: &CollectionRef) -> Option<&str> {
         let rest = self
-            .strip_root_prefix(&col.root_ref)
+            .strip_root_prefix(&col.root_ref)?
             .strip_prefix(&*col.collection_id)?
             .strip_prefix('/')?;
         Some(rest)
