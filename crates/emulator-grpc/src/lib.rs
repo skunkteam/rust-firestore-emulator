@@ -415,9 +415,6 @@ impl firestore_server::Firestore for FirestoreEmulator {
     }
 
     /// Lists all the collection IDs underneath a document.
-    ///
-    /// TODO: Check that this indeed needs to be a list of deeply nested collection IDs or only the
-    /// direct children of the given document.
     #[instrument(skip_all, err)]
     async fn list_collection_ids(
         &self,
@@ -429,15 +426,14 @@ impl firestore_server::Firestore for FirestoreEmulator {
             page_token,
             consistency_selector,
         } = request.into_inner();
-        let parent: DocumentRef = parent.parse()?;
+        let parent: Ref = parent.parse()?;
         let collection_ids = self
             .project
-            .database(&parent.collection_ref.root_ref)
+            .database(parent.root())
             .await
-            .get_collection_ids_deep(&Ref::Document(parent))
+            .get_collection_ids(&(parent))
             .await?
             .into_iter()
-            .map(|name| name.to_string())
             .collect_vec();
         unimplemented_bool!(collection_ids.len() as i32 > page_size);
         unimplemented_collection!(page_token);
