@@ -71,6 +71,7 @@ jobs:
       - name: Run compatibility test suite
         run: npm ci && npm run test:rust-emulator
         working-directory: test-suite
+
   deploy:
     name: Deploy
     needs:
@@ -97,16 +98,16 @@ jobs:
         shell: bash
         run: |
           cd target/release
-          tar czvf ../../firestore-emulator.tgz firestore-emulator
+          tar czvf ../../firestore-emulator.tar.gz firestore-emulator
           cd -
       - name: Publish
         # More info at: https://github.com/softprops/action-gh-release
         uses: softprops/action-gh-release@v2
         with:
           # Will be accessible at:
-          # - https://github.com/skunkteam/rust-firestore-emulator/releases/latest/download/firestore-emulator.tgz
-          # - https://github.com/skunkteam/rust-firestore-emulator/releases/download/<tag>/firestore-emulator.tgz
-          files: firestore-emulator.tgz
+          # - https://github.com/skunkteam/rust-firestore-emulator/releases/latest/download/firestore-emulator.tar.gz
+          # - https://github.com/skunkteam/rust-firestore-emulator/releases/download/<tag>/firestore-emulator.tar.gz
+          files: firestore-emulator.tar.gz
 
   # coverage:
   #   name: Code coverage
