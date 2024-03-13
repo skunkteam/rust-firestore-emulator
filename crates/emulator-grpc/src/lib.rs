@@ -315,13 +315,11 @@ impl firestore_server::Firestore for FirestoreEmulator {
     ) -> Result<Response<Self::RunQueryStream>> {
         let RunQueryRequest {
             parent,
-            // mode,
+            explain_options,
             query_type,
             consistency_selector,
         } = request.into_inner();
-        // if mode != 0 {
-        //     unimplemented!("QueryMode")
-        // }
+        unimplemented_option!(explain_options);
         let Some(run_query_request::QueryType::StructuredQuery(query)) = query_type else {
             unimplemented!("query without query")
         };
@@ -341,7 +339,7 @@ impl firestore_server::Firestore for FirestoreEmulator {
                 document: Some(doc),
                 read_time: Some(Timestamp::now()),
                 skipped_results: 0,
-                // stats: None,
+                explain_metrics: None,
                 continuation_selector: None,
             })
         });
