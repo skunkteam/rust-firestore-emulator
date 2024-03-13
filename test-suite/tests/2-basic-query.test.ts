@@ -278,8 +278,19 @@ describe('paginating results', () => {
         });
 
         test('limit', async () => {
-            const firstTen = await getData(orderedCollection.limit(1));
-            expect(firstTen).toEqual(docs.slice(0, 1));
+            const firstTen = await getData(orderedCollection.limit(10));
+            expect(firstTen).toEqual(docs.slice(0, 10));
+        });
+
+        test('offset', async () => {
+            const skippedTen = await getData(orderedCollection.offset(10));
+            expect(skippedTen).toEqual(docs.slice(10));
+        });
+
+        test('limit and offset', async () => {
+            const secondTen = await getData(orderedCollection.offset(10).limit(10));
+            expect(secondTen).toEqual(docs.slice(10, 20));
+            expect(secondTen).toHaveLength(10);
         });
 
         describe.each([
@@ -317,58 +328,58 @@ describe('paginating results', () => {
     });
 });
 
-fs.notImplementedInRust ||
-    describe('aggregation queries', () => {
-        const cities = [
-            { city: 'Buren', population: 27_718, area: 142.92 },
-            { city: 'Tiel', population: 41_978, area: 35.51 },
-            { city: 'Woerden', population: 53_253, area: 92.92 },
-            { city: 'Zoetermeer', population: 127_047, area: 37.05 },
-        ];
-        const allCities = fs.collection.doc().collection('cityCollection');
-        const biggerCities = allCities.where('population', '>', 50_000);
+describe('aggregation queries', () => {
+    const cities = [
+        { city: 'Buren', population: 27_718, area: 142.92 },
+        { city: 'Tiel', population: 41_978, area: 35.51 },
+        { city: 'Woerden', population: 53_253, area: 92.92 },
+        { city: 'Zoetermeer', population: 127_047, area: 37.05 },
+    ];
+    const allCities = fs.collection.doc().collection('cityCollection');
+    const biggerCities = allCities.where('population', '>', 50_000);
 
-        beforeAll(async () => {
-            await Promise.all(cities.map(cityData => allCities.doc().create(fs.writeData(cityData))));
+    beforeAll(async () => {
+        await Promise.all(cities.map(cityData => allCities.doc().create(fs.writeData(cityData))));
+    });
+
+    test('count method', async () => {
+        expect(await getAggregate(allCities.count())).toEqual({ count: 4 });
+        expect(await getAggregate(biggerCities.count())).toEqual({ count: 2 });
+    });
+
+    test('count Field', async () => {
+        const countField = fs.exported.AggregateField.count();
+        await expect(getAggregate(allCities.aggregate({ countField }))).resolves.toEqual({
+            countField: 4,
+        });
+        await expect(getAggregate(biggerCities.aggregate({ countField }))).resolves.toEqual({
+            countField: 2,
+        });
+    });
+
+    test('average', async () => {
+        const averagePopulation = fs.exported.AggregateField.average('population');
+        await expect(getAggregate(allCities.aggregate({ averagePopulation }))).resolves.toEqual({
+            averagePopulation: 62_499,
         });
 
-        test('count method', async () => {
-            expect(await getAggregate(allCities.count())).toEqual({ count: 4 });
-            expect(await getAggregate(biggerCities.count())).toEqual({ count: 2 });
+        await expect(getAggregate(biggerCities.aggregate({ averagePopulation }))).resolves.toEqual({
+            averagePopulation: 90_150,
+        });
+    });
+
+    test('sum', async () => {
+        const sumArea = fs.exported.AggregateField.sum('area');
+        await expect(getAggregate(allCities.aggregate({ sumArea }))).resolves.toEqual({
+            sumArea: 308.4,
         });
 
-        test('count Field', async () => {
-            const countField = fs.exported.AggregateField.count();
-            await expect(getAggregate(allCities.aggregate({ countField }))).resolves.toEqual({
-                countField: 4,
-            });
-            await expect(getAggregate(biggerCities.aggregate({ countField }))).resolves.toEqual({
-                countField: 2,
-            });
+        await expect(getAggregate(biggerCities.aggregate({ sumArea }))).resolves.toEqual({
+            sumArea: 129.97,
         });
+    });
 
-        test('average', async () => {
-            const averagePopulation = fs.exported.AggregateField.average('population');
-            await expect(getAggregate(allCities.aggregate({ averagePopulation }))).resolves.toEqual({
-                averagePopulation: 62_499,
-            });
-
-            await expect(getAggregate(biggerCities.aggregate({ averagePopulation }))).resolves.toEqual({
-                averagePopulation: 90_150,
-            });
-        });
-
-        test('sum', async () => {
-            const sumArea = fs.exported.AggregateField.sum('area');
-            await expect(getAggregate(allCities.aggregate({ sumArea }))).resolves.toEqual({
-                sumArea: 308.4,
-            });
-
-            await expect(getAggregate(biggerCities.aggregate({ sumArea }))).resolves.toEqual({
-                sumArea: 129.97,
-            });
-        });
-
+    fs.notImplementedInRust ||
         test('all together now', async () => {
             const fields = {
                 count: fs.exported.AggregateField.count(),
@@ -388,13 +399,13 @@ fs.notImplementedInRust ||
             });
         });
 
-        async function getAggregate(
-            aggregate: FirebaseFirestore.AggregateQuery<FirebaseFirestore.AggregateSpec, unknown, FirebaseFirestore.DocumentData>,
-        ) {
-            const snap = await aggregate.get();
-            return snap.data();
-        }
-    });
+    async function getAggregate(
+        aggregate: FirebaseFirestore.AggregateQuery<FirebaseFirestore.AggregateSpec, unknown, FirebaseFirestore.DocumentData>,
+    ) {
+        const snap = await aggregate.get();
+        return snap.data();
+    }
+});
 
 async function getData(query: FirebaseFirestore.Query) {
     const snap = await query.get();

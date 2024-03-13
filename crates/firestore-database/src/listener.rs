@@ -480,16 +480,16 @@ impl QueryTarget {
         })];
 
         self.doctargets_by_name.clear();
-        for (name, doc) in self.query.once(database).await? {
+        for version in self.query.once(database).await? {
             self.doctargets_by_name.insert(
-                name.clone(),
+                version.name.clone(),
                 DocumentTarget {
-                    name,
+                    name: version.name.clone(),
                     last_read_time: time.clone(),
                 },
             );
             msgs.push(ResponseType::DocumentChange(DocumentChange {
-                document: Some(doc),
+                document: Some(self.query.project(&version)?),
                 target_ids: vec![TARGET_ID],
                 removed_target_ids: vec![],
             }))
