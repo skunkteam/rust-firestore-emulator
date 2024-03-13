@@ -14,13 +14,13 @@ jobs:
     name: Test
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
         with:
           submodules: "true"
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Install Protoc
-        uses: arduino/setup-protoc@v2
+        uses: arduino/setup-protoc@v3
       - name: Run tests
         run: cargo test --workspace
 
@@ -28,7 +28,7 @@ jobs:
     name: Rustfmt
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@nightly
         with:
           components: rustfmt
@@ -39,7 +39,7 @@ jobs:
     name: Clippy
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
         with:
           submodules: "true"
       - uses: dtolnay/rust-toolchain@stable
@@ -47,7 +47,7 @@ jobs:
           components: clippy
       - uses: Swatinem/rust-cache@v2
       - name: Install Protoc
-        uses: arduino/setup-protoc@v2
+        uses: arduino/setup-protoc@v3
       - name: Linting
         run: cargo clippy --workspace -- -D warnings
 
@@ -55,13 +55,13 @@ jobs:
     name: Compatibility test
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
         with:
           submodules: "true"
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Install Protoc
-        uses: arduino/setup-protoc@v2
+        uses: arduino/setup-protoc@v3
       - run: cargo build
       - uses: actions/setup-node@v4
         with:
@@ -72,17 +72,54 @@ jobs:
         run: npm ci && npm run test:rust-emulator
         working-directory: test-suite
 
+  deploy:
+    name: Deploy
+    needs:
+      - test
+      - fmt
+      - clippy
+      - compat-test
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: "true"
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install Protoc
+        uses: arduino/setup-protoc@v3
+      - name: Build
+        run: cargo build --release --no-default-features
+      - name: Package
+        shell: bash
+        run: |
+          cd target/release
+          tar czvf ../../firestore-emulator.tar.gz firestore-emulator
+          cd -
+      - name: Publish
+        # More info at: https://github.com/softprops/action-gh-release
+        uses: softprops/action-gh-release@v2
+        with:
+          # Will be accessible at:
+          # - https://github.com/skunkteam/rust-firestore-emulator/releases/latest/download/firestore-emulator.tar.gz
+          # - https://github.com/skunkteam/rust-firestore-emulator/releases/download/<tag>/firestore-emulator.tar.gz
+          files: firestore-emulator.tar.gz
+
   # coverage:
   #   name: Code coverage
   #   runs-on: ubuntu-latest
   #   steps:
-  #     - uses: actions/checkout@v3
+  #     - uses: actions/checkout@v4
   #       with:
   #         submodules: "true"
   #     - uses: dtolnay/rust-toolchain@stable
   #     - uses: Swatinem/rust-cache@v2
   #     - name: Install Protoc
-  #       uses: arduino/setup-protoc@v2
+  #       uses: arduino/setup-protoc@v3
   #     - name: Install tarpaulin
   #       run: cargo install cargo-tarpaulin
   #     - name: Generate code coverage
