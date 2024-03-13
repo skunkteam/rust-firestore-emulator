@@ -41,6 +41,7 @@ pub(crate) mod document;
 pub mod event;
 mod field_path;
 pub(crate) mod query;
+pub mod read_consistency;
 pub mod reference;
 mod transaction;
 
@@ -74,7 +75,7 @@ impl FirestoreDatabase {
     pub async fn get_doc(
         &self,
         name: &DocumentRef,
-        consistency: &ReadConsistency,
+        consistency: &read_consistency::ReadConsistency,
     ) -> Result<Option<Document>> {
         info!(%name);
         let version = if let Some(txn) = self.get_txn_for_consistency(consistency).await? {
@@ -129,9 +130,9 @@ impl FirestoreDatabase {
 
     pub(crate) async fn get_txn_for_consistency(
         &self,
-        consistency: &ReadConsistency,
+        consistency: &read_consistency::ReadConsistency,
     ) -> Result<Option<Arc<Transaction>>> {
-        if let ReadConsistency::Transaction(id) = consistency {
+        if let read_consistency::ReadConsistency::Transaction(id) = consistency {
             Ok(Some(self.get_txn(id).await?))
         } else {
             Ok(None)
@@ -221,7 +222,7 @@ impl FirestoreDatabase {
         &self,
         parent: Ref,
         query: StructuredQuery,
-        consistency: ReadConsistency,
+        consistency: read_consistency::ReadConsistency,
     ) -> Result<Vec<Document>> {
         let mut query = Query::from_structured(parent, query, consistency)?;
         info!(?query);
@@ -453,53 +454,3 @@ pub fn get_doc_name_from_write(write: &Write) -> Result<DocumentRef> {
     };
     name.parse()
 }
-
-#[derive(Clone, Debug)]
-pub enum ReadConsistency {
-    Default,
-    ReadTime(Timestamp),
-    Transaction(TransactionId),
-}
-
-impl ReadConsistency {
-    /// Returns `true` if the read consistency is [`Transaction`].
-    ///
-    /// [`Transaction`]: ReadConsistency::Transaction
-    #[must_use]
-    pub fn is_transaction(&self) -> bool {
-        matches!(self, Self::Transaction(..))
-    }
-}
-
-macro_rules! impl_try_from_consistency_selector {
-    ($lib:ident) => {
-        impl TryFrom<Option<$lib::ConsistencySelector>> for ReadConsistency {
-            type Error = GenericDatabaseError;
-
-            fn try_from(value: Option<$lib::ConsistencySelector>) -> Result<Self, Self::Error> {
-                let result = match value {
-                    None => ReadConsistency::Default,
-                    Some($lib::ConsistencySelector::ReadTime(time)) => {
-                        ReadConsistency::ReadTime(time)
-                    }
-                    Some($lib::ConsistencySelector::Transaction(id)) => {
-                        ReadConsistency::Transaction(id.try_into()?)
-                    }
-                    #[allow(unreachable_patterns)]
-                    _ => {
-                        return Err(GenericDatabaseError::internal(concat!(
-                            stringify!($lib),
-                            "::ConsistencySelector::NewTransaction should be handled by caller"
-                        )));
-                    }
-                };
-                Ok(result)
-            }
-        }
-    };
-}
-
-impl_try_from_consistency_selector!(batch_get_documents_request);
-impl_try_from_consistency_selector!(get_document_request);
-impl_try_from_consistency_selector!(list_documents_request);
-impl_try_from_consistency_selector!(run_query_request);

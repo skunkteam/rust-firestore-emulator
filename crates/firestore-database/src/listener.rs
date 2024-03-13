@@ -26,7 +26,7 @@ use tokio_stream::{
 use tracing::{debug, error, info, instrument};
 
 use crate::{
-    database::{reference::Ref, ReadConsistency},
+    database::{read_consistency::ReadConsistency, reference::Ref},
     document::DocumentVersion,
     error::Result,
     event::DatabaseEvent,
