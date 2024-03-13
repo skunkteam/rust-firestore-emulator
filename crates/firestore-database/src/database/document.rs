@@ -20,7 +20,7 @@ use tokio::{
 };
 use tracing::{instrument, trace, Level};
 
-use super::{reference::DocumentRef, ReadConsistency};
+use super::{read_consistency::ReadConsistency, reference::DocumentRef};
 use crate::{error::Result, GenericDatabaseError};
 
 const WAIT_LOCK_TIMEOUT: Duration = Duration::from_secs(30);

@@ -5,7 +5,7 @@ use axum::{
     routing::get,
     Json, Router,
 };
-use firestore_database::{reference::Ref, FirestoreProject, ReadConsistency};
+use firestore_database::{read_consistency::ReadConsistency, reference::Ref, FirestoreProject};
 use serde_json::json;
 use tower_http::set_header::SetResponseHeaderLayer;
 

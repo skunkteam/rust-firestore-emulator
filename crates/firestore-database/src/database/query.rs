@@ -9,8 +9,9 @@ use super::{
     collection::Collection,
     document::StoredDocumentVersion,
     field_path::FieldReference,
+    read_consistency::ReadConsistency,
     reference::{CollectionRef, DocumentRef, Ref},
-    FirestoreDatabase, ReadConsistency,
+    FirestoreDatabase,
 };
 use crate::{error::Result, GenericDatabaseError};
 

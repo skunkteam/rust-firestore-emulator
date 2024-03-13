@@ -3,8 +3,9 @@ use std::sync::Arc;
 use firestore_database::{
     event::DatabaseEvent,
     get_doc_name_from_write,
+    read_consistency::ReadConsistency,
     reference::{DocumentRef, Ref},
-    FirestoreDatabase, FirestoreProject, ReadConsistency,
+    FirestoreDatabase, FirestoreProject,
 };
 use futures::{future::try_join_all, stream::BoxStream, TryStreamExt};
 use googleapis::google::{
