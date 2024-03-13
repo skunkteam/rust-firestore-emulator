@@ -3,20 +3,23 @@ use std::{cmp, collections::HashMap, ops::Deref, sync::Arc};
 use googleapis::google::firestore::v1::{structured_query::CollectionSelector, *};
 use itertools::Itertools;
 use string_cache::DefaultAtom;
-use tonic::{Result, Status};
 
 use self::filter::Filter;
 use super::{
-    collection::Collection, document::StoredDocumentVersion, field_path::FieldReference, Database,
-    ReadConsistency,
+    collection::Collection,
+    document::StoredDocumentVersion,
+    field_path::FieldReference,
+    reference::{CollectionRef, DocumentRef, Ref},
+    FirestoreDatabase, ReadConsistency,
 };
+use crate::{error::Result, GenericDatabaseError};
 
 mod filter;
 
 /// A Firestore query.
 #[derive(Debug)]
-pub struct Query {
-    parent: String,
+pub(crate) struct Query {
+    parent: Ref,
 
     /// Optional sub-set of the fields to return.
     ///
@@ -57,7 +60,7 @@ pub struct Query {
     /// The ordering of the result set is based on the `ORDER BY` clause of the
     /// original query.
     ///
-    /// ```
+    /// ```sql
     /// SELECT * FROM k WHERE a = 1 AND b > 2 ORDER BY b ASC, __name__ ASC;
     /// ```
     ///
@@ -114,7 +117,7 @@ pub struct Query {
 
 impl Query {
     pub fn from_structured(
-        parent: String,
+        parent: Ref,
         query: StructuredQuery,
         consistency: ReadConsistency,
     ) -> Result<Self> {
@@ -168,7 +171,7 @@ impl Query {
             start_at,
             end_at,
             offset: offset as usize,
-            limit: limit.map(|v| v as usize),
+            limit: limit.map(|v| v.value as usize),
             consistency,
             collection_cache: Default::default(),
         })
@@ -178,7 +181,7 @@ impl Query {
         self.order_by.iter().any(|o| !o.field.is_document_name())
     }
 
-    pub async fn once(&mut self, db: &Database) -> Result<Vec<Document>> {
+    pub async fn once(&mut self, db: &FirestoreDatabase) -> Result<Vec<(DocumentRef, Document)>> {
         // First collect all Arc<Collection>s in a Vec to release the collection lock asap.
         let collections = self.applicable_collections(db).await;
 
@@ -230,11 +233,11 @@ impl Query {
         buffer
             .into_iter()
             .skip(self.offset)
-            .map(|version| self.project(&version))
+            .map(|version| Ok((version.name.clone(), self.project(&version)?)))
             .try_collect()
     }
 
-    async fn applicable_collections(&mut self, db: &Database) -> Vec<Arc<Collection>> {
+    async fn applicable_collections(&mut self, db: &FirestoreDatabase) -> Vec<Arc<Collection>> {
         db.collections
             .read()
             .await
@@ -244,29 +247,30 @@ impl Query {
             .collect_vec()
     }
 
-    fn includes_collection(&mut self, path: &DefaultAtom) -> bool {
-        if let Some(&r) = self.collection_cache.get(path) {
+    fn includes_collection(&mut self, collection: &CollectionRef) -> bool {
+        if let Some(&r) = self.collection_cache.get(&collection.collection_id) {
             return r;
         }
-        let included = match path
-            .strip_prefix(&self.parent)
-            .and_then(|path| path.strip_prefix('/'))
-        {
-            Some(path) => self.from.iter().any(|selector| {
+        let included = collection.strip_prefix(&self.parent).is_some_and(|path| {
+            self.from.iter().any(|selector| {
                 if selector.all_descendants {
-                    path.starts_with(&selector.collection_id)
+                    selector.collection_id.is_empty()
+                        || path == selector.collection_id
+                        || path
+                            .strip_prefix(&selector.collection_id)
+                            .is_some_and(|rest| rest.starts_with('/'))
                 } else {
                     path == selector.collection_id
                 }
-            }),
-            None => false,
-        };
-        self.collection_cache.insert(path.clone(), included);
+            })
+        });
+        self.collection_cache
+            .insert(collection.collection_id.clone(), included);
         included
     }
 
     pub fn includes_document(&mut self, doc: &StoredDocumentVersion) -> Result<bool> {
-        if !self.includes_collection(&doc.collection_name) {
+        if !self.includes_collection(&doc.name.collection_ref) {
             return Ok(false);
         }
         if let Some(filter) = &self.filter {
@@ -368,14 +372,14 @@ struct Order {
 }
 
 impl TryFrom<structured_query::Order> for Order {
-    type Error = Status;
+    type Error = GenericDatabaseError;
 
     fn try_from(value: structured_query::Order) -> Result<Self, Self::Error> {
         Ok(Self {
             field:     value
                 .field
                 .as_ref()
-                .ok_or_else(|| Status::invalid_argument("order_by without field"))?
+                .ok_or_else(|| GenericDatabaseError::invalid_argument("order_by without field"))?
                 .field_path
                 .deref()
                 .try_into()?,
@@ -391,13 +395,13 @@ enum Direction {
 }
 
 impl TryFrom<structured_query::Direction> for Direction {
-    type Error = Status;
+    type Error = GenericDatabaseError;
 
     fn try_from(value: structured_query::Direction) -> std::prelude::v1::Result<Self, Self::Error> {
         match value {
-            structured_query::Direction::Unspecified => Err(Status::invalid_argument(
-                "Invalid structured_query::Direction",
-            )),
+            structured_query::Direction::Unspecified => Err(
+                GenericDatabaseError::invalid_argument("Invalid structured_query::Direction"),
+            ),
             structured_query::Direction::Ascending => Ok(Direction::Ascending),
             structured_query::Direction::Descending => Ok(Direction::Descending),
         }

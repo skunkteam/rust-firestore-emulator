@@ -226,7 +226,7 @@ describe('edge cases', () => {
                 ]),
             {
                 rule: 'cannot contain a forward slash (/)',
-                valid: ['canContain\\', 'canContain/collection/myDoc'],
+                valid: ['canContain\\', 'canContain\\/collection/myDoc'],
                 invalid: ['/', 'only/one'],
                 errorMsg: 'Your path does not contain an even number of components.',
                 sync: true,

@@ -2,11 +2,11 @@ use std::ops::Deref;
 
 use googleapis::google::firestore::v1::{structured_query, Value};
 use itertools::Itertools;
-use tonic::{Result, Status};
 
 use crate::{
     database::{document::StoredDocumentVersion, field_path::FieldReference},
-    unimplemented,
+    error::Result,
+    unimplemented, GenericDatabaseError,
 };
 
 #[derive(Debug)]
@@ -35,7 +35,7 @@ impl Filter {
 }
 
 impl TryFrom<structured_query::Filter> for Filter {
-    type Error = Status;
+    type Error = GenericDatabaseError;
 
     fn try_from(value: structured_query::Filter) -> Result<Self, Self::Error> {
         use structured_query::filter::FilterType;
@@ -61,7 +61,7 @@ impl CompositeFilter {
             .collect()
     }
 
-    fn eval(&self, version: &StoredDocumentVersion) -> Result<bool, Status> {
+    fn eval(&self, version: &StoredDocumentVersion) -> Result<bool> {
         for filter in &self.filters {
             let filter_result = filter.eval(version)?;
             match (&self.op, filter_result) {
@@ -74,7 +74,7 @@ impl CompositeFilter {
 }
 
 impl TryFrom<structured_query::CompositeFilter> for CompositeFilter {
-    type Error = Status;
+    type Error = GenericDatabaseError;
 
     fn try_from(value: structured_query::CompositeFilter) -> Result<Self, Self::Error> {
         Ok(Self {
@@ -105,12 +105,12 @@ impl CompositeOperator {
 }
 
 impl TryFrom<structured_query::composite_filter::Operator> for CompositeOperator {
-    type Error = Status;
+    type Error = GenericDatabaseError;
 
     fn try_from(value: structured_query::composite_filter::Operator) -> Result<Self, Self::Error> {
         use structured_query::composite_filter::Operator as Other;
         match value {
-            Other::Unspecified => Err(Status::invalid_argument(
+            Other::Unspecified => Err(GenericDatabaseError::invalid_argument(
                 "invalid structured_query::composite_filter::Operator",
             )),
             Other::And => Ok(Self::And),
@@ -166,7 +166,7 @@ impl FieldFilter {
 }
 
 impl TryFrom<structured_query::FieldFilter> for FieldFilter {
-    type Error = Status;
+    type Error = GenericDatabaseError;
 
     fn try_from(value: structured_query::FieldFilter) -> Result<Self, Self::Error> {
         Ok(Self {
@@ -276,12 +276,12 @@ impl FieldOperator {
 }
 
 impl TryFrom<structured_query::field_filter::Operator> for FieldOperator {
-    type Error = Status;
+    type Error = GenericDatabaseError;
 
     fn try_from(value: structured_query::field_filter::Operator) -> Result<Self, Self::Error> {
         use structured_query::field_filter::Operator as Other;
         match value {
-            Other::Unspecified => Err(Status::invalid_argument(
+            Other::Unspecified => Err(GenericDatabaseError::invalid_argument(
                 "invalid structured_query::field_filter::Operator",
             )),
             Other::LessThan => Ok(Self::LessThan),
@@ -328,7 +328,7 @@ impl UnaryFilter {
 }
 
 impl TryFrom<structured_query::UnaryFilter> for UnaryFilter {
-    type Error = Status;
+    type Error = GenericDatabaseError;
 
     fn try_from(value: structured_query::UnaryFilter) -> Result<Self, Self::Error> {
         let structured_query::unary_filter::OperandType::Field(field) = value
@@ -375,12 +375,12 @@ impl UnaryOperator {
 }
 
 impl TryFrom<structured_query::unary_filter::Operator> for UnaryOperator {
-    type Error = Status;
+    type Error = GenericDatabaseError;
 
     fn try_from(value: structured_query::unary_filter::Operator) -> Result<Self, Self::Error> {
         use structured_query::unary_filter::Operator as Other;
         match value {
-            Other::Unspecified => Err(Status::invalid_argument(
+            Other::Unspecified => Err(GenericDatabaseError::invalid_argument(
                 "invalid structured_query::unary_filter::Operator",
             )),
             Other::IsNan => Ok(Self::IsNan),

@@ -1,12 +1,6 @@
-[workspace]
-
-[workspace.dependencies]
-tokio = { version = "1.36.0" }
-tonic = { version = "0.11", features = ["gzip"] }
-
 [package]
 name = "firestore-emulator"
-version = "0.1.0"
+version = { workspace = true }
 edition = "2021"
 
 [features]
@@ -22,31 +16,48 @@ tracing = [
     "tracing-subscriber/env-filter",
 ]
 
+[workspace]
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+
+[workspace.dependencies]
+async-trait = "0.1.77"
+axum = "0.6.20"
+firestore-database = { path = "crates/firestore-database" }
+futures = "0.3.30"
+googleapis = { path = "crates/googleapis" }
+hyper = "0.14"
+itertools = "0.12.1"
+pin-project = "1.1.5"
+prost = "0.12"
+serde = "1.0.197"
+serde_with = "3.6.1"
+thiserror = "1.0.57"
+time = "0.3.34"
+tokio = "1.36.0"
+tokio-stream = "0.1.14"
+tonic = "0.11"
+tower = "0.4.13"
+tracing = "0.1.40"
+
 [dependencies]
+axum = { workspace = true }
 clap = { version = "4.5.1", features = ["derive", "env"] }
 color-eyre = "0.6.2"
 console = { version = "0.15.8", optional = true }
 console-subscriber = { version = "0.2.0", optional = true }
-futures = "0.3.30"
-googleapis = { path = "crates/googleapis" }
-itertools = "0.12.1"
-string_cache = "0.8.7"
+emulator-grpc = { path = "crates/emulator-grpc" }
+emulator-ui = { path = "crates/emulator-ui" }
+hybrid-axum-tonic = { path = "crates/hybrid-axum-tonic" }
 tikv-jemallocator = "0.5.4"
-time = { version = "0.3.34", features = [
-    "formatting",
-    "macros",
-], optional = true }
-tokio = { workspace = true, features = ["full"] }
-tokio-stream = { version = "0.1.14", features = ["full"] }
-tonic = { workspace = true }
-tracing = "0.1.40"
+time = { workspace = true, optional = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+tracing = { workspace = true }
 tracing-subscriber = { version = "0.3.18", optional = true }
 
 [profile.release]
-codegen-unit = 1
+codegen-units = 1
 lto = "fat"
 panic = "abort"
-
-[lints.clippy]
-# Until this is resolved: https://github.com/rust-lang/rust-clippy/issues/12281
-blocks_in_conditions = "allow"
