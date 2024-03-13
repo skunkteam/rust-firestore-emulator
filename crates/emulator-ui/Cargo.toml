@@ -3,7 +3,11 @@ name = "emulator-ui"
 version = { workspace = true }
 edition = "2021"
 
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+[features]
+default = []
+
+# Enable the web interface on the same host:port as the other emulator endpoints
+ui = []
 
 [dependencies]
 axum = { workspace = true, features = ["macros"] }

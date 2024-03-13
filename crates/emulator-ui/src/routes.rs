@@ -1,8 +1,11 @@
-use axum::{http::header, response::Html, routing::get, Router};
+use axum::Router;
+#[cfg(feature = "ui")]
+use axum::{http::header, response::Html, routing::get};
 use firestore_database::FirestoreProject;
 
 mod emulator;
 
+#[cfg(feature = "ui")]
 const HTML: &str = concat!(
     include_str!("../../../ui/index.html"),
     "<script>version.innerHTML=\"",
@@ -11,8 +14,12 @@ const HTML: &str = concat!(
 );
 
 pub fn router() -> Router {
-    Router::new()
+    let router = Router::new()
         .nest("/emulator/v1", emulator::router())
+        .with_state(FirestoreProject::get());
+
+    #[cfg(feature = "ui")]
+    let router = router
         .route(
             "/lit-html.js",
             get(|| async {
@@ -22,10 +29,15 @@ pub fn router() -> Router {
                 )
             }),
         )
-        .fallback(fallback)
-        .with_state(FirestoreProject::get())
+        .fallback(fallback);
+
+    #[cfg(not(feature = "ui"))]
+    let router = router.fallback(|| async { "OK" });
+
+    router
 }
 
+#[cfg(feature = "ui")]
 async fn fallback() -> Html<&'static str> {
     Html(HTML)
 }

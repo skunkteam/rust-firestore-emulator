@@ -4,7 +4,7 @@ version = { workspace = true }
 edition = "2021"
 
 [features]
-default = []
+default = ["ui"]
 
 # The console feature enables the use of the tokio console for runtime insight in async behavior.
 console = ["dep:console", "dep:console-subscriber", "dep:tracing-subscriber"]
@@ -15,6 +15,9 @@ tracing = [
     "tracing-subscriber/local-time",
     "tracing-subscriber/env-filter",
 ]
+
+# Enable the web interface on the same host:port as the other emulator endpoints
+ui = ["emulator-ui/ui"]
 
 [workspace]
 members = ["crates/*"]
@@ -61,3 +64,4 @@ tracing-subscriber = { version = "0.3.18", optional = true }
 codegen-units = 1
 lto = "fat"
 panic = "abort"
+strip = true
