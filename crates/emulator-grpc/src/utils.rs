@@ -10,7 +10,7 @@ macro_rules! unimplemented {
 macro_rules! unimplemented_option {
     ($val:expr) => {
         if $val.is_some() {
-            unimplemented!(stringify!($val))
+            unimplemented!(stringify!($val));
         }
     };
 }
@@ -18,7 +18,7 @@ macro_rules! unimplemented_option {
 macro_rules! unimplemented_collection {
     ($val:expr) => {
         if !$val.is_empty() {
-            unimplemented!(stringify!($val))
+            unimplemented!(stringify!($val));
         }
     };
 }
@@ -26,7 +26,13 @@ macro_rules! unimplemented_collection {
 macro_rules! unimplemented_bool {
     ($val:expr) => {
         if $val {
-            unimplemented!(stringify!($val))
+            unimplemented!(stringify!($val));
         }
+    };
+}
+
+macro_rules! mandatory {
+    ($val:expr) => {
+        $val.ok_or_else(|| Status::invalid_argument(concat!("missing ", stringify!($val))))?
     };
 }

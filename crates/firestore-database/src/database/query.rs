@@ -10,7 +10,7 @@ use super::{
     document::StoredDocumentVersion,
     field_path::FieldReference,
     read_consistency::ReadConsistency,
-    reference::{CollectionRef, DocumentRef, Ref},
+    reference::{CollectionRef, Ref},
     FirestoreDatabase,
 };
 use crate::{error::Result, GenericDatabaseError};
@@ -182,7 +182,10 @@ impl Query {
         self.order_by.iter().any(|o| !o.field.is_document_name())
     }
 
-    pub async fn once(&mut self, db: &FirestoreDatabase) -> Result<Vec<(DocumentRef, Document)>> {
+    pub async fn once(
+        &mut self,
+        db: &FirestoreDatabase,
+    ) -> Result<Vec<Arc<StoredDocumentVersion>>> {
         // First collect all Arc<Collection>s in a Vec to release the collection lock asap.
         let collections = self.applicable_collections(db).await;
 
@@ -231,11 +234,7 @@ impl Query {
             buffer.truncate(limit)
         }
 
-        buffer
-            .into_iter()
-            .skip(self.offset)
-            .map(|version| Ok((version.name.clone(), self.project(&version)?)))
-            .try_collect()
+        Ok(buffer)
     }
 
     async fn applicable_collections(&mut self, db: &FirestoreDatabase) -> Vec<Arc<Collection>> {
@@ -287,7 +286,7 @@ impl Query {
         Ok(true)
     }
 
-    fn project(&self, version: &StoredDocumentVersion) -> Result<Document> {
+    pub fn project(&self, version: &StoredDocumentVersion) -> Result<Document> {
         let Some(projection) = &self.select else {
             return Ok(version.to_document());
         };
