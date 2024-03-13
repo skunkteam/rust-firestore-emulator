@@ -7,6 +7,7 @@ use std::{
 use googleapis::google::{
     firestore::v1::{
         document_transform::field_transform::{ServerValue, TransformType},
+        structured_aggregation_query::{aggregation, Aggregation},
         *,
     },
     protobuf::Timestamp,
@@ -28,12 +29,13 @@ use self::{
     event::DatabaseEvent,
     field_path::FieldPath,
     query::Query,
+    read_consistency::ReadConsistency,
     reference::{CollectionRef, DocumentRef, Ref, RootRef},
     transaction::{RunningTransactions, Transaction, TransactionId},
 };
 use crate::{
-    error::Result, unimplemented, unimplemented_collection, unimplemented_option,
-    utils::RwLockHashMapExt, GenericDatabaseError,
+    database::field_path::FieldReference, error::Result, unimplemented, unimplemented_collection,
+    unimplemented_option, utils::RwLockHashMapExt, GenericDatabaseError,
 };
 
 mod collection;
@@ -75,7 +77,7 @@ impl FirestoreDatabase {
     pub async fn get_doc(
         &self,
         name: &DocumentRef,
-        consistency: &read_consistency::ReadConsistency,
+        consistency: &ReadConsistency,
     ) -> Result<Option<Document>> {
         info!(%name);
         let version = if let Some(txn) = self.get_txn_for_consistency(consistency).await? {
@@ -130,9 +132,9 @@ impl FirestoreDatabase {
 
     pub(crate) async fn get_txn_for_consistency(
         &self,
-        consistency: &read_consistency::ReadConsistency,
+        consistency: &ReadConsistency,
     ) -> Result<Option<Arc<Transaction>>> {
-        if let read_consistency::ReadConsistency::Transaction(id) = consistency {
+        if let ReadConsistency::Transaction(id) = consistency {
             Ok(Some(self.get_txn(id).await?))
         } else {
             Ok(None)
@@ -222,13 +224,118 @@ impl FirestoreDatabase {
         &self,
         parent: Ref,
         query: StructuredQuery,
-        consistency: read_consistency::ReadConsistency,
+        consistency: ReadConsistency,
     ) -> Result<Vec<Document>> {
         let mut query = Query::from_structured(parent, query, consistency)?;
         info!(?query);
         let result = query.once(self).await?;
         info!(result_count = result.len());
-        Ok(result.into_iter().map(|t| t.1).collect())
+        result
+            .into_iter()
+            .map(|version| query.project(&version))
+            .try_collect()
+    }
+
+    #[instrument(skip_all, err)]
+    pub async fn run_aggregation_query(
+        &self,
+        parent: Ref,
+        query: StructuredQuery,
+        aggregations: Vec<Aggregation>,
+        consistency: ReadConsistency,
+    ) -> Result<HashMap<String, Value>> {
+        unimplemented_option!(query.select);
+        let mut query = Query::from_structured(parent, query, consistency)?;
+        info!(?query);
+        let docs = query.once(self).await?;
+        let result = aggregations
+            .into_iter()
+            .map(|agg| {
+                use aggregation::*;
+                let operator = agg.operator.ok_or_else(|| {
+                    GenericDatabaseError::invalid_argument("missing operator in aggregation query")
+                })?;
+                let result = match operator {
+                    // Count of documents that match the query.
+                    //
+                    // The `COUNT(*)` aggregation function operates on the entire document
+                    // so it does not require a field reference.
+                    Operator::Count(Count { up_to }) => {
+                        let max = up_to.map(|v| v.value).unwrap_or(i64::MAX);
+                        Value::integer((docs.len() as i64).min(max))
+                    }
+                    // Sum of the values of the requested field.
+                    //
+                    // * Only numeric values will be aggregated. All non-numeric values including
+                    //   `NULL` are skipped.
+                    //
+                    // * If the aggregated values contain `NaN`, returns `NaN`. Infinity math
+                    //   follows IEEE-754 standards.
+                    //
+                    // * If the aggregated value set is empty, returns 0.
+                    //
+                    // * Returns a 64-bit integer if all aggregated numbers are integers and the sum
+                    //   result does not overflow. Otherwise, the result is returned as a double.
+                    //   Note that even if all the aggregated values are integers, the result is
+                    //   returned as a double if it cannot fit within a 64-bit signed integer. When
+                    //   this occurs, the returned value will lose precision.
+                    //
+                    // * When underflow occurs, floating-point aggregation is non-deterministic.
+                    //   This means that running the same query repeatedly without any changes to
+                    //   the underlying values could produce slightly different results each time.
+                    //   In those cases, values should be stored as integers over floating-point
+                    //   numbers.
+                    Operator::Sum(Sum { field }) => {
+                        let field_ref: FieldReference = field
+                            .as_ref()
+                            .ok_or_else(|| {
+                                GenericDatabaseError::invalid_argument(
+                                    "missing field reference in SUM operator",
+                                )
+                            })?
+                            .try_into()?;
+                        docs.iter()
+                            .filter_map(|doc| Some(field_ref.get_value(doc)?.into_owned()))
+                            .sum()
+                    }
+                    // Average of the values of the requested field.
+                    //
+                    // * Only numeric values will be aggregated. All non-numeric values including
+                    //   `NULL` are skipped.
+                    //
+                    // * If the aggregated values contain `NaN`, returns `NaN`. Infinity math
+                    //   follows IEEE-754 standards.
+                    //
+                    // * If the aggregated value set is empty, returns `NULL`.
+                    //
+                    // * Always returns the result as a double.
+                    Operator::Avg(Avg { field }) => {
+                        let field_ref: FieldReference = field
+                            .as_ref()
+                            .ok_or_else(|| {
+                                GenericDatabaseError::invalid_argument(
+                                    "missing field reference in AVG operator",
+                                )
+                            })?
+                            .try_into()?;
+                        let values = docs
+                            .iter()
+                            .filter_map(|doc| Some(field_ref.get_value(doc)?.into_owned()))
+                            .filter(Value::is_number)
+                            .collect_vec();
+                        if values.is_empty() {
+                            Value::null()
+                        } else {
+                            let len = values.len();
+                            let sum: Value = values.into_iter().sum();
+                            Value::double(sum.as_double().unwrap() / len as f64)
+                        }
+                    }
+                };
+                Ok((agg.alias, result))
+            })
+            .try_collect()?;
+        Ok(result)
     }
 
     #[instrument(skip_all, err)]
@@ -336,13 +443,30 @@ impl FirestoreDatabase {
         ))
     }
 
-    pub async fn new_txn(&self) -> Result<TransactionId> {
-        Ok(self.transactions.start().await.id)
-    }
+    pub async fn new_txn(
+        &self,
+        transaction_options: Option<TransactionOptions>,
+    ) -> Result<TransactionId> {
+        use transaction_options::*;
+        let retry_id = match transaction_options {
+            Some(TransactionOptions {
+                mode: None | Some(Mode::ReadOnly(_)),
+            }) => {
+                unimplemented!("read-only transactions")
+            }
+            Some(TransactionOptions {
+                mode: Some(Mode::ReadWrite(ReadWrite { retry_transaction })),
+            }) => retry_transaction,
+            None => vec![],
+        };
 
-    pub async fn new_txn_with_id(&self, id: TransactionId) -> Result<()> {
-        self.transactions.start_with_id(id).await?;
-        Ok(())
+        if retry_id.is_empty() {
+            Ok(self.transactions.start().await.id)
+        } else {
+            let id = retry_id.try_into()?;
+            self.transactions.start_with_id(id).await?;
+            Ok(id)
+        }
     }
 
     pub async fn rollback(&self, transaction: &TransactionId) -> Result<()> {

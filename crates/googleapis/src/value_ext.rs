@@ -1,4 +1,4 @@
-use std::{borrow::Cow, cmp, collections::HashMap, ops::Add};
+use std::{borrow::Cow, cmp, collections::HashMap, iter::Sum, ops::Add};
 
 use crate::google::{
     firestore::v1::{value::ValueType, ArrayValue, MapValue, Value},
@@ -77,8 +77,23 @@ impl Value {
         }
     }
 
+    pub fn as_double(&self) -> Option<f64> {
+        match self.value_type() {
+            ValueType::DoubleValue(d) => Some(*d),
+            ValueType::IntegerValue(i) => Some(*i as f64),
+            _ => None,
+        }
+    }
+
     pub fn is_nan(&self) -> bool {
         matches!(self.value_type(), ValueType::DoubleValue(v) if v.is_nan())
+    }
+
+    pub fn is_number(&self) -> bool {
+        matches!(
+            self.value_type(),
+            ValueType::IntegerValue(_) | ValueType::DoubleValue(_)
+        )
     }
 
     pub fn is_null(&self) -> bool {
@@ -161,18 +176,67 @@ impl Ord for Value {
     }
 }
 
+// This is the implementation specific to: server side increment with the following rules:
+//
+// This must be an integer or a double value.
+// If the field is not an integer or double, or if the field does not yet exist, the transformation
+// will set the field to the given value. If either of the given value or the current field value
+// are doubles, both values will be interpreted as doubles. Double arithmetic and representation of
+// double values follow IEEE 754 semantics. If there is positive/negative integer overflow, the
+// field is resolved to the largest magnitude positive/negative integer.
 impl Add for Value {
     type Output = Self;
 
     fn add(self, rhs: Self) -> Self::Output {
+        use ValueType::*;
         match (self.value_type(), rhs.value_type()) {
-            (ValueType::IntegerValue(a), ValueType::IntegerValue(b)) => {
-                Self::integer(a.saturating_add(*b))
-            }
-            (ValueType::IntegerValue(a), ValueType::DoubleValue(b)) => Self::double(*a as f64 + b),
-            (ValueType::DoubleValue(a), ValueType::IntegerValue(b)) => Self::double(a + *b as f64),
-            (ValueType::DoubleValue(a), ValueType::DoubleValue(b)) => Self::double(a + b),
+            (IntegerValue(a), IntegerValue(b)) => Self::integer(a.saturating_add(*b)),
+            (IntegerValue(a), DoubleValue(b)) => Self::double(*a as f64 + b),
+            (DoubleValue(a), IntegerValue(b)) => Self::double(a + *b as f64),
+            (DoubleValue(a), DoubleValue(b)) => Self::double(a + b),
             _ => rhs,
+        }
+    }
+}
+
+// This is the implementation specific to: server side sum and avg aggregation with the following
+// rules:
+//
+// * Only numeric values will be aggregated. All non-numeric values including `NULL` are skipped.
+//
+// * If the aggregated values contain `NaN`, returns `NaN`. Infinity math follows IEEE-754
+//   standards.
+//
+// * If the aggregated value set is empty, returns 0.
+//
+// * Returns a 64-bit integer if all aggregated numbers are integers and the sum result does not
+//   overflow. Otherwise, the result is returned as a double. Note that even if all the aggregated
+//   values are integers, the result is returned as a double if it cannot fit within a 64-bit signed
+//   integer. When this occurs, the returned value will lose precision.
+//
+// * When underflow occurs, floating-point aggregation is non-deterministic. This means that running
+//   the same query repeatedly without any changes to the underlying values could produce slightly
+//   different results each time. In those cases, values should be stored as integers over
+//   floating-point numbers.
+impl Sum for Value {
+    fn sum<I: Iterator<Item = Self>>(iter: I) -> Self {
+        use ValueType::*;
+        let value_type = iter
+            .map(|v| v.value_type().clone())
+            .fold(IntegerValue(0), |a, b| match (a, b) {
+                (IntegerValue(a), IntegerValue(b)) => a
+                    .checked_add(b)
+                    .map(IntegerValue)
+                    .unwrap_or_else(|| DoubleValue(a as f64 + b as f64)),
+                (IntegerValue(a), DoubleValue(b)) => DoubleValue(a as f64 + b),
+                (DoubleValue(a), IntegerValue(b)) => DoubleValue(a + b as f64),
+                (DoubleValue(a), DoubleValue(b)) => DoubleValue(a + b),
+                (a @ (DoubleValue(_) | IntegerValue(_)), _) => a,
+                (_, b @ (DoubleValue(_) | IntegerValue(_))) => b,
+                _ => IntegerValue(0),
+            });
+        Self {
+            value_type: Some(value_type),
         }
     }
 }
