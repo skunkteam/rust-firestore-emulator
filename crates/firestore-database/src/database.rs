@@ -1,6 +1,5 @@
 use std::{
     collections::{hash_map::Entry, HashMap, HashSet},
-    ops::Deref,
     sync::{Arc, Weak},
 };
 
@@ -25,7 +24,10 @@ use tracing::{info, instrument, Span};
 
 use self::{
     collection::Collection,
-    document::{DocumentContents, DocumentMeta, DocumentVersion, OwnedDocumentContentsWriteGuard},
+    document::{
+        DocumentContents, DocumentMeta, DocumentVersion, OwnedDocumentContentsWriteGuard,
+        StoredDocumentVersion,
+    },
     event::DatabaseEvent,
     field_path::FieldPath,
     query::Query,
@@ -42,6 +44,7 @@ mod collection;
 pub(crate) mod document;
 pub mod event;
 mod field_path;
+pub mod projection;
 pub(crate) mod query;
 pub mod read_consistency;
 pub mod reference;
@@ -78,20 +81,20 @@ impl FirestoreDatabase {
         &self,
         name: &DocumentRef,
         consistency: &ReadConsistency,
-    ) -> Result<Option<Document>> {
+    ) -> Result<Option<Arc<StoredDocumentVersion>>> {
         info!(%name);
         let version = if let Some(txn) = self.get_txn_for_consistency(consistency).await? {
             txn.read_doc(name)
                 .await?
                 .version_for_consistency(consistency)?
-                .map(|version| version.to_document())
+                .map(Arc::clone)
         } else {
             self.get_doc_meta(name)
                 .await?
                 .read()
                 .await?
                 .version_for_consistency(consistency)?
-                .map(|version| version.to_document())
+                .map(Arc::clone)
         };
         Span::current().record("found", version.is_some());
         Ok(version)
@@ -230,10 +233,10 @@ impl FirestoreDatabase {
         info!(?query);
         let result = query.once(self).await?;
         info!(result_count = result.len());
-        result
+        Ok(result
             .into_iter()
             .map(|version| query.project(&version))
-            .try_collect()
+            .collect())
     }
 
     #[instrument(skip_all, err)]
@@ -394,7 +397,7 @@ impl FirestoreDatabase {
             operation,
         } = write;
 
-        let operation = operation.ok_or(GenericDatabaseError::not_implemented(
+        let operation = operation.ok_or(GenericDatabaseError::invalid_argument(
             "missing operation in write",
         ))?;
         let condition = current_document
@@ -408,6 +411,8 @@ impl FirestoreDatabase {
         use write::Operation::*;
         let document_version = match operation {
             Update(doc) => {
+                info!(name = %contents.name, "Update");
+
                 let mut fields = if let Some(mask) = update_mask {
                     apply_updates(contents, mask, &doc.fields)?
                 } else {
@@ -428,6 +433,8 @@ impl FirestoreDatabase {
                 contents.add_version(fields, commit_time.clone()).await
             }
             Delete(_) => {
+                info!(name = %contents.name, "Delete");
+
                 unimplemented_option!(update_mask);
                 unimplemented_collection!(update_transforms);
                 contents.delete(commit_time.clone()).await
@@ -495,7 +502,7 @@ fn apply_updates(
         .map(|v| v.fields.clone())
         .unwrap_or_default();
     for field_path in mask.field_paths {
-        let field_path: FieldPath = field_path.deref().try_into()?;
+        let field_path: FieldPath = field_path.parse()?;
         match field_path.get_value(updated_values) {
             Some(new_value) => field_path.set_value(&mut fields, new_value.clone()),
             None => {
@@ -512,7 +519,7 @@ fn apply_transform(
     transform: TransformType,
     commit_time: &Timestamp,
 ) -> Result<Value> {
-    let field_path: FieldPath = path.deref().try_into()?;
+    let field_path: FieldPath = path.parse()?;
     let result = match transform {
         TransformType::SetToServerValue(code) => {
             match ServerValue::try_from(code).map_err(|_| {

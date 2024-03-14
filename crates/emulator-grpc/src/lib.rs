@@ -3,6 +3,7 @@ use std::{mem, sync::Arc};
 use firestore_database::{
     event::DatabaseEvent,
     get_doc_name_from_write,
+    projection::{Project, Projection},
     read_consistency::ReadConsistency,
     reference::{DocumentRef, Ref},
     FirestoreDatabase, FirestoreProject,
@@ -59,9 +60,10 @@ impl firestore_server::Firestore for FirestoreEmulator {
             mask,
             consistency_selector,
         } = request.into_inner();
-        unimplemented_option!(mask);
 
         let name: DocumentRef = name.parse()?;
+
+        let projection = mask.map(Projection::try_from).transpose()?;
 
         let doc = self
             .project
@@ -70,7 +72,7 @@ impl firestore_server::Firestore for FirestoreEmulator {
             .get_doc(&name, &consistency_selector.try_into()?)
             .await?
             .ok_or_else(|| Status::not_found(Code::NotFound.description()))?;
-        Ok(Response::new(doc))
+        Ok(Response::new(projection.project(&doc)))
     }
 
     /// Server streaming response type for the BatchGetDocuments method.
@@ -94,13 +96,13 @@ impl firestore_server::Firestore for FirestoreEmulator {
             mask,
             consistency_selector,
         } = request.into_inner();
-        unimplemented_option!(mask);
 
         let database = self.project.database(&database.parse()?).await;
         let documents: Vec<_> = documents
             .into_iter()
             .map(|name| name.parse::<DocumentRef>())
             .try_collect()?;
+        let projection = mask.map(Projection::try_from).transpose()?;
 
         let (
             // Only used for new transactions.
@@ -125,7 +127,7 @@ impl firestore_server::Firestore for FirestoreEmulator {
                         Ok(doc) => Ok(BatchGetDocumentsResponse {
                             result:      Some(match doc {
                                 None => Missing(name.to_string()),
-                                Some(doc) => Found(doc),
+                                Some(doc) => Found(projection.project(&doc)),
                             }),
                             read_time:   Some(Timestamp::now()),
                             transaction: mem::take(&mut new_transaction),

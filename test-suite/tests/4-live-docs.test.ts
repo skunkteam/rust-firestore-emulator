@@ -70,6 +70,38 @@ describe('listen to document updates', () => {
 
         for (const { stop } of listeners) stop();
     });
+
+    test.concurrent('receiving a single update on multiple updates in single txn', async () => {
+        const doc = fs.collection.doc();
+        const { stop, getCurrent, getNext } = listen(doc);
+
+        const firstSnap = await getCurrent();
+        expect(firstSnap.exists).toBeFalse();
+
+        const nextSnap = getNext();
+
+        await fs.firestore.runTransaction(async txn => {
+            expect(await txn.get(doc)).toHaveProperty('exists', false);
+            txn.create(doc, { created: fs.exported.FieldValue.serverTimestamp() });
+            txn.update(doc, { updated: fs.exported.FieldValue.serverTimestamp() });
+            txn.update(doc, { counter: fs.exported.FieldValue.increment(1) });
+            txn.update(doc, { counter: fs.exported.FieldValue.increment(1) });
+            txn.update(doc, { array: fs.exported.FieldValue.arrayUnion({ id: 1 }, { id: 2 }) });
+            txn.update(doc, { array: fs.exported.FieldValue.arrayUnion({ id: 2 }, { id: 3 }) });
+            txn.update(doc, { array: fs.exported.FieldValue.arrayRemove({ id: 1 }) });
+        });
+
+        const snap = (await nextSnap).data();
+        expect(snap).toEqual({
+            created: expect.any(fs.exported.Timestamp),
+            updated: expect.any(fs.exported.Timestamp),
+            counter: 2,
+            array: [{ id: 2 }, { id: 3 }],
+        });
+        expect(snap?.created).toEqual(snap?.updated);
+
+        stop();
+    });
 });
 
 function listen(doc: FirebaseFirestore.DocumentReference) {
