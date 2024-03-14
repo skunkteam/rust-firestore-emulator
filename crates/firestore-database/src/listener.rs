@@ -23,7 +23,7 @@ use tokio_stream::{
     wrappers::{errors::BroadcastStreamRecvError, BroadcastStream, ReceiverStream},
     StreamExt, StreamMap,
 };
-use tracing::{error, info, instrument};
+use tracing::{debug, error, instrument, Level};
 
 use crate::{
     database::{read_consistency::ReadConsistency, reference::Ref},
@@ -79,7 +79,7 @@ impl Listener {
         ReceiverStream::new(rx)
     }
 
-    #[instrument(name = "listener", skip_all, fields(id = self.id), err)]
+    #[instrument(level = Level::TRACE, name = "listener", skip_all, fields(id = self.id), err)]
     async fn go(
         mut self,
         mut request_stream: impl tokio_stream::Stream<Item = ListenRequest> + Send + Unpin,
@@ -96,7 +96,7 @@ impl Listener {
                         }
                         // We're done, drop the listener.
                         None => {
-                            info!("request stream finished");
+                            debug!("request stream finished");
                             return Ok(());
                         }
                     }
@@ -119,7 +119,7 @@ impl Listener {
         }
     }
 
-    #[instrument(skip_all, err)]
+    #[instrument(level = Level::TRACE, skip_all, err)]
     async fn process_request(&mut self, msg: ListenRequest) -> Result<()> {
         let ListenRequest {
             database,
@@ -147,7 +147,7 @@ impl Listener {
                 if self.target.is_some() {
                     unimplemented!("target already set inside this listen stream")
                 }
-                info!(target_id);
+                debug!(target_id);
                 if target_id != TARGET_ID {
                     unimplemented!("target_id should always be 1")
                 }
@@ -177,7 +177,7 @@ impl Listener {
         Ok(())
     }
 
-    #[instrument(skip_all, err)]
+    #[instrument(level = Level::TRACE, skip_all, err)]
     async fn process_event(&mut self, event: &DatabaseEvent) -> Result<()> {
         // We rely on the fact that this function will complete before any other events are
         // processed. That's why we know for sure that the output stream is not used for
@@ -203,7 +203,7 @@ impl Listener {
         self.send_complete(update_time).await
     }
 
-    #[instrument(skip_all, err)]
+    #[instrument(level = Level::TRACE, skip_all, err)]
     async fn set_document(
         &mut self,
         database: &FirestoreDatabase,
@@ -236,7 +236,7 @@ impl Listener {
         .await?;
 
         let read_time = Timestamp::now();
-        info!(%name);
+        debug!(%name);
 
         // Now determine the latest version we can find...
         let doc = database.get_doc(&name, &ReadConsistency::Default).await?;
@@ -276,7 +276,7 @@ impl Listener {
         Ok(())
     }
 
-    #[instrument(skip_all, err)]
+    #[instrument(level = Level::TRACE, skip_all, err)]
     async fn set_query(&mut self, database: &FirestoreDatabase, query: Query) -> Result<()> {
         // We rely on the fact that this function will complete before any other events are
         // processed. That's why we know for sure that the output stream is not used for
@@ -286,7 +286,7 @@ impl Listener {
         // might look into optimizing later.
         self.ensure_subscribed_to(database);
 
-        info!(?query);
+        debug!(?query);
 
         // Response: I'm on it!
         self.send(ResponseType::TargetChange(TargetChange {
@@ -346,7 +346,7 @@ impl Listener {
         Ok(())
     }
 
-    #[instrument(skip_all, fields(message = display(show_response_type(&response_type))), err)]
+    #[instrument(level = Level::TRACE, skip_all, fields(message = display(show_response_type(&response_type))), err)]
     async fn send(&self, response_type: ResponseType) -> Result<()> {
         self.sender
             .send(Ok(ListenResponse {
@@ -356,7 +356,7 @@ impl Listener {
             .map_err(|_| GenericDatabaseError::cancelled("stream closed"))
     }
 
-    #[instrument(skip(self), err)]
+    #[instrument(level = Level::TRACE, skip(self), err)]
     async fn send_err(&self, err: GenericDatabaseError) -> Result<()> {
         self.sender
             .send(Err(err))
