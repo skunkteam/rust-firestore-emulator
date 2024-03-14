@@ -133,7 +133,7 @@ impl Transaction {
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub struct TransactionId(pub(self) usize);
+pub struct TransactionId(usize);
 
 impl TransactionId {
     fn new() -> Self {
