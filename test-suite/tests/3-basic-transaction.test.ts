@@ -26,6 +26,18 @@ describe('concurrent tests', () => {
         expect(await getData(docRef1.get())).toEqual({ foo: 'bar' });
     });
 
+    test.concurrent('updating same doc multiple times', async () => {
+        const [docRef1] = refs();
+
+        await fs.firestore.runTransaction(async txn => {
+            expect(await txn.get(docRef1)).toHaveProperty('exists', false);
+
+            txn.set(docRef1, writeData({ foo: fs.exported.FieldValue.increment(1) }));
+            txn.update(docRef1, { foo: fs.exported.FieldValue.increment(1) });
+        });
+        expect(await getData(docRef1.get())).toEqual({ foo: 2 });
+    });
+
     test.concurrent('using txn.getAll', async () => {
         const [docRef1, docRef2] = refs();
 

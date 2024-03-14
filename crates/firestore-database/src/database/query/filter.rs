@@ -1,5 +1,3 @@
-use std::ops::Deref;
-
 use googleapis::google::firestore::v1::{structured_query, Value};
 use itertools::Itertools;
 
@@ -175,8 +173,7 @@ impl TryFrom<structured_query::FieldFilter> for FieldFilter {
                 .as_ref()
                 .expect("missing field in FieldFilter")
                 .field_path
-                .deref()
-                .try_into()?,
+                .parse()?,
             op:    value.op().try_into()?,
             value: value.value.expect("missing value in FieldFilter"),
         })
@@ -336,7 +333,7 @@ impl TryFrom<structured_query::UnaryFilter> for UnaryFilter {
             .as_ref()
             .expect("missing operand_type in UnaryFilter");
         Ok(Self {
-            field: field.field_path.deref().try_into()?,
+            field: field.field_path.parse()?,
             op:    value.op().try_into()?,
         })
     }

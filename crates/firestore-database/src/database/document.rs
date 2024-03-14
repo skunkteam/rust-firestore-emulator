@@ -18,7 +18,7 @@ use tokio::{
     },
     time::{error::Elapsed, timeout},
 };
-use tracing::{instrument, trace, Level};
+use tracing::{info, instrument, trace, Level};
 
 use super::{read_consistency::ReadConsistency, reference::DocumentRef};
 use crate::{error::Result, GenericDatabaseError};
@@ -182,6 +182,16 @@ impl DocumentContents {
             update_time,
             fields,
         }));
+        if let Some(last) = self.versions.last_mut() {
+            if last.update_time() == version.update_time() {
+                last.clone_from(&version);
+                return version;
+            }
+            assert!(
+                last.update_time() < version.update_time(),
+                "update or commit time earlier than last version"
+            );
+        }
         self.versions.push(version.clone());
         version
     }
@@ -209,6 +219,7 @@ pub type OwnedDocumentContentsWriteGuard = OwnedRwLockWriteGuard<DocumentContent
 impl OwnedDocumentContentsReadGuard {
     #[instrument(skip_all, err)]
     pub async fn upgrade(self) -> Result<OwnedDocumentContentsWriteGuard> {
+        info!(name = %self.meta.name);
         let check_time = self.guard.last_updated();
         let OwnedDocumentContentsReadGuard {
             meta,

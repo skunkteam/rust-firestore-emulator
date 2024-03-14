@@ -1,4 +1,4 @@
-use std::{borrow::Cow, collections::HashMap, convert::Infallible, mem::take, ops::Deref};
+use std::{borrow::Cow, collections::HashMap, convert::Infallible, mem::take, str::FromStr};
 
 use googleapis::google::firestore::v1::*;
 
@@ -35,17 +35,17 @@ impl TryFrom<&structured_query::FieldReference> for FieldReference {
     type Error = GenericDatabaseError;
 
     fn try_from(value: &structured_query::FieldReference) -> Result<Self, Self::Error> {
-        value.field_path.deref().try_into()
+        value.field_path.parse()
     }
 }
 
-impl TryFrom<&str> for FieldReference {
-    type Error = GenericDatabaseError;
+impl FromStr for FieldReference {
+    type Err = GenericDatabaseError;
 
-    fn try_from(path: &str) -> Result<Self, Self::Error> {
+    fn from_str(path: &str) -> Result<Self, Self::Err> {
         match path {
             DOC_NAME => Ok(Self::DocumentName),
-            path => Ok(Self::FieldPath((path.try_into())?)),
+            path => Ok(Self::FieldPath((path.parse())?)),
         }
     }
 }
@@ -124,10 +124,10 @@ impl FieldPath {
     }
 }
 
-impl TryFrom<&str> for FieldPath {
-    type Error = GenericDatabaseError;
+impl FromStr for FieldPath {
+    type Err = GenericDatabaseError;
 
-    fn try_from(path: &str) -> Result<Self, Self::Error> {
+    fn from_str(path: &str) -> Result<Self, Self::Err> {
         if path.is_empty() {
             return Err(GenericDatabaseError::invalid_argument(
                 "invalid empty field path",
