@@ -1,4 +1,4 @@
-import { orderBy, reverse, without } from 'lodash';
+import { orderBy, reverse, uniq, without } from 'lodash';
 import { fs } from './utils';
 
 interface Data {
@@ -325,6 +325,17 @@ describe('paginating results', () => {
                 expect(result).toEqual(docs.slice(cursorIdx + 1, endAtIdx + 1));
             });
         });
+    });
+});
+
+describe('projection', () => {
+    test.each([
+        { requested: [], got: [] },
+        { requested: ['type'], got: ['type'] },
+        { requested: ['type', 'ordered', 'non_existing'], got: ['type', 'ordered'] },
+    ])('select subset of fields', async ({ requested, got }) => {
+        const result = await fs.collection.select(...requested).get();
+        expect(uniq(result.docs.flatMap(d => Object.keys(d.data())))).toIncludeSameMembers(got);
     });
 });
 

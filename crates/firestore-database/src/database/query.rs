@@ -9,6 +9,7 @@ use super::{
     collection::Collection,
     document::StoredDocumentVersion,
     field_path::FieldReference,
+    projection::{Project, Projection},
     read_consistency::ReadConsistency,
     reference::{CollectionRef, Ref},
     FirestoreDatabase,
@@ -27,7 +28,7 @@ pub(crate) struct Query {
     /// This acts as a [DocumentMask][google.firestore.v1.DocumentMask] over the
     /// documents returned from a query. When not set, assumes that the caller
     /// wants all fields returned.
-    select: Option<Vec<FieldReference>>,
+    select: Option<Projection>,
 
     /// The collections to query.
     from: Vec<CollectionSelector>,
@@ -133,15 +134,7 @@ impl Query {
             limit,
         } = query;
 
-        let select = select
-            .map(|projection| {
-                projection
-                    .fields
-                    .iter()
-                    .map(TryInto::try_into)
-                    .try_collect()
-            })
-            .transpose()?;
+        let select = select.map(Projection::try_from).transpose()?;
         let filter: Option<Filter> = filter.map(TryInto::try_into).transpose()?;
         let mut order_by: Vec<Order> = order_by.into_iter().map(TryInto::try_into).try_collect()?;
         if order_by.is_empty() {
@@ -286,37 +279,8 @@ impl Query {
         Ok(true)
     }
 
-    pub fn project(&self, version: &StoredDocumentVersion) -> Result<Document> {
-        let Some(projection) = &self.select else {
-            return Ok(version.to_document());
-        };
-
-        match &projection[..] {
-            [] => Ok(version.to_document()),
-            [FieldReference::DocumentName] => Ok(Document {
-                fields: Default::default(),
-                create_time: Some(version.create_time.clone()),
-                update_time: Some(version.update_time.clone()),
-                name: version.name.to_string(),
-            }),
-            fields => {
-                let mut doc = Document {
-                    fields: Default::default(),
-                    create_time: Some(version.create_time.clone()),
-                    update_time: Some(version.update_time.clone()),
-                    name: version.name.to_string(),
-                };
-                for field in fields {
-                    let FieldReference::FieldPath(path) = field else {
-                        continue;
-                    };
-                    if let Some(val) = path.get_value(&version.fields) {
-                        path.set_value(&mut doc.fields, val.clone());
-                    }
-                }
-                Ok(doc)
-            }
-        }
+    pub fn project(&self, version: &StoredDocumentVersion) -> Document {
+        self.select.project(version)
     }
 
     fn order_by_cmp(
@@ -381,8 +345,7 @@ impl TryFrom<structured_query::Order> for Order {
                 .as_ref()
                 .ok_or_else(|| GenericDatabaseError::invalid_argument("order_by without field"))?
                 .field_path
-                .deref()
-                .try_into()?,
+                .parse()?,
             direction: value.direction().try_into()?,
         })
     }

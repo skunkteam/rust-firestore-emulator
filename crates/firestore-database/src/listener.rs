@@ -244,7 +244,7 @@ impl Listener {
         let send_initial = match &send_if_newer_than {
             Some(previous_time) => !doc
                 .as_ref()
-                .is_some_and(|v| (v.update_time.as_ref().unwrap()) <= (previous_time)),
+                .is_some_and(|v| (&v.update_time) <= (previous_time)),
             _ => true,
         };
 
@@ -252,7 +252,7 @@ impl Listener {
             // Response: This is the current version, whether you like it or not.
             let msg = match doc {
                 Some(d) => ResponseType::DocumentChange(DocumentChange {
-                    document: Some(d),
+                    document: Some(d.to_document()),
                     target_ids: vec![TARGET_ID],
                     removed_target_ids: vec![],
                 }),
@@ -489,7 +489,7 @@ impl QueryTarget {
                 },
             );
             msgs.push(ResponseType::DocumentChange(DocumentChange {
-                document: Some(self.query.project(&version)?),
+                document: Some(self.query.project(&version)),
                 target_ids: vec![TARGET_ID],
                 removed_target_ids: vec![],
             }))
