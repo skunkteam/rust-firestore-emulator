@@ -23,7 +23,7 @@ ui = ["emulator-ui/ui"]
 members = ["crates/*"]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.0.1"
 
 [workspace.dependencies]
 async-trait = "0.1.77"
