@@ -22,6 +22,7 @@ use tokio::sync::mpsc;
 use tokio_stream::{once, wrappers::ReceiverStream, StreamExt};
 use tonic::{async_trait, codec::CompressionEncoding, Code, Request, Response, Result, Status};
 use tracing::{info, info_span, instrument, Instrument};
+use utils::error_in_stream;
 
 #[macro_use]
 mod utils;
@@ -76,7 +77,7 @@ impl firestore_server::Firestore for FirestoreEmulator {
     }
 
     /// Server streaming response type for the BatchGetDocuments method.
-    type BatchGetDocumentsStream = ReceiverStream<Result<BatchGetDocumentsResponse>>;
+    type BatchGetDocumentsStream = BoxStream<'static, Result<BatchGetDocumentsResponse>>;
 
     /// Gets multiple documents.
     ///
@@ -97,52 +98,56 @@ impl firestore_server::Firestore for FirestoreEmulator {
             consistency_selector,
         } = request.into_inner();
 
-        let database = self.project.database(&database.parse()?).await;
-        let documents: Vec<_> = documents
-            .into_iter()
-            .map(|name| name.parse::<DocumentRef>())
-            .try_collect()?;
-        let projection = mask.map(Projection::try_from).transpose()?;
+        error_in_stream(async {
+            let database = self.project.database(&database.parse()?).await;
+            let documents: Vec<_> = documents
+                .into_iter()
+                .map(|name| name.parse::<DocumentRef>())
+                .try_collect()?;
+            let projection = mask.map(Projection::try_from).transpose()?;
 
-        let (
-            // Only used for new transactions.
-            mut new_transaction,
-            read_consistency,
-        ) = match consistency_selector {
-            Some(batch_get_documents_request::ConsistencySelector::NewTransaction(txn_opts)) => {
-                let id = database.new_txn(Some(txn_opts)).await?;
-                info!("started new transaction");
-                (id.into(), ReadConsistency::Transaction(id))
-            }
-            s => (vec![], s.try_into()?),
-        };
-        info!(?read_consistency);
+            let (
+                // Only used for new transactions.
+                mut new_transaction,
+                read_consistency,
+            ) = match consistency_selector {
+                Some(batch_get_documents_request::ConsistencySelector::NewTransaction(
+                    txn_opts,
+                )) => {
+                    let id = database.new_txn(Some(txn_opts)).await?;
+                    info!("started new transaction");
+                    (id.into(), ReadConsistency::Transaction(id))
+                }
+                s => (vec![], s.try_into()?),
+            };
+            info!(?read_consistency);
 
-        let (tx, rx) = mpsc::channel(16);
-        tokio::spawn(
-            async move {
-                for name in documents {
-                    use batch_get_documents_response::Result::*;
-                    let msg = match database.get_doc(&name, &read_consistency).await {
-                        Ok(doc) => Ok(BatchGetDocumentsResponse {
-                            result:      Some(match doc {
-                                None => Missing(name.to_string()),
-                                Some(doc) => Found(projection.project(&doc)),
+            let (tx, rx) = mpsc::channel(16);
+            tokio::spawn(
+                async move {
+                    for name in documents {
+                        use batch_get_documents_response::Result::*;
+                        let msg = match database.get_doc(&name, &read_consistency).await {
+                            Ok(doc) => Ok(BatchGetDocumentsResponse {
+                                result:      Some(match doc {
+                                    None => Missing(name.to_string()),
+                                    Some(doc) => Found(projection.project(&doc)),
+                                }),
+                                read_time:   Some(Timestamp::now()),
+                                transaction: mem::take(&mut new_transaction),
                             }),
-                            read_time:   Some(Timestamp::now()),
-                            transaction: mem::take(&mut new_transaction),
-                        }),
-                        Err(err) => Err(Status::from(err)),
-                    };
-                    if tx.send(msg).await.is_err() {
-                        break;
+                            Err(err) => Err(Status::from(err)),
+                        };
+                        if tx.send(msg).await.is_err() {
+                            break;
+                        }
                     }
                 }
-            }
-            .instrument(info_span!("worker")),
-        );
-
-        Ok(Response::new(ReceiverStream::new(rx)))
+                .instrument(info_span!("worker")),
+            );
+            Ok(ReceiverStream::new(rx))
+        })
+        .await
     }
 
     /// Commits a transaction, while optionally updating documents.
@@ -307,43 +312,45 @@ impl firestore_server::Firestore for FirestoreEmulator {
             query_type,
             consistency_selector,
         } = request.into_inner();
-        unimplemented_option!(explain_options);
-        let run_query_request::QueryType::StructuredQuery(query) = mandatory!(query_type);
 
-        let parent: Ref = parent.parse()?;
+        error_in_stream(async {
+            unimplemented_option!(explain_options);
+            let run_query_request::QueryType::StructuredQuery(query) = mandatory!(query_type);
 
-        let database = self.project.database(parent.root()).await;
+            let parent: Ref = parent.parse()?;
 
-        let (
-            // Only used for new transactions.
-            mut new_transaction,
-            read_consistency,
-        ) = match consistency_selector {
-            Some(run_query_request::ConsistencySelector::NewTransaction(txn_opts)) => {
-                let id = database.new_txn(Some(txn_opts)).await?;
-                info!("started new transaction");
-                (id.into(), ReadConsistency::Transaction(id))
-            }
-            s => (vec![], s.try_into()?),
-        };
-        let docs = database.run_query(parent, query, read_consistency).await?;
+            let database = self.project.database(parent.root()).await;
 
-        let stream = tokio_stream::iter(docs).map(move |doc| {
-            Ok(RunQueryResponse {
-                transaction: mem::take(&mut new_transaction),
-                document: Some(doc),
-                read_time: Some(Timestamp::now()),
-                skipped_results: 0,
-                explain_metrics: None,
-                continuation_selector: None,
-            })
-        });
+            let (
+                // Only used for new transactions.
+                mut new_transaction,
+                read_consistency,
+            ) = match consistency_selector {
+                Some(run_query_request::ConsistencySelector::NewTransaction(txn_opts)) => {
+                    let id = database.new_txn(Some(txn_opts)).await?;
+                    info!("started new transaction");
+                    (id.into(), ReadConsistency::Transaction(id))
+                }
+                s => (vec![], s.try_into()?),
+            };
+            let docs = database.run_query(parent, query, read_consistency).await?;
 
-        Ok(Response::new(Box::pin(stream)))
+            Ok(tokio_stream::iter(docs).map(move |doc| -> Result<_> {
+                Ok(RunQueryResponse {
+                    transaction: mem::take(&mut new_transaction),
+                    document: Some(doc),
+                    read_time: Some(Timestamp::now()),
+                    skipped_results: 0,
+                    explain_metrics: None,
+                    continuation_selector: None,
+                })
+            }))
+        })
+        .await
     }
 
     /// Server streaming response type for the RunAggregationQuery method.
-    type RunAggregationQueryStream = tokio_stream::Once<Result<RunAggregationQueryResponse>>;
+    type RunAggregationQueryStream = BoxStream<'static, Result<RunAggregationQueryResponse>>;
 
     /// Runs an aggregation query.
     ///
@@ -369,44 +376,50 @@ impl firestore_server::Firestore for FirestoreEmulator {
             query_type,
             consistency_selector,
         } = request.into_inner();
-        unimplemented_option!(explain_options);
 
-        let run_aggregation_query_request::QueryType::StructuredAggregationQuery(agg_query) =
-            mandatory!(query_type);
+        error_in_stream(async {
+            unimplemented_option!(explain_options);
 
-        let structured_aggregation_query::QueryType::StructuredQuery(query) =
-            mandatory!(agg_query.query_type);
+            let run_aggregation_query_request::QueryType::StructuredAggregationQuery(agg_query) =
+                mandatory!(query_type);
 
-        let parent: Ref = parent.parse()?;
+            let structured_aggregation_query::QueryType::StructuredQuery(query) =
+                mandatory!(agg_query.query_type);
 
-        let database = self.project.database(parent.root()).await;
+            let parent: Ref = parent.parse()?;
 
-        let (
-            // Only used for new transactions.
-            new_transaction,
-            read_consistency,
-        ) = match consistency_selector {
-            Some(run_aggregation_query_request::ConsistencySelector::NewTransaction(txn_opts)) => {
-                let id = database.new_txn(Some(txn_opts)).await?;
-                info!("started new transaction");
-                (id.into(), ReadConsistency::Transaction(id))
-            }
-            s => (vec![], s.try_into()?),
-        };
+            let database = self.project.database(parent.root()).await;
 
-        info!(?read_consistency);
-        let aggregate_fields = database
-            .run_aggregation_query(parent, query, agg_query.aggregations, read_consistency)
-            .await?;
+            let (
+                // Only used for new transactions.
+                new_transaction,
+                read_consistency,
+            ) = match consistency_selector {
+                Some(run_aggregation_query_request::ConsistencySelector::NewTransaction(
+                    txn_opts,
+                )) => {
+                    let id = database.new_txn(Some(txn_opts)).await?;
+                    info!("started new transaction");
+                    (id.into(), ReadConsistency::Transaction(id))
+                }
+                s => (vec![], s.try_into()?),
+            };
 
-        let response = RunAggregationQueryResponse {
-            result: Some(AggregationResult { aggregate_fields }),
-            explain_metrics: None,
-            transaction: new_transaction,
-            read_time: Some(Timestamp::now()),
-        };
+            info!(?read_consistency);
+            let aggregate_fields = database
+                .run_aggregation_query(parent, query, agg_query.aggregations, read_consistency)
+                .await?;
 
-        Ok(Response::new(once(Ok(response))))
+            let response = RunAggregationQueryResponse {
+                result: Some(AggregationResult { aggregate_fields }),
+                explain_metrics: None,
+                transaction: new_transaction,
+                read_time: Some(Timestamp::now()),
+            };
+
+            Ok(once(Ok(response)))
+        })
+        .await
     }
 
     /// Partitions a query by returning partition cursors that can be used to run
