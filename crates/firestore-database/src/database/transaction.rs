@@ -7,7 +7,7 @@ use std::{
 };
 
 use tokio::sync::{Mutex, RwLock};
-use tracing::instrument;
+use tracing::{instrument, Level};
 
 use super::{
     document::{OwnedDocumentContentsReadGuard, OwnedDocumentContentsWriteGuard},
@@ -89,7 +89,7 @@ impl Transaction {
         }
     }
 
-    #[instrument(skip_all)]
+    #[instrument(level = Level::TRACE, skip_all)]
     pub async fn read_doc(
         &self,
         name: &DocumentRef,
