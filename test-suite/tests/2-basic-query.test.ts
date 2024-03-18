@@ -382,7 +382,9 @@ describe('aggregation queries', () => {
     test('sum', async () => {
         const sumArea = fs.exported.AggregateField.sum('area');
         await expect(getAggregate(allCities.aggregate({ sumArea }))).resolves.toEqual({
-            sumArea: 308.4,
+            // Known current limitation of the Rust emulator, depending of the order of the aggregation we
+            // either get the first or the second number (you know, floating point).
+            sumArea: expect.toBeWithin(308.4, 308.40000000000003),
         });
 
         await expect(getAggregate(biggerCities.aggregate({ sumArea }))).resolves.toEqual({
@@ -390,25 +392,26 @@ describe('aggregation queries', () => {
         });
     });
 
-    fs.notImplementedInRust ||
-        test('all together now', async () => {
-            const fields = {
-                count: fs.exported.AggregateField.count(),
-                sumArea: fs.exported.AggregateField.sum('area'),
-                averagePopulation: fs.exported.AggregateField.average('population'),
-            };
-            await expect(getAggregate(allCities.aggregate(fields))).resolves.toEqual({
-                count: 4,
-                sumArea: 308.4,
-                averagePopulation: 62_499,
-            });
-
-            await expect(getAggregate(biggerCities.aggregate(fields))).resolves.toEqual({
-                count: 2,
-                sumArea: 129.97,
-                averagePopulation: 90_150,
-            });
+    test('all together now', async () => {
+        const fields = {
+            count: fs.exported.AggregateField.count(),
+            sumArea: fs.exported.AggregateField.sum('area'),
+            averagePopulation: fs.exported.AggregateField.average('population'),
+        };
+        await expect(getAggregate(allCities.aggregate(fields))).resolves.toEqual({
+            count: 4,
+            // Known current limitation of the Rust emulator, depending of the order of the aggregation we
+            // either get the first or the second number (you know, floating point).
+            sumArea: expect.toBeWithin(308.4, 308.40000000000003),
+            averagePopulation: 62_499,
         });
+
+        await expect(getAggregate(biggerCities.aggregate(fields))).resolves.toEqual({
+            count: 2,
+            sumArea: 129.97,
+            averagePopulation: 90_150,
+        });
+    });
 
     async function getAggregate(
         aggregate: FirebaseFirestore.AggregateQuery<FirebaseFirestore.AggregateSpec, unknown, FirebaseFirestore.DocumentData>,
