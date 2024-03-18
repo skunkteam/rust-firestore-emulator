@@ -374,18 +374,18 @@ describe.each([
 describe('list', () => {
     const data = fs.writeData({ prop: 'foo' });
 
-    fs.notImplementedInRust ||
-        test('listDocuments', async () => {
-            const scope = fs.collection.doc().collection('collection');
+    test('listDocuments', async () => {
+        const scope = fs.collection.doc().collection('collection');
 
-            expect(await scope.listDocuments()).toBeEmpty();
-            // Create three different docs in the given collection
-            await scope.doc('foo').create(data);
-            await scope.doc('bar').create(data);
-            await scope.doc('baz').create(data);
+        expect(await scope.listDocuments()).toBeEmpty();
+        // Create three different docs in the given collection
+        await scope.doc('foo').create(data);
+        await scope.doc('bar').create(data);
+        // This one is only a nested collection, this is a so called "missing doc"
+        await scope.doc('baz').collection('subFoo').doc().collection('really nested').doc().create(data);
 
-            expect((await scope.listDocuments()).map(c => c.id)).toIncludeSameMembers(['foo', 'bar', 'baz']);
-        });
+        expect((await scope.listDocuments()).map(c => c.id)).toIncludeSameMembers(['foo', 'bar', 'baz']);
+    });
 
     test('listCollections', async () => {
         const scope = fs.collection.doc();

@@ -4,17 +4,14 @@ use firestore_database::{
     event::DatabaseEvent,
     get_doc_name_from_write,
     projection::{Project, Projection},
+    query::{Query, QueryBuilder},
     read_consistency::ReadConsistency,
     reference::{DocumentRef, Ref},
     FirestoreDatabase, FirestoreProject,
 };
 use futures::{future::try_join_all, stream::BoxStream, TryStreamExt};
 use googleapis::google::{
-    firestore::v1::{
-        firestore_server::FirestoreServer,
-        structured_query::{CollectionSelector, FieldReference},
-        *,
-    },
+    firestore::v1::{firestore_server::FirestoreServer, structured_query::CollectionSelector, *},
     protobuf::{Empty, Timestamp},
 };
 use itertools::Itertools;
@@ -204,41 +201,46 @@ impl firestore_server::Firestore for FirestoreEmulator {
             consistency_selector,
         } = request.into_inner();
 
-        unimplemented_bool!(show_missing);
         unimplemented_collection!(order_by);
         unimplemented_collection!(page_token);
-        if page_size > 0 {
-            unimplemented!("page_size");
+        if show_missing && collection_id.is_empty() {
+            // This assumption is used with the `strip_prefix` later on.
+            unimplemented!("show_missing without a collection parent");
         }
 
         let parent: Ref = parent.parse()?;
         let database = self.project.database(parent.root()).await;
 
-        let documents = database
-            .run_query(
-                parent,
-                StructuredQuery {
-                    select:   mask.map(|v| structured_query::Projection {
-                        fields: v
-                            .field_paths
-                            .into_iter()
-                            .map(|field_path| FieldReference { field_path })
-                            .collect(),
+        let mut query = QueryBuilder::from(
+            parent.clone(),
+            vec![CollectionSelector {
+                all_descendants: collection_id.is_empty(),
+                collection_id:   collection_id.clone(),
+            }],
+        )
+        .select(mask.map(|mask| mask.try_into()).transpose()?)
+        .consistency(consistency_selector.try_into()?)
+        .build()?;
+
+        let found_docs = query.once(&database).await?;
+        let mut documents = found_docs.iter().map(|v| query.project(v)).collect_vec();
+
+        if show_missing {
+            documents.extend(
+                query
+                    .missing_docs(&database)
+                    .await?
+                    .into_iter()
+                    .map(|name| Document {
+                        name,
+                        ..Default::default()
                     }),
-                    from:     vec![CollectionSelector {
-                        collection_id,
-                        all_descendants: false,
-                    }],
-                    r#where:  None,
-                    order_by: vec![],
-                    start_at: None,
-                    end_at:   None,
-                    offset:   0,
-                    limit:    None,
-                },
-                consistency_selector.try_into()?,
-            )
-            .await?;
+            );
+        }
+
+        if page_size > 0 && documents.len() > page_size as usize {
+            unimplemented!("resultset greater than page_size");
+        }
 
         Ok(Response::new(ListDocumentsResponse {
             documents,
@@ -333,7 +335,8 @@ impl firestore_server::Firestore for FirestoreEmulator {
                 }
                 s => (vec![], s.try_into()?),
             };
-            let docs = database.run_query(parent, query, read_consistency).await?;
+            let mut query = Query::from_structured(parent, query, read_consistency)?;
+            let docs = database.run_query(&mut query).await?;
 
             Ok(tokio_stream::iter(docs).map(move |doc| -> Result<_> {
                 Ok(RunQueryResponse {

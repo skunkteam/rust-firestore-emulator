@@ -47,7 +47,9 @@ macro_rules! mandatory {
 ///
 /// In the NodeJS SDK a request that expects to result in a stream is always retried, while an error
 /// received inside a stream is not retried, this reduces the time of a single test in our
-/// test-suite from 7s to 3ms
+/// test-suite from 7s to 3ms.
+///
+/// The returned Result never fails.
 pub async fn error_in_stream<T, F, S>(stream: F) -> Result<Response<BoxStream<'static, Result<T>>>>
 where
     F: Future<Output = Result<S>>,

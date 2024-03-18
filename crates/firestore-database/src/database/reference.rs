@@ -375,6 +375,37 @@ impl CollectionRef {
             .strip_prefix('/')?;
         Some(rest)
     }
+
+    /// Returns the parent of the collection ref, is either a DocumentRef or a RootRef.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use firestore_database::reference::*;
+    /// # use firestore_database::*;
+    /// # fn main() -> Result<(), GenericDatabaseError> {
+    /// let collection: CollectionRef = "projects/p/databases/d/documents/parent/doc/child".parse()?;
+    /// let parent: Ref = "projects/p/databases/d/documents/parent/doc".parse()?;
+    /// assert_eq!(collection.parent(), parent);
+    ///
+    /// let collection: CollectionRef = "projects/p/databases/d/documents/parent".parse()?;
+    /// let parent: Ref = "projects/p/databases/d/documents".parse()?;
+    /// assert_eq!(collection.parent(), parent);
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn parent(&self) -> Ref {
+        let Some((parent_doc, _)) = self.collection_id.rsplit_once('/') else {
+            return Ref::Root(self.root_ref.clone());
+        };
+        let (collection_id, document_id) = parent_doc
+            .rsplit_once('/')
+            .expect("CollectionRef should always contain pairs of slashes");
+        Ref::Document(DocumentRef::new(
+            CollectionRef::new(self.root_ref.clone(), collection_id),
+            document_id,
+        ))
+    }
 }
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq, PartialOrd, Ord)]
