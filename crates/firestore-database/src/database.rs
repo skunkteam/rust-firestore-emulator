@@ -20,7 +20,7 @@ use tokio::{
         RwLock,
     },
 };
-use tracing::{info, instrument, Span};
+use tracing::{debug, instrument, Level, Span};
 
 use self::{
     collection::Collection,
@@ -76,13 +76,13 @@ impl FirestoreDatabase {
         );
     }
 
-    #[instrument(skip_all, err, fields(in_txn = consistency.is_transaction(), found))]
+    #[instrument(level = Level::TRACE, skip_all, err, fields(in_txn = consistency.is_transaction(), found))]
     pub async fn get_doc(
         &self,
         name: &DocumentRef,
         consistency: &ReadConsistency,
     ) -> Result<Option<Arc<StoredDocumentVersion>>> {
-        info!(%name);
+        debug!(%name);
         let version = if let Some(txn) = self.get_txn_for_consistency(consistency).await? {
             txn.read_doc(name)
                 .await?
@@ -151,26 +151,10 @@ impl FirestoreDatabase {
         self.transactions.get(id).await
     }
 
-    // /// Get all the (deeply nested) collections that reside under the given parent.
-    // #[instrument(skip_all)]
-    // pub async fn get_collection_ids_deep(&self, parent: &Ref) -> Result<Vec<String>> {
-    //     // Cannot use `filter_map` because of the `await`.
-    //     let mut result = vec![];
-    //     for col in self.get_all_collections().await {
-    //         let Some(path) = col.name.strip_prefix(parent) else {
-    //             continue;
-    //         };
-    //         if col.has_doc().await? {
-    //             result.push(path.to_string());
-    //         }
-    //     }
-    //     Ok(result)
-    // }
-
     /// Get all the collections that reside directly under the given parent. This means that:
     /// - the IDs will not contain a `/`
     /// - the result will be empty if `parent` is a [`Ref::Collection`].
-    #[instrument(skip_all)]
+    #[instrument(level = Level::TRACE, skip_all)]
     pub async fn get_collection_ids(&self, parent: &Ref) -> Result<HashSet<String>> {
         // Cannot use `filter_map` because of the `await`.
         let mut result = HashSet::new();
@@ -183,7 +167,7 @@ impl FirestoreDatabase {
                 result.insert(id.to_string());
             }
         }
-        info!(result_count = result.len());
+        debug!(result_count = result.len());
         Ok(result)
     }
 
@@ -192,7 +176,7 @@ impl FirestoreDatabase {
     /// This means that:
     /// - the IDs will not contain a `/`
     /// - IDs may point to documents that do not exist.
-    #[instrument(skip_all)]
+    #[instrument(level = Level::TRACE, skip_all)]
     pub async fn get_document_ids(&self, parent: &CollectionRef) -> Result<HashSet<String>> {
         // Cannot use `filter_map` because of the `await`.
         let mut result = HashSet::new();
@@ -222,7 +206,7 @@ impl FirestoreDatabase {
             .collect_vec()
     }
 
-    #[instrument(skip_all, err)]
+    #[instrument(level = Level::TRACE, skip_all, err)]
     pub async fn run_query(
         &self,
         parent: Ref,
@@ -230,16 +214,16 @@ impl FirestoreDatabase {
         consistency: ReadConsistency,
     ) -> Result<Vec<Document>> {
         let mut query = Query::from_structured(parent, query, consistency)?;
-        info!(?query);
+        debug!(?query);
         let result = query.once(self).await?;
-        info!(result_count = result.len());
+        debug!(result_count = result.len());
         Ok(result
             .into_iter()
             .map(|version| query.project(&version))
             .collect())
     }
 
-    #[instrument(skip_all, err)]
+    #[instrument(level = Level::TRACE, skip_all, err)]
     pub async fn run_aggregation_query(
         &self,
         parent: Ref,
@@ -249,7 +233,7 @@ impl FirestoreDatabase {
     ) -> Result<HashMap<String, Value>> {
         unimplemented_option!(query.select);
         let mut query = Query::from_structured(parent, query, consistency)?;
-        info!(?query);
+        debug!(?query);
         let docs = query.once(self).await?;
         let result = aggregations
             .into_iter()
@@ -341,7 +325,7 @@ impl FirestoreDatabase {
         Ok(result)
     }
 
-    #[instrument(skip_all, err)]
+    #[instrument(level = Level::TRACE, skip_all, err)]
     pub async fn commit(
         self: &Arc<Self>,
         writes: Vec<Write>,
@@ -383,7 +367,7 @@ impl FirestoreDatabase {
         Ok((time, write_results))
     }
 
-    #[instrument(skip_all, err)]
+    #[instrument(level = Level::TRACE, skip_all, err)]
     pub async fn perform_write(
         &self,
         write: Write,
@@ -411,7 +395,7 @@ impl FirestoreDatabase {
         use write::Operation::*;
         let document_version = match operation {
             Update(doc) => {
-                info!(name = %contents.name, "Update");
+                debug!(name = %contents.name, "Update");
 
                 let mut fields = if let Some(mask) = update_mask {
                     apply_updates(contents, mask, &doc.fields)?
@@ -433,7 +417,7 @@ impl FirestoreDatabase {
                 contents.add_version(fields, commit_time.clone()).await
             }
             Delete(_) => {
-                info!(name = %contents.name, "Delete");
+                debug!(name = %contents.name, "Delete");
 
                 unimplemented_option!(update_mask);
                 unimplemented_collection!(update_transforms);
