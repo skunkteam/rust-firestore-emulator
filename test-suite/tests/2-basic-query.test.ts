@@ -415,8 +415,8 @@ describe('aggregation queries', () => {
         const sumArea = fs.exported.AggregateField.sum('area');
         await expect(getAggregate(allCities.aggregate({ sumArea }))).resolves.toEqual({
             // Known current limitation of the Rust emulator, depending of the order of the aggregation we
-            // either get the first or the second number (you know, floating point).
-            sumArea: expect.toBeWithin(308.4, 308.40000000000003),
+            // either get the exact sum of 308.4 or slightly more (you know, floating point).
+            sumArea: expect.toBeWithin(308.4, 308.4000001),
         });
 
         await expect(getAggregate(biggerCities.aggregate({ sumArea }))).resolves.toEqual({
@@ -433,8 +433,8 @@ describe('aggregation queries', () => {
         await expect(getAggregate(allCities.aggregate(fields))).resolves.toEqual({
             count: 4,
             // Known current limitation of the Rust emulator, depending of the order of the aggregation we
-            // either get the first or the second number (you know, floating point).
-            sumArea: expect.toBeWithin(308.4, 308.40000000000003),
+            // either get the exact sum of 308.4 or slightly more (you know, floating point).
+            sumArea: expect.toBeWithin(308.4, 308.4000001),
             averagePopulation: 62_499,
         });
 
