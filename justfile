@@ -46,4 +46,4 @@ build *cmd:
 
 # Watch code and execute just command on change, e.g. `just watch test googleapis`
 watch *cmd:
-    cargo watch --ignore '/*.{info,profraw}' --ignore tarpaulin-report.html --clear --shell 'just {{ cmd }}'
+    cargo watch --ignore '/*.{info,profraw}' --ignore tarpaulin-report.html --ignore test-suite --clear --shell 'just {{ cmd }}'

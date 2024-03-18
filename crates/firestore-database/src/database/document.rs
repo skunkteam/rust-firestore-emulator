@@ -2,6 +2,7 @@ use std::{
     collections::HashMap,
     fmt::{self, Debug},
     ops::Deref,
+    pin::pin,
     sync::Arc,
     time::Duration,
 };
@@ -12,17 +13,19 @@ use googleapis::google::{
     protobuf::Timestamp,
 };
 use tokio::{
+    select,
     sync::{
         oneshot, OwnedRwLockReadGuard, OwnedRwLockWriteGuard, OwnedSemaphorePermit, RwLock,
         RwLockReadGuard, Semaphore,
     },
-    time::{error::Elapsed, timeout},
+    time::{error::Elapsed, sleep, timeout},
 };
-use tracing::{info, instrument, trace, Level};
+use tracing::{debug, instrument, trace, warn, Level};
 
 use super::{read_consistency::ReadConsistency, reference::DocumentRef};
 use crate::{error::Result, GenericDatabaseError};
 
+// TODO: Maybe make the timeout configurable
 const WAIT_LOCK_TIMEOUT: Duration = Duration::from_secs(30);
 
 pub struct DocumentMeta {
@@ -51,7 +54,10 @@ impl DocumentMeta {
     }
 
     pub async fn read(&self) -> Result<DocumentContentsReadGuard> {
-        lock_timeout(self.contents.read()).await
+        lock_timeout(self.contents.read(), || {
+            format!("read lock for {}", self.name)
+        })
+        .await
     }
 
     pub async fn read_owned(self: &Arc<Self>) -> Result<OwnedDocumentContentsReadGuard> {
@@ -70,13 +76,19 @@ impl DocumentMeta {
 
         Ok(OwnedDocumentContentsReadGuard {
             meta: Arc::clone(self),
-            guard: lock_timeout(Arc::clone(&self.contents).read_owned()).await?,
+            guard: lock_timeout(Arc::clone(&self.contents).read_owned(), || {
+                format!("read lock for {}", self.name)
+            })
+            .await?,
             write_permit: rx,
         })
     }
 
     async fn owned_write(&self) -> Result<OwnedDocumentContentsWriteGuard> {
-        lock_timeout(Arc::clone(&self.contents).write_owned()).await
+        lock_timeout(Arc::clone(&self.contents).write_owned(), || {
+            format!("write lock for {}", self.name)
+        })
+        .await
     }
 }
 
@@ -165,10 +177,10 @@ impl DocumentContents {
         }
     }
 
-    #[instrument(skip_all, fields(
+    #[instrument(level = Level::TRACE, skip_all, fields(
         doc_name = %self.name,
         time = display(&update_time),
-    ), level = Level::DEBUG)]
+    ))]
     pub async fn add_version(
         &mut self,
         fields: HashMap<String, Value>,
@@ -217,9 +229,9 @@ pub struct OwnedDocumentContentsReadGuard {
 pub type OwnedDocumentContentsWriteGuard = OwnedRwLockWriteGuard<DocumentContents>;
 
 impl OwnedDocumentContentsReadGuard {
-    #[instrument(skip_all, err)]
+    #[instrument(level = Level::TRACE, skip_all, err)]
     pub async fn upgrade(self) -> Result<OwnedDocumentContentsWriteGuard> {
-        info!(name = %self.meta.name);
+        debug!(name = %self.meta.name);
         let check_time = self.guard.last_updated();
         let OwnedDocumentContentsReadGuard {
             meta,
@@ -227,8 +239,11 @@ impl OwnedDocumentContentsReadGuard {
             write_permit,
         } = self;
         drop(guard);
-        let write_permit = lock_timeout(write_permit).await?.unwrap();
-        let owned_rw_lock_write_guard = lock_timeout(meta.owned_write()).await??;
+        let write_permit =
+            lock_timeout(write_permit, || format!("write permit for {}", &meta.name))
+                .await?
+                .unwrap();
+        let owned_rw_lock_write_guard = meta.owned_write().await?;
         drop(write_permit);
         if check_time == owned_rw_lock_write_guard.last_updated() {
             Ok(owned_rw_lock_write_guard)
@@ -366,8 +381,18 @@ impl From<precondition::ConditionType> for DocumentPrecondition {
     }
 }
 
-async fn lock_timeout<F: Future>(future: F) -> Result<F::Output> {
-    timeout(WAIT_LOCK_TIMEOUT, future)
-        .await
-        .map_err(|_: Elapsed| GenericDatabaseError::aborted("timeout waiting for lock on document"))
+async fn lock_timeout<F: Future>(future: F, id: impl FnOnce() -> String) -> Result<F::Output> {
+    let future_with_timeout = async {
+        timeout(WAIT_LOCK_TIMEOUT, future)
+            .await
+            .map_err(|_: Elapsed| {
+                GenericDatabaseError::aborted("timeout waiting for lock on document")
+            })
+    };
+    let mut future_with_timeout = pin!(future_with_timeout);
+    select! {
+        result = &mut future_with_timeout => return result,
+        _ = sleep(Duration::from_secs(1)) => warn!("waiting more than 1 second on: {}", id()),
+    }
+    future_with_timeout.await
 }
