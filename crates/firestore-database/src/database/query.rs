@@ -220,7 +220,7 @@ impl Query {
         buffer.sort_unstable_by(|a, b| self.order_by_cmp(a, b));
 
         if self.offset > 0 {
-            buffer.drain(0..self.offset);
+            buffer.drain(0..self.offset.min(buffer.len()));
         }
 
         if let Some(limit) = self.limit {
@@ -246,14 +246,28 @@ impl Query {
         }
         let included = collection.strip_prefix(&self.parent).is_some_and(|path| {
             self.from.iter().any(|selector| {
-                if selector.all_descendants {
-                    selector.collection_id.is_empty()
-                        || path == selector.collection_id
-                        || path
-                            .strip_prefix(&selector.collection_id)
-                            .is_some_and(|rest| rest.starts_with('/'))
-                } else {
-                    path == selector.collection_id
+                if !selector.all_descendants {
+                    return path == selector.collection_id;
+                }
+                if selector.collection_id.is_empty() {
+                    // collection_id empty is a special case where all collections should match
+                    return true;
+                }
+                // With all_descendants == true we search for the given collection_id in the
+                // remaining path.
+                // Invariant: path starts with <COLLECTION-NAME>/... or is empty
+                let mut elements = path.split('/');
+                loop {
+                    let Some(next_id) = elements.next() else {
+                        return false;
+                    };
+                    if next_id == selector.collection_id {
+                        return true;
+                    }
+                    // Strip document id and try again
+                    if elements.next().is_none() {
+                        return false;
+                    }
                 }
             })
         });
