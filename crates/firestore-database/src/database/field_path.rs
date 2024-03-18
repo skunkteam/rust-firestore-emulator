@@ -1,4 +1,6 @@
-use std::{borrow::Cow, collections::HashMap, convert::Infallible, mem::take, str::FromStr};
+use std::{
+    borrow::Cow, collections::HashMap, convert::Infallible, fmt::Display, mem::take, str::FromStr,
+};
 
 use googleapis::google::firestore::v1::*;
 
@@ -8,7 +10,7 @@ use crate::{error::Result, GenericDatabaseError};
 /// The virtual field-name that represents the document-name.
 pub const DOC_NAME: &str = "__name__";
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Hash, PartialEq, Eq)]
 pub enum FieldReference {
     DocumentName,
     FieldPath(FieldPath),
@@ -50,7 +52,16 @@ impl FromStr for FieldReference {
     }
 }
 
-#[derive(Clone, Debug)]
+impl Display for FieldReference {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            FieldReference::DocumentName => f.write_str(DOC_NAME),
+            FieldReference::FieldPath(path) => path.fmt(f),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq)]
 pub struct FieldPath(Vec<String>);
 
 /// Field paths may be used to refer to structured fields of Documents.
@@ -134,6 +145,12 @@ impl FromStr for FieldPath {
             ));
         }
         Ok(Self(parse_field_path(path)?))
+    }
+}
+
+impl Display for FieldPath {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0.join("."))
     }
 }
 

@@ -36,11 +36,11 @@ impl TryFrom<structured_query::Filter> for Filter {
     type Error = GenericDatabaseError;
 
     fn try_from(value: structured_query::Filter) -> Result<Self, Self::Error> {
-        use structured_query::filter::FilterType;
+        use structured_query::filter::FilterType::*;
         match value.filter_type.expect("filter without filter_type") {
-            FilterType::CompositeFilter(f) => Ok(Self::Composite(f.try_into()?)),
-            FilterType::FieldFilter(f) => Ok(Self::Field(f.try_into()?)),
-            FilterType::UnaryFilter(f) => Ok(Self::Unary(f.try_into()?)),
+            CompositeFilter(f) => Ok(Self::Composite(f.try_into()?)),
+            FieldFilter(f) => Ok(Self::Field(f.try_into()?)),
+            UnaryFilter(f) => Ok(Self::Unary(f.try_into()?)),
         }
     }
 }
@@ -80,7 +80,7 @@ impl TryFrom<structured_query::CompositeFilter> for CompositeFilter {
             filters: value
                 .filters
                 .into_iter()
-                .map(TryInto::try_into)
+                .map(Filter::try_from)
                 .try_collect()?,
         })
     }

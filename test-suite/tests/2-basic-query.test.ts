@@ -180,19 +180,16 @@ describe.each([
             expect(secondResult).toEqual(result);
         });
 
-        if (!fs.notImplementedInRust) {
-            test('cannot order by a different field than the queried inequality', async () => {
-                await expect(collection.where('type', '>', 'z').orderBy('ordered').get()).rejects.toThrow('3 INVALID_ARGUMENT');
+        test('cannot order by a different field than the queried inequality', async () => {
+            await expect(collection.where('type', '>', 'z').orderBy('ordered').get()).rejects.toThrow(
+                '3 INVALID_ARGUMENT: inequality filter property and first sort order must be the same: type and ordered',
+            );
 
-                // The where will not match any documents, but the query should work!
-                expect(await collection.where('type', '>', 'z').orderBy('type').get()).toHaveProperty('docs', []);
-                // Ordering by another field after ordering by the inequality field should work
-                expect(await collection.where('type', '>', 'z').orderBy('type').orderBy('ordered', 'desc').get()).toHaveProperty(
-                    'docs',
-                    [],
-                );
-            });
-        }
+            // The where will not match any documents, but the query should work!
+            expect(await collection.where('type', '>', 'z').orderBy('type').get()).toHaveProperty('docs', []);
+            // Ordering by another field after ordering by the inequality field should work
+            expect(await collection.where('type', '>', 'z').orderBy('type').orderBy('ordered', 'desc').get()).toHaveProperty('docs', []);
+        });
 
         describe('implicitly filter by Type', () => {
             test.each([
@@ -268,12 +265,14 @@ describe.each([
             });
         });
 
-        fs.notImplementedInRust ||
-            test('multiple inequalities (should not be possible)', async () => {
-                await expect(
-                    getData(collection.where('ordered', '>', numbers[0].ordered).where('type', '>', numbers[0].type)),
-                ).rejects.toThrow('3 INVALID_ARGUMENT: Cannot have inequality filters on multiple properties: [ordered, type]');
-            });
+        test('multiple inequalities (should not be possible)', async () => {
+            // Workaround for bug in FieldPath: https://github.com/googleapis/nodejs-firestore/issues/2019
+            const path = new fs.exported.FieldPath('tbd');
+            Object.defineProperty(path, 'formattedName', { value: '`\\`backticks\\``.nested' });
+            await expect(getData(collection.where(path, '!=', 'data').where('type', '>', 0))).rejects.toThrow(
+                '3 INVALID_ARGUMENT: Cannot have inequality filters on multiple properties: [`backticks`.nested, type]',
+            );
+        });
     });
 
     describe('paginating results', () => {
