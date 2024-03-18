@@ -1,5 +1,5 @@
 use std::{
-    collections::{hash_map::Entry, HashMap, HashSet},
+    collections::{hash_map::Entry, BTreeSet, HashMap},
     sync::{Arc, Weak},
 };
 
@@ -43,9 +43,9 @@ use crate::{
 mod collection;
 pub(crate) mod document;
 pub mod event;
-mod field_path;
+pub mod field_path;
 pub mod projection;
-pub(crate) mod query;
+pub mod query;
 pub mod read_consistency;
 pub mod reference;
 mod transaction;
@@ -155,9 +155,12 @@ impl FirestoreDatabase {
     /// - the IDs will not contain a `/`
     /// - the result will be empty if `parent` is a [`Ref::Collection`].
     #[instrument(level = Level::TRACE, skip_all)]
-    pub async fn get_collection_ids(&self, parent: &Ref) -> Result<HashSet<String>> {
+    pub async fn get_collection_ids(&self, parent: &Ref) -> Result<BTreeSet<String>> {
         // Cannot use `filter_map` because of the `await`.
-        let mut result = HashSet::new();
+        let mut result = BTreeSet::new();
+        if matches!(parent, Ref::Collection(_)) {
+            return Ok(result);
+        }
         for col in self.get_all_collections().await {
             let Some(path) = col.name.strip_prefix(parent) else {
                 continue;
@@ -177,9 +180,9 @@ impl FirestoreDatabase {
     /// - the IDs will not contain a `/`
     /// - IDs may point to documents that do not exist.
     #[instrument(level = Level::TRACE, skip_all)]
-    pub async fn get_document_ids(&self, parent: &CollectionRef) -> Result<HashSet<String>> {
+    pub async fn get_document_ids(&self, parent: &CollectionRef) -> Result<BTreeSet<String>> {
         // Cannot use `filter_map` because of the `await`.
-        let mut result = HashSet::new();
+        let mut result = BTreeSet::new();
         for doc in self.get_collection(parent).await.docs().await {
             result.insert(doc.name.document_id.to_string());
         }
@@ -197,7 +200,7 @@ impl FirestoreDatabase {
 
     /// Get all collections asap collected into a [`Vec`] in order to keep the read lock time
     /// minimal.
-    async fn get_all_collections(&self) -> Vec<Arc<Collection>> {
+    pub async fn get_all_collections(&self) -> Vec<Arc<Collection>> {
         self.collections
             .read()
             .await
@@ -207,13 +210,7 @@ impl FirestoreDatabase {
     }
 
     #[instrument(level = Level::TRACE, skip_all, err)]
-    pub async fn run_query(
-        &self,
-        parent: Ref,
-        query: StructuredQuery,
-        consistency: ReadConsistency,
-    ) -> Result<Vec<Document>> {
-        let mut query = Query::from_structured(parent, query, consistency)?;
+    pub async fn run_query(&self, query: &mut Query) -> Result<Vec<Document>> {
         debug!(?query);
         let result = query.once(self).await?;
         debug!(result_count = result.len());

@@ -1,4 +1,9 @@
-use std::{cmp, collections::HashMap, ops::Deref, sync::Arc};
+use std::{
+    cmp,
+    collections::{HashMap, HashSet},
+    ops::Deref,
+    sync::Arc,
+};
 
 use googleapis::google::firestore::v1::{structured_query::CollectionSelector, *};
 use itertools::Itertools;
@@ -14,13 +19,188 @@ use super::{
     reference::{CollectionRef, Ref},
     FirestoreDatabase,
 };
-use crate::{error::Result, GenericDatabaseError};
+use crate::{error::Result, reference::DocumentRef, GenericDatabaseError};
 
 mod filter;
 
+pub struct QueryBuilder {
+    parent: Ref,
+    select: Option<Projection>,
+    from: Vec<CollectionSelector>,
+    filter: Option<Filter>,
+    order_by: Vec<Order>,
+    start_at: Option<Cursor>,
+    end_at: Option<Cursor>,
+    offset: usize,
+    limit: Option<usize>,
+    consistency: ReadConsistency,
+}
+
+impl QueryBuilder {
+    pub fn from(parent: Ref, from: Vec<CollectionSelector>) -> Self {
+        Self {
+            parent,
+            select: None,
+            from,
+            filter: None,
+            order_by: vec![],
+            start_at: None,
+            end_at: None,
+            offset: 0,
+            limit: None,
+            consistency: ReadConsistency::Default,
+        }
+    }
+
+    /// Optional sub-set of the fields to return.
+    ///
+    /// This acts as a [DocumentMask][google.firestore.v1.DocumentMask] over the
+    /// documents returned from a query. When not set, assumes that the caller
+    /// wants all fields returned.
+    ///
+    /// Subsequent calls will replace previously set values.
+    pub fn select(mut self, projection: impl Into<Option<Projection>>) -> Self {
+        self.select = projection.into();
+        self
+    }
+
+    /// The filter to apply.
+    ///
+    /// Subsequent calls will replace previously set values.
+    pub fn filter(mut self, filter: Filter) -> Self {
+        self.filter = Some(filter);
+        self
+    }
+
+    /// The order to apply to the query results.
+    ///
+    /// Firestore allows callers to provide a full ordering, a partial ordering, or
+    /// no ordering at all. In all cases, Firestore guarantees a stable ordering
+    /// through the following rules:
+    ///
+    ///   * The `order_by` is required to reference all fields used with an inequality filter.
+    ///   * All fields that are required to be in the `order_by` but are not already present are
+    ///     appended in lexicographical ordering of the field name.
+    ///   * If an order on `__name__` is not specified, it is appended by default.
+    ///
+    /// Fields are appended with the same sort direction as the last order
+    /// specified, or 'ASCENDING' if no order was specified. For example:
+    ///
+    ///   * `ORDER BY a` becomes `ORDER BY a ASC, __name__ ASC`
+    ///   * `ORDER BY a DESC` becomes `ORDER BY a DESC, __name__ DESC`
+    ///   * `WHERE a > 1` becomes `WHERE a > 1 ORDER BY a ASC, __name__ ASC`
+    ///   * `WHERE __name__ > ... AND a > 1` becomes `WHERE __name__ > ... AND a > 1 ORDER BY a ASC,
+    ///     __name__ ASC`
+    ///
+    /// Subsequent calls will *add* new order by clauses.
+    pub fn order_by(mut self, field: FieldReference, direction: Direction) -> Self {
+        self.order_by.push(Order { field, direction });
+        self
+    }
+
+    /// A potential prefix of a position in the result set to start the query at.
+    ///
+    /// The ordering of the result set is based on the `ORDER BY` clause of the
+    /// original query.
+    ///
+    /// ```sql
+    /// SELECT * FROM k WHERE a = 1 AND b > 2 ORDER BY b ASC, __name__ ASC;
+    /// ```
+    ///
+    /// This query's results are ordered by `(b ASC, __name__ ASC)`.
+    ///
+    /// Cursors can reference either the full ordering or a prefix of the location,
+    /// though it cannot reference more fields than what are in the provided
+    /// `ORDER BY`.
+    ///
+    /// Continuing off the example above, attaching the following start cursors
+    /// will have varying impact:
+    ///
+    /// - `START BEFORE (2, /k/123)`: start the query right before `a = 1 AND b > 2 AND __name__ >
+    ///   /k/123`.
+    /// - `START AFTER (10)`: start the query right after `a = 1 AND b > 10`.
+    ///
+    /// Unlike `OFFSET` which requires scanning over the first N results to skip,
+    /// a start cursor allows the query to begin at a logical position. This
+    /// position is not required to match an actual result, it will scan forward
+    /// from this position to find the next document.
+    ///
+    /// Requires:
+    ///
+    /// * The number of values cannot be greater than the number of fields specified in the `ORDER
+    ///   BY` clause.
+    ///
+    /// Subsequent calls will replace previously set values.
+    pub fn start_at(mut self, start_at: Cursor) -> Self {
+        self.start_at = Some(start_at);
+        self
+    }
+
+    /// A potential prefix of a position in the result set to end the query at.
+    ///
+    /// This is similar to `START_AT` but with it controlling the end position
+    /// rather than the start position.
+    ///
+    /// Requires:
+    ///
+    /// * The number of values cannot be greater than the number of fields specified in the `ORDER
+    ///   BY` clause.
+    ///
+    /// Subsequent calls will replace previously set values.
+    pub fn end_at(mut self, end_at: Cursor) -> Self {
+        self.end_at = Some(end_at);
+        self
+    }
+
+    /// The number of documents to skip before returning the first result.
+    ///
+    /// This applies after the constraints specified by the `WHERE`, `START AT`, &
+    /// `END AT` but before the `LIMIT` clause.
+    ///
+    /// Subsequent calls will replace previously set values.
+    pub fn offset(mut self, offset: usize) -> Self {
+        self.offset = offset;
+        self
+    }
+
+    /// The maximum number of results to return.
+    ///
+    /// Applies after all other constraints.
+    ///
+    /// Subsequent calls will replace previously set values.
+    pub fn limit(mut self, limit: usize) -> Self {
+        self.limit = Some(limit);
+        self
+    }
+
+    pub fn consistency(mut self, consistency: ReadConsistency) -> Self {
+        self.consistency = consistency;
+        self
+    }
+
+    /// Try to build the final Query struct.
+    pub fn build(self) -> Result<Query> {
+        let mut query = Query {
+            parent: self.parent,
+            select: self.select,
+            from: self.from,
+            filter: self.filter,
+            order_by: self.order_by,
+            start_at: self.start_at,
+            end_at: self.end_at,
+            offset: self.offset,
+            limit: self.limit,
+            consistency: self.consistency,
+            collection_cache: Default::default(),
+        };
+        query.validate()?;
+        Ok(query)
+    }
+}
+
 /// A Firestore query.
 #[derive(Debug)]
-pub(crate) struct Query {
+pub struct Query {
     parent: Ref,
 
     /// Optional sub-set of the fields to return.
@@ -134,34 +314,12 @@ impl Query {
             limit,
         } = query;
 
-        let select = select.map(Projection::try_from).transpose()?;
-        let filter: Option<Filter> = filter.map(TryInto::try_into).transpose()?;
-        let mut order_by: Vec<Order> = order_by.into_iter().map(TryInto::try_into).try_collect()?;
-        if order_by.is_empty() {
-            if let Some(filter) = &filter {
-                order_by.extend(
-                    filter
-                        .get_inequality_fields()
-                        .into_iter()
-                        .map(|field| Order {
-                            field:     field.clone(),
-                            direction: Direction::Ascending,
-                        }),
-                );
-            }
-        }
-        if !order_by.iter().any(|o| o.field.is_document_name()) {
-            order_by.push(Order {
-                field:     FieldReference::DocumentName,
-                direction: Direction::Ascending,
-            })
-        }
-        let query = Self {
+        let mut query = Self {
             parent,
-            select,
+            select: select.map(Projection::try_from).transpose()?,
             from,
-            filter,
-            order_by,
+            filter: filter.map(TryInto::try_into).transpose()?,
+            order_by: order_by.into_iter().map(TryInto::try_into).try_collect()?,
             start_at,
             end_at,
             offset: offset as usize,
@@ -173,7 +331,40 @@ impl Query {
         Ok(query)
     }
 
-    fn validate(&self) -> Result<()> {
+    fn validate(&mut self) -> Result<()> {
+        if matches!(self.parent, Ref::Collection(_)) {
+            return Err(GenericDatabaseError::invalid_argument(
+                "parent must point to a Document or Root",
+            ));
+        }
+        // Validate from clause
+        if self.from.is_empty() {
+            return Err(GenericDatabaseError::invalid_argument(
+                "Query FROM is mandatory",
+            ));
+        }
+        // Ensure order_by is consistent
+        if self.order_by.is_empty() {
+            if let Some(filter) = &self.filter {
+                self.order_by
+                    .extend(
+                        filter
+                            .get_inequality_fields()
+                            .into_iter()
+                            .map(|field| Order {
+                                field:     field.clone(),
+                                direction: Direction::Ascending,
+                            }),
+                    );
+            }
+        }
+        if !self.order_by.iter().any(|o| o.field.is_document_name()) {
+            self.order_by.push(Order {
+                field:     FieldReference::DocumentName,
+                direction: Direction::Ascending,
+            })
+        }
+        // Validate order_by versus inequality field
         match self
             .filter
             .iter()
@@ -219,13 +410,13 @@ impl Query {
         let mut buffer = vec![];
         for col in collections {
             for meta in col.docs().await {
-                let version = if let Some(txn) = &txn {
-                    txn.read_doc(&meta.name)
+                let version = match &txn {
+                    Some(txn) => txn
+                        .read_doc(&meta.name)
                         .await?
                         .current_version()
-                        .map(Arc::clone)
-                } else {
-                    meta.read().await?.current_version().map(Arc::clone)
+                        .map(Arc::clone),
+                    None => meta.read().await?.current_version().map(Arc::clone),
                 };
                 let Some(version) = version else {
                     continue;
@@ -260,6 +451,59 @@ impl Query {
         }
 
         Ok(buffer)
+    }
+
+    /// Get the names of missing documents that match this query. A document is missing if it does
+    /// not exist, but there are sub-documents nested underneath it.
+    pub async fn missing_docs(&self, db: &FirestoreDatabase) -> Result<Vec<String>> {
+        let not_supported = [
+            (self.from.len() != 1).then_some("multiple 'from' selectors"),
+            self.from
+                .iter()
+                .any(|f| f.all_descendants || f.collection_id.is_empty())
+                .then_some("all_descendants or empty collection_ids"),
+            self.filter.is_some().then_some("filter"),
+            // Only the default "order by document name" is allowed
+            (self.order_by.len() > 1).then_some("order_by"),
+            self.start_at.is_some().then_some("start_at"),
+            self.end_at.is_some().then_some("end_at"),
+            (self.offset > 0).then_some("offset"),
+            self.limit.is_some().then_some("limit"),
+        ]
+        .into_iter()
+        .flatten()
+        .join(", ");
+        if !not_supported.is_empty() {
+            return Err(GenericDatabaseError::invalid_argument(format!(
+                "not supported when querying missing docs: {not_supported}"
+            )));
+        }
+
+        // Checked above that self.from has exactly one non empty collection_id.
+        // Lazy conversion using String rep, maybe replace with dedicated methods on refs.
+        let parent: CollectionRef =
+            format!("{}/{}", self.parent, self.from[0].collection_id).parse()?;
+
+        let all_docs: HashSet<_> = db
+            .get_all_collections()
+            .await
+            .into_iter()
+            .filter_map(|col| {
+                let document_id = col
+                    .name
+                    .strip_collection_prefix(&parent)?
+                    .split_once('/')?
+                    .0;
+                Some(DocumentRef::new(parent.clone(), document_id))
+            })
+            .collect();
+        let mut result = vec![];
+        for name in all_docs {
+            if db.get_doc(&name, &self.consistency).await.is_ok() {
+                result.push(name.to_string());
+            }
+        }
+        Ok(result)
     }
 
     async fn applicable_collections(&mut self, db: &FirestoreDatabase) -> Vec<Arc<Collection>> {
@@ -346,10 +590,9 @@ impl Query {
                 result @ (Less | Greater) => result,
                 Equal => continue,
             };
-            return if matches!(order.direction, Direction::Descending) {
-                result.reverse()
-            } else {
-                result
+            return match order.direction {
+                Direction::Descending => result.reverse(),
+                _ => result,
             };
         }
         Equal
@@ -376,7 +619,7 @@ impl Query {
 }
 
 #[derive(Debug)]
-struct Order {
+pub struct Order {
     field:     FieldReference,
     direction: Direction,
 }
@@ -398,7 +641,7 @@ impl TryFrom<structured_query::Order> for Order {
 }
 
 #[derive(Debug)]
-enum Direction {
+pub enum Direction {
     Ascending,
     Descending,
 }
