@@ -371,6 +371,34 @@ describe.each([
     });
 });
 
+describe('list', () => {
+    const data = fs.writeData({ prop: 'foo' });
+
+    fs.notImplementedInRust ||
+        test('listDocuments', async () => {
+            const scope = fs.collection.doc().collection('collection');
+
+            expect(await scope.listDocuments()).toBeEmpty();
+            // Create three different docs in the given collection
+            await scope.doc('foo').create(data);
+            await scope.doc('bar').create(data);
+            await scope.doc('baz').create(data);
+
+            expect((await scope.listDocuments()).map(c => c.id)).toIncludeSameMembers(['foo', 'bar', 'baz']);
+        });
+
+    test('listCollections', async () => {
+        const scope = fs.collection.doc();
+
+        expect(await scope.listCollections()).toBeEmpty();
+        // Create three different collections
+        await scope.collection('foo').doc().create(data);
+        await scope.collection('bar').doc().create(data);
+        await scope.collection('baz').doc().create(data);
+        expect((await scope.listCollections()).map(c => c.id)).toIncludeSameMembers(['foo', 'bar', 'baz']);
+    });
+});
+
 describe('aggregation queries', () => {
     const cities = [
         { city: 'Buren', population: 27_718, area: 142.92 },
