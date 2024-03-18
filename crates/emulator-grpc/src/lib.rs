@@ -21,7 +21,7 @@ use itertools::Itertools;
 use tokio::sync::mpsc;
 use tokio_stream::{once, wrappers::ReceiverStream, StreamExt};
 use tonic::{async_trait, codec::CompressionEncoding, Code, Request, Response, Result, Status};
-use tracing::{info, info_span, instrument, Instrument};
+use tracing::{debug, debug_span, instrument, Instrument, Level};
 use utils::error_in_stream;
 
 #[macro_use]
@@ -51,7 +51,7 @@ impl Default for FirestoreEmulator {
 #[async_trait]
 impl firestore_server::Firestore for FirestoreEmulator {
     /// Gets a single document.
-    #[instrument(skip_all, err)]
+    #[instrument(level = Level::TRACE, skip_all, err)]
     async fn get_document(
         &self,
         request: Request<GetDocumentRequest>,
@@ -83,7 +83,7 @@ impl firestore_server::Firestore for FirestoreEmulator {
     ///
     /// Documents returned by this method are not guaranteed to be returned in the
     /// same order that they were requested.
-    #[instrument(skip_all, fields(
+    #[instrument(level = Level::TRACE, skip_all, fields(
         count = request.get_ref().documents.len(),
         in_txn = display(is_txn(&request.get_ref().consistency_selector))
     ), err)]
@@ -115,12 +115,12 @@ impl firestore_server::Firestore for FirestoreEmulator {
                     txn_opts,
                 )) => {
                     let id = database.new_txn(Some(txn_opts)).await?;
-                    info!("started new transaction");
+                    debug!("started new transaction");
                     (id.into(), ReadConsistency::Transaction(id))
                 }
                 s => (vec![], s.try_into()?),
             };
-            info!(?read_consistency);
+            debug!(?read_consistency);
 
             let (tx, rx) = mpsc::channel(16);
             tokio::spawn(
@@ -143,7 +143,7 @@ impl firestore_server::Firestore for FirestoreEmulator {
                         }
                     }
                 }
-                .instrument(info_span!("worker")),
+                .instrument(debug_span!("worker")),
             );
             Ok(ReceiverStream::new(rx))
         })
@@ -151,7 +151,7 @@ impl firestore_server::Firestore for FirestoreEmulator {
     }
 
     /// Commits a transaction, while optionally updating documents.
-    #[instrument(skip_all, fields(
+    #[instrument(level = Level::TRACE, skip_all, fields(
         count = request.get_ref().writes.len(),
         in_txn = !request.get_ref().transaction.is_empty(),
     ), err)]
@@ -168,7 +168,7 @@ impl firestore_server::Firestore for FirestoreEmulator {
             perform_writes(&database, writes).await?
         } else {
             let txn_id = transaction.try_into()?;
-            info!(?txn_id);
+            debug!(?txn_id);
             database.commit(writes, &txn_id).await?
         };
 
@@ -179,7 +179,7 @@ impl firestore_server::Firestore for FirestoreEmulator {
     }
 
     /// Creates a new document.
-    #[instrument(skip_all, err)]
+    #[instrument(level = Level::TRACE, skip_all, err)]
     async fn create_document(
         &self,
         _request: Request<CreateDocumentRequest>,
@@ -188,7 +188,7 @@ impl firestore_server::Firestore for FirestoreEmulator {
     }
 
     /// Lists documents.
-    #[instrument(skip_all, fields(request = ?request.get_ref()), err)]
+    #[instrument(level = Level::TRACE, skip_all, fields(request = ?request.get_ref()), err)]
     async fn list_documents(
         &self,
         request: Request<ListDocumentsRequest>,
@@ -247,7 +247,7 @@ impl firestore_server::Firestore for FirestoreEmulator {
     }
 
     /// Updates or inserts a document.
-    #[instrument(skip_all, err)]
+    #[instrument(level = Level::TRACE, skip_all, err)]
     async fn update_document(
         &self,
         _request: Request<UpdateDocumentRequest>,
@@ -256,7 +256,7 @@ impl firestore_server::Firestore for FirestoreEmulator {
     }
 
     /// Deletes a document.
-    #[instrument(skip_all, err)]
+    #[instrument(level = Level::TRACE, skip_all, err)]
     async fn delete_document(
         &self,
         _request: Request<DeleteDocumentRequest>,
@@ -265,7 +265,7 @@ impl firestore_server::Firestore for FirestoreEmulator {
     }
 
     /// Starts a new transaction.
-    #[instrument(skip_all, err)]
+    #[instrument(level = Level::TRACE, skip_all, err)]
     async fn begin_transaction(
         &self,
         request: Request<BeginTransactionRequest>,
@@ -279,14 +279,14 @@ impl firestore_server::Firestore for FirestoreEmulator {
             .new_txn(options)
             .await?;
 
-        info!(?txn_id);
+        debug!(?txn_id);
         Ok(Response::new(BeginTransactionResponse {
             transaction: txn_id.into(),
         }))
     }
 
     /// Rolls back a transaction.
-    #[instrument(skip_all, err)]
+    #[instrument(level = Level::TRACE, skip_all, err)]
     async fn rollback(&self, request: Request<RollbackRequest>) -> Result<Response<Empty>> {
         let RollbackRequest {
             database,
@@ -301,7 +301,7 @@ impl firestore_server::Firestore for FirestoreEmulator {
     type RunQueryStream = BoxStream<'static, Result<RunQueryResponse>>;
 
     /// Runs a query.
-    #[instrument(skip_all, err)]
+    #[instrument(level = Level::TRACE, skip_all, err)]
     async fn run_query(
         &self,
         request: Request<RunQueryRequest>,
@@ -328,7 +328,7 @@ impl firestore_server::Firestore for FirestoreEmulator {
             ) = match consistency_selector {
                 Some(run_query_request::ConsistencySelector::NewTransaction(txn_opts)) => {
                     let id = database.new_txn(Some(txn_opts)).await?;
-                    info!("started new transaction");
+                    debug!("started new transaction");
                     (id.into(), ReadConsistency::Transaction(id))
                 }
                 s => (vec![], s.try_into()?),
@@ -365,7 +365,7 @@ impl firestore_server::Firestore for FirestoreEmulator {
     /// -- Return the number of documents in table given a filter.
     /// SELECT COUNT(*) FROM ( SELECT * FROM k where a = true );
     /// ```
-    #[instrument(skip_all, err)]
+    #[instrument(level = Level::TRACE, skip_all, err)]
     async fn run_aggregation_query(
         &self,
         request: Request<RunAggregationQueryRequest>,
@@ -399,13 +399,13 @@ impl firestore_server::Firestore for FirestoreEmulator {
                     txn_opts,
                 )) => {
                     let id = database.new_txn(Some(txn_opts)).await?;
-                    info!("started new transaction");
+                    debug!("started new transaction");
                     (id.into(), ReadConsistency::Transaction(id))
                 }
                 s => (vec![], s.try_into()?),
             };
 
-            info!(?read_consistency);
+            debug!(?read_consistency);
             let aggregate_fields = database
                 .run_aggregation_query(parent, query, agg_query.aggregations, read_consistency)
                 .await?;
@@ -425,7 +425,7 @@ impl firestore_server::Firestore for FirestoreEmulator {
     /// Partitions a query by returning partition cursors that can be used to run
     /// the query in parallel. The returned partition cursors are split points that
     /// can be used by RunQuery as starting/end points for the query results.
-    #[instrument(skip_all, err)]
+    #[instrument(level = Level::TRACE, skip_all, err)]
     async fn partition_query(
         &self,
         _request: Request<PartitionQueryRequest>,
@@ -438,7 +438,7 @@ impl firestore_server::Firestore for FirestoreEmulator {
 
     /// Streams batches of document updates and deletes, in order. This method is
     /// only available via gRPC or WebChannel (not REST).
-    #[instrument(skip_all, err)]
+    #[instrument(level = Level::TRACE, skip_all, err)]
     async fn write(
         &self,
         _request: Request<tonic::Streaming<WriteRequest>>,
@@ -451,7 +451,7 @@ impl firestore_server::Firestore for FirestoreEmulator {
 
     /// Listens to changes. This method is only available via gRPC or WebChannel
     /// (not REST).
-    #[instrument(skip_all, err)]
+    #[instrument(level = Level::TRACE, skip_all, err)]
     async fn listen(
         &self,
         request: Request<tonic::Streaming<ListenRequest>>,
@@ -464,7 +464,7 @@ impl firestore_server::Firestore for FirestoreEmulator {
     }
 
     /// Lists all the collection IDs underneath a document.
-    #[instrument(skip_all, err)]
+    #[instrument(level = Level::TRACE, skip_all, err)]
     async fn list_collection_ids(
         &self,
         request: Request<ListCollectionIdsRequest>,
@@ -504,7 +504,7 @@ impl firestore_server::Firestore for FirestoreEmulator {
     ///
     /// If you require an atomically applied set of writes, use
     /// [Commit][google.firestore.v1.Firestore.Commit] instead.
-    #[instrument(skip_all, err)]
+    #[instrument(level = Level::TRACE, skip_all, err)]
     async fn batch_write(
         &self,
         request: Request<BatchWriteRequest>,

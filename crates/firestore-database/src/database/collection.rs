@@ -2,7 +2,7 @@ use std::{collections::HashMap, ops::Deref, sync::Arc};
 
 use string_cache::DefaultAtom;
 use tokio::sync::RwLock;
-use tracing::instrument;
+use tracing::{instrument, Level};
 
 use super::{
     document::DocumentMeta,
@@ -16,7 +16,7 @@ pub struct Collection {
 }
 
 impl Collection {
-    #[instrument(skip_all)]
+    #[instrument(level = Level::TRACE, skip_all)]
     pub fn new(name: CollectionRef) -> Self {
         Self {
             name,
