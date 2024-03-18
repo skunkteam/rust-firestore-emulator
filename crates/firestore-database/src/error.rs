@@ -67,20 +67,30 @@ impl GenericDatabaseError {
 
     pub fn grpc_code(&self) -> tonic::Code {
         match self {
-            GenericDatabaseError::Aborted(_) => tonic::Code::Aborted,
-            GenericDatabaseError::AlreadyExists(_) => tonic::Code::AlreadyExists,
-            GenericDatabaseError::Cancelled(_) => tonic::Code::Cancelled,
-            GenericDatabaseError::Internal(_) => tonic::Code::Internal,
-            GenericDatabaseError::InvalidArgument(_) => tonic::Code::InvalidArgument,
-            GenericDatabaseError::InvalidReference(_, _) => tonic::Code::InvalidArgument,
-            GenericDatabaseError::FailedPrecondition(_) => tonic::Code::FailedPrecondition,
-            GenericDatabaseError::NotImplemented(_) => tonic::Code::Unimplemented,
+            Self::Aborted(_) => tonic::Code::Aborted,
+            Self::AlreadyExists(_) => tonic::Code::AlreadyExists,
+            Self::Cancelled(_) => tonic::Code::Cancelled,
+            Self::Internal(_) => tonic::Code::Internal,
+            Self::InvalidArgument(_) | Self::InvalidReference(_, _) => tonic::Code::InvalidArgument,
+            Self::FailedPrecondition(_) => tonic::Code::FailedPrecondition,
+            Self::NotImplemented(_) => tonic::Code::Unimplemented,
         }
     }
 }
 
 impl From<GenericDatabaseError> for tonic::Status {
     fn from(value: GenericDatabaseError) -> Self {
-        Self::new(value.grpc_code(), value.to_string())
+        match &value {
+            GenericDatabaseError::Aborted(msg)
+            | GenericDatabaseError::AlreadyExists(msg)
+            | GenericDatabaseError::Cancelled(msg)
+            | GenericDatabaseError::Internal(msg)
+            | GenericDatabaseError::InvalidArgument(msg)
+            | GenericDatabaseError::FailedPrecondition(msg)
+            | GenericDatabaseError::NotImplemented(msg) => Self::new(value.grpc_code(), msg),
+            GenericDatabaseError::InvalidReference(_, _) => {
+                Self::new(value.grpc_code(), value.to_string())
+            }
+        }
     }
 }

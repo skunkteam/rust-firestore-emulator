@@ -156,7 +156,7 @@ impl Query {
                 direction: Direction::Ascending,
             })
         }
-        Ok(Self {
+        let query = Self {
             parent,
             select,
             from,
@@ -168,7 +168,39 @@ impl Query {
             limit: limit.map(|v| v.value as usize),
             consistency,
             collection_cache: Default::default(),
-        })
+        };
+        query.validate()?;
+        Ok(query)
+    }
+
+    fn validate(&self) -> Result<()> {
+        match self
+            .filter
+            .iter()
+            .flat_map(|f| f.get_inequality_fields())
+            .unique()
+            .at_most_one()
+        {
+            Err(mut fields) => {
+                return Err(GenericDatabaseError::InvalidArgument(format!(
+                    "Cannot have inequality filters on multiple properties: [{}]",
+                    fields.join(", ")
+                )));
+            }
+            Ok(Some(inequality_field)) => {
+                if let Some(first_order_by) = self.order_by.first() {
+                    if first_order_by.field != *inequality_field {
+                        return Err(GenericDatabaseError::InvalidArgument(format!(
+                            "inequality filter property and first sort order must be the same: \
+                             {inequality_field} and {}",
+                            first_order_by.field
+                        )));
+                    }
+                }
+            }
+            Ok(None) => (),
+        }
+        Ok(())
     }
 
     pub fn reset_on_update(&self) -> bool {
