@@ -26,7 +26,7 @@ use super::{read_consistency::ReadConsistency, reference::DocumentRef};
 use crate::{error::Result, FirestoreConfig, GenericDatabaseError};
 
 /// Shorter timeout for faster responses in test environments.
-const WAIT_LOCK_TIMEOUT_FAST: Duration = Duration::from_secs(1);
+const WAIT_LOCK_TIMEOUT_FAST: Duration = Duration::from_secs(2);
 
 /// Longer timeout for more accurate simulation of cloud environments.
 const WAIT_LOCK_TIMEOUT_CLOUD: Duration = Duration::from_secs(15);

@@ -17,7 +17,7 @@ struct Args {
     /// Enable more accurate lock timeouts.
     ///
     /// In Cloud Firestore, transactions can take up to 15 seconds before aborting because of
-    /// contention. By default, in the emulator, this is reduced to 1 second for faster unit-tests.
+    /// contention. By default, in the emulator, this is reduced to 2 second for faster unit-tests.
     /// Enable this feature to simulate the Cloud Firestore more accurately.
     #[arg(long, env)]
     long_contention_timeout: bool,
