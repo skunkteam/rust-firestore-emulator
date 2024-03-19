@@ -527,9 +527,7 @@ impl firestore_server::Firestore for FirestoreEmulator {
             try_join_all(writes.into_iter().map(|write| async {
                 let name = get_doc_name_from_write(&write)?;
                 let mut guard = database.get_doc_meta_mut_no_txn(&name).await?;
-                let result = database
-                    .perform_write(write, &mut guard, time.clone())
-                    .await;
+                let result = database.perform_write(write, &mut guard, time).await;
                 use googleapis::google::rpc;
                 Ok(match result {
                     Ok((wr, update)) => (Default::default(), wr, Some((name.clone(), update))),
@@ -550,7 +548,7 @@ impl firestore_server::Firestore for FirestoreEmulator {
 
         database.send_event(DatabaseEvent {
             database:    Arc::downgrade(&database),
-            update_time: time.clone(),
+            update_time: time,
             updates:     updates.into_iter().flatten().collect(),
         });
 
@@ -570,16 +568,14 @@ async fn perform_writes(
         try_join_all(writes.into_iter().map(|write| async {
             let name = get_doc_name_from_write(&write)?;
             let mut guard = database.get_doc_meta_mut_no_txn(&name).await?;
-            database
-                .perform_write(write, &mut guard, time.clone())
-                .await
+            database.perform_write(write, &mut guard, time).await
         }))
         .await?
         .into_iter()
         .unzip();
     database.send_event(DatabaseEvent {
         database:    Arc::downgrade(database),
-        update_time: time.clone(),
+        update_time: time,
         updates:     updates.into_iter().map(|u| (u.name().clone(), u)).collect(),
     });
     Ok((time, write_results))

@@ -113,7 +113,7 @@ impl DocumentContents {
             .and_then(DocumentVersion::stored_document)
     }
 
-    pub fn version_at_time(&self, read_time: &Timestamp) -> Option<&Arc<StoredDocumentVersion>> {
+    pub fn version_at_time(&self, read_time: Timestamp) -> Option<&Arc<StoredDocumentVersion>> {
         self.versions
             .iter()
             .rfind(|version| (version.update_time()) <= (read_time))
@@ -126,7 +126,7 @@ impl DocumentContents {
     ) -> Result<Option<&Arc<StoredDocumentVersion>>> {
         Ok(match consistency {
             ReadConsistency::Default => self.current_version(),
-            ReadConsistency::ReadTime(time) => self.version_at_time(time),
+            ReadConsistency::ReadTime(time) => self.version_at_time(*time),
             ReadConsistency::Transaction(_) => self.current_version(),
         })
     }
@@ -138,17 +138,11 @@ impl DocumentContents {
     }
 
     pub fn create_time(&self) -> Option<Timestamp> {
-        self.versions
-            .last()
-            .and_then(DocumentVersion::create_time)
-            .cloned()
+        self.versions.last().and_then(DocumentVersion::create_time)
     }
 
     pub fn last_updated(&self) -> Option<Timestamp> {
-        self.versions
-            .last()
-            .map(DocumentVersion::update_time)
-            .cloned()
+        self.versions.last().map(DocumentVersion::update_time)
     }
 
     pub fn check_precondition(&self, condition: DocumentPrecondition) -> Result<()> {
@@ -187,7 +181,7 @@ impl DocumentContents {
         update_time: Timestamp,
     ) -> DocumentVersion {
         trace!(?fields);
-        let create_time = self.create_time().unwrap_or_else(|| update_time.clone());
+        let create_time = self.create_time().unwrap_or(update_time);
         let version = DocumentVersion::Stored(Arc::new(StoredDocumentVersion {
             name: self.name.clone(),
             create_time,
@@ -275,17 +269,17 @@ impl DocumentVersion {
         }
     }
 
-    pub fn create_time(&self) -> Option<&Timestamp> {
+    pub fn create_time(&self) -> Option<Timestamp> {
         match self {
             DocumentVersion::Deleted(_) => None,
-            DocumentVersion::Stored(ver) => Some(&ver.create_time),
+            DocumentVersion::Stored(ver) => Some(ver.create_time),
         }
     }
 
-    pub fn update_time(&self) -> &Timestamp {
+    pub fn update_time(&self) -> Timestamp {
         match self {
-            DocumentVersion::Deleted(ver) => &ver.delete_time,
-            DocumentVersion::Stored(ver) => &ver.update_time,
+            DocumentVersion::Deleted(ver) => ver.delete_time,
+            DocumentVersion::Stored(ver) => ver.update_time,
         }
     }
 
@@ -350,8 +344,8 @@ impl StoredDocumentVersion {
         Document {
             name: self.name.to_string(),
             fields: self.fields.clone(),
-            create_time: Some(self.create_time.clone()),
-            update_time: Some(self.update_time.clone()),
+            create_time: Some(self.create_time),
+            update_time: Some(self.update_time),
         }
     }
 }
