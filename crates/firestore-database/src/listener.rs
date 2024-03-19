@@ -192,7 +192,7 @@ impl Listener {
             return Ok(());
         };
 
-        let update_time = event.update_time.clone();
+        let update_time = event.update_time;
         let msgs = target.process_event(&database, event).await?;
 
         if msgs.is_empty() {
@@ -260,13 +260,13 @@ impl Listener {
                 None => ResponseType::DocumentDelete(DocumentDelete {
                     document: name.to_string(),
                     removed_target_ids: vec![TARGET_ID],
-                    read_time: Some(read_time.clone()),
+                    read_time: Some(read_time),
                 }),
             };
             self.send(msg).await?;
         }
 
-        self.send_complete(read_time.clone()).await?;
+        self.send_complete(read_time).await?;
 
         self.target = Some(ListenerTarget::DocumentTarget(DocumentTarget {
             name,
@@ -298,7 +298,7 @@ impl Listener {
 
         let read_time = Timestamp::now();
         let mut target = QueryTarget::new(query);
-        let msgs = target.reset(database, &read_time).await?;
+        let msgs = target.reset(database, read_time).await?;
         self.send_all(msgs).await?;
         self.send_complete(read_time).await?;
 
@@ -325,7 +325,7 @@ impl Listener {
             ResponseType::TargetChange(TargetChange {
                 target_change_type: TargetChangeType::Current as _,
                 target_ids: vec![TARGET_ID],
-                read_time: Some(read_time.clone()),
+                read_time: Some(read_time),
                 resume_token: resume_token.clone(),
                 ..TARGET_CHANGE_DEFAULT
             }),
@@ -399,11 +399,11 @@ impl DocumentTarget {
 
     fn process_update(&mut self, update: &DocumentVersion) -> Result<Vec<ResponseType>> {
         debug_assert_eq!(update.name(), &self.name);
-        let update_time = update.update_time().clone();
+        let update_time = update.update_time();
         if self.last_read_time >= update_time {
             return Ok(vec![]);
         }
-        self.last_read_time = update_time.clone();
+        self.last_read_time = update_time;
 
         let msg = match update.to_document() {
             Some(d) => ResponseType::DocumentChange(DocumentChange {
@@ -464,7 +464,7 @@ impl QueryTarget {
         };
 
         if needs_reset {
-            self.reset(database, &event.update_time).await
+            self.reset(database, event.update_time).await
         } else {
             Ok(updates_to_apply)
         }
@@ -473,7 +473,7 @@ impl QueryTarget {
     async fn reset(
         &mut self,
         database: &FirestoreDatabase,
-        time: &Timestamp,
+        time: Timestamp,
     ) -> Result<Vec<ResponseType>> {
         let mut msgs = vec![ResponseType::TargetChange(TargetChange {
             target_change_type: target_change::TargetChangeType::Reset as _,
@@ -489,7 +489,7 @@ impl QueryTarget {
                 version.name.clone(),
                 DocumentTarget {
                     name: version.name.clone(),
-                    last_read_time: time.clone(),
+                    last_read_time: time,
                 },
             );
             msgs.push(ResponseType::DocumentChange(DocumentChange {

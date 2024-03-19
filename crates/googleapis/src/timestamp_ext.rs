@@ -55,7 +55,7 @@ impl Timestamp {
             .into())
     }
 
-    pub fn get_token(&self) -> Result<Vec<u8>, TimestampOutOfRangeError> {
+    pub fn get_token(self) -> Result<Vec<u8>, TimestampOutOfRangeError> {
         Ok(OffsetDateTime::try_from(self)?
             .unix_timestamp_nanos()
             .to_ne_bytes()
@@ -66,7 +66,7 @@ impl Timestamp {
 impl fmt::Display for Timestamp {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         // TODO: Change to non allocating after: https://github.com/time-rs/time/issues/375
-        let formatted_str = OffsetDateTime::try_from(self)
+        let formatted_str = OffsetDateTime::try_from(*self)
             .ok()
             .and_then(|dt| dt.format(&Iso8601::DEFAULT).ok());
         let formatted_str = formatted_str
@@ -91,10 +91,10 @@ impl From<OffsetDateTime> for Timestamp {
     }
 }
 
-impl TryFrom<&Timestamp> for OffsetDateTime {
+impl TryFrom<Timestamp> for OffsetDateTime {
     type Error = TimestampOutOfRangeError;
 
-    fn try_from(value: &Timestamp) -> Result<Self, Self::Error> {
+    fn try_from(value: Timestamp) -> Result<Self, Self::Error> {
         let date_time = OffsetDateTime::from_unix_timestamp(value.seconds)?
             + Duration::nanoseconds(value.nanos as i64);
         Ok(date_time)
@@ -129,9 +129,9 @@ mod tests {
     #[case(Timestamp { seconds: i64::MAX, nanos: 0 })]
     #[case(Timestamp { seconds: i64::MIN, nanos: 0 })]
     fn out_of_range_timestamps(#[case] timestamp: Timestamp) {
-        println!("{:?}", OffsetDateTime::try_from(&timestamp));
+        println!("{:?}", OffsetDateTime::try_from(timestamp));
         assert!(matches!(
-            OffsetDateTime::try_from(&timestamp),
+            OffsetDateTime::try_from(timestamp),
             Err(TimestampOutOfRangeError(_))
         ));
     }
@@ -140,7 +140,7 @@ mod tests {
     fn tonic_status_compat() {
         assert_eq!(String::from(InvalidTokenError), "Invalid token");
 
-        let out_of_range = OffsetDateTime::try_from(&Timestamp {
+        let out_of_range = OffsetDateTime::try_from(Timestamp {
             seconds: i64::MAX,
             nanos:   0,
         })

@@ -348,7 +348,7 @@ impl FirestoreDatabase {
         for write in writes {
             let name = get_doc_name_from_write(&write)?;
             let guard = write_guard_cache.get_mut(&name).unwrap();
-            let (write_result, version) = self.perform_write(write, guard, time.clone()).await?;
+            let (write_result, version) = self.perform_write(write, guard, time).await?;
             write_results.push(write_result);
             updates.insert(name.clone(), version);
         }
@@ -357,7 +357,7 @@ impl FirestoreDatabase {
 
         self.send_event(DatabaseEvent {
             database: Arc::downgrade(self),
-            update_time: time.clone(),
+            update_time: time,
             updates,
         });
 
@@ -408,17 +408,17 @@ impl FirestoreDatabase {
                                 "empty transform_type in field_transform",
                             )
                         })?,
-                        &commit_time,
+                        commit_time,
                     )?);
                 }
-                contents.add_version(fields, commit_time.clone()).await
+                contents.add_version(fields, commit_time).await
             }
             Delete(_) => {
                 debug!(name = %contents.name, "Delete");
 
                 unimplemented_option!(update_mask);
                 unimplemented_collection!(update_transforms);
-                contents.delete(commit_time.clone()).await
+                contents.delete(commit_time).await
             }
             Transform(_) => unimplemented!("transform"),
         };
@@ -498,7 +498,7 @@ fn apply_transform(
     fields: &mut HashMap<String, Value>,
     path: String,
     transform: TransformType,
-    commit_time: &Timestamp,
+    commit_time: Timestamp,
 ) -> Result<Value> {
     let field_path: FieldPath = path.parse()?;
     let result = match transform {
@@ -507,7 +507,7 @@ fn apply_transform(
                 GenericDatabaseError::invalid_argument(format!("invalid server_value: {code}"))
             })? {
                 ServerValue::RequestTime => {
-                    let new_value = Value::timestamp(commit_time.clone());
+                    let new_value = Value::timestamp(commit_time);
                     field_path.set_value(fields, new_value.clone());
                     new_value
                 }

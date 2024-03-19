@@ -17,8 +17,8 @@ impl Project for Projection {
     fn project(&self, version: &StoredDocumentVersion) -> Document {
         let mut doc = Document {
             fields: Default::default(),
-            create_time: Some(version.create_time.clone()),
-            update_time: Some(version.update_time.clone()),
+            create_time: Some(version.create_time),
+            update_time: Some(version.update_time),
             name: version.name.to_string(),
         };
         for field in &self.fields {
