@@ -37,7 +37,7 @@ use self::{
 };
 use crate::{
     database::field_path::FieldReference, error::Result, unimplemented, unimplemented_collection,
-    unimplemented_option, utils::RwLockHashMapExt, GenericDatabaseError,
+    unimplemented_option, utils::RwLockHashMapExt, FirestoreConfig, GenericDatabaseError,
 };
 
 mod collection;
@@ -53,6 +53,7 @@ mod transaction;
 const MAX_EVENT_BACKLOG: usize = 1024;
 
 pub struct FirestoreDatabase {
+    config: &'static FirestoreConfig,
     pub name: RootRef,
     collections: RwLock<HashMap<DefaultAtom, Arc<Collection>>>,
     transactions: RunningTransactions,
@@ -60,8 +61,9 @@ pub struct FirestoreDatabase {
 }
 
 impl FirestoreDatabase {
-    pub fn new(name: RootRef) -> Arc<Self> {
+    pub fn new(config: &'static FirestoreConfig, name: RootRef) -> Arc<Self> {
         Arc::new_cyclic(|database| FirestoreDatabase {
+            config,
             name,
             collections: Default::default(),
             transactions: RunningTransactions::new(Weak::clone(database)),
@@ -106,7 +108,7 @@ impl FirestoreDatabase {
             &*self
                 .collections
                 .get_or_insert(&collection_name.collection_id, || {
-                    Arc::new(Collection::new(collection_name.clone()))
+                    Arc::new(Collection::new(self.config, collection_name.clone()))
                 })
                 .await,
         )

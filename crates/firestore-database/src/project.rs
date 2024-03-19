@@ -9,30 +9,49 @@ use tokio::sync::RwLock;
 use tokio_stream::Stream;
 
 use crate::{
-    error::Result, listener::Listener, reference::RootRef, utils::RwLockHashMapExt,
-    FirestoreDatabase,
+    config::FirestoreConfig, error::Result, listener::Listener, reference::RootRef,
+    utils::RwLockHashMapExt, FirestoreDatabase,
 };
 
 pub struct FirestoreProject {
+    config:    FirestoreConfig,
     databases: RwLock<HashMap<RootRef, Arc<FirestoreDatabase>>>,
 }
 
+impl std::fmt::Debug for FirestoreProject {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FirestoreProject")
+            .field("config", &self.config)
+            .finish_non_exhaustive()
+    }
+}
+
+static INSTANCE: OnceLock<FirestoreProject> = OnceLock::new();
+
 impl FirestoreProject {
+    pub fn init(config: FirestoreConfig) {
+        INSTANCE
+            .set(FirestoreProject {
+                config,
+                databases: Default::default(),
+            })
+            .expect("FirestoreProject already initialized");
+    }
+
     pub fn get() -> &'static Self {
-        static INSTANCE: OnceLock<FirestoreProject> = OnceLock::new();
-        INSTANCE.get_or_init(|| FirestoreProject {
-            databases: Default::default(),
-        })
+        INSTANCE
+            .get()
+            .expect("FirestoreProject not yet initialized")
     }
 
     pub async fn clear_database(&self, name: &RootRef) {
         self.databases.write().await.remove(name);
     }
 
-    pub async fn database(&self, name: &RootRef) -> Arc<FirestoreDatabase> {
+    pub async fn database(&'static self, name: &RootRef) -> Arc<FirestoreDatabase> {
         Arc::clone(
             self.databases
-                .get_or_insert(name, || FirestoreDatabase::new(name.clone()))
+                .get_or_insert(name, || FirestoreDatabase::new(&self.config, name.clone()))
                 .await
                 .deref(),
         )

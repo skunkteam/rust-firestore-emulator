@@ -53,6 +53,7 @@ console = { version = "0.15.8", optional = true }
 console-subscriber = { version = "0.2.0", optional = true }
 emulator-grpc = { path = "crates/emulator-grpc" }
 emulator-ui = { path = "crates/emulator-ui" }
+firestore-database = { workspace = true }
 hybrid-axum-tonic = { path = "crates/hybrid-axum-tonic" }
 tikv-jemallocator = "0.5.4"
 time = { workspace = true, optional = true }

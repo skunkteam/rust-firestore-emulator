@@ -29,7 +29,7 @@ async fn list_databases(State(project): State<&FirestoreProject>) -> impl IntoRe
 }
 
 async fn get_by_ref(
-    State(project): State<&FirestoreProject>,
+    State(project): State<&'static FirestoreProject>,
     Path(r): Path<Ref>,
 ) -> Result<Response> {
     let database = project.database(r.root()).await;
