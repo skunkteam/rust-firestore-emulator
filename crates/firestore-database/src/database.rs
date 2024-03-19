@@ -350,7 +350,9 @@ impl FirestoreDatabase {
             let guard = write_guard_cache.get_mut(&name).unwrap();
             let (write_result, version) = self.perform_write(write, guard, time).await?;
             write_results.push(write_result);
-            updates.insert(name.clone(), version);
+            if let Some(version) = version {
+                updates.insert(name.clone(), version);
+            }
         }
 
         self.transactions.stop(transaction).await?;
@@ -370,7 +372,7 @@ impl FirestoreDatabase {
         write: Write,
         contents: &mut DocumentContents,
         commit_time: Timestamp,
-    ) -> Result<(WriteResult, DocumentVersion)> {
+    ) -> Result<(WriteResult, Option<DocumentVersion>)> {
         let Write {
             update_mask,
             update_transforms,
@@ -411,20 +413,24 @@ impl FirestoreDatabase {
                         commit_time,
                     )?);
                 }
-                contents.add_version(fields, commit_time).await
+                contents.maybe_add_version(fields, commit_time).await
             }
             Delete(_) => {
                 debug!(name = %contents.name, "Delete");
 
                 unimplemented_option!(update_mask);
                 unimplemented_collection!(update_transforms);
-                contents.delete(commit_time).await
+                Ok(contents.delete(commit_time).await)
             }
             Transform(_) => unimplemented!("transform"),
         };
+        let (update_time, document_version) = match document_version {
+            Ok(version) => (Some(commit_time), Some(version)),
+            Err(time) => (Some(time), None),
+        };
         Ok((
             WriteResult {
-                update_time: Some(commit_time),
+                update_time,
                 transform_results,
             },
             document_version,
