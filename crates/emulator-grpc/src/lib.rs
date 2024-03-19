@@ -530,7 +530,11 @@ impl firestore_server::Firestore for FirestoreEmulator {
                 let result = database.perform_write(write, &mut guard, time).await;
                 use googleapis::google::rpc;
                 Ok(match result {
-                    Ok((wr, update)) => (Default::default(), wr, Some((name.clone(), update))),
+                    Ok((wr, update)) => (
+                        Default::default(),
+                        wr,
+                        update.map(|update| (name.clone(), update)),
+                    ),
                     Err(err) => (
                         rpc::Status {
                             code:    err.grpc_code() as _,
@@ -576,7 +580,11 @@ async fn perform_writes(
     database.send_event(DatabaseEvent {
         database:    Arc::downgrade(database),
         update_time: time,
-        updates:     updates.into_iter().map(|u| (u.name().clone(), u)).collect(),
+        updates:     updates
+            .into_iter()
+            .flatten()
+            .map(|u| (u.name().clone(), u))
+            .collect(),
     });
     Ok((time, write_results))
 }

@@ -171,16 +171,31 @@ impl DocumentContents {
         }
     }
 
+    /// Add a new version with the given `update_time`, if the given `fields` are identical to the
+    /// last version, it will return [`Err`] with the update time ([`Timestamp`]) of the last
+    /// version.
     #[instrument(level = Level::TRACE, skip_all, fields(
         doc_name = %self.name,
         time = display(&update_time),
     ))]
-    pub async fn add_version(
+    pub async fn maybe_add_version(
         &mut self,
         fields: HashMap<String, Value>,
         update_time: Timestamp,
-    ) -> DocumentVersion {
+    ) -> Result<DocumentVersion, Timestamp> {
         trace!(?fields);
+        // Check if the fields are exactly equal to the last version, in that case, do not generate
+        // a new version.
+        if let Some(last) = self
+            .versions
+            .last()
+            .and_then(DocumentVersion::stored_document)
+        {
+            trace!("fields are equal to previous version");
+            if last.fields == fields {
+                return Err(last.update_time);
+            }
+        }
         let create_time = self.create_time().unwrap_or(update_time);
         let version = DocumentVersion::Stored(Arc::new(StoredDocumentVersion {
             name: self.name.clone(),
@@ -188,10 +203,12 @@ impl DocumentContents {
             update_time,
             fields,
         }));
+        // In transactions, we may get multiple updates to the same document, this should result in
+        // only one added version.
         if let Some(last) = self.versions.last_mut() {
             if last.update_time() == version.update_time() {
                 last.clone_from(&version);
-                return version;
+                return Ok(version);
             }
             assert!(
                 last.update_time() < version.update_time(),
@@ -199,7 +216,7 @@ impl DocumentContents {
             );
         }
         self.versions.push(version.clone());
-        version
+        Ok(version)
     }
 
     pub async fn delete(&mut self, delete_time: Timestamp) -> DocumentVersion {

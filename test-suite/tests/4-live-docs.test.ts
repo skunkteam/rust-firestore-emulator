@@ -1,5 +1,5 @@
 import { fromEventPattern } from '@skunkteam/sherlock-utils';
-import { noop, range } from 'lodash';
+import { range } from 'lodash';
 import { fs } from './utils';
 import { writeData } from './utils/firestore';
 
@@ -11,6 +11,39 @@ describe('listen to document updates', () => {
         const { stop, getCurrent } = listen(doc);
 
         checkSnap(await getCurrent(), { createTime, updateTime: createTime, data: { some: 'data' } });
+
+        stop();
+    });
+
+    test.concurrent('no update when writing an empty update', async () => {
+        const doc = fs.collection.doc();
+
+        const { stop, snapshots, getNext, getCurrent } = listen(doc);
+
+        const emptySnap = await getCurrent();
+        expect(snapshots).toHaveLength(1);
+        expect(emptySnap.isEqual(snapshots[0])).toBeTrue();
+
+        const initialData = writeData({ some: { nested: 'data' } });
+        const [firstSnap, { writeTime: createTime }] = await Promise.all([getNext(), doc.create(initialData)]);
+
+        expect(snapshots).toHaveLength(2);
+        expect(firstSnap.isEqual(snapshots[1])).toBeTrue();
+        checkSnap(firstSnap, { createTime, updateTime: createTime, data: { some: { nested: 'data' } } });
+
+        // Try to write the same data again through a `set` and `update`
+        const { writeTime: setTime } = await doc.set(initialData);
+        expect(setTime).toEqual(createTime);
+        const { writeTime: updateTime } = await doc.update('some.nested', 'data');
+        expect(updateTime).toEqual(createTime);
+
+        // Now really update the document, to force a 'true' update
+        const [secondSnap, { writeTime: realUpdateTime }] = await Promise.all([getNext(), doc.update({ some: { other: 'data' } })]);
+        expect(realUpdateTime).not.toEqual(createTime);
+
+        expect(snapshots).toHaveLength(3);
+        expect(secondSnap.isEqual(snapshots[2])).toBeTrue();
+        checkSnap(secondSnap, { createTime, updateTime: realUpdateTime, data: { some: { other: 'data' } } });
 
         stop();
     });
@@ -111,9 +144,11 @@ function listen(doc: FirebaseFirestore.DocumentReference) {
             err => value$.setError(err),
         ),
     );
+    const snapshots: FirebaseFirestore.DocumentSnapshot[] = [];
     return {
         // Start listening:
-        stop: snapshot$.react(noop),
+        stop: snapshot$.react(snap => snapshots.push(snap)),
+        snapshots,
         getCurrent: () => snapshot$.toPromise(),
         getNext: () => snapshot$.toPromise({ skipFirst: true }),
     };

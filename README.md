@@ -6,10 +6,8 @@ TODO:
 ## Missing features
 
 - [ ] Mimic transaction behaviour from cloud Firestore (mixed pessimistic and optimistic)
-- [ ] Detect idempotent updates and do not update `update_time` in those cases
 - [ ] Rest of the updates with Transforms
 - [ ] Documentation
-- [ ] live queries
 - [ ] ...
 
 ## Important to know
