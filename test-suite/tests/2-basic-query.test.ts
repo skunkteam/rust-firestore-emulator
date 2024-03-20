@@ -273,6 +273,15 @@ describe.each([
                 '3 INVALID_ARGUMENT: Cannot have inequality filters on multiple properties: [`backticks`.nested, type]',
             );
         });
+
+        test('multiple array contains (should not be possible)', async () => {
+            // Workaround for bug in FieldPath: https://github.com/googleapis/nodejs-firestore/issues/2019
+            const path = new fs.exported.FieldPath('tbd');
+            Object.defineProperty(path, 'formattedName', { value: '`\\`backticks\\``.nested' });
+            await expect(
+                getData(collection.where(path, 'array-contains', 'data').where('type', 'array-contains-any', [1, 2])),
+            ).rejects.toThrow('Only a single array-contains clause is allowed in a query');
+        });
     });
 
     describe('paginating results', () => {

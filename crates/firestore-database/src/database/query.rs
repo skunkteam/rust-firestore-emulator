@@ -344,53 +344,56 @@ impl Query {
                 "Query FROM is mandatory",
             ));
         }
-        // Ensure order_by is consistent
-        if self.order_by.is_empty() {
-            if let Some(filter) = &self.filter {
+        if let Some(filter) = &self.filter {
+            // Ensure order_by is consistent
+            if self.order_by.is_empty() {
                 self.order_by
-                    .extend(
-                        filter
-                            .get_inequality_fields()
-                            .into_iter()
-                            .map(|field| Order {
-                                field:     field.clone(),
-                                direction: Direction::Ascending,
-                            }),
-                    );
+                    .extend(filter.get_inequality_fields().map(|field| Order {
+                        field:     field.clone(),
+                        direction: Direction::Ascending,
+                    }));
             }
+
+            // Validate order_by versus inequality field
+            match filter.get_inequality_fields().unique().at_most_one() {
+                Err(mut fields) => {
+                    return Err(GenericDatabaseError::invalid_argument(format!(
+                        "Cannot have inequality filters on multiple properties: [{}]",
+                        fields.join(", ")
+                    )));
+                }
+                Ok(Some(inequality_field)) => {
+                    if let Some(first_order_by) = self.order_by.first() {
+                        if first_order_by.field != *inequality_field {
+                            return Err(GenericDatabaseError::invalid_argument(format!(
+                                "inequality filter property and first sort order must be the \
+                                 same: {inequality_field} and {}",
+                                first_order_by.field
+                            )));
+                        }
+                    }
+                }
+                Ok(None) => (),
+            }
+            filter
+                .field_filters()
+                .filter(|f| f.op.is_array_contains())
+                .at_most_one()
+                .map_err(|_| {
+                    // TODO: Error message from cloud read: "A maximum of 1 'ARRAY_CONTAINS' filter
+                    // is allowed per disjunction." Should change message after
+                    // we add support for disjunctions.
+                    GenericDatabaseError::invalid_argument(
+                        "Only a single array-contains clause is allowed in a query",
+                    )
+                })?;
         }
+
         if !self.order_by.iter().any(|o| o.field.is_document_name()) {
             self.order_by.push(Order {
                 field:     FieldReference::DocumentName,
                 direction: Direction::Ascending,
             })
-        }
-        // Validate order_by versus inequality field
-        match self
-            .filter
-            .iter()
-            .flat_map(|f| f.get_inequality_fields())
-            .unique()
-            .at_most_one()
-        {
-            Err(mut fields) => {
-                return Err(GenericDatabaseError::InvalidArgument(format!(
-                    "Cannot have inequality filters on multiple properties: [{}]",
-                    fields.join(", ")
-                )));
-            }
-            Ok(Some(inequality_field)) => {
-                if let Some(first_order_by) = self.order_by.first() {
-                    if first_order_by.field != *inequality_field {
-                        return Err(GenericDatabaseError::InvalidArgument(format!(
-                            "inequality filter property and first sort order must be the same: \
-                             {inequality_field} and {}",
-                            first_order_by.field
-                        )));
-                    }
-                }
-            }
-            Ok(None) => (),
         }
         Ok(())
     }

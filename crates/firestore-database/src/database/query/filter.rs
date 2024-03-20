@@ -1,3 +1,5 @@
+use std::iter;
+
 use googleapis::google::firestore::v1::{structured_query, Value};
 use itertools::Itertools;
 
@@ -15,11 +17,25 @@ pub enum Filter {
 }
 
 impl Filter {
-    pub fn get_inequality_fields(&self) -> Vec<&FieldReference> {
+    pub fn get_inequality_fields(&self) -> impl Iterator<Item = &FieldReference> + '_ {
+        self.depth_first().filter_map(|f| match f {
+            Filter::Composite(_) => None,
+            Filter::Field(f) => f.op.is_inequality().then_some(&f.field),
+            Filter::Unary(f) => f.op.is_inequality().then_some(&f.field),
+        })
+    }
+
+    pub fn field_filters(&self) -> impl Iterator<Item = &FieldFilter> + '_ {
+        self.depth_first().filter_map(Filter::as_field)
+    }
+
+    fn depth_first(&self) -> Box<dyn Iterator<Item = &Filter> + '_> {
+        let me = iter::once(self);
         match self {
-            Filter::Composite(f) => f.get_inequality_fields(),
-            Filter::Field(f) => f.get_inequality_fields(),
-            Filter::Unary(f) => f.get_inequality_fields(),
+            Filter::Composite(f) => {
+                Box::new(me.chain(f.filters.iter().flat_map(|f| f.depth_first())))
+            }
+            Filter::Field(_) | Filter::Unary(_) => Box::new(me),
         }
     }
 
@@ -28,6 +44,30 @@ impl Filter {
             Filter::Composite(f) => f.eval(version),
             Filter::Field(f) => f.eval(version),
             Filter::Unary(f) => Ok(f.eval(version)),
+        }
+    }
+
+    pub fn as_composite(&self) -> Option<&CompositeFilter> {
+        if let Self::Composite(v) = self {
+            Some(v)
+        } else {
+            None
+        }
+    }
+
+    pub fn as_field(&self) -> Option<&FieldFilter> {
+        if let Self::Field(v) = self {
+            Some(v)
+        } else {
+            None
+        }
+    }
+
+    pub fn as_unary(&self) -> Option<&UnaryFilter> {
+        if let Self::Unary(v) = self {
+            Some(v)
+        } else {
+            None
         }
     }
 }
@@ -47,18 +87,11 @@ impl TryFrom<structured_query::Filter> for Filter {
 
 #[derive(Debug)]
 pub struct CompositeFilter {
-    op:      CompositeOperator,
-    filters: Vec<Filter>,
+    pub op:      CompositeOperator,
+    pub filters: Vec<Filter>,
 }
 
 impl CompositeFilter {
-    pub fn get_inequality_fields(&self) -> Vec<&FieldReference> {
-        self.filters
-            .iter()
-            .flat_map(Filter::get_inequality_fields)
-            .collect()
-    }
-
     fn eval(&self, version: &StoredDocumentVersion) -> Result<bool> {
         for filter in &self.filters {
             let filter_result = filter.eval(version)?;
@@ -86,8 +119,8 @@ impl TryFrom<structured_query::CompositeFilter> for CompositeFilter {
     }
 }
 
-#[derive(Debug)]
-enum CompositeOperator {
+#[derive(Clone, Copy, Debug)]
+pub enum CompositeOperator {
     And,
     Or,
 }
@@ -119,20 +152,12 @@ impl TryFrom<structured_query::composite_filter::Operator> for CompositeOperator
 
 #[derive(Debug)]
 pub struct FieldFilter {
-    field: FieldReference,
-    op:    FieldOperator,
-    value: Value,
+    pub field: FieldReference,
+    pub op:    FieldOperator,
+    pub value: Value,
 }
 
 impl FieldFilter {
-    pub fn get_inequality_fields(&self) -> Vec<&FieldReference> {
-        if self.op.is_inequality() {
-            vec![&self.field]
-        } else {
-            vec![]
-        }
-    }
-
     fn eval(&self, version: &StoredDocumentVersion) -> Result<bool> {
         let Some(value) = self.field.get_value(version) else {
             return Ok(false);
@@ -180,8 +205,8 @@ impl TryFrom<structured_query::FieldFilter> for FieldFilter {
     }
 }
 
-#[derive(Debug)]
-enum FieldOperator {
+#[derive(Clone, Copy, Debug)]
+pub enum FieldOperator {
     /// The given `field` is less than the given `value`.
     ///
     /// Requires:
@@ -247,27 +272,38 @@ enum FieldOperator {
 impl FieldOperator {
     pub(crate) fn is_inequality(&self) -> bool {
         match self {
-            FieldOperator::LessThan
-            | FieldOperator::LessThanOrEqual
-            | FieldOperator::GreaterThan
-            | FieldOperator::GreaterThanOrEqual
-            | FieldOperator::NotEqual
-            | FieldOperator::NotIn => true,
-            FieldOperator::Equal
-            | FieldOperator::ArrayContains
-            | FieldOperator::In
-            | FieldOperator::ArrayContainsAny => false,
+            Self::LessThan
+            | Self::LessThanOrEqual
+            | Self::GreaterThan
+            | Self::GreaterThanOrEqual
+            | Self::NotEqual
+            | Self::NotIn => true,
+            Self::Equal | Self::ArrayContains | Self::In | Self::ArrayContainsAny => false,
+        }
+    }
+
+    pub(crate) fn is_array_contains(&self) -> bool {
+        match self {
+            Self::LessThan
+            | Self::LessThanOrEqual
+            | Self::GreaterThan
+            | Self::GreaterThanOrEqual
+            | Self::Equal
+            | Self::NotEqual
+            | Self::In
+            | Self::NotIn => false,
+            Self::ArrayContains | Self::ArrayContainsAny => true,
         }
     }
 
     pub(crate) fn needs_type_compat(&self) -> bool {
         matches!(
             self,
-            FieldOperator::LessThan
-                | FieldOperator::LessThanOrEqual
-                | FieldOperator::GreaterThan
-                | FieldOperator::GreaterThanOrEqual
-                | FieldOperator::Equal
+            Self::LessThan
+                | Self::LessThanOrEqual
+                | Self::GreaterThan
+                | Self::GreaterThanOrEqual
+                | Self::Equal
         )
     }
 }
@@ -297,19 +333,11 @@ impl TryFrom<structured_query::field_filter::Operator> for FieldOperator {
 
 #[derive(Debug)]
 pub struct UnaryFilter {
-    field: FieldReference,
-    op:    UnaryOperator,
+    pub field: FieldReference,
+    pub op:    UnaryOperator,
 }
 
 impl UnaryFilter {
-    pub fn get_inequality_fields(&self) -> Vec<&FieldReference> {
-        if self.op.is_inequality() {
-            vec![&self.field]
-        } else {
-            vec![]
-        }
-    }
-
     fn eval(&self, version: &StoredDocumentVersion) -> bool {
         let Some(value) = self.field.get_value(version) else {
             return false;
@@ -340,8 +368,8 @@ impl TryFrom<structured_query::UnaryFilter> for UnaryFilter {
 }
 
 #[allow(clippy::enum_variant_names)]
-#[derive(Debug)]
-enum UnaryOperator {
+#[derive(Clone, Copy, Debug)]
+pub enum UnaryOperator {
     /// The given `field` is equal to `NaN`.
     IsNan,
     /// The given `field` is equal to `NULL`.
