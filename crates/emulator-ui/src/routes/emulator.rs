@@ -14,7 +14,7 @@ use crate::error::{RestError, Result};
 #[allow(clippy::declare_interior_mutable_const)]
 const NO_CACHE: HeaderValue = HeaderValue::from_static("no-cache");
 
-pub fn router() -> Router<&'static FirestoreProject> {
+pub(crate) fn router() -> Router<&'static FirestoreProject> {
     Router::new()
         .route("/", get(list_databases))
         .route("/*ref", get(get_by_ref).delete(delete_by_ref))
@@ -29,7 +29,7 @@ async fn list_databases(State(project): State<&FirestoreProject>) -> impl IntoRe
 }
 
 async fn get_by_ref(
-    State(project): State<&FirestoreProject>,
+    State(project): State<&'static FirestoreProject>,
     Path(r): Path<Ref>,
 ) -> Result<Response> {
     let database = project.database(r.root()).await;

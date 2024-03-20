@@ -8,17 +8,20 @@ use super::{
     document::DocumentMeta,
     reference::{CollectionRef, DocumentRef},
 };
-use crate::{error::Result, utils::RwLockHashMapExt};
+use crate::{error::Result, utils::RwLockHashMapExt, FirestoreProject};
 
+#[derive(Debug)]
 pub struct Collection {
+    project:   &'static FirestoreProject,
     pub name:  CollectionRef,
     documents: RwLock<HashMap<DefaultAtom, Arc<DocumentMeta>>>,
 }
 
 impl Collection {
     #[instrument(level = Level::TRACE, skip_all)]
-    pub fn new(name: CollectionRef) -> Self {
+    pub fn new(project: &'static FirestoreProject, name: CollectionRef) -> Self {
         Self {
+            project,
             name,
             documents: Default::default(),
         }
@@ -29,7 +32,7 @@ impl Collection {
         Arc::clone(
             self.documents
                 .get_or_insert(&name.document_id, || {
-                    Arc::new(DocumentMeta::new(name.clone()))
+                    Arc::new(DocumentMeta::new(self.project, name.clone()))
                 })
                 .await
                 .deref(),

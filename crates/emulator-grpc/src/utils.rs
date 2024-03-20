@@ -50,7 +50,9 @@ macro_rules! mandatory {
 /// test-suite from 7s to 3ms.
 ///
 /// The returned Result never fails.
-pub async fn error_in_stream<T, F, S>(stream: F) -> Result<Response<BoxStream<'static, Result<T>>>>
+pub(crate) async fn error_in_stream<T, F, S>(
+    stream: F,
+) -> Result<Response<BoxStream<'static, Result<T>>>>
 where
     F: Future<Output = Result<S>>,
     S: Stream<Item = Result<T>> + Send + 'static,

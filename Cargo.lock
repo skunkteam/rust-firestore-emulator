@@ -624,6 +624,7 @@ dependencies = [
  "console-subscriber",
  "emulator-grpc",
  "emulator-ui",
+ "firestore-database",
  "hybrid-axum-tonic",
  "tikv-jemallocator",
  "time",

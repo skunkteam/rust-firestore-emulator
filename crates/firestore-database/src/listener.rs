@@ -46,7 +46,7 @@ const TARGET_CHANGE_DEFAULT: TargetChange = TargetChange {
     read_time: None,
 };
 
-pub struct Listener {
+pub(crate) struct Listener {
     /// For debug purposes.
     id: usize,
     project: &'static FirestoreProject,
@@ -57,7 +57,7 @@ pub struct Listener {
 }
 
 impl Listener {
-    pub fn start(
+    pub(crate) fn start(
         project: &'static FirestoreProject,
         request_stream: impl tokio_stream::Stream<Item = ListenRequest> + Send + Unpin + 'static,
     ) -> ReceiverStream<Result<ListenResponse>> {

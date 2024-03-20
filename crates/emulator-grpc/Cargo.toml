@@ -15,6 +15,5 @@ tokio-stream = { workspace = true }
 tonic = { workspace = true, features = ["gzip"] }
 tracing = { workspace = true }
 
-[lints.clippy]
-# Until this is resolved: https://github.com/rust-lang/rust-clippy/issues/12281
-blocks_in_conditions = "allow"
+[lints]
+workspace = true

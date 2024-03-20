@@ -11,7 +11,11 @@ use firestore_database::{
 };
 use futures::{future::try_join_all, stream::BoxStream, TryStreamExt};
 use googleapis::google::{
-    firestore::v1::{firestore_server::FirestoreServer, structured_query::CollectionSelector, *},
+    firestore::v1::{
+        firestore_server::{Firestore, FirestoreServer},
+        structured_query::CollectionSelector,
+        *,
+    },
     protobuf::{Empty, Timestamp},
 };
 use itertools::Itertools;
@@ -26,27 +30,19 @@ mod utils;
 
 const MAX_MESSAGE_SIZE: usize = 50 * 1024 * 1024;
 
-pub fn service() -> FirestoreServer<FirestoreEmulator> {
-    FirestoreServer::new(FirestoreEmulator::default())
+pub fn service(project: &'static FirestoreProject) -> FirestoreServer<impl Firestore> {
+    FirestoreServer::new(FirestoreEmulator { project })
         .accept_compressed(CompressionEncoding::Gzip)
         .send_compressed(CompressionEncoding::Gzip)
         .max_decoding_message_size(MAX_MESSAGE_SIZE)
 }
 
-pub struct FirestoreEmulator {
+struct FirestoreEmulator {
     project: &'static FirestoreProject,
 }
 
-impl Default for FirestoreEmulator {
-    fn default() -> Self {
-        Self {
-            project: FirestoreProject::get(),
-        }
-    }
-}
-
 #[async_trait]
-impl firestore_server::Firestore for FirestoreEmulator {
+impl Firestore for FirestoreEmulator {
     /// Gets a single document.
     #[instrument(level = Level::TRACE, skip_all, err)]
     async fn get_document(

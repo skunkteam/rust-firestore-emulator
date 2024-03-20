@@ -23,12 +23,10 @@ use tokio::{
 use tracing::{debug, instrument, trace, warn, Level};
 
 use super::{read_consistency::ReadConsistency, reference::DocumentRef};
-use crate::{error::Result, GenericDatabaseError};
-
-// TODO: Maybe make the timeout configurable
-const WAIT_LOCK_TIMEOUT: Duration = Duration::from_secs(30);
+use crate::{error::Result, FirestoreProject, GenericDatabaseError};
 
 pub struct DocumentMeta {
+    project: &'static FirestoreProject,
     /// The resource name of the document, for example
     /// `projects/{project_id}/databases/{database_id}/documents/{document_path}`.
     pub name: DocumentRef,
@@ -45,8 +43,9 @@ impl Debug for DocumentMeta {
 }
 
 impl DocumentMeta {
-    pub fn new(name: DocumentRef) -> Self {
+    pub fn new(project: &'static FirestoreProject, name: DocumentRef) -> Self {
         Self {
+            project,
             contents: Arc::new(RwLock::new(DocumentContents::new(name.clone()))),
             name,
             write_permit_shop: Arc::new(Semaphore::new(1)),
@@ -54,7 +53,7 @@ impl DocumentMeta {
     }
 
     pub async fn read(&self) -> Result<DocumentContentsReadGuard> {
-        lock_timeout(self.contents.read(), || {
+        lock_timeout(self.contents.read(), self.project.timeouts.read, || {
             format!("read lock for {}", self.name)
         })
         .await
@@ -67,7 +66,7 @@ impl DocumentMeta {
         tokio::spawn(async {
             tokio::select! {
                 Ok(permit) = write_permit_shop.acquire_owned() => {
-                    let _: Result<_, _> = tx.send(permit);
+                    let _unused: Result<_, _> = tx.send(permit);
                 }
 
                 _ = tx.closed() => ()
@@ -75,23 +74,29 @@ impl DocumentMeta {
         });
 
         Ok(OwnedDocumentContentsReadGuard {
+            project: self.project,
             meta: Arc::clone(self),
-            guard: lock_timeout(Arc::clone(&self.contents).read_owned(), || {
-                format!("read lock for {}", self.name)
-            })
+            guard: lock_timeout(
+                Arc::clone(&self.contents).read_owned(),
+                self.project.timeouts.read,
+                || format!("read lock for {}", self.name),
+            )
             .await?,
             write_permit: rx,
         })
     }
 
     async fn owned_write(&self) -> Result<OwnedDocumentContentsWriteGuard> {
-        lock_timeout(Arc::clone(&self.contents).write_owned(), || {
-            format!("write lock for {}", self.name)
-        })
+        lock_timeout(
+            Arc::clone(&self.contents).write_owned(),
+            self.project.timeouts.write,
+            || format!("write lock for {}", self.name),
+        )
         .await
     }
 }
 
+#[derive(Debug)]
 pub struct DocumentContents {
     /// The resource name of the document, for example
     /// `projects/{project_id}/databases/{database_id}/documents/{document_path}`.
@@ -145,7 +150,7 @@ impl DocumentContents {
         self.versions.last().map(DocumentVersion::update_time)
     }
 
-    pub fn check_precondition(&self, condition: DocumentPrecondition) -> Result<()> {
+    pub(crate) fn check_precondition(&self, condition: DocumentPrecondition) -> Result<()> {
         match condition {
             DocumentPrecondition::Exists if !self.exists() => {
                 Err(GenericDatabaseError::failed_precondition(format!(
@@ -229,15 +234,17 @@ impl DocumentContents {
     }
 }
 
-pub type DocumentContentsReadGuard<'a> = RwLockReadGuard<'a, DocumentContents>;
+pub(crate) type DocumentContentsReadGuard<'a> = RwLockReadGuard<'a, DocumentContents>;
 
+#[derive(Debug)]
 pub struct OwnedDocumentContentsReadGuard {
+    project: &'static FirestoreProject,
     meta: Arc<DocumentMeta>,
     guard: OwnedRwLockReadGuard<DocumentContents>,
     write_permit: oneshot::Receiver<OwnedSemaphorePermit>,
 }
 
-pub type OwnedDocumentContentsWriteGuard = OwnedRwLockWriteGuard<DocumentContents>;
+pub(crate) type OwnedDocumentContentsWriteGuard = OwnedRwLockWriteGuard<DocumentContents>;
 
 impl OwnedDocumentContentsReadGuard {
     #[instrument(level = Level::TRACE, skip_all, err)]
@@ -245,15 +252,17 @@ impl OwnedDocumentContentsReadGuard {
         debug!(name = %self.meta.name);
         let check_time = self.guard.last_updated();
         let OwnedDocumentContentsReadGuard {
+            project,
             meta,
             guard,
             write_permit,
         } = self;
         drop(guard);
-        let write_permit =
-            lock_timeout(write_permit, || format!("write permit for {}", &meta.name))
-                .await?
-                .unwrap();
+        let write_permit = lock_timeout(write_permit, project.timeouts.write, || {
+            format!("write permit for {}", &meta.name)
+        })
+        .await?
+        .unwrap();
         let owned_rw_lock_write_guard = meta.owned_write().await?;
         drop(write_permit);
         if check_time == owned_rw_lock_write_guard.last_updated() {
@@ -376,7 +385,7 @@ pub struct DeletedDocumentVersion {
     pub delete_time: Timestamp,
 }
 
-pub enum DocumentPrecondition {
+pub(crate) enum DocumentPrecondition {
     NotExists,
     Exists,
     UpdateTime(Timestamp),
@@ -392,13 +401,15 @@ impl From<precondition::ConditionType> for DocumentPrecondition {
     }
 }
 
-async fn lock_timeout<F: Future>(future: F, id: impl FnOnce() -> String) -> Result<F::Output> {
+async fn lock_timeout<F: Future>(
+    future: F,
+    time: Duration,
+    id: impl FnOnce() -> String,
+) -> Result<F::Output> {
     let future_with_timeout = async {
-        timeout(WAIT_LOCK_TIMEOUT, future)
-            .await
-            .map_err(|_: Elapsed| {
-                GenericDatabaseError::aborted("timeout waiting for lock on document")
-            })
+        timeout(time, future).await.map_err(|_: Elapsed| {
+            GenericDatabaseError::aborted("timeout waiting for lock on document")
+        })
     };
     let mut future_with_timeout = pin!(future_with_timeout);
     select! {

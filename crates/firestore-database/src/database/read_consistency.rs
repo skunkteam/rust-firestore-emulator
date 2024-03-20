@@ -8,7 +8,7 @@ use googleapis::google::{
 
 use crate::{database::transaction::TransactionId, error::GenericDatabaseError};
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Copy, Debug)]
 pub enum ReadConsistency {
     Default,
     ReadTime(Timestamp),
