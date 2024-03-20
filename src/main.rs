@@ -3,6 +3,7 @@ use std::net::SocketAddr;
 use clap::Parser;
 use firestore_emulator::run;
 use tikv_jemallocator::Jemalloc;
+use tokio::signal::ctrl_c;
 
 #[global_allocator]
 static GLOBAL_ALLOC: Jemalloc = Jemalloc;
@@ -44,5 +45,7 @@ fn main() -> color_eyre::Result<()> {
         registry.init();
     }
 
-    run(Args::parse().host_port)
+    let ctrl_c_listener = async { ctrl_c().await.expect("failed to listen for ctrl-c event") };
+
+    run(Args::parse().host_port, ctrl_c_listener)
 }
