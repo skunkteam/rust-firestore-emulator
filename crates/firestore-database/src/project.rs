@@ -28,6 +28,13 @@ impl FirestoreProject {
         }
     }
 
+    /// Drop the given database.
+    ///
+    /// All documents and collections will be lost. Active transactions will fail with ABORTED.
+    ///
+    /// Listeners that are still actively listening to this database will automatically reconnect
+    /// to a new database with the same name, so all activity on the same database will still be
+    /// observed by these listeners.
     pub async fn clear_database(&self, name: &RootRef) {
         self.databases.write().await.remove(name);
     }

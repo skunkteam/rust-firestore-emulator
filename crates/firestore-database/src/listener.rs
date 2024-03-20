@@ -21,7 +21,7 @@ use itertools::Itertools;
 use tokio::sync::mpsc;
 use tokio_stream::{
     wrappers::{errors::BroadcastStreamRecvError, BroadcastStream, ReceiverStream},
-    StreamExt, StreamMap,
+    StreamExt, StreamMap, StreamNotifyClose,
 };
 use tracing::{debug, error, instrument, Level};
 
@@ -50,8 +50,7 @@ pub(crate) struct Listener {
     /// For debug purposes.
     id: usize,
     project: &'static FirestoreProject,
-    // databases: HashMap<RootRef, Weak<FirestoreDatabase>>,
-    database_events: StreamMap<RootRef, BroadcastStream<Arc<DatabaseEvent>>>,
+    database_events: StreamMap<RootRef, StreamNotifyClose<BroadcastStream<Arc<DatabaseEvent>>>>,
     sender: mpsc::Sender<Result<ListenResponse>>,
     target: Option<ListenerTarget>,
 }
@@ -67,7 +66,6 @@ impl Listener {
         let listener = Self {
             id: NEXT_ID.fetch_add(1, atomic::Ordering::Relaxed),
             project,
-            // databases: Default::default(),
             database_events: Default::default(),
             sender,
             // No target yet, will be added by a message in the request stream.
@@ -104,8 +102,12 @@ impl Listener {
 
                 Some(database_event) = self.database_events.next() => {
                     match database_event {
-                        (_, Ok(event)) => self.process_event(&event).await?,
-                        (_, Err(BroadcastStreamRecvError::Lagged(count))) => {
+                        // Database was dropped, reconnect to automatically create a new Database.
+                        (db_name, None) => self.ensure_subscribed_to(&*self.project.database(&db_name).await),
+                        // Received an event from the database.
+                        (_, Some(Ok(event))) => self.process_event(&event).await?,
+                        // Buffer overflow, we weren't able to keep up with the amount of events of one of the databases.
+                        (_, Some(Err(BroadcastStreamRecvError::Lagged(count)))) => {
                             error!(
                                 id = self.id,
                                 count = count,
@@ -311,7 +313,7 @@ impl Listener {
         if !self.database_events.contains_key(&database.name) {
             self.database_events.insert(
                 database.name.clone(),
-                BroadcastStream::new(database.subscribe()),
+                StreamNotifyClose::new(BroadcastStream::new(database.subscribe())),
             );
         }
     }

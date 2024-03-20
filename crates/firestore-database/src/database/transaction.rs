@@ -69,10 +69,6 @@ impl RunningTransactions {
         })?;
         Ok(())
     }
-
-    pub(crate) async fn clear(&self) {
-        self.map.write().await.clear()
-    }
 }
 
 #[derive(Debug)]
