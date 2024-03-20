@@ -11,7 +11,7 @@ pub trait NestTonic: Sized {
     fn nest_tonic<S>(self, svc: S) -> Self
     where
         S: Service<
-                hyper::Request<hyper::Body>,
+                Request<hyper::Body>,
                 Error = Infallible,
                 Response = hyper::Response<tonic::body::BoxBody>,
             >
@@ -26,7 +26,7 @@ impl NestTonic for Router {
     fn nest_tonic<S>(self, svc: S) -> Self
     where
         S: Service<
-                hyper::Request<hyper::Body>,
+                Request<hyper::Body>,
                 Error = Infallible,
                 Response = hyper::Response<tonic::body::BoxBody>,
             >

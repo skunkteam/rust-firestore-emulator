@@ -16,26 +16,27 @@ use super::{
 };
 use crate::{error::Result, GenericDatabaseError};
 
-pub struct RunningTransactions {
+#[derive(Debug)]
+pub(crate) struct RunningTransactions {
     database: Weak<FirestoreDatabase>,
     map:      RwLock<HashMap<TransactionId, Arc<Transaction>>>,
 }
 
 impl RunningTransactions {
-    pub fn new(database: Weak<FirestoreDatabase>) -> Self {
+    pub(crate) fn new(database: Weak<FirestoreDatabase>) -> Self {
         Self {
             database,
             map: Default::default(),
         }
     }
 
-    pub async fn get(&self, id: &TransactionId) -> Result<Arc<Transaction>> {
+    pub(crate) async fn get(&self, id: &TransactionId) -> Result<Arc<Transaction>> {
         self.map.read().await.get(id).cloned().ok_or_else(|| {
             GenericDatabaseError::invalid_argument(format!("invalid transaction ID: {}", id.0))
         })
     }
 
-    pub async fn start(&self) -> Arc<Transaction> {
+    pub(crate) async fn start(&self) -> Arc<Transaction> {
         let mut lock = self.map.write().await;
         let id = loop {
             let id = TransactionId::new();
@@ -48,7 +49,7 @@ impl RunningTransactions {
         txn
     }
 
-    pub async fn start_with_id(&self, id: TransactionId) -> Result<Arc<Transaction>> {
+    pub(crate) async fn start_with_id(&self, id: TransactionId) -> Result<Arc<Transaction>> {
         let mut lock = self.map.write().await;
         match lock.entry(id) {
             Entry::Occupied(_) => Err(GenericDatabaseError::failed_precondition(
@@ -62,18 +63,19 @@ impl RunningTransactions {
         }
     }
 
-    pub async fn stop(&self, id: &TransactionId) -> Result<()> {
+    pub(crate) async fn stop(&self, id: &TransactionId) -> Result<()> {
         self.map.write().await.remove(id).ok_or_else(|| {
             GenericDatabaseError::invalid_argument(format!("invalid transaction ID: {}", id.0))
         })?;
         Ok(())
     }
 
-    pub async fn clear(&self) {
+    pub(crate) async fn clear(&self) {
         self.map.write().await.clear()
     }
 }
 
+#[derive(Debug)]
 pub struct Transaction {
     pub id:   TransactionId,
     database: Weak<FirestoreDatabase>,

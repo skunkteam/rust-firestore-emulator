@@ -1,6 +1,6 @@
 mod common;
 
-use std::{sync::Mutex, time::Duration};
+use std::{net::TcpListener, sync::Mutex, time::Duration};
 
 use axum::{
     middleware::{from_fn, Next},
@@ -16,7 +16,7 @@ use common::{
     server::{Test1Service, Test2Service},
 };
 use hybrid_axum_tonic::{GrpcStatus, NestTonic, RestGrpcService};
-use hyper::Request;
+use hyper::{Request, Uri};
 use tonic::transport::Channel;
 
 async fn do_nothing<B>(req: Request<B>, next: Next<B>) -> Result<Response, GrpcStatus> {
@@ -29,37 +29,40 @@ async fn cancel_request<B>(_req: Request<B>, _next: Next<B>) -> Result<Response,
 
 #[tokio::test]
 async fn test_hybrid() {
+    let grpc_router1 = Router::new()
+        .nest_tonic(Test1Server::new(Test1Service {
+            state: Mutex::new(10),
+            str:   String::new(),
+        }))
+        .layer(from_fn(do_nothing));
+
+    let grpc_router2 = Router::new()
+        .nest_tonic(Test2Server::new(Test2Service))
+        .layer(from_fn(cancel_request));
+
+    let grpc_router = grpc_router1.merge(grpc_router2);
+
+    let rest_router = Router::new().nest("/", Router::new().route("/123", get(|| async move {})));
+
+    let make_service = RestGrpcService::new(rest_router, grpc_router).into_make_service();
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+
+    let uri: Uri = format!("http://{}", listener.local_addr().unwrap())
+        .parse()
+        .unwrap();
+
     tokio::task::spawn(async move {
-        let grpc_router1 = Router::new()
-            .nest_tonic(Test1Server::new(Test1Service {
-                state: Mutex::new(10),
-                str:   String::new(),
-            }))
-            .layer(from_fn(do_nothing));
-
-        let grpc_router2 = Router::new()
-            .nest_tonic(Test2Server::new(Test2Service))
-            .layer(from_fn(cancel_request));
-
-        let grpc_router = grpc_router1.merge(grpc_router2);
-
-        let rest_router =
-            Router::new().nest("/", Router::new().route("/123", get(|| async move {})));
-
-        let service = RestGrpcService::new(rest_router, grpc_router);
-
-        axum::Server::bind(&"127.0.0.1:8080".parse().unwrap())
-            .serve(service.into_make_service())
+        axum::Server::from_tcp(listener)
+            .unwrap()
+            .serve(make_service)
             .await
-            .unwrap();
+        // .unwrap();
     });
 
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    tokio::time::sleep(Duration::from_millis(10)).await;
 
-    let channel = Channel::from_static("http://127.0.0.1:8080")
-        .connect()
-        .await
-        .unwrap();
+    let channel = Channel::builder(uri.clone()).connect().await.unwrap();
 
     let mut client1 = Test1Client::new(channel.clone());
     client1.test1(Test1Request {}).await.unwrap();
@@ -68,10 +71,7 @@ async fn test_hybrid() {
     client1.test1(Test1Request {}).await.unwrap();
     client1.test1(Test1Request {}).await.unwrap();
 
-    let channel = Channel::from_static("http://127.0.0.1:8080")
-        .connect()
-        .await
-        .unwrap();
+    let channel = Channel::builder(uri).connect().await.unwrap();
 
     client1.test1(Test1Request {}).await.unwrap();
     client1.test1(Test1Request {}).await.unwrap();

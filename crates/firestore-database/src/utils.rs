@@ -56,7 +56,7 @@ macro_rules! unimplemented_bool {
 }
 
 #[async_trait]
-pub trait RwLockHashMapExt<Q: ?Sized, V> {
+pub(crate) trait RwLockHashMapExt<Q: ?Sized, V> {
     async fn get_or_insert(
         &self,
         key: &Q,

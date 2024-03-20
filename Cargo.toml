@@ -45,6 +45,25 @@ tonic = "0.11"
 tower = "0.4.13"
 tracing = "0.1.40"
 
+[workspace.lints.rust]
+unsafe_code = "forbid"
+explicit_outlives_requirements = "forbid"
+let_underscore_drop = "warn"
+missing_copy_implementations = "warn"
+missing_debug_implementations = "warn"
+non_ascii_idents = "forbid"
+single_use_lifetimes = "warn"
+unit_bindings = "warn"
+unreachable_pub = "warn"
+unused_crate_dependencies = "warn"
+unused_lifetimes = "warn"
+unused_macro_rules = "warn"
+unused_qualifications = "warn"
+
+[workspace.lints.clippy]
+# Until this is resolved: https://github.com/rust-lang/rust-clippy/issues/12281
+blocks_in_conditions = "allow"
+
 [dependencies]
 axum = { workspace = true }
 clap = { version = "4.5.1", features = ["derive", "env"] }

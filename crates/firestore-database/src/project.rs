@@ -1,8 +1,4 @@
-use std::{
-    collections::HashMap,
-    ops::Deref,
-    sync::{Arc, OnceLock},
-};
+use std::{collections::HashMap, ops::Deref, sync::Arc};
 
 use googleapis::google::firestore::v1::{ListenRequest, ListenResponse};
 use tokio::sync::RwLock;
@@ -10,38 +6,26 @@ use tokio_stream::Stream;
 
 use crate::{
     config::FirestoreConfig, error::Result, listener::Listener, reference::RootRef,
-    utils::RwLockHashMapExt, FirestoreDatabase,
+    timeouts::Timeouts, utils::RwLockHashMapExt, FirestoreDatabase,
 };
 
+#[derive(Debug)]
 pub struct FirestoreProject {
-    config:    FirestoreConfig,
+    pub(crate) timeouts: Timeouts,
     databases: RwLock<HashMap<RootRef, Arc<FirestoreDatabase>>>,
 }
 
-impl std::fmt::Debug for FirestoreProject {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("FirestoreProject")
-            .field("config", &self.config)
-            .finish_non_exhaustive()
-    }
-}
-
-static INSTANCE: OnceLock<FirestoreProject> = OnceLock::new();
-
 impl FirestoreProject {
-    pub fn init(config: FirestoreConfig) {
-        INSTANCE
-            .set(FirestoreProject {
-                config,
-                databases: Default::default(),
-            })
-            .expect("FirestoreProject already initialized");
-    }
-
-    pub fn get() -> &'static Self {
-        INSTANCE
-            .get()
-            .expect("FirestoreProject not yet initialized")
+    pub fn new(config: FirestoreConfig) -> Self {
+        let timeouts = if config.long_contention_timeout {
+            Timeouts::CLOUD
+        } else {
+            Timeouts::FAST
+        };
+        FirestoreProject {
+            timeouts,
+            databases: Default::default(),
+        }
     }
 
     pub async fn clear_database(&self, name: &RootRef) {
@@ -51,7 +35,7 @@ impl FirestoreProject {
     pub async fn database(&'static self, name: &RootRef) -> Arc<FirestoreDatabase> {
         Arc::clone(
             self.databases
-                .get_or_insert(name, || FirestoreDatabase::new(&self.config, name.clone()))
+                .get_or_insert(name, || FirestoreDatabase::new(self, name.clone()))
                 .await
                 .deref(),
         )

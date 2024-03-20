@@ -18,7 +18,7 @@ struct Args {
     /// Enable more accurate lock timeouts.
     ///
     /// In Cloud Firestore, transactions can take up to 15 seconds before aborting because of
-    /// contention. By default, in the emulator, this is reduced to 2 second for faster unit-tests.
+    /// contention. By default, in the emulator, this is reduced to 1 second for faster unit-tests.
     /// Enable this feature to simulate the Cloud Firestore more accurately.
     #[arg(long, env)]
     long_contention_timeout: bool,
@@ -59,11 +59,14 @@ fn main() -> color_eyre::Result<()> {
         long_contention_timeout,
     } = Args::parse();
 
-    FirestoreProject::init(FirestoreConfig {
+    // Create a new Firestore Project.
+    let project = Box::new(FirestoreProject::new(FirestoreConfig {
         long_contention_timeout,
-    });
+    }));
+    // Make it live for the remainder of the program's life. ('static)
+    let project = Box::leak(project);
 
     let ctrl_c_listener = async { ctrl_c().await.expect("failed to listen for ctrl-c event") };
 
-    run(host_port, ctrl_c_listener)
+    run(project, host_port, ctrl_c_listener)
 }

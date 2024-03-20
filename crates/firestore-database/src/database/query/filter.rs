@@ -245,7 +245,7 @@ enum FieldOperator {
 }
 
 impl FieldOperator {
-    pub fn is_inequality(&self) -> bool {
+    pub(crate) fn is_inequality(&self) -> bool {
         match self {
             FieldOperator::LessThan
             | FieldOperator::LessThanOrEqual
@@ -260,7 +260,7 @@ impl FieldOperator {
         }
     }
 
-    pub fn needs_type_compat(&self) -> bool {
+    pub(crate) fn needs_type_compat(&self) -> bool {
         matches!(
             self,
             FieldOperator::LessThan
@@ -363,7 +363,7 @@ enum UnaryOperator {
 }
 
 impl UnaryOperator {
-    pub fn is_inequality(&self) -> bool {
+    pub(crate) fn is_inequality(&self) -> bool {
         match self {
             UnaryOperator::IsNan | UnaryOperator::IsNull => false,
             UnaryOperator::IsNotNan | UnaryOperator::IsNotNull => true,

@@ -37,7 +37,7 @@ use self::{
 };
 use crate::{
     database::field_path::FieldReference, error::Result, unimplemented, unimplemented_collection,
-    unimplemented_option, utils::RwLockHashMapExt, FirestoreConfig, GenericDatabaseError,
+    unimplemented_option, utils::RwLockHashMapExt, FirestoreProject, GenericDatabaseError,
 };
 
 mod collection;
@@ -48,12 +48,14 @@ pub mod projection;
 pub mod query;
 pub mod read_consistency;
 pub mod reference;
+pub(crate) mod timeouts;
 mod transaction;
 
 const MAX_EVENT_BACKLOG: usize = 1024;
 
+#[derive(Debug)]
 pub struct FirestoreDatabase {
-    config: &'static FirestoreConfig,
+    project: &'static FirestoreProject,
     pub name: RootRef,
     collections: RwLock<HashMap<DefaultAtom, Arc<Collection>>>,
     transactions: RunningTransactions,
@@ -61,9 +63,9 @@ pub struct FirestoreDatabase {
 }
 
 impl FirestoreDatabase {
-    pub fn new(config: &'static FirestoreConfig, name: RootRef) -> Arc<Self> {
+    pub fn new(project: &'static FirestoreProject, name: RootRef) -> Arc<Self> {
         Arc::new_cyclic(|database| FirestoreDatabase {
-            config,
+            project,
             name,
             collections: Default::default(),
             transactions: RunningTransactions::new(Weak::clone(database)),
@@ -108,7 +110,7 @@ impl FirestoreDatabase {
             &*self
                 .collections
                 .get_or_insert(&collection_name.collection_id, || {
-                    Arc::new(Collection::new(self.config, collection_name.clone()))
+                    Arc::new(Collection::new(self.project, collection_name.clone()))
                 })
                 .await,
         )
@@ -473,7 +475,7 @@ impl FirestoreDatabase {
     pub fn send_event(&self, event: DatabaseEvent) {
         // A send operation can only fail if there are no active receivers,
         // which is ok by me.
-        let _ = self.events.send(event.into());
+        let _unused = self.events.send(event.into());
     }
 
     pub fn subscribe(&self) -> Receiver<Arc<DatabaseEvent>> {

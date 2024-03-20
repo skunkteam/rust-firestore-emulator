@@ -72,6 +72,9 @@ describe('concurrent tests', () => {
     });
 
     describe('locks', () => {
+        // In Java emulator, either leads to:
+        // - 10 ABORTED: Transaction lock timeout
+        // - inconsistent number of `tries`
         fs.notImplementedInJava ||
             test.concurrent('retry if document is locked', async () => {
                 const [docRef1] = refs();

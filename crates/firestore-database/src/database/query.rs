@@ -23,6 +23,7 @@ use crate::{error::Result, reference::DocumentRef, GenericDatabaseError};
 
 mod filter;
 
+#[derive(Debug)]
 pub struct QueryBuilder {
     parent: Ref,
     select: Option<Projection>,
@@ -640,7 +641,7 @@ impl TryFrom<structured_query::Order> for Order {
     }
 }
 
-#[derive(Debug)]
+#[derive(Clone, Copy, Debug)]
 pub enum Direction {
     Ascending,
     Descending,

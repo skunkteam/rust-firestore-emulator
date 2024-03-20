@@ -13,10 +13,10 @@ const HTML: &str = concat!(
     "\"</script>",
 );
 
-pub fn router() -> Router {
+pub fn router(project: &'static FirestoreProject) -> Router {
     let router = Router::new()
         .nest("/emulator/v1", emulator::router())
-        .with_state(FirestoreProject::get());
+        .with_state(project);
 
     #[cfg(feature = "ui")]
     let router = router

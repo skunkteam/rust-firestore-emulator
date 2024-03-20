@@ -19,3 +19,16 @@ tonic-build = "0.11"
 [dev-dependencies]
 itertools = "0.12.1"
 rstest = "0.18.2"
+
+# Do not use workspace lints here, because generated code is not that clean.
+[lints.rust]
+unsafe_code = "forbid"
+explicit_outlives_requirements = "forbid"
+let_underscore_drop = "warn"
+missing_debug_implementations = "warn"
+non_ascii_idents = "warn"
+single_use_lifetimes = "warn"
+unit_bindings = "warn"
+unused_crate_dependencies = "warn"
+unused_lifetimes = "warn"
+unused_macro_rules = "warn"
