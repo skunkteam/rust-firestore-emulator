@@ -5,8 +5,8 @@
     "private": true,
     "scripts": {
         "test": "jest",
-        "test:java-emulator": "firebase emulators:exec --only firestore \"jest --maxConcurrency 1 ${npm_config_watch:+--watchAll}\"",
-        "test:rust-emulator": "RUST_EMULATOR=true FIRESTORE_EMULATOR_HOST=127.0.0.1:8080 concurrently -k -s command-jest -n \"emulator,jest\" \"../target/debug/firestore-emulator\" \"jest ${npm_config_watch:+--watchAll}\"",
+        "test:java-emulator": "f() { firebase emulators:exec --only firestore \"jest --maxConcurrency 1$(printf ' %q' \"$@\")\"; }; f",
+        "test:rust-emulator": "f() { export RUST_EMULATOR=true; export FIRESTORE_EMULATOR_HOST=127.0.0.1:8080; ../target/debug/firestore-emulator & PID=$!; jest \"$@\"; RET=$?; kill -INT $PID; return $RET; }; f",
         "build:rust": "cd .. && cargo build",
         "lint": "eslint tests && prettier -c tests"
     },
@@ -14,7 +14,6 @@
     "dependencies": {
         "@skunkteam/sherlock": "^8.0.0",
         "@skunkteam/sherlock-utils": "^8.0.0",
-        "concurrently": "^8.2.2",
         "firebase": "^10.8.1",
         "firebase-admin": "^12.0.0",
         "lodash": "^4.17.21",
