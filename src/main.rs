@@ -4,6 +4,7 @@ use clap::Parser;
 use firestore_database::{FirestoreConfig, FirestoreProject};
 use firestore_emulator::run;
 use tikv_jemallocator::Jemalloc;
+use tokio::signal::ctrl_c;
 
 #[global_allocator]
 static GLOBAL_ALLOC: Jemalloc = Jemalloc;
@@ -62,5 +63,7 @@ fn main() -> color_eyre::Result<()> {
         long_contention_timeout,
     });
 
-    run(host_port)
+    let ctrl_c_listener = async { ctrl_c().await.expect("failed to listen for ctrl-c event") };
+
+    run(host_port, ctrl_c_listener)
 }
