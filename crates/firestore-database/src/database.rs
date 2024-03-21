@@ -13,12 +13,9 @@ use googleapis::google::{
 };
 use itertools::Itertools;
 use string_cache::DefaultAtom;
-use tokio::{
-    join,
-    sync::{
-        broadcast::{self, Receiver},
-        RwLock,
-    },
+use tokio::sync::{
+    broadcast::{self, Receiver},
+    RwLock,
 };
 use tracing::{debug, instrument, Level, Span};
 
@@ -71,13 +68,6 @@ impl FirestoreDatabase {
             transactions: RunningTransactions::new(Weak::clone(database)),
             events: broadcast::channel(MAX_EVENT_BACKLOG).0,
         })
-    }
-
-    pub async fn clear(&self) {
-        join!(
-            async { self.collections.write().await.clear() },
-            self.transactions.clear(),
-        );
     }
 
     #[instrument(level = Level::TRACE, skip_all, err, fields(in_txn = consistency.is_transaction(), found))]
