@@ -81,14 +81,14 @@ impl FirestoreDatabase {
             txn.read_doc(name)
                 .await?
                 .version_for_consistency(consistency)?
-                .map(Arc::clone)
+                .cloned()
         } else {
             self.get_doc_meta(name)
                 .await?
                 .read()
                 .await?
                 .version_for_consistency(consistency)?
-                .map(Arc::clone)
+                .cloned()
         };
         Span::current().record("found", version.is_some());
         Ok(version)
