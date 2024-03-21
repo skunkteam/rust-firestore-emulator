@@ -87,7 +87,7 @@ impl Transaction {
         }
     }
 
-    #[instrument(level = Level::TRACE, skip_all)]
+    #[instrument(level = Level::DEBUG, skip_all)]
     pub async fn read_doc(
         &self,
         name: &DocumentRef,

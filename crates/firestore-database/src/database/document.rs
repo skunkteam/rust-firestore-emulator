@@ -179,7 +179,7 @@ impl DocumentContents {
     /// Add a new version with the given `update_time`, if the given `fields` are identical to the
     /// last version, it will return [`Err`] with the update time ([`Timestamp`]) of the last
     /// version.
-    #[instrument(level = Level::TRACE, skip_all, fields(
+    #[instrument(level = Level::DEBUG, skip_all, fields(
         doc_name = %self.name,
         time = display(&update_time),
     ))]
@@ -247,7 +247,7 @@ pub struct OwnedDocumentContentsReadGuard {
 pub(crate) type OwnedDocumentContentsWriteGuard = OwnedRwLockWriteGuard<DocumentContents>;
 
 impl OwnedDocumentContentsReadGuard {
-    #[instrument(level = Level::TRACE, skip_all, err)]
+    #[instrument(level = Level::DEBUG, skip_all, err)]
     pub async fn upgrade(self) -> Result<OwnedDocumentContentsWriteGuard> {
         debug!(name = %self.meta.name);
         let check_time = self.guard.last_updated();
