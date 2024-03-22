@@ -103,7 +103,14 @@ impl Listener {
                 Some(database_event) = self.database_events.next() => {
                     match database_event {
                         // Database was dropped, reconnect to automatically create a new Database.
-                        (db_name, None) => self.ensure_subscribed_to(&*self.project.database(&db_name).await),
+                        (db_name, None) => {
+                            let database = &*self.project.database(&db_name).await;
+                            self.database_events.insert(
+                                db_name,
+                                StreamNotifyClose::new(BroadcastStream::new(database.subscribe())),
+                            );
+                            self.reset(database).await?;
+                        },
                         // Received an event from the database.
                         (_, Some(Ok(event))) => self.process_event(&event).await?,
                         // Buffer overflow, we weren't able to keep up with the amount of events of one of the databases.
@@ -205,7 +212,24 @@ impl Listener {
         self.send_complete(update_time).await
     }
 
-    #[instrument(level = Level::TRACE, skip_all, err)]
+    async fn reset(&mut self, database: &FirestoreDatabase) -> Result<()> {
+        // We rely on the fact that this function will complete before any other events are
+        // processed. That's why we know for sure that the output stream is not used for
+        // something else until we respond with our NO_CHANGE msg. That msg means that everything is
+        // up to date until that point and this is (for now) the easiest way to make sure
+        // that is actually the case. This is probably okay, but if it becomes a hotspot we
+        // might look into optimizing later.
+        let Some(target) = &mut self.target else {
+            return Ok(());
+        };
+
+        let time = Timestamp::now();
+        let msgs = target.reset(database, time).await?;
+        self.send_all(msgs).await?;
+        self.send_complete(time).await?;
+        Ok(())
+    }
+
     async fn set_document(
         &mut self,
         database: &FirestoreDatabase,
@@ -383,6 +407,17 @@ impl ListenerTarget {
             ListenerTarget::QueryTarget(target) => target.process_event(database, event).await,
         }
     }
+
+    async fn reset(
+        &mut self,
+        database: &FirestoreDatabase,
+        time: Timestamp,
+    ) -> Result<Vec<ResponseType>> {
+        match self {
+            ListenerTarget::DocumentTarget(target) => Ok(target.reset(time)),
+            ListenerTarget::QueryTarget(target) => target.reset(database, time).await,
+        }
+    }
 }
 
 struct DocumentTarget {
@@ -420,6 +455,15 @@ impl DocumentTarget {
             }),
         };
         Ok(vec![msg])
+    }
+
+    // TODO: Reuse code of initial setup of this target.
+    fn reset(&mut self, time: Timestamp) -> Vec<ResponseType> {
+        vec![ResponseType::DocumentDelete(DocumentDelete {
+            document: self.name.to_string(),
+            removed_target_ids: vec![TARGET_ID],
+            read_time: Some(time),
+        })]
     }
 }
 
