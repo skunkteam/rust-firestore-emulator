@@ -63,7 +63,7 @@ impl Firestore for FirestoreEmulator {
             .project
             .database(&name.collection_ref.root_ref)
             .await
-            .get_doc(&name, &consistency_selector.try_into()?)
+            .get_doc(&name, consistency_selector.try_into()?)
             .await?
             .ok_or_else(|| Status::not_found(Code::NotFound.description()))?;
         Ok(Response::new(projection.project(&doc)))
@@ -107,7 +107,7 @@ impl Firestore for FirestoreEmulator {
                 Some(batch_get_documents_request::ConsistencySelector::NewTransaction(
                     txn_opts,
                 )) => {
-                    let id = database.new_txn(Some(txn_opts)).await?;
+                    let id = database.new_txn(txn_opts).await?;
                     debug!("started new transaction");
                     (id.into(), ReadConsistency::Transaction(id))
                 }
@@ -120,7 +120,7 @@ impl Firestore for FirestoreEmulator {
                 async move {
                     for name in documents {
                         use batch_get_documents_response::Result::*;
-                        let msg = match database.get_doc(&name, &read_consistency).await {
+                        let msg = match database.get_doc(&name, read_consistency).await {
                             Ok(doc) => Ok(BatchGetDocumentsResponse {
                                 result:      Some(match doc {
                                     None => Missing(name.to_string()),
@@ -162,7 +162,7 @@ impl Firestore for FirestoreEmulator {
         } else {
             let txn_id = transaction.try_into()?;
             debug!(?txn_id);
-            database.commit(writes, &txn_id).await?
+            database.commit(writes, txn_id).await?
         };
 
         Ok(Response::new(CommitResponse {
@@ -274,7 +274,7 @@ impl Firestore for FirestoreEmulator {
             .project
             .database(&database.parse()?)
             .await
-            .new_txn(options)
+            .new_txn(options.unwrap_or(TransactionOptions::READ_WRITE))
             .await?;
 
         debug!(?txn_id);
@@ -291,7 +291,7 @@ impl Firestore for FirestoreEmulator {
             transaction,
         } = request.into_inner();
         let database = self.project.database(&database.parse()?).await;
-        database.rollback(&transaction.try_into()?).await?;
+        database.rollback(transaction.try_into()?).await?;
         Ok(Response::new(Empty {}))
     }
 
@@ -325,7 +325,7 @@ impl Firestore for FirestoreEmulator {
                 read_consistency,
             ) = match consistency_selector {
                 Some(run_query_request::ConsistencySelector::NewTransaction(txn_opts)) => {
-                    let id = database.new_txn(Some(txn_opts)).await?;
+                    let id = database.new_txn(txn_opts).await?;
                     debug!("started new transaction");
                     (id.into(), ReadConsistency::Transaction(id))
                 }
@@ -397,7 +397,7 @@ impl Firestore for FirestoreEmulator {
                 Some(run_aggregation_query_request::ConsistencySelector::NewTransaction(
                     txn_opts,
                 )) => {
-                    let id = database.new_txn(Some(txn_opts)).await?;
+                    let id = database.new_txn(txn_opts).await?;
                     debug!("started new transaction");
                     (id.into(), ReadConsistency::Transaction(id))
                 }

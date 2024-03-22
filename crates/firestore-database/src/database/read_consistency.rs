@@ -1,7 +1,7 @@
 use googleapis::google::{
     firestore::v1::{
         batch_get_documents_request, get_document_request, list_documents_request,
-        run_aggregation_query_request, run_query_request,
+        run_aggregation_query_request, run_query_request, transaction_options,
     },
     protobuf::Timestamp,
 };
@@ -32,12 +32,10 @@ macro_rules! impl_try_from_consistency_selector {
 
             fn try_from(value: Option<$lib::ConsistencySelector>) -> Result<Self, Self::Error> {
                 let result = match value {
-                    None => ReadConsistency::Default,
-                    Some($lib::ConsistencySelector::ReadTime(time)) => {
-                        ReadConsistency::ReadTime(time)
-                    }
+                    None => Self::Default,
+                    Some($lib::ConsistencySelector::ReadTime(time)) => Self::ReadTime(time),
                     Some($lib::ConsistencySelector::Transaction(id)) => {
-                        ReadConsistency::Transaction(id.try_into()?)
+                        Self::Transaction(id.try_into()?)
                     }
                     #[allow(unreachable_patterns)]
                     _ => {
@@ -58,3 +56,14 @@ impl_try_from_consistency_selector!(get_document_request);
 impl_try_from_consistency_selector!(list_documents_request);
 impl_try_from_consistency_selector!(run_query_request);
 impl_try_from_consistency_selector!(run_aggregation_query_request);
+
+impl From<Option<transaction_options::read_only::ConsistencySelector>> for ReadConsistency {
+    fn from(value: Option<transaction_options::read_only::ConsistencySelector>) -> Self {
+        match value {
+            Some(transaction_options::read_only::ConsistencySelector::ReadTime(time)) => {
+                Self::ReadTime(time)
+            }
+            None => Self::Default,
+        }
+    }
+}

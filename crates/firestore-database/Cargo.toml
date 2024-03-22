@@ -3,6 +3,9 @@ name = "firestore-database"
 version = { workspace = true }
 edition = "2021"
 
+[features]
+tracing = []
+
 [dependencies]
 async-trait = { workspace = true }
 futures = { workspace = true }

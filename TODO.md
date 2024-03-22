@@ -1,2 +1,2 @@
-- clear firestore should not delete the database, but just clear it, because listeners need to keep working
 - UNIMPLEMENTED: target_id should always be 1 is not supported yet
+- 60 second timeouts for transactions

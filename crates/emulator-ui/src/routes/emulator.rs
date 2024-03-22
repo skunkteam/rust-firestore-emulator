@@ -45,7 +45,7 @@ async fn get_by_ref(
         .into_response()),
         Ref::Document(r) => Ok(Json(json!({
             "type": "document",
-            "document": database.get_doc(&r, &ReadConsistency::Default).await?.map(|d| d.to_document()),
+            "document": database.get_doc(&r, ReadConsistency::Default).await?.map(|d| d.to_document()),
             "collections": database.get_collection_ids(&Ref::Document(r)).await?,
         }))
         .into_response()),

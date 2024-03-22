@@ -409,13 +409,13 @@ impl Query {
         // First collect all Arc<Collection>s in a Vec to release the collection lock asap.
         let collections = self.applicable_collections(db).await;
 
-        let txn = db.get_txn_for_consistency(&self.consistency).await?;
+        let txn = db.get_txn_for_consistency(self.consistency).await?;
 
         let mut buffer = vec![];
         for col in collections {
             for meta in col.docs().await {
                 let version = match &txn {
-                    Some(txn) => txn.read_doc(&meta.name).await?.current_version().cloned(),
+                    Some(txn) => txn.read_doc(&meta.name).await?,
                     None => meta.read().await?.current_version().cloned(),
                 };
                 let Some(version) = version else {
@@ -499,7 +499,7 @@ impl Query {
             .collect();
         let mut result = vec![];
         for name in all_docs {
-            if db.get_doc(&name, &self.consistency).await.is_ok() {
+            if db.get_doc(&name, self.consistency).await.is_ok() {
                 result.push(name.to_string());
             }
         }
