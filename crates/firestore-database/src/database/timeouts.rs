@@ -21,9 +21,9 @@ impl Timeouts {
 
     /// Must faster lock timeouts (than [`CLOUD`](Self::CLOUD)).
     ///
-    /// Reduced to 1 second write locks and 2 second read locks for faster unit-tests.
+    /// Reduced to 2 second write locks and 5 second read locks for faster unit-tests.
     pub(crate) const FAST: Timeouts = Timeouts {
-        write: Duration::from_secs(1),
-        read:  Duration::from_secs(2),
+        write: Duration::from_secs(2),
+        read:  Duration::from_secs(5),
     };
 }
