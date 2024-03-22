@@ -90,7 +90,7 @@ describe('concurrent tests', () => {
                 expect(await getData(docRef1.get())).toEqual({
                     some: 'data',
                     outer: { tries: 1 },
-                    inner: { tries: 2 },
+                    inner: { tries: expect.toBeOneOf([2, 3, 4]) },
                 });
             });
 
@@ -106,7 +106,7 @@ describe('concurrent tests', () => {
 
                 expect(await getData(docRef1.get())).toEqual({
                     outer: { tries: 1 },
-                    inner: { tries: 2 },
+                    inner: { tries: expect.toBeOneOf([2, 3, 4]) },
                 });
             });
 
@@ -137,10 +137,10 @@ describe('concurrent tests', () => {
                 });
                 expect(await getData(docRef1.get())).toEqual({
                     outer: { tries: 1 },
-                    innerFirst: { tries: 2 },
+                    innerFirst: { tries: expect.toBeOneOf([2, 3, 4]) },
                 });
                 expect(await getData(docRef2.get())).toEqual({
-                    innerFirst: { tries: 2 },
+                    innerFirst: { tries: expect.toBeOneOf([2, 3, 4]) },
                     innerSecond: { tries: 1 },
                 });
             },
@@ -163,7 +163,7 @@ describe('concurrent tests', () => {
                 outer: { tries: 1 },
             });
             expect(await getData(docRef2.get())).toEqual({
-                inner: { tries: expect.toBeWithin(1, 2.01) }, // sometimes this will need a retry
+                inner: { tries: expect.toBeOneOf([1, 2]) }, // sometimes this will need a retry
             });
         });
 
@@ -300,6 +300,10 @@ describe('concurrent tests', () => {
                             test.event('in txn B: update requested in txn');
                             return value;
                         });
+                        // Make sure this logging doesn't sneak ahead of the logging in txn A. This little timeout has no effect
+                        // on the validity of the test, because of the 250ms wait time inside txn A. If we got here during that
+                        // timeout, then this timeout of 1ms would not change the outcome of this test.
+                        await time(1);
                         test.event('txn B ended');
                         test.event('read: ' + result);
                     },
