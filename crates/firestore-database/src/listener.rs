@@ -77,7 +77,7 @@ impl Listener {
         ReceiverStream::new(rx)
     }
 
-    #[instrument(level = Level::TRACE, name = "listener", skip_all, fields(id = self.id), err)]
+    #[instrument(level = Level::DEBUG, name = "listener", skip_all, fields(id = self.id), err)]
     async fn go(
         mut self,
         mut request_stream: impl tokio_stream::Stream<Item = ListenRequest> + Send + Unpin,
@@ -128,7 +128,7 @@ impl Listener {
         }
     }
 
-    #[instrument(level = Level::TRACE, skip_all, err)]
+    #[instrument(level = Level::DEBUG, skip_all, err)]
     async fn process_request(&mut self, msg: ListenRequest) -> Result<()> {
         let ListenRequest {
             database,
@@ -186,7 +186,7 @@ impl Listener {
         Ok(())
     }
 
-    #[instrument(level = Level::TRACE, skip_all, err)]
+    #[instrument(level = Level::DEBUG, skip_all, err)]
     async fn process_event(&mut self, event: &DatabaseEvent) -> Result<()> {
         // We rely on the fact that this function will complete before any other events are
         // processed. That's why we know for sure that the output stream is not used for
@@ -230,6 +230,7 @@ impl Listener {
         Ok(())
     }
 
+    #[instrument(level = Level::DEBUG, skip_all, err)]
     async fn set_document(
         &mut self,
         database: &FirestoreDatabase,
@@ -302,7 +303,7 @@ impl Listener {
         Ok(())
     }
 
-    #[instrument(level = Level::TRACE, skip_all, err)]
+    #[instrument(level = Level::DEBUG, skip_all, err)]
     async fn set_query(&mut self, database: &FirestoreDatabase, query: Query) -> Result<()> {
         // We rely on the fact that this function will complete before any other events are
         // processed. That's why we know for sure that the output stream is not used for
@@ -372,7 +373,7 @@ impl Listener {
         Ok(())
     }
 
-    #[instrument(level = Level::TRACE, skip_all, fields(message = display(show_response_type(&response_type))), err)]
+    #[instrument(level = Level::DEBUG, skip_all, fields(message = display(show_response_type(&response_type))), err)]
     async fn send(&self, response_type: ResponseType) -> Result<()> {
         self.sender
             .send(Ok(ListenResponse {
@@ -382,7 +383,7 @@ impl Listener {
             .map_err(|_| GenericDatabaseError::cancelled("stream closed"))
     }
 
-    #[instrument(level = Level::TRACE, skip(self), err)]
+    #[instrument(level = Level::DEBUG, skip(self), err)]
     async fn send_err(&self, err: GenericDatabaseError) -> Result<()> {
         self.sender
             .send(Err(err))

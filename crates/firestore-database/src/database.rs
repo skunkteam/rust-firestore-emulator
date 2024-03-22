@@ -70,7 +70,7 @@ impl FirestoreDatabase {
         })
     }
 
-    #[instrument(level = Level::TRACE, skip_all, err, fields(in_txn = consistency.is_transaction(), found))]
+    #[instrument(level = Level::DEBUG, skip_all, err, fields(in_txn = consistency.is_transaction(), found))]
     pub async fn get_doc(
         &self,
         name: &DocumentRef,
@@ -148,7 +148,7 @@ impl FirestoreDatabase {
     /// Get all the collections that reside directly under the given parent. This means that:
     /// - the IDs will not contain a `/`
     /// - the result will be empty if `parent` is a [`Ref::Collection`].
-    #[instrument(level = Level::TRACE, skip_all)]
+    #[instrument(level = Level::DEBUG, skip_all)]
     pub async fn get_collection_ids(&self, parent: &Ref) -> Result<BTreeSet<String>> {
         // Cannot use `filter_map` because of the `await`.
         let mut result = BTreeSet::new();
@@ -173,7 +173,7 @@ impl FirestoreDatabase {
     /// This means that:
     /// - the IDs will not contain a `/`
     /// - IDs may point to documents that do not exist.
-    #[instrument(level = Level::TRACE, skip_all)]
+    #[instrument(level = Level::DEBUG, skip_all)]
     pub async fn get_document_ids(&self, parent: &CollectionRef) -> Result<BTreeSet<String>> {
         // Cannot use `filter_map` because of the `await`.
         let mut result = BTreeSet::new();
@@ -203,7 +203,7 @@ impl FirestoreDatabase {
             .collect_vec()
     }
 
-    #[instrument(level = Level::TRACE, skip_all, err)]
+    #[instrument(level = Level::DEBUG, skip_all, err)]
     pub async fn run_query(&self, query: &mut Query) -> Result<Vec<Document>> {
         debug!(?query);
         let result = query.once(self).await?;
@@ -214,7 +214,7 @@ impl FirestoreDatabase {
             .collect())
     }
 
-    #[instrument(level = Level::TRACE, skip_all, err)]
+    #[instrument(level = Level::DEBUG, skip_all, err)]
     pub async fn run_aggregation_query(
         &self,
         parent: Ref,
@@ -316,7 +316,7 @@ impl FirestoreDatabase {
         Ok(result)
     }
 
-    #[instrument(level = Level::TRACE, skip_all, err)]
+    #[instrument(level = Level::DEBUG, skip_all, err)]
     pub async fn commit(
         self: &Arc<Self>,
         writes: Vec<Write>,
@@ -360,7 +360,7 @@ impl FirestoreDatabase {
         Ok((time, write_results))
     }
 
-    #[instrument(level = Level::TRACE, skip_all, err)]
+    #[instrument(level = Level::DEBUG, skip_all, err)]
     pub async fn perform_write(
         &self,
         write: Write,

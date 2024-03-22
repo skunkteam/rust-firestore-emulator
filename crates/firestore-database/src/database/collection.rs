@@ -18,7 +18,7 @@ pub struct Collection {
 }
 
 impl Collection {
-    #[instrument(level = Level::TRACE, skip_all)]
+    #[instrument(level = Level::DEBUG, skip_all)]
     pub fn new(project: &'static FirestoreProject, name: CollectionRef) -> Self {
         Self {
             project,
