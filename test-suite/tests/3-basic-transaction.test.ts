@@ -175,7 +175,7 @@ describe('concurrent tests', () => {
             let setDone = false;
             await runTxn('outer', [docRef1], async () => {
                 const updateDone = docRef1.update({ extraProp: 'foo' }).then(() => (setDone = true));
-                await time(500);
+                await time(250);
                 expect(setDone).toBeFalse();
                 return { awaitAfterTxn: updateDone };
             });
@@ -277,9 +277,9 @@ describe('concurrent tests', () => {
                             test.event('in txn A: doc read');
 
                             await test.when('in txn B: update requested in txn');
-                            await time(500);
+                            await time(250);
                             expect(test.lastEvent$.get()).toBe('in txn B: update requested in txn');
-                            test.event('waited 500ms, txn B still pending');
+                            test.event('waited 250ms, txn B still pending');
                             return value;
                         });
                         test.event('txn A ended');
@@ -314,7 +314,7 @@ describe('concurrent tests', () => {
                     '       | <<2>> | EVENT: txn B started',
                     '       | <<2>> | EVENT: in txn B: doc read',
                     '       | <<2>> | EVENT: in txn B: update requested in txn',
-                    ' <<1>> | EVENT: waited 500ms, txn B still pending',
+                    ' <<1>> | EVENT: waited 250ms, txn B still pending',
                     ' <<1>> | EVENT: txn A ended',
                     ' <<1>> | EVENT: read: original value',
                     '       | <<2>> | EVENT: txn B ended',
@@ -355,9 +355,9 @@ describe('concurrent tests', () => {
                             test.event('in txn A: doc read');
 
                             await test.when('in txn B: update requested in txn');
-                            await time(500);
+                            await time(250);
                             expect(test.lastEvent$.get()).toBe('in txn B: update requested in txn');
-                            test.event('waited 500ms, txn B still pending');
+                            test.event('waited 250ms, txn B still pending');
                             txn.update(ref, { value: 'changed by txn A' });
                             return value;
                         });
@@ -394,7 +394,7 @@ describe('concurrent tests', () => {
                     '       | <<2>> | EVENT: in txn B: doc read',
                     '       | <<2>> | EVENT: in txn B: update requested in txn',
                     // Now txn B is stalled, waiting to get the verdict on the lock acquisition
-                    ' <<1>> | EVENT: waited 500ms, txn B still pending',
+                    ' <<1>> | EVENT: waited 250ms, txn B still pending',
                     ' <<1>> | EVENT: txn A ended',
                     // txn A succeeded and was allowed to write to doc, it read the original value of doc:
                     ' <<1>> | EVENT: read: original value',
@@ -601,7 +601,7 @@ describe('concurrent tests', () => {
                                 const snaps = await txn.get(query);
                                 expect(snaps.size).toBe(2);
                                 test.event('transaction locked the query');
-                                await time(500);
+                                await time(250);
                                 expect(test.lastEvent$.get()).toBe('transaction locked the query');
 
                                 txn.update(docRef1, { other: 'data' });
@@ -647,7 +647,7 @@ describe('concurrent tests', () => {
                                 const snaps = await txn.get(query);
                                 expect(snaps.size).toBe(2);
                                 test.event('transaction locked the query');
-                                await time(500);
+                                await time(250);
                                 expect(test.lastEvent$.get()).toBe('transaction locked the query');
 
                                 txn.update(docRef1, { other: 'data' });
