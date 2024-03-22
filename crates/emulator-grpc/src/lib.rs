@@ -44,7 +44,7 @@ struct FirestoreEmulator {
 #[async_trait]
 impl Firestore for FirestoreEmulator {
     /// Gets a single document.
-    #[instrument(level = Level::TRACE, skip_all, err)]
+    #[instrument(level = Level::DEBUG, skip_all, err)]
     async fn get_document(
         &self,
         request: Request<GetDocumentRequest>,
@@ -76,7 +76,7 @@ impl Firestore for FirestoreEmulator {
     ///
     /// Documents returned by this method are not guaranteed to be returned in the
     /// same order that they were requested.
-    #[instrument(level = Level::TRACE, skip_all, fields(
+    #[instrument(level = Level::DEBUG, skip_all, fields(
         count = request.get_ref().documents.len(),
         in_txn = display(is_txn(&request.get_ref().consistency_selector))
     ), err)]
@@ -144,7 +144,7 @@ impl Firestore for FirestoreEmulator {
     }
 
     /// Commits a transaction, while optionally updating documents.
-    #[instrument(level = Level::TRACE, skip_all, fields(
+    #[instrument(level = Level::DEBUG, skip_all, fields(
         count = request.get_ref().writes.len(),
         in_txn = !request.get_ref().transaction.is_empty(),
     ), err)]
@@ -172,7 +172,7 @@ impl Firestore for FirestoreEmulator {
     }
 
     /// Creates a new document.
-    #[instrument(level = Level::TRACE, skip_all, err)]
+    #[instrument(level = Level::DEBUG, skip_all, err)]
     async fn create_document(
         &self,
         _request: Request<CreateDocumentRequest>,
@@ -181,7 +181,7 @@ impl Firestore for FirestoreEmulator {
     }
 
     /// Lists documents.
-    #[instrument(level = Level::TRACE, skip_all, fields(request = ?request.get_ref()), err)]
+    #[instrument(level = Level::DEBUG, skip_all, fields(request = ?request.get_ref()), err)]
     async fn list_documents(
         &self,
         request: Request<ListDocumentsRequest>,
@@ -245,7 +245,7 @@ impl Firestore for FirestoreEmulator {
     }
 
     /// Updates or inserts a document.
-    #[instrument(level = Level::TRACE, skip_all, err)]
+    #[instrument(level = Level::DEBUG, skip_all, err)]
     async fn update_document(
         &self,
         _request: Request<UpdateDocumentRequest>,
@@ -254,7 +254,7 @@ impl Firestore for FirestoreEmulator {
     }
 
     /// Deletes a document.
-    #[instrument(level = Level::TRACE, skip_all, err)]
+    #[instrument(level = Level::DEBUG, skip_all, err)]
     async fn delete_document(
         &self,
         _request: Request<DeleteDocumentRequest>,
@@ -263,7 +263,7 @@ impl Firestore for FirestoreEmulator {
     }
 
     /// Starts a new transaction.
-    #[instrument(level = Level::TRACE, skip_all, err)]
+    #[instrument(level = Level::DEBUG, skip_all, err)]
     async fn begin_transaction(
         &self,
         request: Request<BeginTransactionRequest>,
@@ -284,7 +284,7 @@ impl Firestore for FirestoreEmulator {
     }
 
     /// Rolls back a transaction.
-    #[instrument(level = Level::TRACE, skip_all, err)]
+    #[instrument(level = Level::DEBUG, skip_all, err)]
     async fn rollback(&self, request: Request<RollbackRequest>) -> Result<Response<Empty>> {
         let RollbackRequest {
             database,
@@ -299,7 +299,7 @@ impl Firestore for FirestoreEmulator {
     type RunQueryStream = BoxStream<'static, Result<RunQueryResponse>>;
 
     /// Runs a query.
-    #[instrument(level = Level::TRACE, skip_all, err)]
+    #[instrument(level = Level::DEBUG, skip_all, err)]
     async fn run_query(
         &self,
         request: Request<RunQueryRequest>,
@@ -364,7 +364,7 @@ impl Firestore for FirestoreEmulator {
     /// -- Return the number of documents in table given a filter.
     /// SELECT COUNT(*) FROM ( SELECT * FROM k where a = true );
     /// ```
-    #[instrument(level = Level::TRACE, skip_all, err)]
+    #[instrument(level = Level::DEBUG, skip_all, err)]
     async fn run_aggregation_query(
         &self,
         request: Request<RunAggregationQueryRequest>,
@@ -424,7 +424,7 @@ impl Firestore for FirestoreEmulator {
     /// Partitions a query by returning partition cursors that can be used to run
     /// the query in parallel. The returned partition cursors are split points that
     /// can be used by RunQuery as starting/end points for the query results.
-    #[instrument(level = Level::TRACE, skip_all, err)]
+    #[instrument(level = Level::DEBUG, skip_all, err)]
     async fn partition_query(
         &self,
         _request: Request<PartitionQueryRequest>,
@@ -437,7 +437,7 @@ impl Firestore for FirestoreEmulator {
 
     /// Streams batches of document updates and deletes, in order. This method is
     /// only available via gRPC or WebChannel (not REST).
-    #[instrument(level = Level::TRACE, skip_all, err)]
+    #[instrument(level = Level::DEBUG, skip_all, err)]
     async fn write(
         &self,
         _request: Request<tonic::Streaming<WriteRequest>>,
@@ -450,7 +450,7 @@ impl Firestore for FirestoreEmulator {
 
     /// Listens to changes. This method is only available via gRPC or WebChannel
     /// (not REST).
-    #[instrument(level = Level::TRACE, skip_all, err)]
+    #[instrument(level = Level::DEBUG, skip_all, err)]
     async fn listen(
         &self,
         request: Request<tonic::Streaming<ListenRequest>>,
@@ -463,7 +463,7 @@ impl Firestore for FirestoreEmulator {
     }
 
     /// Lists all the collection IDs underneath a document.
-    #[instrument(level = Level::TRACE, skip_all, err)]
+    #[instrument(level = Level::DEBUG, skip_all, err)]
     async fn list_collection_ids(
         &self,
         request: Request<ListCollectionIdsRequest>,
@@ -503,7 +503,7 @@ impl Firestore for FirestoreEmulator {
     ///
     /// If you require an atomically applied set of writes, use
     /// [Commit][google.firestore.v1.Firestore.Commit] instead.
-    #[instrument(level = Level::TRACE, skip_all, err)]
+    #[instrument(level = Level::DEBUG, skip_all, err)]
     async fn batch_write(
         &self,
         request: Request<BatchWriteRequest>,
