@@ -415,8 +415,12 @@ impl Query {
         for col in collections {
             for meta in col.docs().await {
                 let version = match &txn {
-                    Some(txn) => txn.read_doc(&meta.name).await?.current_version().cloned(),
-                    None => meta.read().await?.current_version().cloned(),
+                    Some(txn) => txn
+                        .read_doc(&meta.name)
+                        .await?
+                        .current_version()
+                        .map(Arc::clone),
+                    None => meta.read().await?.current_version().map(Arc::clone),
                 };
                 let Some(version) = version else {
                     continue;
