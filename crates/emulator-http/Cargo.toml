@@ -1,5 +1,5 @@
 [package]
-name = "emulator-ui"
+name = "emulator-http"
 version = { workspace = true }
 edition = "2021"
 
