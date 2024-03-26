@@ -17,7 +17,7 @@ use tokio::sync::{
     broadcast::{self, Receiver},
     RwLock,
 };
-use tracing::{debug, instrument, Level, Span};
+use tracing::{debug, field::display, instrument, Level, Span};
 
 use self::{
     collection::Collection,
@@ -70,22 +70,32 @@ impl FirestoreDatabase {
         })
     }
 
-    #[instrument(level = Level::DEBUG, skip_all, err, fields(in_txn = consistency.is_transaction(), found))]
+    #[instrument(level = Level::DEBUG, skip_all, err, fields(txn_id, found))]
     pub async fn get_doc(
         &self,
         name: &DocumentRef,
         consistency: ReadConsistency,
     ) -> Result<Option<Arc<StoredDocumentVersion>>> {
         debug!(%name);
-        let version = if let Some(txn) = self.get_txn_for_consistency(consistency).await? {
-            txn.read_doc(name).await?
-        } else {
-            self.get_doc_meta(name)
+        let version = match consistency {
+            ReadConsistency::Default => self
+                .get_doc_meta(name)
                 .await?
                 .read()
                 .await?
-                .version_for_consistency(consistency)?
-                .cloned()
+                .current_version()
+                .cloned(),
+            ReadConsistency::ReadTime(time) => self
+                .get_doc_meta(name)
+                .await?
+                .read()
+                .await?
+                .version_at_time(time)
+                .cloned(),
+            ReadConsistency::Transaction(id) => {
+                Span::current().record("txn_id", display(id));
+                self.transactions.get(id).await?.read_doc(name).await?
+            }
         };
         Span::current().record("found", version.is_some());
         Ok(version)
@@ -433,13 +443,13 @@ impl FirestoreDatabase {
     pub async fn new_txn(&self, transaction_options: TransactionOptions) -> Result<TransactionId> {
         use transaction_options::*;
         match transaction_options.mode {
-            None => Ok(self
-                .transactions
-                .start_read_only(ReadConsistency::Default)
-                .await),
+            None => Ok(self.transactions.start_read_only(None).await),
             Some(Mode::ReadOnly(ro)) => Ok(self
                 .transactions
-                .start_read_only(ro.consistency_selector.into())
+                .start_read_only(
+                    ro.consistency_selector
+                        .map(|read_only::ConsistencySelector::ReadTime(read_time)| read_time),
+                )
                 .await),
             Some(Mode::ReadWrite(rw)) => {
                 if rw.retry_transaction.is_empty() {
