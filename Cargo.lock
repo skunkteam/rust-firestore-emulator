@@ -547,7 +547,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "emulator-ui"
+name = "emulator-http"
 version = "0.0.1"
 dependencies = [
  "axum",
@@ -623,7 +623,7 @@ dependencies = [
  "console",
  "console-subscriber",
  "emulator-grpc",
- "emulator-ui",
+ "emulator-http",
  "firestore-database",
  "hybrid-axum-tonic",
  "tikv-jemallocator",
