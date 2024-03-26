@@ -5,43 +5,40 @@ import { AsyncLocalStorage } from 'async_hooks';
 import { range } from 'lodash';
 import { setTimeout as time } from 'timers/promises';
 import { fs } from './utils';
-import { writeData } from './utils/firestore';
 
 describe('concurrent tests', () => {
     // no concurrent tests with the Java Emulator..
-    if (fs.connection === 'JAVA EMULATOR') {
-        test.concurrent = test;
-    }
+    const concurrent = fs.connection === 'JAVA EMULATOR' ? test : test.concurrent;
 
-    test.concurrent('simple txn', async () => {
+    concurrent('simple txn', async () => {
         const [docRef1] = refs();
 
         await fs.firestore.runTransaction(async txn => {
             expect(await txn.get(docRef1)).toHaveProperty('exists', false);
 
-            txn.set(docRef1, writeData({ foo: 'bar' }));
+            txn.set(docRef1, fs.writeData({ foo: 'bar' }));
 
             expect(() => txn.get(docRef1)).toThrow('Firestore transactions require all reads to be executed before all writes.');
         });
         expect(await getData(docRef1.get())).toEqual({ foo: 'bar' });
     });
 
-    test.concurrent('updating same doc multiple times', async () => {
+    concurrent('updating same doc multiple times', async () => {
         const [docRef1] = refs();
 
         await fs.firestore.runTransaction(async txn => {
             expect(await txn.get(docRef1)).toHaveProperty('exists', false);
 
-            txn.set(docRef1, writeData({ foo: fs.exported.FieldValue.increment(1) }));
+            txn.set(docRef1, fs.writeData({ foo: fs.exported.FieldValue.increment(1) }));
             txn.update(docRef1, { foo: fs.exported.FieldValue.increment(1) });
         });
         expect(await getData(docRef1.get())).toEqual({ foo: 2 });
     });
 
-    test.concurrent('using txn.getAll', async () => {
+    concurrent('using txn.getAll', async () => {
         const [docRef1, docRef2] = refs();
 
-        await docRef1.set(writeData({ some: 'data' }));
+        await docRef1.set(fs.writeData({ some: 'data' }));
 
         await fs.firestore.runTransaction(async txn => {
             const [snap1, snap2] = await txn.getAll(docRef1, docRef2);
@@ -49,20 +46,20 @@ describe('concurrent tests', () => {
             expect(await getData(snap1)).toEqual({ some: 'data' });
             expect(snap2.exists).toBeFalse();
 
-            txn.set(docRef2, writeData({ foo: 'bar' }));
+            txn.set(docRef2, fs.writeData({ foo: 'bar' }));
         });
         expect(await getData(docRef1.get())).toEqual({ some: 'data' });
         expect(await getData(docRef2.get())).toEqual({ foo: 'bar' });
     });
 
-    test.concurrent('aborting transaction', async () => {
+    concurrent('aborting transaction', async () => {
         const [docRef1] = refs();
 
         await expect(
             fs.firestore.runTransaction(async txn => {
                 expect(await txn.get(docRef1)).toHaveProperty('exists', false);
 
-                txn.set(docRef1, writeData({ foo: 'bar' }));
+                txn.set(docRef1, fs.writeData({ foo: 'bar' }));
 
                 throw new Error('I quit!');
             }),
@@ -76,10 +73,10 @@ describe('concurrent tests', () => {
         // - 10 ABORTED: Transaction lock timeout
         // - inconsistent number of `tries`
         fs.notImplementedInJava ||
-            test.concurrent('retry if document is locked', async () => {
+            concurrent('retry if document is locked', async () => {
                 const [docRef1] = refs();
 
-                await docRef1.set(writeData({ some: 'data' }));
+                await docRef1.set(fs.writeData({ some: 'data' }));
 
                 await runTxn('outer', [docRef1], async () => {
                     const { innerTxnCompleted } = await innerTxn('inner', [docRef1]);
@@ -95,7 +92,7 @@ describe('concurrent tests', () => {
             });
 
         fs.notImplementedInJava ||
-            test.concurrent('lock on non-existing document', async () => {
+            concurrent('lock on non-existing document', async () => {
                 const [docRef1] = refs();
 
                 await runTxn('outer', [docRef1], async () => {
@@ -110,7 +107,7 @@ describe('concurrent tests', () => {
                 });
             });
 
-        test.concurrent('no lock if getting separate documents', async () => {
+        concurrent('no lock if getting separate documents', async () => {
             const [docRef1, docRef2] = refs();
 
             await runTxn('outer', [docRef1], async () => {
@@ -122,7 +119,7 @@ describe('concurrent tests', () => {
         });
 
         // Note: Very slow on Cloud Firestore!!
-        test.concurrent(
+        concurrent(
             'chaos',
             async () => {
                 const [docRef1, docRef2] = refs();
@@ -147,7 +144,7 @@ describe('concurrent tests', () => {
             45_000,
         );
 
-        test.concurrent('only read locked document', async () => {
+        concurrent('only read locked document', async () => {
             const [docRef1, docRef2] = refs();
 
             await docRef1.create(fs.writeData());
@@ -167,10 +164,10 @@ describe('concurrent tests', () => {
             });
         });
 
-        test.concurrent('regular `set` waits on transaction', async () => {
+        concurrent('regular `set` waits on transaction', async () => {
             const [docRef1] = refs();
 
-            await docRef1.set(writeData({ some: 'data' }));
+            await docRef1.set(fs.writeData({ some: 'data' }));
 
             let setDone = false;
             await runTxn('outer', [docRef1], async () => {
@@ -183,7 +180,7 @@ describe('concurrent tests', () => {
         });
 
         describe('tests with synchronized processes', () => {
-            test.concurrent('reading the same doc from different txns', async () => {
+            concurrent('reading the same doc from different txns', async () => {
                 const test = new ConcurrentTest();
                 // Scenario:
                 // Process 1 - create doc
@@ -248,7 +245,7 @@ describe('concurrent tests', () => {
                 ]);
             });
 
-            test.concurrent('reading the same doc from different txns, try to write in second txn', async () => {
+            concurrent('reading the same doc from different txns, try to write in second txn', async () => {
                 const test = new ConcurrentTest();
                 // Scenario:
                 // Process 1 - create doc
@@ -326,7 +323,7 @@ describe('concurrent tests', () => {
                 ]);
             });
 
-            test.concurrent('reading the same doc from different txns, try to write in both txns', async () => {
+            concurrent('reading the same doc from different txns, try to write in both txns', async () => {
                 const test = new ConcurrentTest();
                 // Scenario:
                 // Process 1 - create doc
@@ -411,7 +408,7 @@ describe('concurrent tests', () => {
                 ]);
             });
 
-            test.concurrent('regular writes also wait until all txns-locks are released', async () => {
+            concurrent('regular writes also wait until all txns-locks are released', async () => {
                 const test = new ConcurrentTest();
                 // Scenario:
                 // Process 1 - create outside txn (doc 1), completes immediately.
@@ -538,7 +535,7 @@ describe('concurrent tests', () => {
             fs.notImplementedInRust ||
                 fs.notImplementedInJava ||
                 fs.notImplementedInCloud ||
-                test.concurrent('deadlock', async () => {
+                concurrent('deadlock', async () => {
                     const test = new ConcurrentTest(40_000);
 
                     const [ref1, ref2] = refs();
@@ -585,7 +582,7 @@ describe('concurrent tests', () => {
                 });
 
             describe('queries', () => {
-                test.concurrent('update after reading a query', async () => {
+                concurrent('update after reading a query', async () => {
                     const testName = 'update';
 
                     const [docRef1, docRef2] = refs();
@@ -631,7 +628,7 @@ describe('concurrent tests', () => {
                     ]);
                 });
 
-                test.concurrent('delete after reading a query', async () => {
+                concurrent('delete after reading a query', async () => {
                     const testName = 'delete';
 
                     const [docRef1, docRef2] = refs();
@@ -676,7 +673,7 @@ describe('concurrent tests', () => {
 
                 fs.notImplementedInJava || // Timeout
                     fs.notImplementedInRust || // Timeout
-                    test.concurrent('create after reading a query', async () => {
+                    concurrent('create after reading a query', async () => {
                         const testName = 'create';
 
                         const [docRef1, docRef2] = refs();
@@ -769,7 +766,7 @@ describe('concurrent tests', () => {
                 ({ awaitAfterTxn } = (await runAfterGet()) ?? {});
 
                 for (const ref of write) {
-                    txn.set(ref, writeData({ [name]: { tries } }), { merge: true });
+                    txn.set(ref, fs.writeData({ [name]: { tries } }), { merge: true });
                 }
             });
             await awaitAfterTxn;

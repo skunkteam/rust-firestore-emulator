@@ -3,6 +3,7 @@ use std::{collections::HashMap, ops::Deref, sync::Arc};
 use googleapis::google::firestore::v1::{ListenRequest, ListenResponse};
 use tokio::sync::RwLock;
 use tokio_stream::Stream;
+use tracing::{debug, instrument, Level};
 
 use crate::{
     config::FirestoreConfig, error::Result, listener::Listener, reference::RootRef,
@@ -35,8 +36,15 @@ impl FirestoreProject {
     /// Listeners that are still actively listening to this database will automatically reconnect
     /// to a new database with the same name, so all activity on the same database will still be
     /// observed by these listeners.
+    #[instrument(level = Level::DEBUG)]
     pub async fn clear_database(&self, name: &RootRef) {
-        self.databases.write().await.remove(name);
+        let Some(database) = self.databases.write().await.remove(name) else {
+            debug!("database unknown");
+            return;
+        };
+        let strong = Arc::strong_count(&database) - 1;
+        let weak = Arc::weak_count(&database);
+        debug!("database cleared, remaining references: strong: {strong}, weak: {weak}");
     }
 
     pub async fn database(&'static self, name: &RootRef) -> Arc<FirestoreDatabase> {

@@ -266,7 +266,7 @@ impl Listener {
         debug!(%name);
 
         // Now determine the latest version we can find...
-        let doc = database.get_doc(&name, &ReadConsistency::Default).await?;
+        let doc = database.get_doc(&name, ReadConsistency::Default).await?;
 
         // Only send if newer than the resume_token
         let send_initial = match &send_if_newer_than {

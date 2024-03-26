@@ -12,6 +12,7 @@ console = ["dep:console", "dep:console-subscriber", "dep:tracing-subscriber"]
 # The tracing feature enables tracing logging to stdout.
 tracing = [
     "dep:time",
+    "firestore-database/tracing",
     "tracing-subscriber/local-time",
     "tracing-subscriber/env-filter",
 ]

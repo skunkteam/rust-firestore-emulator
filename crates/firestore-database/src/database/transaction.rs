@@ -14,98 +14,134 @@ use super::{
     reference::DocumentRef,
     FirestoreDatabase,
 };
-use crate::{error::Result, GenericDatabaseError};
+use crate::{
+    document::StoredDocumentVersion, error::Result, read_consistency::ReadConsistency,
+    GenericDatabaseError,
+};
 
 #[derive(Debug)]
 pub(crate) struct RunningTransactions {
     database: Weak<FirestoreDatabase>,
-    map:      RwLock<HashMap<TransactionId, Arc<Transaction>>>,
+    txns:     RwLock<HashMap<TransactionId, Arc<Transaction>>>,
 }
 
 impl RunningTransactions {
     pub(crate) fn new(database: Weak<FirestoreDatabase>) -> Self {
         Self {
             database,
-            map: Default::default(),
+            txns: Default::default(),
         }
     }
 
-    pub(crate) async fn get(&self, id: &TransactionId) -> Result<Arc<Transaction>> {
-        self.map.read().await.get(id).cloned().ok_or_else(|| {
+    pub(crate) async fn get(&self, id: TransactionId) -> Result<Arc<Transaction>> {
+        self.txns.read().await.get(&id).cloned().ok_or_else(|| {
             GenericDatabaseError::invalid_argument(format!("invalid transaction ID: {}", id.0))
         })
     }
 
-    pub(crate) async fn start(&self) -> Arc<Transaction> {
-        let mut lock = self.map.write().await;
-        let id = loop {
-            let id = TransactionId::new();
-            if !lock.contains_key(&id) {
-                break id;
-            }
-        };
-        let txn = Arc::new(Transaction::new(id, Weak::clone(&self.database)));
-        lock.insert(id, Arc::clone(&txn));
-        txn
+    pub(crate) async fn start_read_write(&self) -> TransactionId {
+        let id = TransactionId::new();
+        let txn = Arc::new(Transaction::ReadWrite(ReadWriteTransaction::new(
+            id,
+            Weak::clone(&self.database),
+        )));
+        self.txns.write().await.insert(id, txn);
+        id
     }
 
-    pub(crate) async fn start_with_id(&self, id: TransactionId) -> Result<Arc<Transaction>> {
-        let mut lock = self.map.write().await;
-        match lock.entry(id) {
+    pub(crate) async fn start_read_only(&self, consistency: ReadConsistency) -> TransactionId {
+        let id = TransactionId::new();
+        let txn = Arc::new(Transaction::ReadOnly(ReadOnlyTransaction::new(
+            id,
+            Weak::clone(&self.database),
+            consistency,
+        )));
+        self.txns.write().await.insert(id, txn);
+        id
+    }
+
+    pub(crate) async fn start_read_write_with_id(&self, id: TransactionId) -> Result<()> {
+        id.check()?;
+        match self.txns.write().await.entry(id) {
             Entry::Occupied(_) => Err(GenericDatabaseError::failed_precondition(
                 "transaction_id already/still in use",
             )),
             Entry::Vacant(e) => {
-                let txn = Arc::new(Transaction::new(id, Weak::clone(&self.database)));
-                e.insert(Arc::clone(&txn));
-                Ok(txn)
+                let txn = Arc::new(Transaction::ReadWrite(ReadWriteTransaction::new(
+                    id,
+                    Weak::clone(&self.database),
+                )));
+                e.insert(txn);
+                Ok(())
             }
         }
     }
 
-    pub(crate) async fn stop(&self, id: &TransactionId) -> Result<()> {
-        self.map.write().await.remove(id).ok_or_else(|| {
+    pub(crate) async fn remove(&self, id: TransactionId) -> Result<Arc<Transaction>> {
+        self.txns.write().await.remove(&id).ok_or_else(|| {
             GenericDatabaseError::invalid_argument(format!("invalid transaction ID: {}", id.0))
-        })?;
-        Ok(())
+        })
     }
 }
 
 #[derive(Debug)]
-pub struct Transaction {
-    pub id:   TransactionId,
-    database: Weak<FirestoreDatabase>,
-    guards:   Mutex<HashMap<DocumentRef, Arc<OwnedDocumentContentsReadGuard>>>,
+pub(crate) enum Transaction {
+    ReadWrite(ReadWriteTransaction),
+    ReadOnly(ReadOnlyTransaction),
 }
 
 impl Transaction {
+    pub(crate) async fn read_doc(
+        &self,
+        name: &DocumentRef,
+    ) -> Result<Option<Arc<StoredDocumentVersion>>> {
+        match self {
+            Transaction::ReadWrite(txn) => txn.read_doc(name).await,
+            Transaction::ReadOnly(txn) => txn.read_doc(name).await,
+        }
+    }
+
+    pub(crate) fn as_read_write(&self) -> Option<&ReadWriteTransaction> {
+        if let Self::ReadWrite(v) = self {
+            Some(v)
+        } else {
+            None
+        }
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct ReadWriteTransaction {
+    pub(crate) id: TransactionId,
+    database: Weak<FirestoreDatabase>,
+    guards: Mutex<HashMap<DocumentRef, Arc<OwnedDocumentContentsReadGuard>>>,
+}
+
+impl ReadWriteTransaction {
     fn new(id: TransactionId, database: Weak<FirestoreDatabase>) -> Self {
-        Transaction {
+        ReadWriteTransaction {
             id,
             database,
             guards: Default::default(),
         }
     }
 
-    #[instrument(level = Level::DEBUG, skip_all)]
-    pub async fn read_doc(
+    pub(crate) async fn read_doc(
         &self,
         name: &DocumentRef,
-    ) -> Result<Arc<OwnedDocumentContentsReadGuard>> {
-        let mut guards = self.guards.lock().await;
-        if let Some(guard) = guards.get(name) {
-            return Ok(Arc::clone(guard));
-        }
-        let guard = self.new_read_guard(name).await?.into();
-        guards.insert(name.clone(), Arc::clone(&guard));
-        Ok(guard)
+    ) -> Result<Option<Arc<StoredDocumentVersion>>> {
+        Ok(self
+            .read_guard(name)
+            .await?
+            .version_for_consistency(ReadConsistency::Transaction(self.id))?
+            .cloned())
     }
 
-    pub async fn drop_remaining_guards(&self) {
+    pub(crate) async fn drop_remaining_guards(&self) {
         self.guards.lock().await.clear();
     }
 
-    pub async fn take_write_guard(
+    pub(crate) async fn take_write_guard(
         &self,
         name: &DocumentRef,
     ) -> Result<OwnedDocumentContentsWriteGuard> {
@@ -119,6 +155,17 @@ impl Transaction {
         read_guard.upgrade().await
     }
 
+    #[instrument(level = Level::DEBUG, skip_all)]
+    async fn read_guard(&self, name: &DocumentRef) -> Result<Arc<OwnedDocumentContentsReadGuard>> {
+        let mut guards = self.guards.lock().await;
+        if let Some(guard) = guards.get(name) {
+            return Ok(Arc::clone(guard));
+        }
+        let guard = self.new_read_guard(name).await?.into();
+        guards.insert(name.clone(), Arc::clone(&guard));
+        Ok(guard)
+    }
+
     async fn new_read_guard(&self, name: &DocumentRef) -> Result<OwnedDocumentContentsReadGuard> {
         self.database
             .upgrade()
@@ -130,13 +177,62 @@ impl Transaction {
     }
 }
 
+#[derive(Debug)]
+pub(crate) struct ReadOnlyTransaction {
+    #[allow(dead_code)] // Only useful in logging
+    pub(crate) id: TransactionId,
+    pub(crate) database: Weak<FirestoreDatabase>,
+    pub(crate) consistency: ReadConsistency,
+}
+
+impl ReadOnlyTransaction {
+    pub(crate) fn new(
+        id: TransactionId,
+        database: Weak<FirestoreDatabase>,
+        consistency: ReadConsistency,
+    ) -> Self {
+        Self {
+            id,
+            database,
+            consistency,
+        }
+    }
+
+    async fn read_doc(&self, name: &DocumentRef) -> Result<Option<Arc<StoredDocumentVersion>>> {
+        Ok(self
+            .database
+            .upgrade()
+            .ok_or_else(|| GenericDatabaseError::aborted("database was dropped"))?
+            .get_doc_meta(name)
+            .await?
+            .read()
+            .await?
+            .version_for_consistency(self.consistency)?
+            .cloned())
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct TransactionId(usize);
 
+static NEXT_TXN_ID: AtomicUsize = AtomicUsize::new(1);
+
 impl TransactionId {
     fn new() -> Self {
-        static NEXT_TXN_ID: AtomicUsize = AtomicUsize::new(1);
         Self(NEXT_TXN_ID.fetch_add(1, atomic::Ordering::Relaxed))
+    }
+
+    /// Check if the given [`TransactionId`] could have been issued by the currently running
+    /// instance. This doesn't guarantee that the given id is valid, but it prevents collisions with
+    /// future IDs.
+    fn check(self: TransactionId) -> Result<()> {
+        if self.0 < NEXT_TXN_ID.load(atomic::Ordering::Relaxed) {
+            Ok(())
+        } else {
+            Err(GenericDatabaseError::InvalidArgument(format!(
+                "Invalid transaction ID, {self:?} has not been issued by this instance"
+            )))
+        }
     }
 }
 

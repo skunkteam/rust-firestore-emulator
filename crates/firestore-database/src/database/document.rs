@@ -127,11 +127,11 @@ impl DocumentContents {
 
     pub fn version_for_consistency(
         &self,
-        consistency: &ReadConsistency,
+        consistency: ReadConsistency,
     ) -> Result<Option<&Arc<StoredDocumentVersion>>> {
         Ok(match consistency {
             ReadConsistency::Default => self.current_version(),
-            ReadConsistency::ReadTime(time) => self.version_at_time(*time),
+            ReadConsistency::ReadTime(time) => self.version_at_time(time),
             ReadConsistency::Transaction(_) => self.current_version(),
         })
     }

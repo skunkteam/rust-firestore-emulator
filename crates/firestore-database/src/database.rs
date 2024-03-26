@@ -74,14 +74,11 @@ impl FirestoreDatabase {
     pub async fn get_doc(
         &self,
         name: &DocumentRef,
-        consistency: &ReadConsistency,
+        consistency: ReadConsistency,
     ) -> Result<Option<Arc<StoredDocumentVersion>>> {
         debug!(%name);
         let version = if let Some(txn) = self.get_txn_for_consistency(consistency).await? {
-            txn.read_doc(name)
-                .await?
-                .version_for_consistency(consistency)?
-                .cloned()
+            txn.read_doc(name).await?
         } else {
             self.get_doc_meta(name)
                 .await?
@@ -129,20 +126,13 @@ impl FirestoreDatabase {
 
     pub(crate) async fn get_txn_for_consistency(
         &self,
-        consistency: &ReadConsistency,
+        consistency: ReadConsistency,
     ) -> Result<Option<Arc<Transaction>>> {
         if let ReadConsistency::Transaction(id) = consistency {
-            Ok(Some(self.get_txn(id).await?))
+            Ok(Some(self.transactions.get(id).await?))
         } else {
             Ok(None)
         }
-    }
-
-    pub async fn get_txn(
-        &self,
-        id: &TransactionId,
-    ) -> Result<Arc<Transaction>, GenericDatabaseError> {
-        self.transactions.get(id).await
     }
 
     /// Get all the collections that reside directly under the given parent. This means that:
@@ -320,10 +310,10 @@ impl FirestoreDatabase {
     pub async fn commit(
         self: &Arc<Self>,
         writes: Vec<Write>,
-        transaction: &TransactionId,
+        transaction: TransactionId,
     ) -> Result<(Timestamp, Vec<WriteResult>)> {
-        let txn = &self.transactions.get(transaction).await?;
-        let time = Timestamp::now();
+        let txn = self.transactions.get(transaction).await?;
+        let rw_txn = txn.as_read_write();
 
         let mut write_results = vec![];
         let mut updates = HashMap::new();
@@ -333,11 +323,20 @@ impl FirestoreDatabase {
         for write in &writes {
             let name = get_doc_name_from_write(write)?;
             if let Entry::Vacant(entry) = write_guard_cache.entry(name.clone()) {
+                let txn = rw_txn.as_ref().ok_or_else(|| {
+                    GenericDatabaseError::invalid_argument(
+                        "Cannot modify entities in a read-only transaction",
+                    )
+                })?;
                 entry.insert(txn.take_write_guard(&name).await?);
             }
         }
 
-        txn.drop_remaining_guards().await;
+        if let Some(txn) = rw_txn {
+            txn.drop_remaining_guards().await;
+        }
+
+        let time = Timestamp::now();
 
         for write in writes {
             let name = get_doc_name_from_write(&write)?;
@@ -349,7 +348,7 @@ impl FirestoreDatabase {
             }
         }
 
-        self.transactions.stop(transaction).await?;
+        self.transactions.remove(transaction).await?;
 
         self.send_event(DatabaseEvent {
             database: Arc::downgrade(self),
@@ -431,34 +430,31 @@ impl FirestoreDatabase {
         ))
     }
 
-    pub async fn new_txn(
-        &self,
-        transaction_options: Option<TransactionOptions>,
-    ) -> Result<TransactionId> {
+    pub async fn new_txn(&self, transaction_options: TransactionOptions) -> Result<TransactionId> {
         use transaction_options::*;
-        let retry_id = match transaction_options {
-            Some(TransactionOptions {
-                mode: None | Some(Mode::ReadOnly(_)),
-            }) => {
-                unimplemented!("read-only transactions")
+        match transaction_options.mode {
+            None => Ok(self
+                .transactions
+                .start_read_only(ReadConsistency::Default)
+                .await),
+            Some(Mode::ReadOnly(ro)) => Ok(self
+                .transactions
+                .start_read_only(ro.consistency_selector.into())
+                .await),
+            Some(Mode::ReadWrite(rw)) => {
+                if rw.retry_transaction.is_empty() {
+                    Ok(self.transactions.start_read_write().await)
+                } else {
+                    let id = rw.retry_transaction.try_into()?;
+                    self.transactions.start_read_write_with_id(id).await?;
+                    Ok(id)
+                }
             }
-            Some(TransactionOptions {
-                mode: Some(Mode::ReadWrite(ReadWrite { retry_transaction })),
-            }) => retry_transaction,
-            None => vec![],
-        };
-
-        if retry_id.is_empty() {
-            Ok(self.transactions.start().await.id)
-        } else {
-            let id = retry_id.try_into()?;
-            self.transactions.start_with_id(id).await?;
-            Ok(id)
         }
     }
 
-    pub async fn rollback(&self, transaction: &TransactionId) -> Result<()> {
-        self.transactions.stop(transaction).await?;
+    pub async fn rollback(&self, transaction: TransactionId) -> Result<()> {
+        self.transactions.remove(transaction).await?;
         Ok(())
     }
 
@@ -470,6 +466,13 @@ impl FirestoreDatabase {
 
     pub fn subscribe(&self) -> Receiver<Arc<DatabaseEvent>> {
         self.events.subscribe()
+    }
+}
+
+#[cfg(feature = "tracing")]
+impl Drop for FirestoreDatabase {
+    fn drop(&mut self) {
+        debug!("Database \"{}\" dropped", self.name);
     }
 }
 
