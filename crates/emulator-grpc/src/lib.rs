@@ -22,7 +22,7 @@ use itertools::Itertools;
 use tokio::sync::mpsc;
 use tokio_stream::{once, wrappers::ReceiverStream, StreamExt};
 use tonic::{async_trait, codec::CompressionEncoding, Code, Request, Response, Result, Status};
-use tracing::{debug, debug_span, instrument, Instrument, Level};
+use tracing::{debug, debug_span, field::display, instrument, Instrument, Level, Span};
 use utils::error_in_stream;
 
 #[macro_use]
@@ -78,7 +78,7 @@ impl Firestore for FirestoreEmulator {
     /// same order that they were requested.
     #[instrument(level = Level::DEBUG, skip_all, fields(
         count = request.get_ref().documents.len(),
-        in_txn = display(is_txn(&request.get_ref().consistency_selector))
+        txn_id,
     ), err)]
     async fn batch_get_documents(
         &self,
@@ -114,6 +114,9 @@ impl Firestore for FirestoreEmulator {
                 s => (vec![], s.try_into()?),
             };
             debug!(?read_consistency);
+            if let ReadConsistency::Transaction(id) = read_consistency {
+                Span::current().record("txn_id", display(id));
+            }
 
             let (tx, rx) = mpsc::channel(16);
             tokio::spawn(
@@ -146,7 +149,7 @@ impl Firestore for FirestoreEmulator {
     /// Commits a transaction, while optionally updating documents.
     #[instrument(level = Level::DEBUG, skip_all, fields(
         count = request.get_ref().writes.len(),
-        in_txn = !request.get_ref().transaction.is_empty(),
+        txn_id,
     ), err)]
     async fn commit(&self, request: Request<CommitRequest>) -> Result<Response<CommitResponse>> {
         let CommitRequest {
@@ -161,6 +164,7 @@ impl Firestore for FirestoreEmulator {
             perform_writes(&database, writes).await?
         } else {
             let txn_id = transaction.try_into()?;
+            Span::current().record("txn_id", display(txn_id));
             debug!(?txn_id);
             database.commit(writes, txn_id).await?
         };
@@ -583,12 +587,4 @@ async fn perform_writes(
             .collect(),
     });
     Ok((time, write_results))
-}
-
-fn is_txn(selector: &Option<batch_get_documents_request::ConsistencySelector>) -> &'static str {
-    match selector {
-        Some(batch_get_documents_request::ConsistencySelector::Transaction(_)) => "true",
-        Some(batch_get_documents_request::ConsistencySelector::NewTransaction(_)) => "new",
-        Some(batch_get_documents_request::ConsistencySelector::ReadTime(_)) | None => "false",
-    }
 }

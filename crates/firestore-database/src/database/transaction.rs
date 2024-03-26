@@ -1,11 +1,13 @@
 use std::{
     collections::{hash_map::Entry, HashMap},
+    fmt::Display,
     sync::{
         atomic::{self, AtomicUsize},
         Arc, Weak,
     },
 };
 
+use googleapis::google::protobuf::Timestamp;
 use tokio::sync::{Mutex, RwLock};
 use tracing::{instrument, Level};
 
@@ -14,10 +16,7 @@ use super::{
     reference::DocumentRef,
     FirestoreDatabase,
 };
-use crate::{
-    document::StoredDocumentVersion, error::Result, read_consistency::ReadConsistency,
-    GenericDatabaseError,
-};
+use crate::{document::StoredDocumentVersion, error::Result, GenericDatabaseError};
 
 #[derive(Debug)]
 pub(crate) struct RunningTransactions {
@@ -49,12 +48,12 @@ impl RunningTransactions {
         id
     }
 
-    pub(crate) async fn start_read_only(&self, consistency: ReadConsistency) -> TransactionId {
+    pub(crate) async fn start_read_only(&self, read_time: Option<Timestamp>) -> TransactionId {
         let id = TransactionId::new();
         let txn = Arc::new(Transaction::ReadOnly(ReadOnlyTransaction::new(
             id,
             Weak::clone(&self.database),
-            consistency,
+            read_time,
         )));
         self.txns.write().await.insert(id, txn);
         id
@@ -112,6 +111,7 @@ impl Transaction {
 
 #[derive(Debug)]
 pub(crate) struct ReadWriteTransaction {
+    #[allow(dead_code)] // For logging
     pub(crate) id: TransactionId,
     database: Weak<FirestoreDatabase>,
     guards: Mutex<HashMap<DocumentRef, Arc<OwnedDocumentContentsReadGuard>>>,
@@ -130,11 +130,7 @@ impl ReadWriteTransaction {
         &self,
         name: &DocumentRef,
     ) -> Result<Option<Arc<StoredDocumentVersion>>> {
-        Ok(self
-            .read_guard(name)
-            .await?
-            .version_for_consistency(ReadConsistency::Transaction(self.id))?
-            .cloned())
+        Ok(self.read_guard(name).await?.current_version().cloned())
     }
 
     pub(crate) async fn drop_remaining_guards(&self) {
@@ -179,36 +175,38 @@ impl ReadWriteTransaction {
 
 #[derive(Debug)]
 pub(crate) struct ReadOnlyTransaction {
-    #[allow(dead_code)] // Only useful in logging
+    #[allow(dead_code)] // For logging
     pub(crate) id: TransactionId,
     pub(crate) database: Weak<FirestoreDatabase>,
-    pub(crate) consistency: ReadConsistency,
+    pub(crate) read_time: Option<Timestamp>,
 }
 
 impl ReadOnlyTransaction {
     pub(crate) fn new(
         id: TransactionId,
         database: Weak<FirestoreDatabase>,
-        consistency: ReadConsistency,
+        read_time: Option<Timestamp>,
     ) -> Self {
         Self {
             id,
             database,
-            consistency,
+            read_time,
         }
     }
 
     async fn read_doc(&self, name: &DocumentRef) -> Result<Option<Arc<StoredDocumentVersion>>> {
-        Ok(self
+        let doc = self
             .database
             .upgrade()
             .ok_or_else(|| GenericDatabaseError::aborted("database was dropped"))?
             .get_doc_meta(name)
-            .await?
-            .read()
-            .await?
-            .version_for_consistency(self.consistency)?
-            .cloned())
+            .await?;
+        let lock = doc.read().await?;
+        let version = match self.read_time {
+            Some(read_time) => lock.version_at_time(read_time),
+            None => lock.current_version(),
+        };
+        Ok(version.cloned())
     }
 }
 
@@ -225,14 +223,20 @@ impl TransactionId {
     /// Check if the given [`TransactionId`] could have been issued by the currently running
     /// instance. This doesn't guarantee that the given id is valid, but it prevents collisions with
     /// future IDs.
-    fn check(self: TransactionId) -> Result<()> {
+    fn check(self) -> Result<()> {
         if self.0 < NEXT_TXN_ID.load(atomic::Ordering::Relaxed) {
             Ok(())
         } else {
             Err(GenericDatabaseError::InvalidArgument(format!(
-                "Invalid transaction ID, {self:?} has not been issued by this instance"
+                "Invalid transaction ID, {self} has not been issued by this instance"
             )))
         }
+    }
+}
+
+impl Display for TransactionId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
     }
 }
 
