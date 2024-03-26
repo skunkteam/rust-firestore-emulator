@@ -22,7 +22,7 @@ use tokio::{
 };
 use tracing::{debug, instrument, trace, warn, Level};
 
-use super::{read_consistency::ReadConsistency, reference::DocumentRef};
+use super::reference::DocumentRef;
 use crate::{error::Result, FirestoreProject, GenericDatabaseError};
 
 pub struct DocumentMeta {
@@ -123,17 +123,6 @@ impl DocumentContents {
             .iter()
             .rfind(|version| (version.update_time()) <= (read_time))
             .and_then(DocumentVersion::stored_document)
-    }
-
-    pub fn version_for_consistency(
-        &self,
-        consistency: ReadConsistency,
-    ) -> Result<Option<&Arc<StoredDocumentVersion>>> {
-        Ok(match consistency {
-            ReadConsistency::Default => self.current_version(),
-            ReadConsistency::ReadTime(time) => self.version_at_time(time),
-            ReadConsistency::Transaction(_) => self.current_version(),
-        })
     }
 
     pub fn exists(&self) -> bool {

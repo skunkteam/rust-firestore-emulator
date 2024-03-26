@@ -71,7 +71,7 @@ jobs:
           cache: npm
           cache-dependency-path: test-suite/package-lock.json
       - name: Run compatibility test suite
-        run: npm ci && npm run test:rust-emulator
+        run: npm ci && npm run test:rust-emulator -- --maxConcurrency=3
         working-directory: test-suite
 
   deploy:
