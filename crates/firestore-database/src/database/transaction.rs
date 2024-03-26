@@ -77,29 +77,31 @@ impl RunningTransactions {
         }
     }
 
-    pub(crate) async fn stop(&self, id: TransactionId) -> Result<()> {
+    pub(crate) async fn remove(&self, id: TransactionId) -> Result<Arc<Transaction>> {
         self.txns.write().await.remove(&id).ok_or_else(|| {
             GenericDatabaseError::invalid_argument(format!("invalid transaction ID: {}", id.0))
-        })?;
-        Ok(())
+        })
     }
 }
 
 #[derive(Debug)]
-pub enum Transaction {
+pub(crate) enum Transaction {
     ReadWrite(ReadWriteTransaction),
     ReadOnly(ReadOnlyTransaction),
 }
 
 impl Transaction {
-    pub async fn read_doc(&self, name: &DocumentRef) -> Result<Option<Arc<StoredDocumentVersion>>> {
+    pub(crate) async fn read_doc(
+        &self,
+        name: &DocumentRef,
+    ) -> Result<Option<Arc<StoredDocumentVersion>>> {
         match self {
             Transaction::ReadWrite(txn) => txn.read_doc(name).await,
             Transaction::ReadOnly(txn) => txn.read_doc(name).await,
         }
     }
 
-    pub fn as_read_write(&self) -> Option<&ReadWriteTransaction> {
+    pub(crate) fn as_read_write(&self) -> Option<&ReadWriteTransaction> {
         if let Self::ReadWrite(v) = self {
             Some(v)
         } else {
@@ -109,10 +111,10 @@ impl Transaction {
 }
 
 #[derive(Debug)]
-pub struct ReadWriteTransaction {
-    pub id:   TransactionId,
+pub(crate) struct ReadWriteTransaction {
+    pub(crate) id: TransactionId,
     database: Weak<FirestoreDatabase>,
-    guards:   Mutex<HashMap<DocumentRef, Arc<OwnedDocumentContentsReadGuard>>>,
+    guards: Mutex<HashMap<DocumentRef, Arc<OwnedDocumentContentsReadGuard>>>,
 }
 
 impl ReadWriteTransaction {
@@ -124,7 +126,10 @@ impl ReadWriteTransaction {
         }
     }
 
-    pub async fn read_doc(&self, name: &DocumentRef) -> Result<Option<Arc<StoredDocumentVersion>>> {
+    pub(crate) async fn read_doc(
+        &self,
+        name: &DocumentRef,
+    ) -> Result<Option<Arc<StoredDocumentVersion>>> {
         Ok(self
             .read_guard(name)
             .await?
@@ -132,11 +137,11 @@ impl ReadWriteTransaction {
             .cloned())
     }
 
-    pub async fn drop_remaining_guards(&self) {
+    pub(crate) async fn drop_remaining_guards(&self) {
         self.guards.lock().await.clear();
     }
 
-    pub async fn take_write_guard(
+    pub(crate) async fn take_write_guard(
         &self,
         name: &DocumentRef,
     ) -> Result<OwnedDocumentContentsWriteGuard> {
@@ -173,14 +178,15 @@ impl ReadWriteTransaction {
 }
 
 #[derive(Debug)]
-pub struct ReadOnlyTransaction {
-    pub id: TransactionId,
-    pub database: Weak<FirestoreDatabase>,
-    pub consistency: ReadConsistency,
+pub(crate) struct ReadOnlyTransaction {
+    #[allow(dead_code)] // Only useful in logging
+    pub(crate) id: TransactionId,
+    pub(crate) database: Weak<FirestoreDatabase>,
+    pub(crate) consistency: ReadConsistency,
 }
 
 impl ReadOnlyTransaction {
-    pub fn new(
+    pub(crate) fn new(
         id: TransactionId,
         database: Weak<FirestoreDatabase>,
         consistency: ReadConsistency,

@@ -23,6 +23,8 @@ export const notImplementedInCloud = connection === 'CLOUD FIRESTORE' ? [] : und
 const mainTestDoc = firestore.collection('tests').doc();
 export const collection = mainTestDoc.collection('collection');
 
+export function writeData<T extends object>(data: FirebaseFirestore.WithFieldValue<T>): object;
+export function writeData(): object;
 export function writeData(data: object = {}) {
     const ttl = exported.Timestamp.fromMillis(Date.now() + ms('1h'));
     return { ...data, ttl };

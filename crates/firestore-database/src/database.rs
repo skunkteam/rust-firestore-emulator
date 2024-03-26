@@ -129,17 +129,10 @@ impl FirestoreDatabase {
         consistency: ReadConsistency,
     ) -> Result<Option<Arc<Transaction>>> {
         if let ReadConsistency::Transaction(id) = consistency {
-            Ok(Some(self.get_txn(id).await?))
+            Ok(Some(self.transactions.get(id).await?))
         } else {
             Ok(None)
         }
-    }
-
-    pub async fn get_txn(
-        &self,
-        id: TransactionId,
-    ) -> Result<Arc<Transaction>, GenericDatabaseError> {
-        self.transactions.get(id).await
     }
 
     /// Get all the collections that reside directly under the given parent. This means that:
@@ -320,12 +313,7 @@ impl FirestoreDatabase {
         transaction: TransactionId,
     ) -> Result<(Timestamp, Vec<WriteResult>)> {
         let txn = self.transactions.get(transaction).await?;
-        let txn = &txn.as_read_write().ok_or_else(|| {
-            GenericDatabaseError::invalid_argument(format!(
-                "Transaction {transaction:?} is read-only"
-            ))
-        })?;
-        let time = Timestamp::now();
+        let rw_txn = txn.as_read_write();
 
         let mut write_results = vec![];
         let mut updates = HashMap::new();
@@ -335,11 +323,20 @@ impl FirestoreDatabase {
         for write in &writes {
             let name = get_doc_name_from_write(write)?;
             if let Entry::Vacant(entry) = write_guard_cache.entry(name.clone()) {
+                let txn = rw_txn.as_ref().ok_or_else(|| {
+                    GenericDatabaseError::invalid_argument(
+                        "Cannot modify entities in a read-only transaction",
+                    )
+                })?;
                 entry.insert(txn.take_write_guard(&name).await?);
             }
         }
 
-        txn.drop_remaining_guards().await;
+        if let Some(txn) = rw_txn {
+            txn.drop_remaining_guards().await;
+        }
+
+        let time = Timestamp::now();
 
         for write in writes {
             let name = get_doc_name_from_write(&write)?;
@@ -351,7 +348,7 @@ impl FirestoreDatabase {
             }
         }
 
-        self.transactions.stop(transaction).await?;
+        self.transactions.remove(transaction).await?;
 
         self.send_event(DatabaseEvent {
             database: Arc::downgrade(self),
@@ -457,7 +454,7 @@ impl FirestoreDatabase {
     }
 
     pub async fn rollback(&self, transaction: TransactionId) -> Result<()> {
-        self.transactions.stop(transaction).await?;
+        self.transactions.remove(transaction).await?;
         Ok(())
     }
 
