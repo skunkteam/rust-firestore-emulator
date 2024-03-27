@@ -1,5 +1,6 @@
 [package]
 name = "firestore-emulator"
+description = "Google Cloud Firestore emulator with focus on stability"
 version = { workspace = true }
 edition = "2021"
 
@@ -24,7 +25,7 @@ ui = ["emulator-http/ui"]
 members = ["crates/*"]
 
 [workspace.package]
-version = "0.0.1"
+version = "0.0.3"
 
 [workspace.dependencies]
 async-trait = "0.1.77"

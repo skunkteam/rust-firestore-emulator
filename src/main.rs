@@ -10,6 +10,7 @@ use tokio::signal::ctrl_c;
 static GLOBAL_ALLOC: Jemalloc = Jemalloc;
 
 #[derive(Parser, Debug)]
+#[command(version, about)]
 struct Args {
     /// The host:port to which the emulator should be bound.
     #[arg(long, env = "FIRESTORE_EMULATOR_HOST")]
