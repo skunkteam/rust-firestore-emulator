@@ -101,7 +101,7 @@ impl FirestoreDatabase {
         Ok(version)
     }
 
-    pub async fn get_collection(&self, collection_name: &CollectionRef) -> Arc<Collection> {
+    async fn get_collection(&self, collection_name: &CollectionRef) -> Arc<Collection> {
         debug_assert_eq!(self.name, collection_name.root_ref);
         Arc::clone(
             &*self
@@ -479,7 +479,6 @@ impl FirestoreDatabase {
     }
 }
 
-#[cfg(feature = "tracing")]
 impl Drop for FirestoreDatabase {
     fn drop(&mut self) {
         debug!("Database \"{}\" dropped", self.name);

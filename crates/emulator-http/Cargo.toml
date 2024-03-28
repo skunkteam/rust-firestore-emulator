@@ -11,6 +11,7 @@ ui = []
 
 [dependencies]
 axum = { workspace = true, features = ["macros"] }
+emulator-tracing = { workspace = true }
 firestore-database = { workspace = true }
 serde_json = "1.0.114"
 tower-http = { version = "0.4.4", features = ["full"] }

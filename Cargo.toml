@@ -8,15 +8,7 @@ edition = "2021"
 default = ["ui"]
 
 # The console feature enables the use of the tokio console for runtime insight in async behavior.
-console = ["dep:console", "dep:console-subscriber", "dep:tracing-subscriber"]
-
-# The tracing feature enables tracing logging to stdout.
-tracing = [
-    "dep:time",
-    "firestore-database/tracing",
-    "tracing-subscriber/local-time",
-    "tracing-subscriber/env-filter",
-]
+console = ["emulator-tracing/console"]
 
 # Enable the web interface on the same host:port as the other emulator endpoints
 ui = ["emulator-http/ui"]
@@ -30,6 +22,7 @@ version = "0.0.3"
 [workspace.dependencies]
 async-trait = "0.1.77"
 axum = "0.6.20"
+emulator-tracing = { path = "crates/emulator-tracing" }
 firestore-database = { path = "crates/firestore-database" }
 futures = "0.3.30"
 googleapis = { path = "crates/googleapis" }
@@ -70,17 +63,14 @@ blocks_in_conditions = "allow"
 axum = { workspace = true }
 clap = { version = "4.5.1", features = ["derive", "env"] }
 color-eyre = "0.6.2"
-console = { version = "0.15.8", optional = true }
-console-subscriber = { version = "0.2.0", optional = true }
 emulator-grpc = { path = "crates/emulator-grpc" }
 emulator-http = { path = "crates/emulator-http" }
+emulator-tracing = { workspace = true }
 firestore-database = { workspace = true }
 hybrid-axum-tonic = { path = "crates/hybrid-axum-tonic" }
 tikv-jemallocator = "0.5.4"
-time = { workspace = true, optional = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "signal"] }
 tracing = { workspace = true }
-tracing-subscriber = { version = "0.3.18", optional = true }
 
 [profile.release]
 codegen-units = 1

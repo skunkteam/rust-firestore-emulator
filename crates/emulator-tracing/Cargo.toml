@@ -1,0 +1,19 @@
+[package]
+name = "emulator-tracing"
+version = { workspace = true }
+edition = "2021"
+
+[features]
+console = ["dep:console-subscriber"]
+
+[dependencies]
+console-subscriber = { version = "0.2.0", optional = true }
+thiserror = { workspace = true }
+time = { workspace = true }
+tracing-subscriber = { version = "0.3.18", features = [
+    "local-time",
+    "env-filter",
+] }
+
+[lints]
+workspace = true
