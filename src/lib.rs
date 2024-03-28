@@ -1,6 +1,7 @@
 use std::{future::Future, net::SocketAddr};
 
 use axum::Router;
+use emulator_tracing::Tracing;
 use firestore_database::FirestoreProject;
 use hybrid_axum_tonic::{NestTonic, RestGrpcService};
 use tracing::{enabled, info, Level};
@@ -10,8 +11,11 @@ pub async fn run(
     project: &'static FirestoreProject,
     host_port: SocketAddr,
     shutdown: impl Future<Output = ()>,
+    tracing: impl Tracing + Send + Sync + 'static,
 ) -> color_eyre::Result<()> {
-    let rest_router = emulator_http::router(project);
+    let rest_router = emulator_http::RouterBuilder::new(project)
+        .add_dynamic_tracing(tracing)
+        .build();
     let grpc_router = Router::new().nest_tonic(emulator_grpc::service(project));
     let combined = RestGrpcService::new(rest_router, grpc_router).into_make_service();
     let server = axum::Server::bind(&host_port)

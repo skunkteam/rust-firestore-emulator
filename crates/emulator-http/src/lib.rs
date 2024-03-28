@@ -1,4 +1,4 @@
-pub use routes::router;
+pub use routes::RouterBuilder;
 
 mod error;
 mod routes;

@@ -1,6 +1,7 @@
 use std::net::SocketAddr;
 
 use clap::Parser;
+use emulator_tracing::DefaultTracing;
 use firestore_database::{FirestoreConfig, FirestoreProject};
 use firestore_emulator::run;
 use tikv_jemallocator::Jemalloc;
@@ -28,32 +29,7 @@ struct Args {
 fn main() -> color_eyre::Result<()> {
     color_eyre::install()?;
 
-    #[cfg(any(feature = "tracing", feature = "console"))]
-    {
-        use tracing_subscriber::prelude::*;
-        let registry = tracing_subscriber::registry();
-
-        #[cfg(feature = "tracing")]
-        let registry = registry.with({
-            use time::{macros::format_description, UtcOffset};
-            use tracing_subscriber::{
-                fmt::{format::FmtSpan, time::OffsetTime},
-                EnvFilter,
-            };
-            let time_offset = UtcOffset::current_local_offset()?;
-            let time_format = format_description!("[hour]:[minute]:[second].[subsecond digits:6]");
-
-            tracing_subscriber::fmt::layer()
-                .with_span_events(FmtSpan::NEW | FmtSpan::CLOSE)
-                .with_timer(OffsetTime::new(time_offset, time_format))
-                .with_filter(EnvFilter::from_default_env())
-        });
-
-        #[cfg(feature = "console")]
-        let registry = registry.with(console_subscriber::spawn());
-
-        registry.init();
-    }
+    let tracing = DefaultTracing::start()?;
 
     let Args {
         host_port,
@@ -69,5 +45,5 @@ fn main() -> color_eyre::Result<()> {
 
     let ctrl_c_listener = async { ctrl_c().await.expect("failed to listen for ctrl-c event") };
 
-    run(project, host_port, ctrl_c_listener)
+    run(project, host_port, ctrl_c_listener, tracing)
 }
