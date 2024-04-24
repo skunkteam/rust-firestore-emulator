@@ -14,7 +14,7 @@
     "dependencies": {
         "@skunkteam/sherlock": "^8.0.0",
         "@skunkteam/sherlock-utils": "^8.0.0",
-        "firebase": "^10.8.1",
+        "firebase": "^10.11.0",
         "firebase-admin": "^12.0.0",
         "lodash": "^4.17.21",
         "ms": "^2.1.3"
