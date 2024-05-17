@@ -12,7 +12,7 @@ use googleapis::google::{
         listen_request,
         listen_response::ResponseType,
         target::{self, query_target},
-        target_change::{self, TargetChangeType},
+        target_change::TargetChangeType,
         DocumentChange, DocumentDelete, ListenRequest, ListenResponse, Target, TargetChange,
     },
     protobuf::Timestamp,
@@ -523,7 +523,7 @@ impl QueryTarget {
         time: Timestamp,
     ) -> Result<Vec<ResponseType>> {
         let mut msgs = vec![ResponseType::TargetChange(TargetChange {
-            target_change_type: target_change::TargetChangeType::Reset as _,
+            target_change_type: TargetChangeType::Reset as _,
             target_ids: vec![TARGET_ID],
             cause: None,
             resume_token: vec![],
