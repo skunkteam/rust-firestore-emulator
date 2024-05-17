@@ -163,6 +163,7 @@ impl<'a> MakeWriter<'a> for BufferWriter {
 
     fn make_writer_for(&'a self, meta: &tracing::Metadata<'_>) -> Self::Writer {
         if self.filter.allows(meta) {
+            println!("Found something to log from {}", meta.target());
             EitherWriter::some(self.buffer.make_writer_for(meta))
         } else {
             EitherWriter::none()

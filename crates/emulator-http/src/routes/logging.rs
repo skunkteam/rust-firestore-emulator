@@ -10,7 +10,7 @@ use axum::{
     BoxError, Router,
 };
 use emulator_tracing::{DynamicSubscriber, Tracing};
-use tracing::{debug, error};
+use tracing::{debug, error, trace};
 
 pub(crate) fn router<S: Tracing>() -> Router<&'static S> {
     Router::new().route("/", get(logging_route))
@@ -25,6 +25,7 @@ async fn logging_route(
             error!(error = err, "error in logging socket");
             let _unused = socket.send(Message::Text(format!("ERROR: {err}"))).await;
         };
+        debug!("WebSockets connection closing");
     })
 }
 
@@ -32,15 +33,17 @@ async fn logging_handler(
     socket: &mut WebSocket,
     tracing: &'static impl Tracing,
 ) -> Result<(), BoxError> {
+    debug!("WebSockets connection established, waiting for directives");
     let Some(cmd) = socket.recv().await else {
         // Closed before receiving the first message
         return Ok(());
     };
-    let Message::Text(level) = cmd? else {
-        return Err("unexpected command".into());
+    let Message::Text(dirs) = cmd? else {
+        return Err("unexpected message".into());
     };
 
-    let subscription = tracing.subscribe(&level)?;
+    debug!("Received directives: {dirs:?}");
+    let subscription = tracing.subscribe(&dirs)?;
 
     let mut interval = tokio::time::interval(Duration::from_millis(100));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -49,6 +52,7 @@ async fn logging_handler(
             _ = interval.tick() => {
                 let logs = subscription.consume();
                 if !logs.is_empty() {
+                    trace!("Flushing logs");
                     socket.send(Message::Text(String::from_utf8_lossy(&logs).into_owned())).await?;
                 }
             }
@@ -63,7 +67,11 @@ async fn logging_handler(
                     return Err("unexpected command".into());
                 }
                 debug!("Received STOP command, flushing logs");
-                socket.send(Message::Text(String::from_utf8_lossy(&subscription.consume()).into_owned())).await?;
+                let logs = subscription.consume();
+                if !logs.is_empty() {
+                    debug!("Flushing logs");
+                    socket.send(Message::Text(String::from_utf8_lossy(&logs).into_owned())).await?;
+                }
                 return Ok(());
             }
         }
