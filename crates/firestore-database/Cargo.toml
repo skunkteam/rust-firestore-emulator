@@ -6,11 +6,11 @@ edition = "2021"
 [dependencies]
 async-trait = { workspace = true }
 futures = { workspace = true }
-googleapis = { workspace = true }
+googleapis = { path = "../googleapis" }
 itertools = { workspace = true }
 serde = { workspace = true, features = ["serde_derive"] }
 serde_with = { workspace = true }
-string_cache = "0.8.7"
+string_cache = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["macros"] }
 tokio-stream = { workspace = true, features = ["sync"] }
@@ -18,7 +18,7 @@ tonic = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]
-rstest = "0.18.2"
+rstest = { workspace = true }
 
 [lints]
 workspace = true
