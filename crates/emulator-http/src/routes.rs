@@ -1,18 +1,11 @@
-use std::sync::Arc;
-
-use axum::{
-    extract::State,
-    http::StatusCode,
-    response::Result,
-    routing::{get, put},
-    Router,
-};
 #[cfg(feature = "ui")]
 use axum::{http::header, response::Html};
-use emulator_tracing::{SetLogLevelsError, Tracing};
+use axum::{routing::get, Router};
+use emulator_tracing::Tracing;
 use firestore_database::FirestoreProject;
 
 mod emulator;
+mod logging;
 
 #[cfg(feature = "ui")]
 const HTML: &str = concat!(
@@ -34,11 +27,11 @@ impl RouterBuilder {
         )
     }
 
-    pub fn add_dynamic_tracing(self, tracing: impl Tracing + Send + Sync + 'static) -> Self {
+    pub fn add_dynamic_tracing(self, tracing: &'static impl Tracing) -> Self {
         let Self(router) = self;
-        let router = router.route(
-            "/emulator/v1/loglevels",
-            put(set_log_levels).with_state(Arc::new(tracing)),
+        let router = router.nest(
+            "/emulator/v1/logging",
+            logging::router().with_state(tracing),
         );
         Self(router)
     }
@@ -64,15 +57,4 @@ impl RouterBuilder {
 
         router
     }
-}
-
-async fn set_log_levels(
-    State(tracing): State<Arc<impl Tracing + Send + Sync>>,
-    body: String,
-) -> Result<()> {
-    tracing.set_log_levels(&body).map_err(|err| match err {
-        SetLogLevelsError::InvalidDirectives(_) => (StatusCode::BAD_REQUEST, err.to_string()),
-        SetLogLevelsError::ReloadError(_) => (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()),
-    })?;
-    Ok(())
 }

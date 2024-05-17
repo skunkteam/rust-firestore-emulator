@@ -10,10 +10,19 @@ use crate::{
     timeouts::Timeouts, utils::RwLockHashMapExt, FirestoreDatabase,
 };
 
-#[derive(Debug)]
 pub struct FirestoreProject {
     pub(crate) timeouts: Timeouts,
     databases: RwLock<HashMap<RootRef, Arc<FirestoreDatabase>>>,
+}
+
+// A lot of structs refer back to FirestoreProject, so make sure not to print them out in Debug to
+// prevent stack overflows.
+impl std::fmt::Debug for FirestoreProject {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FirestoreProject")
+            .field("timeouts", &self.timeouts)
+            .finish_non_exhaustive()
+    }
 }
 
 impl FirestoreProject {
@@ -23,7 +32,7 @@ impl FirestoreProject {
         } else {
             Timeouts::FAST
         };
-        FirestoreProject {
+        Self {
             timeouts,
             databases: Default::default(),
         }
