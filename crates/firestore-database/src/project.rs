@@ -23,7 +23,7 @@ impl FirestoreProject {
         } else {
             Timeouts::FAST
         };
-        FirestoreProject {
+        Self {
             timeouts,
             databases: Default::default(),
         }

@@ -11,7 +11,7 @@ pub async fn run(
     project: &'static FirestoreProject,
     host_port: SocketAddr,
     shutdown: impl Future<Output = ()>,
-    tracing: impl Tracing + Send + Sync + 'static,
+    tracing: &'static impl Tracing,
 ) -> color_eyre::Result<()> {
     let rest_router = emulator_http::RouterBuilder::new(project)
         .add_dynamic_tracing(tracing)

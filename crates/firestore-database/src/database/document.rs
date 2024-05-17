@@ -13,7 +13,6 @@ use googleapis::google::{
     protobuf::Timestamp,
 };
 use tokio::{
-    select,
     sync::{
         oneshot, OwnedRwLockReadGuard, OwnedRwLockWriteGuard, OwnedSemaphorePermit, RwLock,
         RwLockReadGuard, Semaphore,
@@ -401,7 +400,7 @@ async fn lock_timeout<F: Future>(
         })
     };
     let mut future_with_timeout = pin!(future_with_timeout);
-    select! {
+    tokio::select! {
         result = &mut future_with_timeout => return result,
         _ = sleep(Duration::from_secs(1)) => warn!("waiting more than 1 second on: {}", id()),
     }
