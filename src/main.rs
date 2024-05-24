@@ -29,7 +29,7 @@ struct Args {
 fn main() -> color_eyre::Result<()> {
     color_eyre::install()?;
 
-    let tracing = DefaultTracing::start()?;
+    let tracing = DefaultTracing::start();
 
     let Args {
         host_port,
