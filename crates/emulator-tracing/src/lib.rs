@@ -24,13 +24,6 @@ use tracing_subscriber::{
 
 mod metadata_filter;
 
-#[allow(missing_copy_implementations)]
-#[derive(Debug, Error)]
-pub enum TracingStartError {
-    #[error("cannot determine local timezone")]
-    CannotGetLocalTimezone(#[from] IndeterminateOffset),
-}
-
 type BoxedLayer = Box<dyn Layer<Registry> + Send + Sync + 'static>;
 
 pub struct DefaultTracing {
@@ -47,19 +40,27 @@ impl Debug for DefaultTracing {
 impl DefaultTracing {
     /// Will start tracing by setting the global default dispatcher for all tracing events for the
     /// duration of the entire program.
-    pub fn start() -> Result<&'static Self, TracingStartError> {
+    pub fn start() -> &'static Self {
         let timer = {
-            let time_offset = UtcOffset::current_local_offset()?;
+            let time_offset =
+                UtcOffset::current_local_offset().unwrap_or_else(|_: IndeterminateOffset| {
+                    eprintln!("Note: could not determine local timezone, logging in UTC.");
+                    UtcOffset::UTC
+                });
             let time_format = format_description!("[hour]:[minute]:[second].[subsecond digits:6]");
             OffsetTime::new(time_offset, time_format)
         };
-        let default_layer = tracing_subscriber::fmt::layer()
-            .with_span_events(FmtSpan::NEW | FmtSpan::CLOSE)
-            .with_timer(timer.clone())
-            .with_filter(EnvFilter::from_default_env())
-            .boxed();
-        let layers = vec![default_layer];
-        let (layer, reload_handle) = reload::Layer::new(layers);
+
+        let (layer, reload_handle) = {
+            let default_layer = tracing_subscriber::fmt::layer()
+                .with_span_events(FmtSpan::NEW | FmtSpan::CLOSE)
+                .with_timer(timer.clone())
+                .with_filter(EnvFilter::from_default_env())
+                .boxed();
+            let layers = vec![default_layer];
+            reload::Layer::new(layers)
+        };
+
         let registry = tracing_subscriber::registry().with(layer);
 
         #[cfg(feature = "console")]
@@ -67,10 +68,10 @@ impl DefaultTracing {
 
         registry.init();
 
-        Ok(Box::leak(Box::new(Self {
+        Box::leak(Box::new(Self {
             reload_handle,
             timer,
-        })))
+        }))
     }
 }
 
