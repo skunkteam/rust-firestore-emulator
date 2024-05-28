@@ -1,8 +1,7 @@
-use std::{
-    borrow::Cow, collections::HashMap, convert::Infallible, fmt::Display, mem::take, str::FromStr,
-};
+use std::{borrow::Cow, collections::HashMap, convert::Infallible, fmt::Display, str::FromStr};
 
 use googleapis::google::firestore::v1::*;
+use itertools::{Itertools, PeekingNext};
 
 use super::document::StoredDocumentVersion;
 use crate::{error::Result, GenericDatabaseError};
@@ -10,6 +9,7 @@ use crate::{error::Result, GenericDatabaseError};
 /// The virtual field-name that represents the document-name.
 pub const DOC_NAME: &str = "__name__";
 
+/// A field reference as used in queries. Can refer either to the document name or to a field path.
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
 pub enum FieldReference {
     DocumentName,
@@ -17,6 +17,8 @@ pub enum FieldReference {
 }
 
 impl FieldReference {
+    /// Returns the value of the field this [`FieldReference`] points to in the given `doc`, if
+    /// found. Returns [`None`] if the field is not found.
     pub fn get_value<'a>(&self, doc: &'a StoredDocumentVersion) -> Option<Cow<'a, Value>> {
         match self {
             Self::DocumentName => Some(Cow::Owned(Value::reference(doc.name.to_string()))),
@@ -61,9 +63,6 @@ impl Display for FieldReference {
     }
 }
 
-#[derive(Clone, Debug, Hash, PartialEq, Eq)]
-pub struct FieldPath(Vec<String>);
-
 /// Field paths may be used to refer to structured fields of Documents.
 /// For `map_value`, the field path is represented by the simple
 /// or quoted field names of the containing fields, delimited by `.`. For
@@ -75,17 +74,28 @@ pub struct FieldPath(Vec<String>);
 /// may contain any character. Some characters, including `` ` ``, must be
 /// escaped using a `\`. For example, `` `x&y` `` represents `x&y` and
 /// `` `bak\`tik` `` represents `` bak`tik ``.
+#[derive(Clone, Debug, Hash, PartialEq, Eq)]
+pub struct FieldPath(Vec<String>);
+
 impl FieldPath {
+    /// Walk the path as represented by this [`FieldPath`] into the given object fields and return
+    /// the value found at the end of the path, if any. Also returns [`None`] if any intermediate
+    /// value was absent or not an object.
     pub fn get_value<'a>(&self, fields: &'a HashMap<String, Value>) -> Option<&'a Value> {
         let (first, rest) = self.0.split_first()?;
         rest.iter()
             .try_fold(fields.get(first)?, |prev, key| prev.as_map()?.get(key))
     }
 
+    /// Walk the path as represented by this [`FieldPath`] into the given object, making sure all
+    /// intermediate steps are objects, setting the end of the path to the given value.
     pub fn set_value(&self, fields: &mut HashMap<String, Value>, new_value: Value) {
         self.transform_value(fields, |_| new_value);
     }
 
+    /// Walk the path as represented by this [`FieldPath`] into the given object and takes the value
+    /// that is found at the end of the path if any. Also returns [`None`] if any intermediate
+    /// value was absent or not an object.
     pub fn delete_value(&self, fields: &mut HashMap<String, Value>) -> Option<Value> {
         match &self.0[..] {
             [] => unreachable!(),
@@ -100,6 +110,9 @@ impl FieldPath {
         }
     }
 
+    /// Walk the path as represented by this [`FieldPath`] into the given object and transform the
+    /// value that is found at the end of the path (if any) using the given function. Returns a
+    /// reference to the transformed value.
     pub fn transform_value<'a>(
         &self,
         fields: &'a mut HashMap<String, Value>,
@@ -144,7 +157,7 @@ impl FromStr for FieldPath {
                 "invalid empty field path",
             ));
         }
-        Ok(Self(parse_field_path(path)?))
+        parse_field_path(path).map(Self)
     }
 }
 
@@ -155,57 +168,134 @@ impl Display for FieldPath {
 }
 
 fn parse_field_path(path: &str) -> Result<Vec<String>> {
-    let mut elements = vec![];
-    let mut cur_element = String::new();
-    let mut iter = path.chars();
-    let mut inside_backticks = false;
-    while let Some(ch) = iter.next() {
-        if inside_backticks {
-            match ch {
-                '`' => {
-                    inside_backticks = false;
-                    if !matches!(iter.next(), Some('.') | None) {
-                        return Err(GenericDatabaseError::invalid_argument(format!(
-                            "invalid field path: {path}"
-                        )));
+    let mut iter = path.chars().enumerate().peekable();
+    let mut segments = vec![];
+    'next_segment: loop {
+        // I'm not sure if empty segments are used like this, but this is what they would mean if
+        // they were, I think.
+        while iter.peeking_next(|&(_, ch)| ch == '.').is_some() {
+            segments.push("".to_string());
+        }
+
+        let Some((start_pos, first_ch)) = iter.next() else {
+            // When we enter the loop or after a `.` we explicitly expect another element, so if we
+            // don't find any, we assume a single empty segment.
+            segments.push("".to_string());
+            return Ok(segments);
+        };
+
+        match first_ch {
+            // Two possibilities, either the segment begins with a backtick with possibility to
+            // escape, or it doesn't and we are sure we don't need to unescape.
+            '`' => {
+                let mut segment = String::new();
+                while let Some((_, ch)) = iter.next() {
+                    match ch {
+                        // We expect only complete elements to be escaped with backticks,
+                        // partial escaping (e.g. "ab`cd`ef") should not occur. This is checked
+                        // here.
+                        // Normally, we would be as lenient as possible when parsing input, but in
+                        // this case, this is particularly important, because of the following bug:
+                        // https://github.com/googleapis/nodejs-firestore/issues/2019
+                        // which may result in wrong paths because of incorrect escaping in
+                        // the Firestore SDK.
+                        '`' => {
+                            segments.push(segment);
+                            match iter.next() {
+                                None => return Ok(segments),
+                                Some((_, '.')) => continue 'next_segment,
+                                Some((pos, ch)) => {
+                                    return Err(GenericDatabaseError::invalid_argument(format!(
+                                        r"unexpected character {ch:?} after '`' in pos {pos} of field path: {path:?}"
+                                    )));
+                                }
+                            }
+                        }
+                        '\\' => {
+                            // Unconditionally add the next character if we can find it. Complain if
+                            // we can't.
+                            match iter.next() {
+                                Some((_, ch)) => segment.push(ch),
+                                None => {
+                                    return Err(GenericDatabaseError::invalid_argument(format!(
+                                        r"unexpected end after '\' in field path: {path:?}"
+                                    )));
+                                }
+                            }
+                        }
+                        // All other characters are simply added to the current segment.
+                        ch => segment.push(ch),
                     }
-                    elements.push(take(&mut cur_element));
                 }
-                '\\' => cur_element.push(iter.next().ok_or_else(|| {
-                    GenericDatabaseError::invalid_argument(format!("invalid field path: {path}"))
-                })?),
-                ch => cur_element.push(ch),
+                // If we get here, we've depleted the iterator before we got a closing '`'.
+                return Err(GenericDatabaseError::invalid_argument(format!(
+                    r"missing closing '`' in field path: {path:?}"
+                )));
             }
-        } else {
-            match ch {
-                '.' => elements.push(take(&mut cur_element)),
-                '`' => inside_backticks = true,
-                ch => cur_element.push(ch),
+
+            _ => {
+                let end_pos = iter
+                    .by_ref()
+                    .peeking_take_while(|&(_, ch)| ch != '.')
+                    .map(|(pos, _)| pos)
+                    .last()
+                    .unwrap_or(start_pos);
+                segments.push(path[start_pos..=end_pos].to_string());
+                // Consume the next '.' or return if we got at the end.
+                if iter.next().is_none() {
+                    return Ok(segments);
+                }
             }
         }
     }
-    if !cur_element.is_empty() {
-        elements.push(cur_element);
-    }
-    Ok(elements)
 }
 
 #[cfg(test)]
 mod tests {
-    use crate::database::field_path::parse_field_path;
+    use rstest::rstest;
 
-    #[test]
-    fn test_parse_field_path() {
-        assert_eq!(parse_field_path("a.b.c").unwrap(), ["a", "b", "c"]);
-        assert_eq!(parse_field_path("foo.x&y").unwrap(), ["foo", "x&y"]);
-        assert_eq!(parse_field_path("foo.`x&y`").unwrap(), ["foo", "x&y"]);
+    use super::*;
+    use crate::GenericDatabaseError;
+
+    #[rstest]
+    #[case("",              &[""])]
+    #[case("``",            &[""])]
+    #[case("a.b.c",         &["a", "b", "c"])]
+    #[case("a.b.c.",        &["a", "b", "c", ""])]
+    #[case("foo.x&y",       &["foo", "x&y"])]
+    #[case(r"foo.x\y",      &["foo", r"x\y"])]
+    #[case("foo.`x&y`",     &["foo", "x&y"])]
+    #[case("foo.`x&y`.",    &["foo", "x&y", ""])]
+    #[case("foo.`x&y`.``",  &["foo", "x&y", ""])]
+    #[case("a.b.c",         &["a", "b", "c"])]
+    #[case(r"`bak\`tik`.`x&y`",     &["bak`tik", "x&y"])]
+    #[case(r"`bak.\`.tik`.`x&y`",   &["bak.`.tik", "x&y"])]
+    #[case("a`b",           &["a`b"])] // Tricky case, should we allow this?
+    fn test_parse_field_path_success(#[case] input: &str, #[case] result: &[&str]) {
+        assert_eq!(parse_field_path(input).unwrap(), result);
+    }
+
+    #[rstest]
+    #[case(
+        r"`missing closing backslash",
+        r#"missing closing '`' in field path: "`missing closing backslash""#
+    )]
+    #[case(
+        r"`escaped closing backslash\`",
+        r#"missing closing '`' in field path: "`escaped closing backslash\\`""#
+    )]
+    #[case(
+        r"`unescaped `before end`",
+        r#"unexpected character 'b' after '`' in pos 12 of field path: "`unescaped `before end`""#
+    )]
+    #[case(
+        r"`end after \",
+        r#"unexpected end after '\' in field path: "`end after \\""#
+    )]
+    fn test_parse_field_path_fail(#[case] input: &str, #[case] msg: &str) {
         assert_eq!(
-            parse_field_path(r"`bak\`tik`.`x&y`").unwrap(),
-            ["bak`tik", "x&y"]
-        );
-        assert_eq!(
-            parse_field_path(r"`bak.\`.tik`.`x&y`").unwrap(),
-            ["bak.`.tik", "x&y"]
+            parse_field_path(input),
+            Err(GenericDatabaseError::invalid_argument(msg))
         );
     }
 }

@@ -2,7 +2,7 @@ use thiserror::Error;
 
 pub(crate) type Result<T, E = GenericDatabaseError> = std::result::Result<T, E>;
 
-#[derive(Debug, Error)]
+#[derive(Debug, Error, Clone, PartialEq, Eq)]
 pub enum GenericDatabaseError {
     /// The operation was aborted, typically due to a concurrency issue like sequencer check
     /// failures, transaction aborts, etc.
