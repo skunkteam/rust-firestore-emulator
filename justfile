@@ -1,3 +1,14 @@
+# Usage:
+# Most recipes can re-run automatically on file change by prepending "watch" to the command. For example: `just lint` runs linting once, `just watch lint` runs linting on file change.
+# Some commands:
+# just                          - Run test and linting once
+# just watch                    - Watch test and lint, re-run on filechange
+# just [watch] test [crate]     - Run tests on workspace or the specified crate, e.g. `just test` or `just watch test emulator-tracing`
+# just [watch] lint [crate]     - Run linting on workspace or the specified crate
+# just [watch] clean            - Clean the repo, removing all compiled and generated artifacts
+# just [watch] run [args..]     - Run the application, passing the provided args to `cargo run`
+# just [watch] build [args..]   - Build the application, passing the provided args to `cargo build`
+
 set quiet
 
 # Default action is to test and lint once.
@@ -23,6 +34,7 @@ doctest target: (
     }
 )
 
+# Trick to be able to use `if` statement for conditional execution above
 [private]
 exec +cmd:
     {{ cmd }}

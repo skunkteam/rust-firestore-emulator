@@ -12,7 +12,7 @@ ctreg = { workspace = true }
 itertools = { workspace = true }
 once_cell = { workspace = true }
 thiserror = { workspace = true }
-time = { workspace = true }
+time = { workspace = true, features = ["macros"] }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true, features = [
     "local-time",
