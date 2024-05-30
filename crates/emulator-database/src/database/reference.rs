@@ -12,8 +12,8 @@ use crate::GenericDatabaseError;
 /// # Examples
 ///
 /// ```
-/// # use firestore_database::reference::*;
-/// # use firestore_database::*;
+/// # use emulator_database::reference::*;
+/// # use emulator_database::*;
 /// # fn main() -> Result<(), GenericDatabaseError> {
 /// assert_eq!(
 ///     "projects/my-project/databases/my-database".parse::<Ref>()?,
@@ -82,8 +82,8 @@ impl Ref {
     /// # Examples
     ///
     /// ```
-    /// # use firestore_database::reference::*;
-    /// # use firestore_database::*;
+    /// # use emulator_database::reference::*;
+    /// # use emulator_database::*;
     /// # fn main() -> Result<(), GenericDatabaseError> {
     /// let root: Ref = "projects/p/databases/d/documents".parse()?;
     /// let collection: Ref = "projects/p/databases/d/documents/collection".parse()?;
@@ -291,8 +291,8 @@ impl CollectionRef {
     /// # Examples
     ///
     /// ```
-    /// # use firestore_database::reference::*;
-    /// # use firestore_database::*;
+    /// # use emulator_database::reference::*;
+    /// # use emulator_database::*;
     /// # fn main() -> Result<(), GenericDatabaseError> {
     /// let parent: Ref = "projects/p/databases/d/documents/parent".parse()?;
     /// let child: CollectionRef = "projects/p/databases/d/documents/parent/doc/child".parse()?;
@@ -315,8 +315,8 @@ impl CollectionRef {
     /// # Examples
     ///
     /// ```
-    /// # use firestore_database::reference::*;
-    /// # use firestore_database::*;
+    /// # use emulator_database::reference::*;
+    /// # use emulator_database::*;
     /// # fn main() -> Result<(), GenericDatabaseError> {
     /// let parent: RootRef = "projects/p/databases/d/documents".parse()?;
     /// let child: CollectionRef = "projects/p/databases/d/documents/parent/doc/child".parse()?;
@@ -335,8 +335,8 @@ impl CollectionRef {
     /// # Examples
     ///
     /// ```
-    /// # use firestore_database::reference::*;
-    /// # use firestore_database::*;
+    /// # use emulator_database::reference::*;
+    /// # use emulator_database::*;
     /// # fn main() -> Result<(), GenericDatabaseError> {
     /// let parent: CollectionRef = "projects/p/databases/d/documents/parent".parse()?;
     /// let child: CollectionRef = "projects/p/databases/d/documents/parent/doc/child".parse()?;
@@ -359,8 +359,8 @@ impl CollectionRef {
     /// # Examples
     ///
     /// ```
-    /// # use firestore_database::reference::*;
-    /// # use firestore_database::*;
+    /// # use emulator_database::reference::*;
+    /// # use emulator_database::*;
     /// # fn main() -> Result<(), GenericDatabaseError> {
     /// let parent: DocumentRef = "projects/p/databases/d/documents/parent/doc".parse()?;
     /// let child: CollectionRef = "projects/p/databases/d/documents/parent/doc/child".parse()?;
@@ -381,8 +381,8 @@ impl CollectionRef {
     /// # Examples
     ///
     /// ```
-    /// # use firestore_database::reference::*;
-    /// # use firestore_database::*;
+    /// # use emulator_database::reference::*;
+    /// # use emulator_database::*;
     /// # fn main() -> Result<(), GenericDatabaseError> {
     /// let collection: CollectionRef = "projects/p/databases/d/documents/parent/doc/child".parse()?;
     /// let parent: Ref = "projects/p/databases/d/documents/parent/doc".parse()?;

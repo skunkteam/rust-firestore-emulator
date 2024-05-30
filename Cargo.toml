@@ -72,10 +72,10 @@ blocks_in_conditions = "allow"
 axum = { workspace = true }
 clap = { workspace = true, features = ["derive", "env"] }
 color-eyre = { workspace = true }
+emulator-database = { path = "crates/emulator-database" }
 emulator-grpc = { path = "crates/emulator-grpc" }
 emulator-http = { path = "crates/emulator-http" }
 emulator-tracing = { path = "crates/emulator-tracing" }
-firestore-database = { path = "crates/firestore-database" }
 hybrid-axum-tonic = { path = "crates/hybrid-axum-tonic" }
 tikv-jemallocator = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "signal"] }

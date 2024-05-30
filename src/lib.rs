@@ -1,8 +1,8 @@
 use std::{future::Future, net::SocketAddr};
 
 use axum::Router;
+use emulator_database::FirestoreProject;
 use emulator_tracing::Tracing;
-use firestore_database::FirestoreProject;
 use hybrid_axum_tonic::{NestTonic, RestGrpcService};
 use tracing::{enabled, info, Level};
 

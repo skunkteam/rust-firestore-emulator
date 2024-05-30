@@ -1,8 +1,8 @@
 use std::net::SocketAddr;
 
 use clap::Parser;
+use emulator_database::{FirestoreConfig, FirestoreProject};
 use emulator_tracing::DefaultTracing;
-use firestore_database::{FirestoreConfig, FirestoreProject};
 use firestore_emulator::run;
 use tikv_jemallocator::Jemalloc;
 use tokio::signal::ctrl_c;

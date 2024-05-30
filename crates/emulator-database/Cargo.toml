@@ -1,5 +1,5 @@
 [package]
-name = "firestore-database"
+name = "emulator-database"
 version = { workspace = true }
 edition = "2021"
 
