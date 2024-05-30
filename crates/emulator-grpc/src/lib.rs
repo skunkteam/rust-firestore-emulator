@@ -53,10 +53,12 @@ const MAX_MESSAGE_SIZE: usize = 50 * 1024 * 1024;
 ///
 /// let service = emulator_grpc::service(project);
 ///
-/// Server::builder()
+/// let server = Server::builder()
 ///     .add_service(service)
-///     .serve("[::1]:0".parse()?)
-///     .await?;
+///     .serve("[::1]:0".parse()?);
+///
+/// // Spawn task or await using: `server.await?;`
+/// tokio::spawn(server);
 /// # Ok(())
 /// # }
 /// ```
