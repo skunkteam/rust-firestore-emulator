@@ -1,6 +1,6 @@
 use std::{mem, sync::Arc};
 
-use firestore_database::{
+use emulator_database::{
     event::DatabaseEvent,
     get_doc_name_from_write,
     projection::{Project, Projection},
