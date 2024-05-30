@@ -2,7 +2,7 @@ use axum::{
     http::StatusCode,
     response::{IntoResponse, Response},
 };
-use firestore_database::GenericDatabaseError;
+use emulator_database::GenericDatabaseError;
 
 pub(crate) type Result<T, E = RestError> = std::result::Result<T, E>;
 

@@ -588,10 +588,29 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3dca9240753cf90908d7e4aac30f630662b02aebaa1b58a3cadabdb23385b58b"
 
 [[package]]
+name = "emulator-database"
+version = "0.0.6"
+dependencies = [
+ "async-trait",
+ "futures",
+ "googleapis",
+ "itertools 0.13.0",
+ "rstest",
+ "serde",
+ "serde_with",
+ "string_cache",
+ "thiserror",
+ "tokio",
+ "tokio-stream",
+ "tonic 0.11.0",
+ "tracing",
+]
+
+[[package]]
 name = "emulator-grpc"
 version = "0.0.6"
 dependencies = [
- "firestore-database",
+ "emulator-database",
  "futures",
  "googleapis",
  "itertools 0.13.0",
@@ -606,8 +625,8 @@ name = "emulator-http"
 version = "0.0.6"
 dependencies = [
  "axum",
+ "emulator-database",
  "emulator-tracing",
- "firestore-database",
  "serde_json",
  "tokio",
  "tower-http",
@@ -661,35 +680,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9fc0510504f03c51ada170672ac806f1f105a88aa97a5281117e1ddc3368e51a"
 
 [[package]]
-name = "firestore-database"
-version = "0.0.6"
-dependencies = [
- "async-trait",
- "futures",
- "googleapis",
- "itertools 0.13.0",
- "rstest",
- "serde",
- "serde_with",
- "string_cache",
- "thiserror",
- "tokio",
- "tokio-stream",
- "tonic 0.11.0",
- "tracing",
-]
-
-[[package]]
 name = "firestore-emulator"
 version = "0.0.6"
 dependencies = [
  "axum",
  "clap",
  "color-eyre",
+ "emulator-database",
  "emulator-grpc",
  "emulator-http",
  "emulator-tracing",
- "firestore-database",
  "hybrid-axum-tonic",
  "tikv-jemallocator",
  "tokio",

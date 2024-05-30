@@ -1,8 +1,8 @@
 #[cfg(feature = "ui")]
 use axum::{http::header, response::Html};
 use axum::{routing::get, Router};
+use emulator_database::FirestoreProject;
 use emulator_tracing::Tracing;
-use firestore_database::FirestoreProject;
 
 mod emulator;
 mod logging;
