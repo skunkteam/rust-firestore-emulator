@@ -49,7 +49,7 @@ macro_rules! mandatory {
 /// received inside a stream is not retried, this reduces the time of a single test in our
 /// test-suite from 7s to 3ms.
 ///
-/// The returned Result never fails.
+/// The returned Result never fails, all errors are reported inside the stream.
 pub(crate) async fn error_in_stream<T, F, S>(
     stream: F,
 ) -> Result<Response<BoxStream<'static, Result<T>>>>
