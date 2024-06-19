@@ -14,12 +14,12 @@ pub trait NestTonic: Sized {
                 Request<hyper::Body>,
                 Error = Infallible,
                 Response = hyper::Response<tonic::body::BoxBody>,
+                Future: Send + 'static + Unpin,
             >
             + Clone
             + Send
             + 'static
-            + NamedService,
-        S::Future: Send + 'static + Unpin;
+            + NamedService;
 }
 
 impl NestTonic for Router {
@@ -29,12 +29,12 @@ impl NestTonic for Router {
                 Request<hyper::Body>,
                 Error = Infallible,
                 Response = hyper::Response<tonic::body::BoxBody>,
+                Future: Send + 'static + Unpin,
             >
             + Clone
             + Send
             + 'static
             + NamedService,
-        S::Future: Send + 'static + Unpin,
     {
         // Nest it at /S::NAME, and wrap the service in an AxumTonicService
         self.route(
@@ -56,8 +56,12 @@ struct AxumTonicService<S> {
 
 impl<B, S> Service<Request<B>> for AxumTonicService<S>
 where
-    S: Service<Request<B>, Error = Infallible, Response = hyper::Response<tonic::body::BoxBody>>,
-    S::Future: Unpin,
+    S: Service<
+            Request<B>,
+            Error = Infallible,
+            Response = hyper::Response<tonic::body::BoxBody>,
+            Future: Unpin,
+        >,
 {
     type Response = axum::response::Response;
     type Error = Infallible;

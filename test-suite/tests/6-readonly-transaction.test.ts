@@ -58,15 +58,8 @@ describe('readonly transactions', () => {
             { readOnly: true },
         );
 
-        if (fs.connection === 'JAVA EMULATOR') {
-            // Java Firestore Emulator allows writing in read-only transactions.
-            await expect(txnPromise).resolves.toBeUndefined();
-            const snaps = await Promise.all(refs.map(ref => ref.get()));
-            const docs = snaps.map(s => fs.readData(s.data()));
-            expect(docs).toEqual([expect.objectContaining({ broken: true }), expect.objectContaining({ broken: true })]);
-        } else {
-            await expect(txnPromise).rejects.toThrow('INVALID_ARGUMENT: Cannot modify entities in a read-only transaction');
-        }
+        // The server reports: 'INVALID_ARGUMENT: Cannot modify entities in a read-only transaction', but this is now checked client-side.
+        await expect(txnPromise).rejects.toThrow('Firestore read-only transactions cannot execute writes');
     });
 
     test.concurrent('with specific read-time', async () => {

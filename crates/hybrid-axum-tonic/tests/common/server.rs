@@ -7,8 +7,8 @@ use crate::common::proto::{test1_server::*, test2_server::*, *};
 
 pub struct Test1Service {
     pub state: Mutex<u32>,
-    pub str:   String,
 }
+
 #[async_trait]
 impl Test1 for Test1Service {
     async fn test1(

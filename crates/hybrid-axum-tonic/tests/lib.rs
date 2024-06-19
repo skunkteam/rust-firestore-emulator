@@ -32,7 +32,6 @@ async fn test_hybrid() {
     let grpc_router1 = Router::new()
         .nest_tonic(Test1Server::new(Test1Service {
             state: Mutex::new(10),
-            str:   String::new(),
         }))
         .layer(from_fn(do_nothing));
 
