@@ -354,37 +354,13 @@ impl Query {
                     }));
             }
 
-            // Validate order_by versus inequality field
-            match filter.get_inequality_fields().unique().at_most_one() {
-                Err(mut fields) => {
-                    return Err(GenericDatabaseError::invalid_argument(format!(
-                        "Cannot have inequality filters on multiple properties: [{}]",
-                        fields.join(", ")
-                    )));
-                }
-                Ok(Some(inequality_field)) => {
-                    if let Some(first_order_by) = self.order_by.first() {
-                        if first_order_by.field != *inequality_field {
-                            return Err(GenericDatabaseError::invalid_argument(format!(
-                                "inequality filter property and first sort order must be the \
-                                 same: {inequality_field} and {}",
-                                first_order_by.field
-                            )));
-                        }
-                    }
-                }
-                Ok(None) => (),
-            }
             filter
                 .field_filters()
                 .filter(|f| f.op.is_array_contains())
                 .at_most_one()
                 .map_err(|_| {
-                    // TODO: Error message from cloud read: "A maximum of 1 'ARRAY_CONTAINS' filter
-                    // is allowed per disjunction." Should change message after
-                    // we add support for disjunctions.
                     GenericDatabaseError::invalid_argument(
-                        "Only a single array-contains clause is allowed in a query",
+                        "A maximum of 1 'ARRAY_CONTAINS' filter is allowed per disjunction.",
                     )
                 })?;
         }

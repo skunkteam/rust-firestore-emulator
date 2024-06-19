@@ -1,4 +1,4 @@
-import { differenceWith, isEqual, omit, orderBy, reverse, uniq } from 'lodash';
+import { differenceWith, isEqual, omit, orderBy, reverse, sortedUniq, uniq } from 'lodash';
 import { fs } from './utils';
 
 interface Data {
@@ -180,15 +180,55 @@ describe.each([
             expect(secondResult).toEqual(result);
         });
 
-        test('cannot order by a different field than the queried inequality', async () => {
-            await expect(collection.where('type', '>', 'z').orderBy('ordered').get()).rejects.toThrow(
-                '3 INVALID_ARGUMENT: inequality filter property and first sort order must be the same: type and ordered',
-            );
+        test('can apply arbitrary order-by clauses (that also filter on existence because of index usage)', async () => {
+            const allResults = await getData(collection.where('type', '>', 'A'));
+            const allResultsExplicitOrderBy = await getData(collection.where('type', '>', 'A').orderBy('type'));
+            const allResultsDifferentOrderBy = await getData(collection.where('type', '>', 'A').orderBy('ordered'));
+            const allResultsDoubleOrderBy = await getData(collection.where('type', '>', 'A').orderBy('type').orderBy('ordered'));
+            const allResultsDifferentDoubleOrderBy = await getData(collection.where('type', '>', 'A').orderBy('ordered').orderBy('type'));
 
-            // The where will not match any documents, but the query should work!
-            expect(await collection.where('type', '>', 'z').orderBy('type').get()).toHaveProperty('docs', []);
-            // Ordering by another field after ordering by the inequality field should work
-            expect(await collection.where('type', '>', 'z').orderBy('type').orderBy('ordered', 'desc').get()).toHaveProperty('docs', []);
+            // implicit ordering by the inequality field if not otherwise specified:
+            expect(allResults).toStrictEqual(allResultsExplicitOrderBy);
+
+            // One result is missing from the last two queries, because one specific value has no `ordered` field.
+            expect(allResultsDifferentOrderBy).toIncludeSameMembers(without(allResults, nothing));
+            expect(allResultsDoubleOrderBy).toIncludeSameMembers(without(allResults, nothing));
+
+            // The extra ordering on the field `ordered` should have an effect on the resulting data (using another index)
+            expect(allResultsDoubleOrderBy).not.toStrictEqual(without(allResults, nothing));
+
+            // no implicit ordering, both should be the same, because the additional ordering on `type` has no effect after the ordering on
+            // the field `ordered`.
+            expect(allResultsDifferentOrderBy).toStrictEqual(allResultsDifferentDoubleOrderBy);
+
+            // Ordering on field `type` (ordering on the string value):
+            expect(sortedUniq(allResults.map(r => r.type))).toEqual([
+                'NaN',
+                'array',
+                'boolean',
+                'bytes',
+                'date',
+                ...(fs.notImplementedInRust || ['map']),
+                'none',
+                'null',
+                'number',
+                'ref',
+                'string',
+            ]);
+
+            // Ordering on the defined natural ordering between data-types:
+            expect(sortedUniq(allResultsDifferentOrderBy.map(r => r.type))).toEqual([
+                'null',
+                'boolean',
+                'NaN',
+                'number',
+                'date',
+                'string',
+                'bytes',
+                'ref',
+                'array',
+                ...(fs.notImplementedInRust || ['map']),
+            ]);
         });
 
         describe('implicitly filter by Type', () => {
@@ -265,12 +305,9 @@ describe.each([
             });
         });
 
-        test('multiple inequalities (should not be possible)', async () => {
-            // Workaround for bug in FieldPath: https://github.com/googleapis/nodejs-firestore/issues/2019
-            const path = new fs.exported.FieldPath('tbd');
-            Object.defineProperty(path, 'formattedName', { value: '`\\`backticks\\``.nested' });
-            await expect(getData(collection.where(path, '!=', 'data').where('type', '>', 0))).rejects.toThrow(
-                '3 INVALID_ARGUMENT: Cannot have inequality filters on multiple properties: [`backticks`.nested, type]',
+        test('multiple inequalities', async () => {
+            expect(await getData(collection.where('type', '!=', 'none').where('ordered', '>', 0))).toStrictEqual(
+                testData.filter(d => d.type === 'number' && (d.ordered as number) > 0),
             );
         });
 
@@ -280,7 +317,7 @@ describe.each([
             Object.defineProperty(path, 'formattedName', { value: '`\\`backticks\\``.nested' });
             await expect(
                 getData(collection.where(path, 'array-contains', 'data').where('type', 'array-contains-any', [1, 2])),
-            ).rejects.toThrow('Only a single array-contains clause is allowed in a query');
+            ).rejects.toThrow("3 INVALID_ARGUMENT: A maximum of 1 'ARRAY_CONTAINS' filter is allowed per disjunction.");
         });
     });
 
