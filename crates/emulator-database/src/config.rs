@@ -1,4 +1,4 @@
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Default)]
 pub struct FirestoreConfig {
     /// Enable more accurate lock timeouts.
     ///

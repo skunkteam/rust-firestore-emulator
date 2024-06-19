@@ -1,3 +1,6 @@
+//! This crate provides the service that implements the GRPC API to the emulator database. See
+//! [`service`] for usage info.
+
 use std::{mem, sync::Arc};
 
 use emulator_database::{
@@ -30,6 +33,35 @@ mod utils;
 
 const MAX_MESSAGE_SIZE: usize = 50 * 1024 * 1024;
 
+/// Instantiate a tonic service that provides the GRPC access to the given emulated Firestore
+/// database.
+///
+/// Note that the service expects a reference to the Firestore database with a static
+/// lifetime as we assume that there will only ever be one instance.
+///
+/// # Usage
+/// ```
+/// use emulator_database::{FirestoreConfig, FirestoreProject};
+/// use tonic::transport::Server;
+///
+/// # #[tokio::main(flavor = "current_thread")]
+/// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
+/// let config = FirestoreConfig::default();
+/// let project = FirestoreProject::new(config);
+/// // `service` needs a static reference to the `FirestoreProject`
+/// let project = Box::leak(Box::new(project));
+///
+/// let service = emulator_grpc::service(project);
+///
+/// let server = Server::builder()
+///     .add_service(service)
+///     .serve("[::1]:0".parse()?);
+///
+/// // Spawn task or await using: `server.await?;`
+/// tokio::spawn(server);
+/// # Ok(())
+/// # }
+/// ```
 pub fn service(project: &'static FirestoreProject) -> FirestoreServer<impl Firestore> {
     FirestoreServer::new(FirestoreEmulator { project })
         .accept_compressed(CompressionEncoding::Gzip)
