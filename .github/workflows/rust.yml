@@ -111,6 +111,43 @@ jobs:
           # - https://github.com/skunkteam/rust-firestore-emulator/releases/download/<tag>/firestore-emulator.tar.gz
           files: firestore-emulator.tar.gz
 
+  deploy-arm64:
+    name: Deploy ARM64
+    needs:
+      - test
+      - fmt
+      - clippy
+      - compat-test
+    runs-on: ubuntu-24.04-arm-4core
+    if: startsWith(github.ref, 'refs/tags/v')
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: "true"
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install Protoc
+        uses: arduino/setup-protoc@v3
+      - name: Build
+        run: cargo build --release --no-default-features
+      - name: Package
+        shell: bash
+        run: |
+          cd target/release
+          tar czvf ../../firestore-emulator-arm64.tar.gz firestore-emulator
+          cd -
+      - name: Publish
+        # More info at: https://github.com/softprops/action-gh-release
+        uses: softprops/action-gh-release@v2
+        with:
+          # Will be accessible at:
+          # - https://github.com/skunkteam/rust-firestore-emulator/releases/latest/download/firestore-emulator-arm64.tar.gz
+          # - https://github.com/skunkteam/rust-firestore-emulator/releases/download/<tag>/firestore-emulator-arm64.tar.gz
+          files: firestore-emulator-arm64.tar.gz
+
   # coverage:
   #   name: Code coverage
   #   runs-on: ubuntu-latest
