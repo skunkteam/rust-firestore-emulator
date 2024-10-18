@@ -304,7 +304,7 @@ impl Listener {
     }
 
     #[instrument(level = Level::DEBUG, skip_all, err)]
-    async fn set_query(&mut self, database: &FirestoreDatabase, query: Query) -> Result<()> {
+    async fn set_query(&mut self, database: &FirestoreDatabase, query: Box<Query>) -> Result<()> {
         // We rely on the fact that this function will complete before any other events are
         // processed. That's why we know for sure that the output stream is not used for
         // something else until we respond with our NO_CHANGE msg. That msg means that everything is
@@ -469,12 +469,12 @@ impl DocumentTarget {
 }
 
 struct QueryTarget {
-    query: Query,
+    query: Box<Query>,
     reset_on_update: bool,
     doctargets_by_name: HashMap<DocumentRef, DocumentTarget>,
 }
 impl QueryTarget {
-    fn new(query: Query) -> Self {
+    fn new(query: Box<Query>) -> Self {
         let reset_on_update = query.reset_on_update();
         Self {
             query,

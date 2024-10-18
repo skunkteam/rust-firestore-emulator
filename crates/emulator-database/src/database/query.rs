@@ -303,7 +303,7 @@ impl Query {
         parent: Ref,
         query: StructuredQuery,
         consistency: ReadConsistency,
-    ) -> Result<Self> {
+    ) -> Result<Box<Self>> {
         let StructuredQuery {
             select,
             from,
@@ -315,7 +315,7 @@ impl Query {
             limit,
         } = query;
 
-        let mut query = Self {
+        let mut query = Box::new(Self {
             parent,
             select: select.map(Projection::try_from).transpose()?,
             from,
@@ -327,7 +327,7 @@ impl Query {
             limit: limit.map(|v| v.value as usize),
             consistency,
             collection_cache: Default::default(),
-        };
+        });
         query.validate()?;
         Ok(query)
     }

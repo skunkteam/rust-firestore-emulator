@@ -118,8 +118,9 @@ impl FieldPath {
         fields: &'a mut HashMap<String, Value>,
         transform: impl FnOnce(Option<Value>) -> Value,
     ) -> &'a Value {
-        self.try_transform_value(fields, |val| Ok(transform(val)) as Result<_, Infallible>)
-            .unwrap()
+        let Ok(value) =
+            self.try_transform_value(fields, |val| Ok(transform(val)) as Result<_, Infallible>);
+        value
     }
 
     pub fn try_transform_value<'a, E>(

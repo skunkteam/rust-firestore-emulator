@@ -57,11 +57,11 @@ struct AxumTonicService<S> {
 impl<B, S> Service<Request<B>> for AxumTonicService<S>
 where
     S: Service<
-            Request<B>,
-            Error = Infallible,
-            Response = hyper::Response<tonic::body::BoxBody>,
-            Future: Unpin,
-        >,
+        Request<B>,
+        Error = Infallible,
+        Response = hyper::Response<tonic::body::BoxBody>,
+        Future: Unpin,
+    >,
 {
     type Response = axum::response::Response;
     type Error = Infallible;

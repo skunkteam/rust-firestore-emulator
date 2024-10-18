@@ -3,6 +3,7 @@ name = "firestore-emulator"
 description = "Google Cloud Firestore emulator with focus on stability"
 version = { workspace = true }
 edition = "2021"
+rust-version = "1.82"
 
 [features]
 default = ["ui"]
@@ -63,10 +64,6 @@ unused_crate_dependencies = "warn"
 unused_lifetimes = "warn"
 unused_macro_rules = "warn"
 unused_qualifications = "warn"
-
-[workspace.lints.clippy]
-# Until this is resolved: https://github.com/rust-lang/rust-clippy/issues/12281
-blocks_in_conditions = "allow"
 
 [dependencies]
 axum = { workspace = true }
