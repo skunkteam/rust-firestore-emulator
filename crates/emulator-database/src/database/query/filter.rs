@@ -17,7 +17,7 @@ pub enum Filter {
 }
 
 impl Filter {
-    pub fn get_inequality_fields(&self) -> impl Iterator<Item = &FieldReference> + '_ {
+    pub fn get_inequality_fields(&self) -> impl Iterator<Item = &FieldReference> {
         self.depth_first().filter_map(|f| match f {
             Filter::Composite(_) => None,
             Filter::Field(f) => f.op.is_inequality().then_some(&f.field),
@@ -25,7 +25,7 @@ impl Filter {
         })
     }
 
-    pub fn field_filters(&self) -> impl Iterator<Item = &FieldFilter> + '_ {
+    pub fn field_filters(&self) -> impl Iterator<Item = &FieldFilter> {
         self.depth_first().filter_map(Filter::as_field)
     }
 

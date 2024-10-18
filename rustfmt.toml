@@ -1,6 +1,3 @@
-edition = "2021"
-version = "Two"
-
 # Allow rustfmt to format our doc comments, such an awesome feature 😍
 wrap_comments = true
 comment_width = 100
