@@ -19,6 +19,7 @@ pub async fn run(
     let grpc_router = Router::new().nest_tonic(emulator_grpc::service(project));
     let combined = RestGrpcService::new(rest_router, grpc_router).into_make_service();
     let server = axum::Server::bind(&host_port)
+        .tcp_nodelay(true)
         .serve(combined)
         .with_graceful_shutdown(shutdown);
 
