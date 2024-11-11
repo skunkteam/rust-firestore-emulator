@@ -24,7 +24,7 @@ use tracing::{debug, instrument, trace, warn, Level};
 use super::reference::DocumentRef;
 use crate::{error::Result, FirestoreProject, GenericDatabaseError};
 
-pub struct DocumentMeta {
+pub(crate) struct DocumentMeta {
     project: &'static FirestoreProject,
     /// The resource name of the document, for example
     /// `projects/{project_id}/databases/{database_id}/documents/{document_path}`.
@@ -42,7 +42,7 @@ impl Debug for DocumentMeta {
 }
 
 impl DocumentMeta {
-    pub fn new(project: &'static FirestoreProject, name: DocumentRef) -> Self {
+    pub(crate) fn new(project: &'static FirestoreProject, name: DocumentRef) -> Self {
         Self {
             project,
             contents: Arc::new(RwLock::new(DocumentContents::new(name.clone()))),
@@ -51,14 +51,14 @@ impl DocumentMeta {
         }
     }
 
-    pub async fn read(&self) -> Result<DocumentContentsReadGuard> {
+    pub(crate) async fn read(&self) -> Result<DocumentContentsReadGuard> {
         lock_timeout(self.contents.read(), self.project.timeouts.read, || {
             format!("read lock for {}", self.name)
         })
         .await
     }
 
-    pub async fn read_owned(self: &Arc<Self>) -> Result<OwnedDocumentContentsReadGuard> {
+    pub(crate) async fn read_owned(self: &Arc<Self>) -> Result<OwnedDocumentContentsReadGuard> {
         let (mut tx, rx) = oneshot::channel();
 
         let write_permit_shop = Arc::clone(&self.write_permit_shop);
@@ -225,7 +225,7 @@ impl DocumentContents {
 pub(crate) type DocumentContentsReadGuard<'a> = RwLockReadGuard<'a, DocumentContents>;
 
 #[derive(Debug)]
-pub struct OwnedDocumentContentsReadGuard {
+pub(crate) struct OwnedDocumentContentsReadGuard {
     project: &'static FirestoreProject,
     meta: Arc<DocumentMeta>,
     guard: OwnedRwLockReadGuard<DocumentContents>,

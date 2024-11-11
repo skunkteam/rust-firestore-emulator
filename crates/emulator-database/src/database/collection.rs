@@ -11,7 +11,7 @@ use super::{
 use crate::{error::Result, utils::RwLockHashMapExt, FirestoreProject};
 
 #[derive(Debug)]
-pub struct Collection {
+pub(crate) struct Collection {
     project:   &'static FirestoreProject,
     pub name:  CollectionRef,
     documents: RwLock<HashMap<DefaultAtom, Arc<DocumentMeta>>>,
@@ -27,7 +27,7 @@ impl Collection {
         }
     }
 
-    pub async fn get_doc(self: &Arc<Self>, name: &DocumentRef) -> Arc<DocumentMeta> {
+    pub(crate) async fn get_doc(self: &Arc<Self>, name: &DocumentRef) -> Arc<DocumentMeta> {
         debug_assert_eq!(self.name, name.collection_ref);
         Arc::clone(
             self.documents
@@ -40,12 +40,12 @@ impl Collection {
     }
 
     /// Get all documents in an allocated Vec, not using Iterator to keep the lock time minimal.
-    pub async fn docs(&self) -> Vec<Arc<DocumentMeta>> {
+    pub(crate) async fn docs(&self) -> Vec<Arc<DocumentMeta>> {
         self.documents.read().await.values().cloned().collect()
     }
 
     /// Checks if this collection has a document with a current version.
-    pub async fn has_doc(&self) -> Result<bool> {
+    pub(crate) async fn has_doc(&self) -> Result<bool> {
         for doc in self.documents.read().await.values() {
             if doc.read().await?.exists() {
                 return Ok(true);

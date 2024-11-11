@@ -168,9 +168,9 @@ impl FirestoreDatabase {
         Ok(result)
     }
 
-    /// Get all the document IDs that reside directly under the given parent. This differs from
-    /// [`Collection::docs`] in that this also includes empty documents with nested collections.
-    /// This means that:
+    /// Get all the document IDs that reside directly under the given parent.
+    /// This also includes empty documents with nested collections. This means
+    /// that:
     /// - the IDs will not contain a `/`
     /// - IDs may point to documents that do not exist.
     #[instrument(level = Level::DEBUG, skip_all)]
@@ -194,7 +194,7 @@ impl FirestoreDatabase {
 
     /// Get all collections asap collected into a [`Vec`] in order to keep the read lock time
     /// minimal.
-    pub async fn get_all_collections(&self) -> Vec<Arc<Collection>> {
+    async fn get_all_collections(&self) -> Vec<Arc<Collection>> {
         self.collections
             .read()
             .await
