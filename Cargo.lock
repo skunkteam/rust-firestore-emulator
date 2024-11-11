@@ -607,7 +607,7 @@ checksum = "60b1af1c220855b6ceac025d3f6ecdd2b7c4894bfe9cd9bda4fbb4bc7c0d4cf0"
 
 [[package]]
 name = "emulator-database"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "async-trait",
  "futures",
@@ -626,7 +626,7 @@ dependencies = [
 
 [[package]]
 name = "emulator-grpc"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "emulator-database",
  "futures",
@@ -640,7 +640,7 @@ dependencies = [
 
 [[package]]
 name = "emulator-http"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "axum",
  "emulator-database",
@@ -653,7 +653,7 @@ dependencies = [
 
 [[package]]
 name = "emulator-tracing"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "console-subscriber",
  "ctreg",
@@ -699,7 +699,7 @@ checksum = "486f806e73c5707928240ddc295403b1b93c96a02038563881c4a2fd84b81ac4"
 
 [[package]]
 name = "firestore-emulator"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "axum",
  "clap",
@@ -875,7 +875,7 @@ checksum = "d2fabcfbdc87f4758337ca535fb41a6d701b65693ce38287d856d1674551ec9b"
 
 [[package]]
 name = "googleapis"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "itertools 0.13.0",
  "prost",
@@ -997,7 +997,7 @@ checksum = "9a3a5bfb195931eeb336b2a7b4d761daec841b97f947d34394601737a7bba5e4"
 
 [[package]]
 name = "hybrid-axum-tonic"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "axum",
  "futures",
