@@ -270,9 +270,7 @@ impl Listener {
 
         // Only send if newer than the resume_token
         let send_initial = match &send_if_newer_than {
-            Some(previous_time) => !doc
-                .as_ref()
-                .is_some_and(|v| (&v.update_time) <= (previous_time)),
+            Some(previous_time) => doc.as_ref().is_none_or(|v| &v.update_time > previous_time),
             _ => true,
         };
 
