@@ -13,6 +13,9 @@ fn main() {
             "#[derive(serde::Serialize)]",
         )
         .message_attribute(".google.firestore.v1.Value", "#[derive(serde::Serialize)]")
+        .message_attribute(".google.firestore.v1.Value", "#[serde(transparent)]")
+        .enum_attribute(".google.firestore.v1.Value", "#[derive(serde::Serialize)]")
+        .enum_attribute(".google.firestore.v1.Value", "#[serde(untagged)]")
         .message_attribute(
             ".google.firestore.v1.ArrayValue",
             "#[derive(serde::Serialize)]",
@@ -21,7 +24,6 @@ fn main() {
             ".google.firestore.v1.MapValue",
             "#[derive(serde::Serialize)]",
         )
-        .enum_attribute(".google.firestore.v1.Value", "#[derive(serde::Serialize)]")
         .compile(
             &["include/google/firestore/v1/firestore.proto"],
             &["include"],
