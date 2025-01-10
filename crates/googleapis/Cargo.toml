@@ -7,10 +7,12 @@ edition = "2021"
 doctest = false
 
 [dependencies]
-time = { workspace = true, features = ["formatting", "macros"] }
+base64 = { workspace = true }
+bytes = { workspace = true }
 prost = { workspace = true }
 serde = { workspace = true, features = ["serde_derive"] }
 thiserror = { workspace = true }
+time = { workspace = true, features = ["formatting", "macros"] }
 tonic = { workspace = true }
 
 [build-dependencies]
