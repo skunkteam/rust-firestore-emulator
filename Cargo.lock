@@ -878,11 +878,11 @@ name = "googleapis"
 version = "0.1.2"
 dependencies = [
  "base64 0.22.1",
- "bytes",
  "itertools 0.13.0",
  "prost",
  "rstest",
  "serde",
+ "serde_json",
  "thiserror",
  "time",
  "tonic",

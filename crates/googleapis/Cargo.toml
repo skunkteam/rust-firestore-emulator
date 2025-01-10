@@ -8,7 +8,6 @@ doctest = false
 
 [dependencies]
 base64 = { workspace = true }
-bytes = { workspace = true }
 prost = { workspace = true }
 serde = { workspace = true, features = ["serde_derive"] }
 thiserror = { workspace = true }
@@ -21,6 +20,7 @@ tonic-build = { workspace = true }
 [dev-dependencies]
 itertools = { workspace = true }
 rstest = { workspace = true }
+serde_json = { workspace = true }
 
 # Do not use workspace lints here, because generated code is not that clean.
 [lints.rust]
