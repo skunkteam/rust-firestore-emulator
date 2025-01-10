@@ -26,7 +26,11 @@ fn main() {
         .enum_attribute(".google.firestore.v1.Value", "#[serde(untagged)]")
         .field_attribute(
             "bytes_value",
-            r#"#[serde(serialize_with="crate::bytes_base64::serialize")]"#,
+            r#"#[serde(serialize_with="crate::ser::as_base64")]"#,
+        )
+        .field_attribute(
+            "value_type.null_value",
+            r#"#[serde(serialize_with="crate::ser::as_null")]"#,
         )
         .compile(
             &["include/google/firestore/v1/firestore.proto"],

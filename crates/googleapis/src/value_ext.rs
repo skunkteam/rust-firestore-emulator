@@ -266,14 +266,13 @@ impl PartialOrd for LatLng {
 const REFERENCE_NAME_MIN_ID: &str = "__id-9223372036854775808__";
 
 fn prep_ref_for_cmp(path: &str) -> Cow<str> {
-    (|| -> Option<Cow<str>> {
+    (|| {
         let path = path.strip_suffix(REFERENCE_NAME_MIN_ID)?;
         let collection = path.strip_suffix('/')?;
-        let result = match collection.strip_suffix('\0') {
-            Some(collection) => Cow::Owned(collection.to_string() + "@"),
-            None => Cow::Borrowed(path),
-        };
-        Some(result)
+        match collection.strip_suffix('\0') {
+            Some(collection) => Some(Cow::Owned(collection.to_string() + "@")),
+            None => Some(Cow::Borrowed(path)),
+        }
     })()
     .unwrap_or(Cow::Borrowed(path))
 }
