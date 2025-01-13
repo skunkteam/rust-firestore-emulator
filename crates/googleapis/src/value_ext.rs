@@ -1,5 +1,7 @@
 use std::{borrow::Cow, cmp, collections::HashMap, iter::Sum, ops::Add};
 
+use prost::bytes::Bytes;
+
 use crate::google::{
     firestore::v1::{value::ValueType, ArrayValue, MapValue, Value},
     protobuf::Timestamp,
@@ -46,6 +48,12 @@ impl Value {
     pub fn timestamp(value: Timestamp) -> Self {
         Self {
             value_type: Some(ValueType::TimestampValue(value)),
+        }
+    }
+
+    pub fn bytes(value: impl Into<Bytes>) -> Self {
+        Self {
+            value_type: Some(ValueType::BytesValue(value.into())),
         }
     }
 
