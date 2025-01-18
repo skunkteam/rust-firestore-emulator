@@ -19,7 +19,7 @@ use super::{
     reference::{CollectionRef, Ref},
     FirestoreDatabase,
 };
-use crate::{error::Result, reference::DocumentRef, GenericDatabaseError};
+use crate::{error::Result, reference::DocumentRef, unimplemented_option, GenericDatabaseError};
 
 mod filter;
 
@@ -313,7 +313,10 @@ impl Query {
             end_at,
             offset,
             limit,
+            find_nearest,
         } = query;
+
+        unimplemented_option!(find_nearest);
 
         let mut query = Box::new(Self {
             parent,
