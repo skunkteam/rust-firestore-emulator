@@ -5,7 +5,10 @@ use std::{
     sync::Arc,
 };
 
-use googleapis::google::firestore::v1::{structured_query::CollectionSelector, *};
+use googleapis::google::firestore::v1::{
+    structured_query::{self, CollectionSelector},
+    Cursor, Document, StructuredQuery,
+};
 use itertools::Itertools;
 use string_cache::DefaultAtom;
 
@@ -614,7 +617,7 @@ impl TryFrom<structured_query::Order> for Order {
                 .ok_or_else(|| GenericDatabaseError::invalid_argument("order_by without field"))?
                 .field_path
                 .parse()?,
-            direction: value.direction().try_into()?,
+            direction: value.direction().into(),
         })
     }
 }
@@ -625,16 +628,12 @@ pub enum Direction {
     Descending,
 }
 
-impl TryFrom<structured_query::Direction> for Direction {
-    type Error = GenericDatabaseError;
-
-    fn try_from(value: structured_query::Direction) -> std::prelude::v1::Result<Self, Self::Error> {
+impl From<structured_query::Direction> for Direction {
+    fn from(value: structured_query::Direction) -> Self {
         match value {
-            structured_query::Direction::Unspecified => Err(
-                GenericDatabaseError::invalid_argument("Invalid structured_query::Direction"),
-            ),
-            structured_query::Direction::Ascending => Ok(Direction::Ascending),
-            structured_query::Direction::Descending => Ok(Direction::Descending),
+            structured_query::Direction::Unspecified => Direction::Ascending,
+            structured_query::Direction::Ascending => Direction::Ascending,
+            structured_query::Direction::Descending => Direction::Descending,
         }
     }
 }
