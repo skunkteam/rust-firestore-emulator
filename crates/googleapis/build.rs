@@ -4,10 +4,10 @@ fn main() {
         .include_file("googleapis.rs")
         .compile_well_known_types(true)
         .bytes(["bytes_value"])
-        .type_attribute(".google.type.LatLng", "#[derive(serde::Serialize, Copy)]")
+        .type_attribute(".google.type.LatLng", "#[derive(serde::Serialize)]")
         .type_attribute(
             ".google.protobuf.Timestamp",
-            "#[derive(Eq, PartialOrd, Ord, serde::Serialize, Copy)]",
+            "#[derive(Eq, PartialOrd, Ord, serde::Serialize)]",
         )
         .type_attribute(
             ".google.firestore.v1.Document",
@@ -32,7 +32,7 @@ fn main() {
             "value_type.null_value",
             r#"#[serde(serialize_with="crate::ser::as_null")]"#,
         )
-        .compile(
+        .compile_protos(
             &["include/google/firestore/v1/firestore.proto"],
             &["include"],
         )

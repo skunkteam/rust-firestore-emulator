@@ -1,63 +1,40 @@
 mod common;
 
-use std::{net::TcpListener, sync::Mutex, time::Duration};
+use std::{sync::Mutex, time::Duration};
 
-use axum::{
-    middleware::{from_fn, Next},
-    response::Response,
-    routing::get,
-    Router,
-};
+use axum::routing::get;
 use common::{
-    proto::{
-        test1_client::Test1Client, test1_server::Test1Server, test2_client::Test2Client,
-        test2_server::Test2Server, Test1Request, Test2Request,
-    },
-    server::{Test1Service, Test2Service},
+    proto::{test1_client::Test1Client, test1_server::Test1Server, Test1Request},
+    server::Test1Service,
 };
-use hybrid_axum_tonic::{GrpcStatus, NestTonic, RestGrpcService};
-use hyper::{Request, Uri};
-use tonic::transport::Channel;
-
-async fn do_nothing<B>(req: Request<B>, next: Next<B>) -> Result<Response, GrpcStatus> {
-    Ok(next.run(req).await)
-}
-
-async fn cancel_request<B>(_req: Request<B>, _next: Next<B>) -> Result<Response, GrpcStatus> {
-    Err(tonic::Status::cancelled("Canceled").into())
-}
+use hybrid_axum_tonic::GrpcMultiplexLayer;
+use tokio::net::TcpListener;
+use tonic::transport::{server::TcpIncoming, Channel, Uri};
+use tower::ServiceExt;
 
 #[tokio::test]
 async fn test_hybrid() {
-    let grpc_router1 = Router::new()
-        .nest_tonic(Test1Server::new(Test1Service {
+    let rest = axum::Router::new()
+        .route("/", get(|| async move { "FIXED RESPONSE" }))
+        .into_service()
+        .map_response(|r| r.map(tonic::body::boxed));
+
+    let grpc = tonic::transport::Server::builder()
+        .accept_http1(true)
+        .tcp_nodelay(true)
+        .layer(GrpcMultiplexLayer::new(rest))
+        .add_service(Test1Server::new(Test1Service {
             state: Mutex::new(10),
-        }))
-        .layer(from_fn(do_nothing));
+        }));
 
-    let grpc_router2 = Router::new()
-        .nest_tonic(Test2Server::new(Test2Service))
-        .layer(from_fn(cancel_request));
-
-    let grpc_router = grpc_router1.merge(grpc_router2);
-
-    let rest_router = Router::new().nest("/", Router::new().route("/123", get(|| async move {})));
-
-    let make_service = RestGrpcService::new(rest_router, grpc_router).into_make_service();
-
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
 
     let uri: Uri = format!("http://{}", listener.local_addr().unwrap())
         .parse()
         .unwrap();
 
-    tokio::task::spawn(async move {
-        axum::Server::from_tcp(listener)
-            .unwrap()
-            .serve(make_service)
-            .await
-        // .unwrap();
-    });
+    let incoming = TcpIncoming::from_listener(listener, true, None).unwrap();
+    tokio::task::spawn(async move { grpc.serve_with_incoming(incoming).await });
 
     tokio::time::sleep(Duration::from_millis(10)).await;
 
@@ -70,17 +47,11 @@ async fn test_hybrid() {
     client1.test1(Test1Request {}).await.unwrap();
     client1.test1(Test1Request {}).await.unwrap();
 
-    let channel = Channel::builder(uri).connect().await.unwrap();
-
-    client1.test1(Test1Request {}).await.unwrap();
-    client1.test1(Test1Request {}).await.unwrap();
-    client1.test1(Test1Request {}).await.unwrap();
-    client1.test1(Test1Request {}).await.unwrap();
-    client1.test1(Test1Request {}).await.unwrap();
-
-    let mut client2 = Test2Client::new(channel);
-    assert_eq!(
-        client2.test2(Test2Request {}).await.unwrap_err().code(),
-        tonic::Code::Cancelled,
-    );
+    let resp = reqwest::get(uri.to_string())
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert_eq!(resp, "FIXED RESPONSE")
 }
