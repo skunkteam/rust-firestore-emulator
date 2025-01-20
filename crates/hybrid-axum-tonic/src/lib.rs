@@ -1,78 +1,29 @@
+//! Implementation of a layer that routes non-grpc request to the same port to
+//! an Axum Router, inspired by:
+//! https://github.com/tokio-rs/axum/issues/2736#issuecomment-2256154646
+//!
 //! ```ignore
-//! /// A middleware that does nothing, but just passes on the request.
-//! async fn do_nothing_middleware<B>(
-//!     req: Request<B>,
-//!     next: Next<B>,
-//! ) -> Result<Response, GrpcStatus> {
-//!     Ok(next.run(req).await)
-//! }
-//!
-//! /// A middleware that cancels the request with a grpc status-code
-//! async fn cancel_request_middleware<B>(
-//!     _req: Request<B>,
-//!     _next: Next<B>,
-//! ) -> Result<Response, GrpcStatus> {
-//!     Err(tonic::Status::cancelled("Canceled").into())
-//! }
-//!
 //! #[tokio::main]
 //! async fn main() {
-//!     // Spawn the Server
-//!     tokio::task::spawn(async move {
-//!         // The first grpc-service has middleware that accepts the request.
-//!         let grpc_router1 = Router::new()
-//!             .nest_tonic(Test1Server::new(Test1Service))
-//!             .layer(from_fn(do_nothing_middleware));
+//!     // This is the normal rest-router, to which all normal requests are routed
+//!     let rest = axum::Router::new()
+//!         .route("/", get(|| async move { "FIXED RESPONSE" }))
+//!         .into_service()
+//!         .map_response(|r| r.map(tonic::body::boxed));
 //!
-//!         // The second grpc-service instead cancels the request
-//!         let grpc_router2 = Router::new()
-//!             .nest_tonic(Test2Server::new(Test2Service))
-//!             .layer(from_fn(cancel_request_middleware));
+//!     // This is the GRPC router with the multiplex layer installed
+//!     let grpc = tonic::transport::Server::builder()
+//!         .accept_http1(true)
+//!         .tcp_nodelay(true)
+//!         .layer(GrpcMultiplexLayer::new(rest))
+//!         .add_service(Test1Server::new(Test1Service));
 //!
-//!         // Merge both routers into one.
-//!         let grpc_router = grpc_router1.merge(grpc_router2);
-//!
-//!         // This is the normal rest-router, to which all normal requests are routed
-//!         let rest_router = Router::new()
-//!             .nest("/", Router::new().route("/123", get(|| async move {})))
-//!             .route("/", get(|| async move {}));
-//!
-//!         // Combine both services into one
-//!         let service = RestGrpcService::new(rest_router, grpc_router);
-//!
-//!         // And serve at 127.0.0.1:8080
-//!         axum::Server::bind(&"127.0.0.1:8080".parse().unwrap())
-//!             .serve(service.into_make_service())
-//!             .await
-//!             .unwrap();
-//!     });
-//!
-//!     tokio::time::sleep(Duration::from_millis(100)).await;
-//!
-//!     // Connect to the server with a grpc-client
-//!     let channel = Channel::from_static("http://127.0.0.1:8080")
-//!         .connect()
+//!     // Serve at 127.0.0.1:8080
+//!     grpc.serve(&"127.0.0.1:8080".parse().unwrap())
 //!         .await
 //!         .unwrap();
-//!
-//!     let mut client1 = Test1Client::new(channel.clone());
-//!     let mut client2 = Test2Client::new(channel);
-//!
-//!     // The first request will succeed
-//!     client1.test1(Test1Request {}).await.unwrap();
-//!
-//!     // While the second one gives a grpc Status::Canceled code.
-//!     assert_eq!(
-//!         client2.test2(Test2Request {}).await.unwrap_err().code(),
-//!         tonic::Code::Cancelled,
-//!     );
 //! }
 //! ```
 
-mod nest;
-mod rest_grpc;
-mod status;
-
-pub use nest::NestTonic;
-pub use rest_grpc::RestGrpcService;
-pub use status::GrpcStatus;
+mod multiplex;
+pub use multiplex::GrpcMultiplexLayer;

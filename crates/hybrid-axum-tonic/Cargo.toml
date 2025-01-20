@@ -4,23 +4,26 @@ version = { workspace = true }
 edition = "2021"
 
 [dependencies]
-axum = { workspace = true }
 futures = { workspace = true }
-hyper = { workspace = true }
-tonic = { workspace = true }
+http = { workspace = true }
+http-body = { workspace = true }
+pin-project.workspace = true
 tower = { workspace = true }
 
 [build-dependencies]
 tonic-build = { workspace = true }
 
 [dev-dependencies]
+axum.workspace = true
 prost = { workspace = true }
+reqwest = { workspace = true }
 tokio = { workspace = true, features = ["macros"] }
+tonic.workspace = true
 
 # Do not use workspace lints here, because generated code is not that clean.
 [lints.rust]
 unsafe_code = "forbid"
-explicit_outlives_requirements = "forbid"
+explicit_outlives_requirements = "warn"
 let_underscore_drop = "warn"
 missing_debug_implementations = "warn"
 non_ascii_idents = "warn"

@@ -1,27 +1,30 @@
 use std::{future::Future, net::SocketAddr};
 
-use axum::Router;
 use emulator_database::FirestoreProject;
 use emulator_tracing::Tracing;
-use hybrid_axum_tonic::{NestTonic, RestGrpcService};
+use hybrid_axum_tonic::GrpcMultiplexLayer;
+use tonic::transport::Server;
+use tower::ServiceExt;
 use tracing::{enabled, info, Level};
 
 #[tokio::main]
 pub async fn run(
     project: &'static FirestoreProject,
     host_port: SocketAddr,
-    shutdown: impl Future<Output = ()>,
+    shutdown: impl Future<Output = ()> + Send + 'static,
     tracing: &'static impl Tracing,
 ) -> color_eyre::Result<()> {
     let rest_router = emulator_http::RouterBuilder::new(project)
         .add_dynamic_tracing(tracing)
-        .build();
-    let grpc_router = Router::new().nest_tonic(emulator_grpc::service(project));
-    let combined = RestGrpcService::new(rest_router, grpc_router).into_make_service();
-    let server = axum::Server::bind(&host_port)
+        .build()
+        .into_service()
+        .map_response(|r| r.map(tonic::body::boxed));
+    let server = Server::builder()
+        .accept_http1(true)
         .tcp_nodelay(true)
-        .serve(combined)
-        .with_graceful_shutdown(shutdown);
+        .layer(GrpcMultiplexLayer::new(rest_router))
+        .add_service(emulator_grpc::service(project))
+        .serve_with_shutdown(host_port, shutdown);
 
     if enabled!(Level::INFO) {
         info!("Firestore emulator listening on {}", host_port);
