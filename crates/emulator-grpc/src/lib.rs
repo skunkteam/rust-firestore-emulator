@@ -369,17 +369,28 @@ impl Firestore for FirestoreEmulator {
             };
             let mut query = Query::from_structured(parent, query, read_consistency)?;
             let docs = database.run_query(&mut query).await?;
+            // The docs of RunQueryResponse::read_time say:
+            // If the query returns no results, a response with `read_time` and
+            // no `document` will be sent, and this represents the time at which
+            // the query was run. So if we find no documents, we will send one
+            // `RunQueryResponse` with `document: None` anyway.
+            let docs = docs
+                .into_iter()
+                .map(Some)
+                .pad_using(1, |_| None)
+                .map(move |document| {
+                    Ok(RunQueryResponse {
+                        // only send the transaction ID in the first element (if any):
+                        transaction: mem::take(&mut new_transaction),
+                        document,
+                        read_time: Some(Timestamp::now()),
+                        skipped_results: 0,
+                        explain_metrics: None,
+                        continuation_selector: None,
+                    })
+                });
 
-            Ok(tokio_stream::iter(docs).map(move |doc| -> Result<_> {
-                Ok(RunQueryResponse {
-                    transaction: mem::take(&mut new_transaction),
-                    document: Some(doc),
-                    read_time: Some(Timestamp::now()),
-                    skipped_results: 0,
-                    explain_metrics: None,
-                    continuation_selector: None,
-                })
-            }))
+            Ok(tokio_stream::iter(docs))
         })
         .await
     }
