@@ -488,6 +488,7 @@ impl Query {
         Ok(result)
     }
 
+    /// Find all collections that are selected in the FROM clause of the query.
     async fn applicable_collections(&mut self, db: &FirestoreDatabase) -> Vec<Arc<Collection>> {
         db.collections
             .read()
@@ -498,37 +499,35 @@ impl Query {
             .collect_vec()
     }
 
+    /// Check whether the given collection matches the FROM clause of the query.
     fn includes_collection(&mut self, collection: &CollectionRef) -> bool {
         if let Some(&r) = self.collection_cache.get(&collection.collection_id) {
             return r;
         }
-        let included = collection.strip_prefix(&self.parent).is_some_and(|path| {
-            self.from.iter().any(|selector| {
-                if !selector.all_descendants {
-                    return path == selector.collection_id;
-                }
-                if selector.collection_id.is_empty() {
-                    // collection_id empty is a special case where all collections should match
-                    return true;
-                }
-                // With all_descendants == true we search for the given collection_id in the
-                // remaining path.
-                // Invariant: path starts with <COLLECTION-NAME>/... or is empty
-                let mut elements = path.split('/');
-                loop {
-                    let Some(next_id) = elements.next() else {
-                        return false;
-                    };
-                    if next_id == selector.collection_id {
+        // The collection name should start with the Query's parent...
+        let included = collection
+            .strip_prefix(&self.parent)
+            .is_some_and(|remaining_path| {
+                // ... and it should match one of the FROM selectors:
+                self.from.iter().any(|selector| {
+                    if !selector.all_descendants {
+                        return remaining_path == selector.collection_id;
+                    }
+                    if selector.collection_id.is_empty() {
+                        // collection_id empty is a special case where all collections should match
                         return true;
                     }
-                    // Strip document id and try again
-                    if elements.next().is_none() {
-                        return false;
-                    }
-                }
-            })
-        });
+                    // Searching for documents where the direct parent collection is equal to the
+                    // given collection_id when `all_descendants == true`. "The direct parent
+                    // collection" translates to the rightmost collection name in
+                    // `remaining_path`. So we check whether the `remaining_path` ends with the
+                    // requested `collection_id` and is preceded by either a '/' or nothing (when
+                    // `remaining_path == collection_id`).
+                    remaining_path
+                        .strip_suffix(&selector.collection_id)
+                        .is_some_and(|rem| rem.is_empty() || rem.ends_with('/'))
+                })
+            });
         self.collection_cache
             .insert(collection.collection_id.clone(), included);
         included

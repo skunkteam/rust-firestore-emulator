@@ -18,8 +18,8 @@ export const notImplementedInRust = connection === 'RUST EMULATOR' ? [] : undefi
 export const notImplementedInJava = connection === 'JAVA EMULATOR' ? [] : undefined;
 export const notImplementedInCloud = connection === 'CLOUD FIRESTORE' ? [] : undefined;
 
-// create a separate collection for each test, use TTL to delete every document after a set time as a fallback, if the tests did not
-// get the chance to delete itself
+// create a separate collection for each test, use TTL on the field `ttl` to delete every document in the collection group `collection`
+// after a set time as a fallback, if the tests did not get the chance to delete itself
 const mainTestDoc = firestore.collection('tests').doc();
 export const collection = mainTestDoc.collection('collection');
 
