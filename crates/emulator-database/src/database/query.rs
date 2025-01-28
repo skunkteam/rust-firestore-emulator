@@ -5,9 +5,12 @@ use std::{
     sync::Arc,
 };
 
-use googleapis::google::firestore::v1::{
-    structured_query::{self, CollectionSelector},
-    Cursor, Document, StructuredQuery,
+use googleapis::google::{
+    firestore::v1::{
+        structured_query::{self, CollectionSelector},
+        Cursor, Document, StructuredQuery,
+    },
+    protobuf::Timestamp,
 };
 use itertools::Itertools;
 use string_cache::DefaultAtom;
@@ -387,18 +390,26 @@ impl Query {
     pub async fn once(
         &mut self,
         db: &FirestoreDatabase,
-    ) -> Result<Vec<Arc<StoredDocumentVersion>>> {
+    ) -> Result<(Timestamp, Vec<Arc<StoredDocumentVersion>>)> {
         // First collect all Arc<Collection>s in a Vec to release the collection lock asap.
         let collections = self.applicable_collections(db).await;
 
-        let txn = db.get_txn_for_consistency(self.consistency).await?;
+        let (txn, read_time) = match self.consistency {
+            ReadConsistency::Transaction(transaction_id) => {
+                let txn = db.transactions.get(transaction_id).await?;
+                let read_time = txn.read_time().unwrap_or_else(Timestamp::now);
+                (Some(txn), read_time)
+            }
+            ReadConsistency::Default => (None, Timestamp::now()),
+            ReadConsistency::ReadTime(timestamp) => (None, timestamp),
+        };
 
         let mut buffer = vec![];
         for col in collections {
             for meta in col.docs().await {
                 let version = match &txn {
                     Some(txn) => txn.read_doc(&meta.name).await?,
-                    None => meta.read().await?.current_version().cloned(),
+                    None => meta.read().await?.version_at_time(read_time).cloned(),
                 };
                 let Some(version) = version else {
                     continue;
@@ -432,7 +443,7 @@ impl Query {
             buffer.truncate(limit)
         }
 
-        Ok(buffer)
+        Ok((read_time, buffer))
     }
 
     /// Get the names of missing documents that match this query. A document is missing if it does
