@@ -529,7 +529,8 @@ impl QueryTarget {
         })];
 
         self.doctargets_by_name.clear();
-        for version in self.query.once(database).await? {
+        let (_, versions) = self.query.once(database).await?;
+        for version in versions {
             self.doctargets_by_name.insert(
                 version.name.clone(),
                 DocumentTarget {

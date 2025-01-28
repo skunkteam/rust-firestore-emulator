@@ -30,7 +30,7 @@ use self::{
     query::Query,
     read_consistency::ReadConsistency,
     reference::{CollectionRef, DocumentRef, Ref, RootRef},
-    transaction::{RunningTransactions, Transaction, TransactionId},
+    transaction::{RunningTransactions, TransactionId},
 };
 use crate::{
     database::field_path::FieldReference, error::Result, unimplemented, unimplemented_collection,
@@ -134,17 +134,6 @@ impl FirestoreDatabase {
             .await
     }
 
-    pub(crate) async fn get_txn_for_consistency(
-        &self,
-        consistency: ReadConsistency,
-    ) -> Result<Option<Arc<Transaction>>> {
-        if let ReadConsistency::Transaction(id) = consistency {
-            Ok(Some(self.transactions.get(id).await?))
-        } else {
-            Ok(None)
-        }
-    }
-
     /// Get all the collections that reside directly under the given parent. This means that:
     /// - the IDs will not contain a `/`
     /// - the result will be empty if `parent` is a [`Ref::Collection`].
@@ -204,14 +193,17 @@ impl FirestoreDatabase {
     }
 
     #[instrument(level = Level::DEBUG, skip_all, err)]
-    pub async fn run_query(&self, query: &mut Query) -> Result<Vec<Document>> {
+    pub async fn run_query(&self, query: &mut Query) -> Result<(Timestamp, Vec<Document>)> {
         debug!(?query);
-        let result = query.once(self).await?;
+        let (read_time, result) = query.once(self).await?;
         debug!(result_count = result.len());
-        Ok(result
-            .into_iter()
-            .map(|version| query.project(&version))
-            .collect())
+        Ok((
+            read_time,
+            result
+                .into_iter()
+                .map(|version| query.project(&version))
+                .collect(),
+        ))
     }
 
     #[instrument(level = Level::DEBUG, skip_all, err)]
@@ -221,11 +213,11 @@ impl FirestoreDatabase {
         query: StructuredQuery,
         aggregations: Vec<Aggregation>,
         consistency: ReadConsistency,
-    ) -> Result<HashMap<String, Value>> {
+    ) -> Result<(Timestamp, HashMap<String, Value>)> {
         unimplemented_option!(query.select);
         let mut query = Query::from_structured(parent, query, consistency)?;
         debug!(?query);
-        let docs = query.once(self).await?;
+        let (read_time, docs) = query.once(self).await?;
         let result = aggregations
             .into_iter()
             .map(|agg| {
@@ -313,7 +305,7 @@ impl FirestoreDatabase {
                 Ok((agg.alias, result))
             })
             .try_collect()?;
-        Ok(result)
+        Ok((read_time, result))
     }
 
     #[instrument(level = Level::DEBUG, skip_all, err)]

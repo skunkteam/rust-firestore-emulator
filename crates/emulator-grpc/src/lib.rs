@@ -254,7 +254,7 @@ impl Firestore for FirestoreEmulator {
         .consistency(consistency_selector.try_into()?)
         .build()?;
 
-        let found_docs = query.once(&database).await?;
+        let (_, found_docs) = query.once(&database).await?;
         let mut documents = found_docs.iter().map(|v| query.project(v)).collect_vec();
 
         if show_missing {
@@ -368,7 +368,7 @@ impl Firestore for FirestoreEmulator {
                 s => (vec![], s.try_into()?),
             };
             let mut query = Query::from_structured(parent, query, read_consistency)?;
-            let docs = database.run_query(&mut query).await?;
+            let (read_time, docs) = database.run_query(&mut query).await?;
             // The docs of RunQueryResponse::read_time say:
             // If the query returns no results, a response with `read_time` and
             // no `document` will be sent, and this represents the time at which
@@ -383,7 +383,7 @@ impl Firestore for FirestoreEmulator {
                         // only send the transaction ID in the first element (if any):
                         transaction: mem::take(&mut new_transaction),
                         document,
-                        read_time: Some(Timestamp::now()),
+                        read_time: Some(read_time),
                         skipped_results: 0,
                         explain_metrics: None,
                         continuation_selector: None,
@@ -452,7 +452,7 @@ impl Firestore for FirestoreEmulator {
             };
 
             debug!(?read_consistency);
-            let aggregate_fields = database
+            let (read_time, aggregate_fields) = database
                 .run_aggregation_query(parent, query, agg_query.aggregations, read_consistency)
                 .await?;
 
@@ -460,7 +460,7 @@ impl Firestore for FirestoreEmulator {
                 result: Some(AggregationResult { aggregate_fields }),
                 explain_metrics: None,
                 transaction: new_transaction,
-                read_time: Some(Timestamp::now()),
+                read_time: Some(read_time),
             };
 
             Ok(once(Ok(response)))

@@ -415,6 +415,43 @@ describe.each([
             expect(uniq(result.docs.flatMap(d => Object.keys(d.data())))).toIncludeSameMembers(got);
         });
     });
+
+    describe('testing read-time in queries', () => {
+        let beforeFirstDocument: FirebaseFirestore.Timestamp;
+        let beforeExtraDocument: FirebaseFirestore.Timestamp;
+        let afterExtraDocument: FirebaseFirestore.Timestamp;
+        let extraRef: FirebaseFirestore.DocumentReference;
+        let query: FirebaseFirestore.Query;
+
+        beforeAll(async () => {
+            beforeFirstDocument = fs.exported.Timestamp.fromMillis(Date.now() - 1_000_000);
+            beforeExtraDocument = fs.exported.Timestamp.now();
+            query = collection.where('type', '==', 'number');
+            extraRef = createRef();
+            const { writeTime } = await extraRef.create({ type: 'number' });
+            afterExtraDocument = writeTime;
+        });
+
+        afterAll(async () => {
+            await extraRef.delete();
+        });
+
+        test('in transaction with read-time', async () => {
+            const cases = [
+                { readTime: beforeFirstDocument, expectedCount: 0 },
+                { readTime: beforeExtraDocument, expectedCount: numbers.length },
+                { readTime: afterExtraDocument, expectedCount: numbers.length + 1 },
+                { readTime: undefined, expectedCount: numbers.length + 1 },
+            ];
+            for (const { readTime, expectedCount } of cases) {
+                const count = await fs.firestore.runTransaction(async txn => (await txn.get(query)).docs.length, {
+                    readOnly: true,
+                    readTime,
+                });
+                expect(count).toBe(expectedCount);
+            }
+        });
+    });
 });
 
 describe('list', () => {

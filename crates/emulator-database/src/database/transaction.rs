@@ -107,6 +107,13 @@ impl Transaction {
             None
         }
     }
+
+    pub(crate) fn read_time(&self) -> Option<Timestamp> {
+        match self {
+            Transaction::ReadWrite(_) => None,
+            Transaction::ReadOnly(txn) => txn.read_time,
+        }
+    }
 }
 
 #[derive(Debug)]
