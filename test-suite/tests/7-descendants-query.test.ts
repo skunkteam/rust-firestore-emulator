@@ -307,8 +307,8 @@ type MappedQueryDocumentSnapshot = { ref: FirebaseFirestore.DocumentReference; d
  *
  * The returned query does not support live queries and `onSnapshot` will throw a runtime error
  *
- * When the query was constructed with a `collection` argument, you cannot use `withConverter` on it as that will re-introduce an (internal)
- * predicate on the `collectionId` with a non existing collection.
+ * When the query was constructed without a `collection` argument, you cannot use `withConverter` on it as that will re-introduce an
+ * (internal) predicate on the `collectionId` with a non existing collection.
  */
 function allDescendants(parent: FirebaseFirestore.DocumentReference, collection?: string) {
     // determine if this will be a "kindless" query meaning without restriction on the name of the direct parent (collection) of the found
