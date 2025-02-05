@@ -10,7 +10,7 @@
     nixpkgs.url = "github:nixos/nixpkgs/nixos-unstable";
     naersk.url = "github:nix-community/naersk";
     googleapis = {
-      url = "https://github.com/googleapis/googleapis.git";
+      url = "github:googleapis/googleapis";
       flake = false;
     };
   };
@@ -21,6 +21,7 @@
     flake-utils,
     rust-overlay,
     naersk,
+    googleapis,
     ...
   }:
     flake-utils.lib.eachDefaultSystem (
@@ -73,6 +74,9 @@
           compressTarget = false;
           PROTOC = "${pkgs.protobuf}/bin/protoc";
           PROTOC_INCLUDE = "${pkgs.protobuf}/include";
+          patchPhase = ''
+            sed -i 's:"include:"${googleapis}:g' crates/googleapis/build.rs
+          '';
         };
       }
     );
