@@ -21,13 +21,17 @@
     "googleapis": {
       "flake": false,
       "locked": {
-        "narHash": "sha256-12pJW1vrppY3bzW64pejbjrScGsq9q5KSQbVtKSqdsw=",
-        "type": "file",
-        "url": "https://github.com/googleapis/googleapis.git"
+        "lastModified": 1738744571,
+        "narHash": "sha256-ofnvh4sTSE26CxiAtsqFtsZwHE5gnrlEjYqmLkpAVkE=",
+        "owner": "googleapis",
+        "repo": "googleapis",
+        "rev": "f42682088d3d6d4bb267c350f8d37411d304d047",
+        "type": "github"
       },
       "original": {
-        "type": "file",
-        "url": "https://github.com/googleapis/googleapis.git"
+        "owner": "googleapis",
+        "repo": "googleapis",
+        "type": "github"
       }
     },
     "naersk": {
