@@ -21,16 +21,17 @@
     "googleapis": {
       "flake": false,
       "locked": {
-        "lastModified": 1738744571,
-        "narHash": "sha256-ofnvh4sTSE26CxiAtsqFtsZwHE5gnrlEjYqmLkpAVkE=",
+        "lastModified": 1737146115,
+        "narHash": "sha256-hGTyhc8/2Rf6nOtCSjCMHjrj7JbgiijyOSoZyeyUw+c=",
         "owner": "googleapis",
         "repo": "googleapis",
-        "rev": "f42682088d3d6d4bb267c350f8d37411d304d047",
+        "rev": "3776db131e34e42ec8d287203020cb4282166aa5",
         "type": "github"
       },
       "original": {
         "owner": "googleapis",
         "repo": "googleapis",
+        "rev": "3776db131e34e42ec8d287203020cb4282166aa5",
         "type": "github"
       }
     },
