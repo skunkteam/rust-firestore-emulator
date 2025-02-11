@@ -5,7 +5,7 @@ use emulator_database::{FirestoreConfig, FirestoreProject};
 use emulator_tracing::DefaultTracing;
 use firestore_emulator::run;
 use tikv_jemallocator::Jemalloc;
-use tokio::signal::ctrl_c;
+use tokio::{net::TcpListener, signal::ctrl_c};
 
 #[global_allocator]
 static GLOBAL_ALLOC: Jemalloc = Jemalloc;
@@ -26,7 +26,8 @@ struct Args {
     long_contention_timeout: bool,
 }
 
-fn main() -> color_eyre::Result<()> {
+#[tokio::main]
+async fn main() -> color_eyre::Result<()> {
     color_eyre::install()?;
 
     let tracing = DefaultTracing::start();
@@ -45,5 +46,6 @@ fn main() -> color_eyre::Result<()> {
 
     let ctrl_c_listener = async { ctrl_c().await.expect("failed to listen for ctrl-c event") };
 
-    run(project, host_port, ctrl_c_listener, tracing)
+    let listener = TcpListener::bind(host_port).await.unwrap();
+    run(project, listener, ctrl_c_listener, tracing).await
 }

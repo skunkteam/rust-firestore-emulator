@@ -11,5 +11,6 @@
       "source.fixAll": "explicit"
     }
   },
-  "rust-analyzer.rustfmt.extraArgs": ["+nightly"]
+  "rust-analyzer.rustfmt.extraArgs": ["+nightly"],
+  "rust-analyzer.cargo.buildScripts.enable": true
 }

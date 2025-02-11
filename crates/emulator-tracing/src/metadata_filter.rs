@@ -1,12 +1,11 @@
-use std::str::FromStr;
+use std::{str::FromStr, sync::LazyLock};
 
 use ctreg::regex;
 use itertools::Itertools;
-use once_cell::sync::Lazy;
 use thiserror::Error;
 use tracing::{level_filters::LevelFilter, Metadata};
 
-static DIRECTIVE_RE: Lazy<DirectiveRe> = Lazy::new(DirectiveRe::new);
+static DIRECTIVE_RE: LazyLock<DirectiveRe> = LazyLock::new(DirectiveRe::new);
 regex! {
     DirectiveRe =
         r"(?x)
