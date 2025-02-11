@@ -1,8 +1,9 @@
 #[cfg(feature = "ui")]
 use axum::{http::header, response::Html};
-use axum::{routing::get, Router};
+use axum::{http::HeaderValue, routing::get, Router};
 use emulator_database::FirestoreProject;
 use emulator_tracing::Tracing;
+use tower_http::{set_header::SetResponseHeaderLayer, trace::TraceLayer};
 
 mod emulator;
 mod logging;
@@ -14,6 +15,9 @@ const HTML: &str = concat!(
     env!("CARGO_PKG_VERSION"),
     "\"</script>",
 );
+
+#[allow(clippy::declare_interior_mutable_const)]
+const NO_CACHE: HeaderValue = HeaderValue::from_static("no-cache");
 
 #[derive(Debug)]
 pub struct RouterBuilder(Router);
@@ -29,10 +33,7 @@ impl RouterBuilder {
 
     pub fn add_dynamic_tracing(self, tracing: &'static impl Tracing) -> Self {
         let Self(router) = self;
-        let router = router.nest(
-            "/emulator/v1/logging",
-            logging::router().with_state(tracing),
-        );
+        let router = router.nest("/emulator/v1/logging", logging::router(tracing));
         Self(router)
     }
 
@@ -56,5 +57,10 @@ impl RouterBuilder {
         let router = router.fallback(get(|| async { "OK" }));
 
         router
+            .layer(SetResponseHeaderLayer::overriding(
+                header::CACHE_CONTROL,
+                NO_CACHE,
+            ))
+            .layer(TraceLayer::new_for_http())
     }
 }

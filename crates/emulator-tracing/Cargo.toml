@@ -10,7 +10,6 @@ console = ["dep:console-subscriber"]
 console-subscriber = { workspace = true, optional = true }
 ctreg = { workspace = true }
 itertools = { workspace = true }
-once_cell = { workspace = true }
 thiserror = { workspace = true }
 time = { workspace = true, features = ["macros"] }
 tracing = { workspace = true }

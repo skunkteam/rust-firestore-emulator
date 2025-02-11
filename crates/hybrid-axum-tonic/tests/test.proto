@@ -1,9 +1,0 @@
-syntax = "proto3";
-package proto;
-
-message Test1Request { }
-message Test1Reply { }
-
-service Test1 {
-    rpc test1(Test1Request) returns (Test1Reply);
-}

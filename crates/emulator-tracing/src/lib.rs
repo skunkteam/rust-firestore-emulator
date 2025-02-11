@@ -84,16 +84,18 @@ pub enum SetLogLevelsError {
 }
 
 pub trait Tracing: Send + Sync {
-    fn subscribe(&self, dirs: &str) -> Result<impl DynamicSubscriber, SetLogLevelsError>;
+    fn subscribe(&self, dirs: &str) -> Result<impl DynamicSubscriber + '_, SetLogLevelsError>;
 }
 
 pub trait DynamicSubscriber: Send {
-    fn consume(&self) -> Vec<u8>;
-    fn stop(self) -> Vec<u8>;
+    fn consume(&mut self) -> Vec<u8>;
 }
 
 impl Tracing for DefaultTracing {
-    fn subscribe(&self, directives: &str) -> Result<impl DynamicSubscriber, SetLogLevelsError> {
+    fn subscribe(
+        &self,
+        directives: &str,
+    ) -> Result<impl DynamicSubscriber + '_, SetLogLevelsError> {
         let filter = directives.parse()?;
         let buffer = Default::default();
         let buffer_writer = BufferWriter {
@@ -118,19 +120,16 @@ impl Tracing for DefaultTracing {
     }
 }
 
-struct DefaultDynamicSubscriber<'a> {
+#[derive(Debug)]
+pub struct DefaultDynamicSubscriber<'a> {
     ptr:     usize,
     tracing: &'a DefaultTracing,
     buffer:  Arc<Mutex<Vec<u8>>>,
 }
 
 impl DynamicSubscriber for DefaultDynamicSubscriber<'_> {
-    fn consume(&self) -> Vec<u8> {
+    fn consume(&mut self) -> Vec<u8> {
         mem::take(&mut self.buffer.lock().unwrap())
-    }
-
-    fn stop(self) -> Vec<u8> {
-        self.consume()
     }
 }
 

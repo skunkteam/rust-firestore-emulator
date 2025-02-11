@@ -1,27 +1,19 @@
 use axum::{
     extract::{Path, State},
-    http::{header, HeaderValue, StatusCode},
+    http::StatusCode,
     response::{IntoResponse, Response},
     routing::get,
     Json, Router,
 };
 use emulator_database::{read_consistency::ReadConsistency, reference::Ref, FirestoreProject};
 use serde_json::json;
-use tower_http::set_header::SetResponseHeaderLayer;
 
 use crate::error::{RestError, Result};
-
-#[allow(clippy::declare_interior_mutable_const)]
-const NO_CACHE: HeaderValue = HeaderValue::from_static("no-cache");
 
 pub(crate) fn router() -> Router<&'static FirestoreProject> {
     Router::new()
         .route("/", get(list_databases))
         .route("/*ref", get(get_by_ref).delete(delete_by_ref))
-        .layer(SetResponseHeaderLayer::overriding(
-            header::CACHE_CONTROL,
-            NO_CACHE,
-        ))
 }
 
 async fn list_databases(State(project): State<&FirestoreProject>) -> impl IntoResponse {
