@@ -6,7 +6,7 @@ use std::{
 use axum::{
     extract::{Path, State},
     response::IntoResponse,
-    routing::{get, post},
+    routing::post,
     Router,
 };
 use emulator_tracing::{DynamicSubscriber, Tracing};
