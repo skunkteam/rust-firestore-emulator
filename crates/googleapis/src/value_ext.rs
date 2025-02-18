@@ -1,4 +1,4 @@
-use std::{borrow::Cow, cmp, collections::HashMap, iter::Sum, ops::Add};
+use std::{cmp, collections::HashMap, iter::Sum, ops::Add};
 
 use prost::bytes::Bytes;
 
@@ -155,12 +155,22 @@ impl PartialOrd for Value {
     }
 }
 
+/// Datastore allowed numeric IDs where Firestore only allows strings. Numeric
+/// IDs are exposed to Firestore as `__idNUM__`, so this is the lowest possible
+/// negative numeric value expressed in that format. It should be lower than
+/// everything else.
+///
+/// This constant is used to specify startAt/endAt values when querying for all
+/// descendants in a single collection.
+const REFERENCE_NAME_MIN_ID: &str = "__id-9223372036854775808__";
+
 impl Ord for Value {
     fn cmp(&self, other: &Self) -> cmp::Ordering {
         let type_order = self.value_type_order().cmp(&other.value_type_order());
         if type_order != cmp::Ordering::Equal {
             return type_order;
         }
+        // See: https://cloud.google.com/firestore/docs/concepts/data-types#data_types
         match (self.value_type(), other.value_type()) {
             (ValueType::NullValue(_), ValueType::NullValue(_)) => cmp::Ordering::Equal,
             (ValueType::BooleanValue(a), ValueType::BooleanValue(b)) => a.cmp(b),
@@ -172,7 +182,18 @@ impl Ord for Value {
             (ValueType::StringValue(a), ValueType::StringValue(b)) => a.cmp(b),
             (ValueType::BytesValue(a), ValueType::BytesValue(b)) => a.cmp(b),
             (ValueType::ReferenceValue(a), ValueType::ReferenceValue(b)) => {
-                prep_ref_for_cmp(a).cmp(&prep_ref_for_cmp(b))
+                fn process_numeric_ids(s: &str) -> &str {
+                    // TODO: Maybe support all numeric IDs? We need this one at least, because it is
+                    // used by the JavaScript SDK, but we could try to support all numeric IDs here
+                    // for fun and profit.
+                    match s {
+                        REFERENCE_NAME_MIN_ID => "",
+                        _ => s,
+                    }
+                }
+                let a = a.split('/').map(process_numeric_ids);
+                let b = b.split('/').map(process_numeric_ids);
+                a.cmp(b)
             }
             (ValueType::GeoPointValue(a), ValueType::GeoPointValue(b)) => a.cmp(b),
             (ValueType::ArrayValue(a), ValueType::ArrayValue(b)) => a.values.cmp(&b.values),
@@ -265,22 +286,35 @@ impl PartialOrd for LatLng {
     }
 }
 
-/// Datastore allowed numeric IDs where Firestore only allows strings. Numeric
-/// IDs are exposed to Firestore as `__idNUM__`, so this is the lowest possible
-/// negative numeric value expressed in that format.
-///
-/// This constant is used to specify startAt/endAt values when querying for all
-/// descendants in a single collection.
-const REFERENCE_NAME_MIN_ID: &str = "__id-9223372036854775808__";
+#[cfg(test)]
+mod tests {
+    use googletest::prelude::*;
+    use itertools::Itertools;
 
-fn prep_ref_for_cmp(path: &str) -> Cow<str> {
-    (|| {
-        let path = path.strip_suffix(REFERENCE_NAME_MIN_ID)?;
-        let collection = path.strip_suffix('/')?;
-        match collection.strip_suffix('\0') {
-            Some(collection) => Some(Cow::Owned(collection.to_string() + "@")),
-            None => Some(Cow::Borrowed(path)),
+    use crate::google::firestore::v1::Value;
+
+    #[gtest]
+    fn reference_ordering() {
+        let ordered_refs = [
+            "/cola",
+            "/cola/__id-9223372036854775808__",
+            "/cola/\0",
+            "/cola/_",
+            "/cola\0/doca",
+            "/cola\0/doca/colb/__id-9223372036854775808__",
+            "/cola\0/doca/colb/\0",
+            "/cola\0/doca/colb/docb",
+            "/cola\0/doca\0",
+            "/cola\0/docb",
+            "/colb/doca",
+        ];
+        for (a, b) in ordered_refs
+            .into_iter()
+            .map(str::to_string)
+            .map(Value::reference)
+            .tuple_windows()
+        {
+            expect_that!(a, lt(&b));
         }
-    })()
-    .unwrap_or(Cow::Borrowed(path))
+    }
 }

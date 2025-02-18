@@ -19,6 +19,8 @@
 
 set quiet
 
+export FORCE_COLOR := "1"
+
 # Default action is to test and lint once.
 default: test lint
 

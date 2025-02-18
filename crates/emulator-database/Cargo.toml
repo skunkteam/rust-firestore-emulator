@@ -18,6 +18,7 @@ tonic = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]
+googletest = { workspace = true }
 rstest = { workspace = true }
 
 [lints]

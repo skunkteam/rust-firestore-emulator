@@ -253,11 +253,13 @@ fn parse_field_path(path: &str) -> Result<Vec<String>> {
 
 #[cfg(test)]
 mod tests {
+    use googletest::prelude::*;
     use rstest::rstest;
 
     use super::*;
     use crate::GenericDatabaseError;
 
+    #[gtest]
     #[rstest]
     #[case("",              &[""])]
     #[case("``",            &[""])]
@@ -273,9 +275,10 @@ mod tests {
     #[case(r"`bak.\`.tik`.`x&y`",   &["bak.`.tik", "x&y"])]
     #[case("a`b",           &["a`b"])] // Tricky case, should we allow this?
     fn test_parse_field_path_success(#[case] input: &str, #[case] result: &[&str]) {
-        assert_eq!(parse_field_path(input).unwrap(), result);
+        assert_that!(parse_field_path(input), ok(eq(result)));
     }
 
+    #[gtest]
     #[rstest]
     #[case(
         r"`missing closing backslash",
@@ -294,9 +297,9 @@ mod tests {
         r#"unexpected end after '\' in field path: "`end after \\""#
     )]
     fn test_parse_field_path_fail(#[case] input: &str, #[case] msg: &str) {
-        assert_eq!(
+        assert_that!(
             parse_field_path(input),
-            Err(GenericDatabaseError::invalid_argument(msg))
+            err(eq(&GenericDatabaseError::invalid_argument(msg)))
         );
     }
 }
