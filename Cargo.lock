@@ -603,6 +603,7 @@ dependencies = [
 name = "emulator-tracing"
 version = "0.1.5"
 dependencies = [
+ "bytes",
  "console-subscriber",
  "ctreg",
  "itertools 0.14.0",
