@@ -1,10 +1,9 @@
 use std::{
     fmt::Debug,
-    io::Sink,
-    mem,
     sync::{Arc, Mutex},
 };
 
+use bytes::{buf::Writer, BufMut, Bytes, BytesMut};
 use metadata_filter::Filter;
 use thiserror::Error;
 use time::{
@@ -12,12 +11,7 @@ use time::{
     UtcOffset,
 };
 use tracing_subscriber::{
-    fmt::{
-        format::FmtSpan,
-        time::OffsetTime,
-        writer::{EitherWriter, MutexGuardWriter},
-        MakeWriter,
-    },
+    fmt::{format::FmtSpan, time::OffsetTime, writer::MutexGuardWriter, MakeWriter},
     prelude::*,
     reload, EnvFilter, Layer, Registry,
 };
@@ -88,7 +82,7 @@ pub trait Tracing: Send + Sync {
 }
 
 pub trait DynamicSubscriber: Send {
-    fn consume(&mut self) -> Vec<u8>;
+    fn drain(&mut self) -> Bytes;
 }
 
 impl Tracing for DefaultTracing {
@@ -96,14 +90,13 @@ impl Tracing for DefaultTracing {
         &self,
         directives: &str,
     ) -> Result<impl DynamicSubscriber + '_, SetLogLevelsError> {
-        let filter = directives.parse()?;
-        let buffer = Default::default();
-        let buffer_writer = BufferWriter {
-            buffer: Arc::clone(&buffer),
-            filter,
-        };
+        let filter: Filter = directives.parse()?;
+        let buffer = SharedBuffer::new();
         // Cannot use a filter layer here because of: https://github.com/tokio-rs/tracing/issues/1629
         // If that gets fixes we would really like that, for now just filter at the writer.
+        let buffer_writer = buffer
+            .clone()
+            .with_filter(move |metadata| filter.allows(metadata));
         let layer = tracing_subscriber::fmt::layer()
             .with_span_events(FmtSpan::NEW | FmtSpan::CLOSE)
             .with_timer(self.timer.clone())
@@ -120,16 +113,15 @@ impl Tracing for DefaultTracing {
     }
 }
 
-#[derive(Debug)]
-pub struct DefaultDynamicSubscriber<'a> {
+struct DefaultDynamicSubscriber<'a> {
     ptr:     usize,
     tracing: &'a DefaultTracing,
-    buffer:  Arc<Mutex<Vec<u8>>>,
+    buffer:  SharedBuffer,
 }
 
 impl DynamicSubscriber for DefaultDynamicSubscriber<'_> {
-    fn consume(&mut self) -> Vec<u8> {
-        mem::take(&mut self.buffer.lock().unwrap())
+    fn drain(&mut self) -> Bytes {
+        self.buffer.drain()
     }
 }
 
@@ -148,26 +140,27 @@ impl Drop for DefaultDynamicSubscriber<'_> {
     }
 }
 
-#[derive(Debug)]
-struct BufferWriter {
-    buffer: Arc<Mutex<Vec<u8>>>,
-    filter: Filter,
+#[derive(Clone)]
+struct SharedBuffer {
+    buffer: Arc<Mutex<Writer<BytesMut>>>,
 }
 
-impl<'a> MakeWriter<'a> for BufferWriter {
-    type Writer = EitherWriter<MutexGuardWriter<'a, Vec<u8>>, Sink>;
-
-    fn make_writer(&'a self) -> Self::Writer {
-        panic!("always call make_writer_for");
+impl SharedBuffer {
+    fn new() -> Self {
+        Self {
+            buffer: Arc::new(Mutex::new(BytesMut::new().writer())),
+        }
     }
 
-    fn make_writer_for(&'a self, meta: &tracing::Metadata<'_>) -> Self::Writer {
-        if self.filter.allows(meta) {
-            println!("Found something to log from {}", meta.target());
-            EitherWriter::some(self.buffer.make_writer_for(meta))
-        } else {
-            EitherWriter::none()
-        }
+    fn drain(&self) -> Bytes {
+        self.buffer.lock().unwrap().get_mut().split().freeze()
+    }
+}
+impl<'a> MakeWriter<'a> for SharedBuffer {
+    type Writer = MutexGuardWriter<'a, Writer<BytesMut>>;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        self.buffer.make_writer()
     }
 }
 
