@@ -4,8 +4,8 @@ use std::{
 };
 
 use axum::{
+    body::Bytes,
     extract::{Path, State},
-    response::IntoResponse,
     routing::post,
     Router,
 };
@@ -43,36 +43,34 @@ async fn start_capture_or_poll_logs<S: Tracing + 'static>(
     State(tracing): State<TracingState<S>>,
     Path(name): Path<String>,
     body: String,
-) -> Result<impl IntoResponse> {
+) -> Result<Bytes> {
     if let Some(name) = name.strip_suffix(":poll") {
         return poll_logs(tracing, name);
     }
+    let mut subscribers = tracing.subscribers.lock().unwrap();
     let subscriber = tracing.tracing.subscribe(&body)?;
-    let replaced = tracing
-        .subscribers
-        .lock()
-        .unwrap()
+    let current_logs = subscribers
         .insert(name, Box::new(subscriber))
-        .is_some();
-    let msg = if replaced { "Restarted." } else { "Started." };
-    Ok(msg.as_bytes().to_vec())
+        .map(|mut subscriber| subscriber.drain())
+        .unwrap_or_default();
+    Ok(current_logs)
 }
 
-fn poll_logs<S: Tracing + 'static>(tracing: TracingState<S>, name: &str) -> Result<Vec<u8>> {
+fn poll_logs<S: Tracing + 'static>(tracing: TracingState<S>, name: &str) -> Result<Bytes> {
     let mut subscribers = tracing.subscribers.lock().unwrap();
     subscribers
         .get_mut(name)
         .ok_or_else(RestError::not_found)
-        .map(|subscriber| subscriber.consume())
+        .map(|subscriber| subscriber.drain())
 }
 
 async fn stop_capture<S: Tracing + 'static>(
     State(tracing): State<TracingState<S>>,
     Path(name): Path<String>,
-) -> impl IntoResponse {
+) -> Result<Bytes> {
     let mut subscribers = tracing.subscribers.lock().unwrap();
     subscribers
         .remove(&name)
         .ok_or_else(RestError::not_found)
-        .map(|mut subscriber| subscriber.consume())
+        .map(|mut subscriber| subscriber.drain())
 }
