@@ -18,14 +18,14 @@ ui = ["emulator-http/ui"]
 members = ["crates/*"]
 
 [workspace.package]
-version = "0.1.5"
+version = "0.1.6"
 
 [workspace.dependencies]
 async-trait = "0.1.86"
 axum = "0.7"
 base64 = "0.22.1"
 bytes = "1.10"
-clap = "4.5.28"
+clap = "4.5.30"
 color-eyre = "0.6.3"
 console-subscriber = "0.4.1"
 ctreg = "1.0.3"
