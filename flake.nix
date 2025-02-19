@@ -88,7 +88,7 @@
           # naersk can't deal with `version = { workspace = true}` for the root package, so extract it
           # manually:
           version = with builtins; (fromTOML (readFile ./Cargo.toml)).workspace.package.version;
-          nativeBuildInputs = [pkgs.protobuf];
+          nativeBuildInputs = with pkgs; [protobuf openssl pkg-config rust-toolchain];
           # Workaround - build.rs refers to git submodule path `./crates/googleapis/include`, but this
           # doesn't get copied over to the nix store for some reason. This patch replaces the reference
           # to local directory `include` by the absolute path to the nix store in the build.rs source
