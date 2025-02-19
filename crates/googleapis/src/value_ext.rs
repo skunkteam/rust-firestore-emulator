@@ -155,15 +155,6 @@ impl PartialOrd for Value {
     }
 }
 
-/// Datastore allowed numeric IDs where Firestore only allows strings. Numeric
-/// IDs are exposed to Firestore as `__idNUM__`, so this is the lowest possible
-/// negative numeric value expressed in that format. It should be lower than
-/// everything else.
-///
-/// This constant is used to specify startAt/endAt values when querying for all
-/// descendants in a single collection.
-const REFERENCE_NAME_MIN_ID: &str = "__id-9223372036854775808__";
-
 impl Ord for Value {
     fn cmp(&self, other: &Self) -> cmp::Ordering {
         let type_order = self.value_type_order().cmp(&other.value_type_order());
@@ -182,6 +173,15 @@ impl Ord for Value {
             (ValueType::StringValue(a), ValueType::StringValue(b)) => a.cmp(b),
             (ValueType::BytesValue(a), ValueType::BytesValue(b)) => a.cmp(b),
             (ValueType::ReferenceValue(a), ValueType::ReferenceValue(b)) => {
+                /// Datastore allowed numeric IDs where Firestore only allows strings. Numeric
+                /// IDs are exposed to Firestore as `__idNUM__`, so this is the lowest possible
+                /// negative numeric value expressed in that format. It should be lower than
+                /// everything else.
+                ///
+                /// This constant is used to specify startAt/endAt values when querying for all
+                /// descendants in a single collection.
+                const REFERENCE_NAME_MIN_ID: &str = "__id-9223372036854775808__";
+
                 fn process_numeric_ids(s: &str) -> &str {
                     // TODO: Maybe support all numeric IDs? We need this one at least, because it is
                     // used by the JavaScript SDK, but we could try to support all numeric IDs here
