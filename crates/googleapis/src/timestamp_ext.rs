@@ -105,6 +105,7 @@ impl TryFrom<Timestamp> for OffsetDateTime {
 mod tests {
     use std::array;
 
+    use googletest::prelude::*;
     use itertools::Itertools;
     use rstest::rstest;
     use time::macros::datetime;
@@ -113,68 +114,66 @@ mod tests {
 
     const TOKEN_LEN: usize = 16;
 
+    #[gtest]
     #[rstest]
     #[case(vec![])]
     // Using 127 to get a high number because the token is signed (0 would mean 1970-01-01,
     // 255 results in a -1_i128 which would mean end of 1769-12-31)
     #[case(vec![127; TOKEN_LEN])]
     fn invalid_tokens(#[case] token: Vec<u8>) {
-        assert!(matches!(
-            Timestamp::from_token(token),
-            Err(InvalidTokenError)
-        ));
+        expect_that!(Timestamp::from_token(token), err(pat!(InvalidTokenError)));
     }
 
+    #[gtest]
     #[rstest]
     #[case(Timestamp { seconds: i64::MAX, nanos: 0 })]
     #[case(Timestamp { seconds: i64::MIN, nanos: 0 })]
     fn out_of_range_timestamps(#[case] timestamp: Timestamp) {
-        println!("{:?}", OffsetDateTime::try_from(timestamp));
-        assert!(matches!(
+        expect_that!(
             OffsetDateTime::try_from(timestamp),
-            Err(TimestampOutOfRangeError(_))
-        ));
+            err(pat!(TimestampOutOfRangeError(_)))
+        );
     }
 
-    #[test]
+    #[gtest]
     fn tonic_status_compat() {
-        assert_eq!(String::from(InvalidTokenError), "Invalid token");
+        expect_that!(InvalidTokenError, displays_as(eq("Invalid token")));
 
         let out_of_range = OffsetDateTime::try_from(Timestamp {
             seconds: i64::MAX,
             nanos:   0,
         })
         .unwrap_err();
-        assert_eq!(String::from(out_of_range), "Timestamp out of range");
+        expect_that!(out_of_range, displays_as(eq("Timestamp out of range")));
     }
 
-    #[test]
+    #[gtest]
     fn now_monotonically_increasing() {
         let timestamps: [Timestamp; 100] = array::from_fn(|_| Timestamp::now());
         for (a, b) in timestamps.into_iter().tuple_windows() {
-            assert!(a < b, "a should be strictly less than b, always");
+            expect_that!(a, lt(b), "a should be strictly less than b, always");
         }
     }
 
-    #[test]
+    #[gtest]
     fn to_from_token() {
         let ndt = datetime!(2001-02-03 04:05:06.123456789 UTC);
         let timestamp: Timestamp = ndt.into();
         let token = timestamp.get_token().unwrap();
-        assert_eq!(token.len(), TOKEN_LEN);
+        expect_that!(token, len(eq(TOKEN_LEN)));
         let timestamp2 = Timestamp::from_token(token).unwrap();
-        assert_eq!(timestamp, timestamp2);
+        expect_that!(timestamp, eq(timestamp2));
     }
 
-    #[test]
+    #[gtest]
     fn timestamp_display() {
         let timestamp: Timestamp = datetime!(2001-02-03 04:05:06.123456789 UTC).into();
-        assert_eq!(timestamp.to_string(), "2001-02-03T04:05:06.123456789Z");
+        expect_that!(timestamp, displays_as(eq("2001-02-03T04:05:06.123456789Z")));
 
         let timestamp = Timestamp {
             seconds: i64::MAX,
             nanos:   0,
         };
-        assert_eq!(timestamp.to_string(), "<Timestamp outside common era>");
+        expect_that!(timestamp, displays_as(eq("<Timestamp outside common era>")));
     }
 }

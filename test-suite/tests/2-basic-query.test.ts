@@ -51,7 +51,18 @@ const strings = [
     { type: 'string', ordered: 'Æ' },
 ] satisfies Data[];
 const bytes: Data[] = strings.map(({ ordered }) => ({ type: 'bytes', ordered: Buffer.from(ordered, 'utf-8') }));
-const storedReferences: Data[] = strings.map(({ ordered }) => ({ type: 'ref', ordered: fs.collection.doc(ordered) }));
+const storedReferences: Data[] = [
+    { type: 'ref', ordered: fs.firestore.doc('cola/__id-9223372036854775808__') },
+    { type: 'ref', ordered: fs.firestore.doc('cola/\0') },
+    { type: 'ref', ordered: fs.firestore.doc('cola/_') },
+    { type: 'ref', ordered: fs.firestore.doc('cola\0/doca') },
+    { type: 'ref', ordered: fs.firestore.doc('cola\0/doca/colb/__id-9223372036854775808__') },
+    { type: 'ref', ordered: fs.firestore.doc('cola\0/doca/colb/\0') },
+    { type: 'ref', ordered: fs.firestore.doc('cola\0/doca/colb/docb') },
+    { type: 'ref', ordered: fs.firestore.doc('cola\0/doca\0') },
+    { type: 'ref', ordered: fs.firestore.doc('cola\0/docb') },
+    { type: 'ref', ordered: fs.firestore.doc('colb/doca') },
+];
 const references = storedReferences.map(sanitizeData);
 const arrays: Data[] = [
     { type: 'array', ordered: [1, 2, 3] },

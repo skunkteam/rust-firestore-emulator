@@ -441,10 +441,12 @@ impl DocumentRef {
 
 #[cfg(test)]
 mod tests {
+    use googletest::prelude::*;
     use rstest::rstest;
 
     use super::*;
 
+    #[gtest]
     #[rstest]
     #[case(
         // With `/documents` suffix
@@ -459,12 +461,13 @@ mod tests {
         "(default)"
     )]
     fn parse_root_ref(#[case] input: &str, #[case] project_id: &str, #[case] database_id: &str) {
-        assert_eq!(
-            input.parse::<Ref>().unwrap(),
-            Ref::Root(RootRef::new(project_id, database_id))
+        assert_that!(
+            input.parse::<Ref>(),
+            ok(eq(&Ref::Root(RootRef::new(project_id, database_id))))
         )
     }
 
+    #[gtest]
     #[rstest]
     #[case(
         "projects/proj/databases/database/documents/collection",
@@ -484,15 +487,16 @@ mod tests {
         #[case] database_id: &str,
         #[case] collection_id: &str,
     ) {
-        assert_eq!(
-            input.parse::<Ref>().unwrap(),
-            Ref::Collection(CollectionRef::new(
+        assert_that!(
+            input.parse::<Ref>(),
+            ok(eq(&Ref::Collection(CollectionRef::new(
                 RootRef::new(project_id, database_id),
                 collection_id
-            ))
+            ))))
         );
     }
 
+    #[gtest]
     #[rstest]
     #[case(
         "projects/proj/databases/database/documents/collection/document",
@@ -515,12 +519,12 @@ mod tests {
         #[case] collection_id: &str,
         #[case] doc_id: &str,
     ) {
-        assert_eq!(
-            input.parse::<Ref>().unwrap(),
-            Ref::Document(DocumentRef::new(
+        assert_that!(
+            input.parse::<Ref>(),
+            ok(eq(&Ref::Document(DocumentRef::new(
                 CollectionRef::new(RootRef::new(project_id, database_id), collection_id),
                 doc_id
-            ))
+            ))))
         );
     }
 }
