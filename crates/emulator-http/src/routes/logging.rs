@@ -87,7 +87,7 @@ mod tests {
 
     #[gtest]
     #[tokio::test]
-    async fn test_dynamic_tracing() {
+    async fn test_dynamic_tracing() -> Result<()> {
         let project = FirestoreProject::new(FirestoreConfig::default());
         let project = Box::leak(Box::new(project));
         let tracing = DefaultTracing::start();
@@ -95,8 +95,8 @@ mod tests {
             .add_dynamic_tracing(tracing)
             .build();
 
-        let tcp_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let host = tcp_listener.local_addr().unwrap();
+        let tcp_listener = TcpListener::bind("127.0.0.1:0").await?;
+        let host = tcp_listener.local_addr()?;
         tokio::spawn(async {
             axum::serve(tcp_listener, router).await.unwrap();
         });
@@ -110,10 +110,8 @@ mod tests {
             .post(&handle_url)
             .body("tower_http=debug")
             .send()
-            .await
-            .unwrap()
-            .error_for_status()
-            .unwrap()
+            .await?
+            .error_for_status()?
             .text()
             .await;
 
@@ -122,10 +120,8 @@ mod tests {
         let logs = client
             .post(&poll_url)
             .send()
-            .await
-            .unwrap()
-            .error_for_status()
-            .unwrap()
+            .await?
+            .error_for_status()?
             .text()
             .await;
         expect_that!(
@@ -142,10 +138,8 @@ mod tests {
             .post(&handle_url)
             .body("warn")
             .send()
-            .await
-            .unwrap()
-            .error_for_status()
-            .unwrap()
+            .await?
+            .error_for_status()?
             .text()
             .await;
         expect_that!(
@@ -160,10 +154,8 @@ mod tests {
         let logs = client
             .post(&poll_url)
             .send()
-            .await
-            .unwrap()
-            .error_for_status()
-            .unwrap()
+            .await?
+            .error_for_status()?
             .text()
             .await;
         expect_that!(
@@ -176,16 +168,15 @@ mod tests {
         client
             .delete(&handle_url)
             .send()
-            .await
-            .unwrap()
-            .error_for_status()
-            .unwrap();
+            .await?
+            .error_for_status()?;
 
-        let unknown_poll_status = client.post(&poll_url).send().await.unwrap().status();
+        let unknown_poll_status = client.post(&poll_url).send().await?.status();
         expect_that!(
             unknown_poll_status,
             eq(404),
             "polling on an unknown handle gives a 404"
         );
+        Ok(())
     }
 }
