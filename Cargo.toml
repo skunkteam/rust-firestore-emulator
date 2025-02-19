@@ -18,14 +18,14 @@ ui = ["emulator-http/ui"]
 members = ["crates/*"]
 
 [workspace.package]
-version = "0.1.5"
+version = "0.1.6"
 
 [workspace.dependencies]
 async-trait = "0.1.86"
 axum = "0.7"
 base64 = "0.22.1"
 bytes = "1.10"
-clap = "4.5.28"
+clap = "4.5.30"
 color-eyre = "0.6.3"
 console-subscriber = "0.4.1"
 ctreg = "1.0.3"
@@ -34,6 +34,7 @@ googletest = "0.13.0"
 http = "1.2"
 itertools = "0.14.0"
 prost = "0.13"
+reqwest = "0.12.12"
 rstest = "0.24.0"
 serde = "1.0.217"
 serde_json = "1.0.138"
