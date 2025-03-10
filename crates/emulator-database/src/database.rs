@@ -148,7 +148,7 @@ impl FirestoreDatabase {
             let Some(path) = col.name.strip_prefix(parent) else {
                 continue;
             };
-            let id = path.split_once('/').unwrap_or((path, "")).0;
+            let id = path.split('/').next().unwrap();
             if !result.contains(id) && col.has_doc().await? {
                 result.insert(id.to_string());
             }
@@ -173,7 +173,7 @@ impl FirestoreDatabase {
             let Some(path) = col.name.strip_collection_prefix(parent) else {
                 continue;
             };
-            let id = path.split_once('/').unwrap_or((path, "")).0;
+            let id = path.split('/').next().unwrap();
             if !result.contains(id) && col.has_doc().await? {
                 result.insert(id.to_string());
             }

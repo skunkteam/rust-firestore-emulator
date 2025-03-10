@@ -7,10 +7,15 @@ use axum::{
 };
 use emulator_database::FirestoreProject;
 use emulator_tracing::Tracing;
-use tower_http::{set_header::SetResponseHeaderLayer, trace::TraceLayer};
+use tower_http::{
+    cors::{Any, CorsLayer},
+    set_header::SetResponseHeaderLayer,
+    trace::TraceLayer,
+};
 
 mod emulator;
 mod logging;
+mod rest_api;
 
 #[cfg(feature = "ui")]
 const HTML: &str = concat!(
@@ -31,6 +36,7 @@ impl RouterBuilder {
         Self(
             Router::new()
                 .nest("/emulator/v1", emulator::router())
+                .nest("/v1", rest_api::router())
                 .with_state(project),
         )
     }
@@ -60,11 +66,17 @@ impl RouterBuilder {
         #[cfg(not(feature = "ui"))]
         let router = router.fallback(get(|| async { "OK" }));
 
+        let cors = CorsLayer::new()
+            .allow_methods(Any)
+            .allow_origin(Any)
+            .allow_headers(Any);
+
         router
             .layer(SetResponseHeaderLayer::overriding(
                 header::CACHE_CONTROL,
                 NO_CACHE,
             ))
+            .layer(cors)
             .layer(TraceLayer::new_for_http())
     }
 }
