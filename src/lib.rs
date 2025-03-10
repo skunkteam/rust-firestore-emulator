@@ -31,17 +31,17 @@ pub async fn run(
         .accept_http1(true)
         // simulator is only used on localhost, so TCP_NODELAY is a nobrainer
         .tcp_nodelay(true)
-        // route to our Axum service if the request is not a GRPC request
-        .layer(multiplex::MultiplexLayer {
-            when:    is_not_a_grpc_request,
-            use_svc: rest_router,
-        })
         .layer(
             CorsLayer::new()
                 .allow_methods(Any)
                 .allow_origin(Any)
                 .allow_headers(Any),
         )
+        // route to our Axum service if the request is not a GRPC request
+        .layer(multiplex::MultiplexLayer {
+            when:    is_not_a_grpc_request,
+            use_svc: rest_router,
+        })
         .add_service(emulator_grpc::service(project));
 
     if enabled!(Level::INFO) {
