@@ -563,6 +563,7 @@ dependencies = [
  "axum",
  "emulator-database",
  "emulator-tracing",
+ "googleapis",
  "googletest",
  "reqwest",
  "serde_json",
@@ -641,6 +642,7 @@ dependencies = [
  "tokio",
  "tonic",
  "tower 0.5.2",
+ "tower-http",
  "tracing",
 ]
 

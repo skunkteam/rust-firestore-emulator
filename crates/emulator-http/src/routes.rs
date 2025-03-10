@@ -8,7 +8,7 @@ use axum::{
 use emulator_database::FirestoreProject;
 use emulator_tracing::Tracing;
 use tower_http::{
-    cors::{Any, CorsLayer},
+    // cors::{Any, CorsLayer},
     set_header::SetResponseHeaderLayer,
     trace::TraceLayer,
 };
@@ -66,17 +66,17 @@ impl RouterBuilder {
         #[cfg(not(feature = "ui"))]
         let router = router.fallback(get(|| async { "OK" }));
 
-        let cors = CorsLayer::new()
-            .allow_methods(Any)
-            .allow_origin(Any)
-            .allow_headers(Any);
+        // let cors = CorsLayer::new()
+        //     .allow_methods(Any)
+        //     .allow_origin(Any)
+        //     .allow_headers(Any);
 
         router
             .layer(SetResponseHeaderLayer::overriding(
                 header::CACHE_CONTROL,
                 NO_CACHE,
             ))
-            .layer(cors)
+            // .layer(cors)
             .layer(TraceLayer::new_for_http())
     }
 }

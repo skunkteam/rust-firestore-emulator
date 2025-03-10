@@ -6,6 +6,7 @@ use http::header::CONTENT_TYPE;
 use tokio::net::TcpListener;
 use tonic::transport::{server::TcpIncoming, Server};
 use tower::ServiceExt;
+use tower_http::cors::{Any, Cors, CorsLayer};
 use tracing::{enabled, info, Level};
 
 mod multiplex;
@@ -35,6 +36,12 @@ pub async fn run(
             when:    is_not_a_grpc_request,
             use_svc: rest_router,
         })
+        .layer(
+            CorsLayer::new()
+                .allow_methods(Any)
+                .allow_origin(Any)
+                .allow_headers(Any),
+        )
         .add_service(emulator_grpc::service(project));
 
     if enabled!(Level::INFO) {

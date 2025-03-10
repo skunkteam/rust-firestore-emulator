@@ -27,7 +27,7 @@ async fn handler(
         .await
         .get_collection_ids(&path)
         .await?;
-    Ok(Json(json!({ "collectonIds": collections })).into_response())
+    Ok(Json(json!({ "collectionIds": collections })).into_response())
 }
 
 // #[cfg(test)]

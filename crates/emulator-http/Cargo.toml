@@ -20,6 +20,7 @@ tower-http = { workspace = true, features = ["cors", "set-header", "trace"] }
 workspace = true
 
 [dev-dependencies]
+googleapis = { path = "../googleapis/" }
 googletest = { workspace = true }
 reqwest = { workspace = true }
 tokio = { workspace = true }
