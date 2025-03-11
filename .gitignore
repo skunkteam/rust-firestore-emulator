@@ -3,3 +3,4 @@ tarpaulin-report.html
 lcov.info
 *.profraw
 *_git2_*
+/.jj
