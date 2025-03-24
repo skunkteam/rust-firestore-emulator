@@ -1,18 +1,16 @@
 //! This crate provides the service that implements the GRPC API to the emulator database. See
 //! [`service`] for usage info.
 
-use std::{mem, sync::Arc};
+use std::mem;
 
 use emulator_database::{
-    event::DatabaseEvent,
-    get_doc_name_from_write,
     projection::{Project, Projection},
     query::{Query, QueryBuilder},
     read_consistency::ReadConsistency,
     reference::{DocumentRef, Ref},
-    FirestoreDatabase, FirestoreProject,
+    FirestoreProject,
 };
-use futures::{future::try_join_all, stream::BoxStream, TryStreamExt};
+use futures::{future::join_all, stream::BoxStream, TryStreamExt};
 use googleapis::google::{
     firestore::v1::{
         firestore_server::{Firestore, FirestoreServer},
@@ -192,14 +190,23 @@ impl Firestore for FirestoreEmulator {
 
         let database = self.project.database(&database.parse()?).await;
 
-        let (commit_time, write_results) = if transaction.is_empty() {
-            perform_writes(&database, writes).await?
+        let txn_id = if transaction.is_empty() {
+            database
+                .new_txn(TransactionOptions {
+                    mode: Some(transaction_options::Mode::ReadWrite(
+                        transaction_options::ReadWrite {
+                            retry_transaction: vec![],
+                        },
+                    )),
+                })
+                .await?
         } else {
-            let txn_id = transaction.try_into()?;
-            Span::current().record("txn_id", display(txn_id));
-            debug!(?txn_id);
-            database.commit(writes, txn_id).await?
+            transaction.try_into()?
         };
+
+        Span::current().record("txn_id", display(txn_id));
+        debug!(?txn_id);
+        let (commit_time, write_results) = database.commit(writes, txn_id).await?;
 
         Ok(Response::new(CommitResponse {
             write_results,
@@ -562,72 +569,26 @@ impl Firestore for FirestoreEmulator {
         } = request.into_inner();
         unimplemented_collection!(labels);
 
-        let time: Timestamp = Timestamp::now();
-
         let database = self.project.database(&database.parse()?).await;
 
-        let (status, write_results, updates): (Vec<_>, Vec<_>, Vec<_>) =
-            try_join_all(writes.into_iter().map(|write| async {
-                let name = get_doc_name_from_write(&write)?;
-                let mut guard = database.get_doc_meta_mut_no_txn(&name).await?;
-                let result = database.perform_write(write, &mut guard, time).await;
-                use googleapis::google::rpc;
-                Ok(match result {
-                    Ok((wr, update)) => (
-                        Default::default(),
-                        wr,
-                        update.map(|update| (name.clone(), update)),
-                    ),
-                    Err(err) => (
-                        rpc::Status {
-                            code:    err.grpc_code() as _,
-                            message: err.to_string(),
-                            details: vec![],
-                        },
-                        Default::default(),
-                        None,
-                    ),
-                }) as Result<_, Status>
+        let (status, write_results): (Vec<_>, Vec<_>) =
+            join_all(writes.into_iter().map(|write| async {
+                let result = database
+                    .write(write)
+                    .await
+                    .map_err(googleapis::google::rpc::Status::from);
+                match result {
+                    Ok(write_result) => (Default::default(), write_result),
+                    Err(status) => (status, Default::default()),
+                }
             }))
-            .await?
+            .await
             .into_iter()
-            .multiunzip();
-
-        database.send_event(DatabaseEvent {
-            database:    Arc::downgrade(&database),
-            update_time: time,
-            updates:     updates.into_iter().flatten().collect(),
-        });
+            .unzip();
 
         Ok(Response::new(BatchWriteResponse {
             write_results,
             status,
         }))
     }
-}
-
-async fn perform_writes(
-    database: &Arc<FirestoreDatabase>,
-    writes: Vec<Write>,
-) -> Result<(Timestamp, Vec<WriteResult>)> {
-    let time: Timestamp = Timestamp::now();
-    let (write_results, updates): (Vec<_>, Vec<_>) =
-        try_join_all(writes.into_iter().map(|write| async {
-            let name = get_doc_name_from_write(&write)?;
-            let mut guard = database.get_doc_meta_mut_no_txn(&name).await?;
-            database.perform_write(write, &mut guard, time).await
-        }))
-        .await?
-        .into_iter()
-        .unzip();
-    database.send_event(DatabaseEvent {
-        database:    Arc::downgrade(database),
-        update_time: time,
-        updates:     updates
-            .into_iter()
-            .flatten()
-            .map(|u| (u.name().clone(), u))
-            .collect(),
-    });
-    Ok((time, write_results))
 }

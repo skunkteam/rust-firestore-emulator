@@ -94,3 +94,13 @@ impl From<GenericDatabaseError> for tonic::Status {
         }
     }
 }
+
+impl From<GenericDatabaseError> for googleapis::google::rpc::Status {
+    fn from(value: GenericDatabaseError) -> Self {
+        googleapis::google::rpc::Status {
+            code:    value.grpc_code() as _,
+            message: value.to_string(),
+            details: vec![],
+        }
+    }
+}

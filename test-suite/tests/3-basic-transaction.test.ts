@@ -532,6 +532,58 @@ describe('concurrent tests', () => {
                 }
             });
 
+            concurrent('write using a batch write to a document that is locked by a transaction', async () => {
+                const test = new ConcurrentTest();
+                // Scenario:
+                // Process 1 - create doc
+                // Process 1 - start txn A
+                // Process 1 - in txn A: read doc
+                // Process 2 - start batch write, writing to doc
+                // wait a few millisecs
+                // Process 1 - end txn A, writing to doc
+                // Process 2 - finish batch write, writing to doc
+
+                const [ref] = refs();
+
+                await test.run(
+                    async () => {
+                        await ref.create(fs.writeData({ value: 'original value' }));
+                        await fs.firestore.runTransaction(async txn => {
+                            await txn.get(ref);
+                            test.event('txn A got lock on doc');
+                            await test.when('batch write waiting on lock');
+                            txn.update(ref, { value: 'changed by txn' });
+                        });
+                        test.event('transaction completed');
+                    },
+                    async () => {
+                        await test.when('txn A got lock on doc');
+                        const batchPromise = fs.firestore
+                            .batch()
+                            .update(ref, { value: 'changed in batch' })
+                            .commit()
+                            .then(() => test.event('batch write finished'));
+                        await time(50);
+                        test.event('batch write waiting on lock');
+                        await batchPromise;
+                    },
+                );
+
+                expect(test.log).toEqual([
+                    '       | <<2>> | WAITING UNTIL: txn A got lock on doc',
+                    ' <<1>> | EVENT: txn A got lock on doc',
+                    ' <<1>> | WAITING UNTIL: batch write waiting on lock',
+                    '       | <<2>> | EVENT: batch write waiting on lock',
+                    ' <<1>> | EVENT: transaction completed',
+                    '       | <<2>> | EVENT: batch write finished',
+                ]);
+
+                const finalSnap = await ref.get();
+                expect(fs.readData(finalSnap.data())).toEqual({
+                    value: 'changed in batch',
+                });
+            });
+
             fs.notImplementedInRust ||
                 fs.notImplementedInJava ||
                 fs.notImplementedInCloud ||

@@ -24,12 +24,26 @@ use tracing::{debug, instrument, trace, warn, Level};
 use super::reference::DocumentRef;
 use crate::{error::Result, FirestoreProject, GenericDatabaseError};
 
+/// DocumentMeta is the representation of one document in Firestore. Or more accurately, one
+/// document name or "spot" if you will, the document itself may or may not exist at any point in
+/// time.
+///
+/// In order to write to a document, you can either upgrade an owned read lock or acquire a write
+/// lock immediately. The moment you get a read lock, you are put in the queue for a write permit,
+/// making sure that clients are rewarded a write lock based on the time they started reading the
+/// document and not the time they expressed interest in writing to the document. This is relevant
+/// for transactions that lock documents early on, if they wouldn't have the earliest rights to
+/// write then we would have far more contention during transactions.
 pub(crate) struct DocumentMeta {
     project: &'static FirestoreProject,
     /// The resource name of the document, for example
     /// `projects/{project_id}/databases/{database_id}/documents/{document_path}`.
     pub name: DocumentRef,
+    /// The actual contents (full history), protected by a RWLock.
     contents: Arc<RwLock<DocumentContents>>,
+    /// The authority that determines who is allowed to write to this document. Hands out write
+    /// permits one at a time using a fair queue. Readers get in line for this shop and get out of
+    /// line whenever they did not need to upgrade to a write lock.
     write_permit_shop: Arc<Semaphore>,
 }
 
@@ -51,16 +65,22 @@ impl DocumentMeta {
         }
     }
 
+    /// Get a quick temporary read lock.
     pub(crate) async fn read(&self) -> Result<DocumentContentsReadGuard> {
-        lock_timeout(self.contents.read(), self.project.timeouts.read, || {
-            format!("read lock for {}", self.name)
-        })
+        lock_timeout(
+            self.contents.read(),
+            self.project.timeouts.read,
+            "read lock",
+            &self.name,
+        )
         .await
     }
 
+    /// Get a read lock that can be held indefinitely. Can be upgraded to a write lock if needed.
     pub(crate) async fn read_owned(self: &Arc<Self>) -> Result<OwnedDocumentContentsReadGuard> {
         let (mut tx, rx) = oneshot::channel();
 
+        // Put an assistent in the queue for the permit counter, we may want one in the future.
         let write_permit_shop = Arc::clone(&self.write_permit_shop);
         tokio::spawn(async {
             tokio::select! {
@@ -78,63 +98,95 @@ impl DocumentMeta {
             guard: lock_timeout(
                 Arc::clone(&self.contents).read_owned(),
                 self.project.timeouts.read,
-                || format!("read lock for {}", self.name),
+                "read lock",
+                &self.name,
             )
             .await?,
             write_permit: rx,
         })
     }
 
-    async fn owned_write(&self) -> Result<OwnedDocumentContentsWriteGuard> {
-        lock_timeout(
-            Arc::clone(&self.contents).write_owned(),
-            self.project.timeouts.write,
-            || format!("write lock for {}", self.name),
+    /// Get a write lock asap without any consistency guarantees.
+    pub(crate) async fn write_owned(self: &Arc<Self>) -> Result<OwnedDocumentContentsWriteGuard> {
+        // Using maximum timeout here, because there is no chance of failing because of contention,
+        // the only way this fails is because of a timeout.
+        let timeout = self.project.timeouts.write.max(self.project.timeouts.read);
+
+        // Get in line for the permit counter, we want one asap.
+        let write_permit = lock_timeout(
+            self.write_permit_shop.acquire(),
+            timeout,
+            "write permit",
+            &self.name,
         )
-        .await
+        .await?
+        .unwrap();
+
+        // Now that we have got the permit we will try to acquire the write lock. This can timeout,
+        // dropping everything. That is ok.
+        let guard = lock_timeout(
+            Arc::clone(&self.contents).write_owned(),
+            timeout,
+            "write lock",
+            &self.name,
+        )
+        .await?;
+        drop(write_permit);
+
+        Ok(OwnedDocumentContentsWriteGuard {
+            guard,
+            acquire_time: Timestamp::now(),
+        })
     }
 }
 
+/// DocumentContents maintains the history of versions of a single document (document-name), this
+/// includes "deleted versions". Note that all mutating methods are defined on
+/// `OwnedDocumentContentsWriteGuard`, because these methods check whether the specified update-time
+/// is on or after the time of acquiring the lock.
 #[derive(Debug)]
-pub struct DocumentContents {
+pub(crate) struct DocumentContents {
     /// The resource name of the document, for example
     /// `projects/{project_id}/databases/{database_id}/documents/{document_path}`.
-    pub name: DocumentRef,
+    pub(crate) name: DocumentRef,
     versions: Vec<DocumentVersion>,
 }
 
 impl DocumentContents {
-    pub fn new(name: DocumentRef) -> Self {
+    pub(crate) fn new(name: DocumentRef) -> Self {
         Self {
             name,
             versions: Default::default(),
         }
     }
 
-    pub fn current_version(&self) -> Option<&Arc<StoredDocumentVersion>> {
+    pub(crate) fn current_version(&self) -> Option<&Arc<StoredDocumentVersion>> {
         self.versions
             .last()
             .and_then(DocumentVersion::stored_document)
     }
 
-    pub fn version_at_time(&self, read_time: Timestamp) -> Option<&Arc<StoredDocumentVersion>> {
+    pub(crate) fn version_at_time(
+        &self,
+        read_time: Timestamp,
+    ) -> Option<&Arc<StoredDocumentVersion>> {
         self.versions
             .iter()
             .rfind(|version| (version.update_time()) <= (read_time))
             .and_then(DocumentVersion::stored_document)
     }
 
-    pub fn exists(&self) -> bool {
+    pub(crate) fn exists(&self) -> bool {
         self.versions
             .last()
             .is_some_and(|version| matches!(version, DocumentVersion::Stored(_)))
     }
 
-    pub fn create_time(&self) -> Option<Timestamp> {
+    pub(crate) fn create_time(&self) -> Option<Timestamp> {
         self.versions.last().and_then(DocumentVersion::create_time)
     }
 
-    pub fn last_updated(&self) -> Option<Timestamp> {
+    pub(crate) fn last_updated(&self) -> Option<Timestamp> {
         self.versions.last().map(DocumentVersion::update_time)
     }
 
@@ -163,63 +215,6 @@ impl DocumentContents {
             _ => Ok(()),
         }
     }
-
-    /// Add a new version with the given `update_time`, if the given `fields` are identical to the
-    /// last version, it will return [`Err`] with the update time ([`Timestamp`]) of the last
-    /// version.
-    #[instrument(level = Level::DEBUG, skip_all, fields(
-        doc_name = %self.name,
-        time = display(&update_time),
-    ))]
-    pub async fn maybe_add_version(
-        &mut self,
-        fields: HashMap<String, Value>,
-        update_time: Timestamp,
-    ) -> Result<DocumentVersion, Timestamp> {
-        trace!(?fields);
-        // Check if the fields are exactly equal to the last version, in that case, do not generate
-        // a new version.
-        if let Some(last) = self
-            .versions
-            .last()
-            .and_then(DocumentVersion::stored_document)
-        {
-            trace!("fields are equal to previous version");
-            if last.fields == fields {
-                return Err(last.update_time);
-            }
-        }
-        let create_time = self.create_time().unwrap_or(update_time);
-        let version = DocumentVersion::Stored(Arc::new(StoredDocumentVersion {
-            name: self.name.clone(),
-            create_time,
-            update_time,
-            fields,
-        }));
-        // In transactions, we may get multiple updates to the same document, this should result in
-        // only one added version.
-        if let Some(last) = self.versions.last_mut() {
-            if last.update_time() == version.update_time() {
-                last.clone_from(&version);
-                return Ok(version);
-            }
-            assert!(
-                last.update_time() < version.update_time(),
-                "update or commit time earlier than last version"
-            );
-        }
-        self.versions.push(version.clone());
-        Ok(version)
-    }
-
-    pub async fn delete(&mut self, delete_time: Timestamp) -> DocumentVersion {
-        let version = DocumentVersion::Deleted(Arc::new(DeletedDocumentVersion {
-            name: self.name.clone(),
-            delete_time,
-        }));
-        self.versions.push(version.clone());
-        version
-    }
 }
 
 pub(crate) type DocumentContentsReadGuard<'a> = RwLockReadGuard<'a, DocumentContents>;
@@ -232,36 +227,145 @@ pub(crate) struct OwnedDocumentContentsReadGuard {
     write_permit: oneshot::Receiver<OwnedSemaphorePermit>,
 }
 
-pub(crate) type OwnedDocumentContentsWriteGuard = OwnedRwLockWriteGuard<DocumentContents>;
-
 impl OwnedDocumentContentsReadGuard {
+    /// Try to upgrade this owned read lock to an owned write lock. Can result in a timeout or a
+    /// contention error (GRPC Aborted).
     #[instrument(level = Level::DEBUG, skip_all, err)]
-    pub async fn upgrade(self) -> Result<OwnedDocumentContentsWriteGuard> {
+    pub(crate) async fn upgrade(self) -> Result<OwnedDocumentContentsWriteGuard> {
         debug!(name = %self.meta.name);
-        let check_time = self.guard.last_updated();
         let OwnedDocumentContentsReadGuard {
             project,
             meta,
             guard,
             write_permit,
         } = self;
+
+        // Remember what the current last version is of the document, and then release the read
+        // lock. We know that this current last version is also the version that our consumer has
+        // seen, because they had a read lock all along.
+        let check_time = guard.last_updated();
         drop(guard);
-        let write_permit = lock_timeout(write_permit, project.timeouts.write, || {
-            format!("write permit for {}", &meta.name)
-        })
+
+        // Now wait until our assistent tells us they have acquired a write permit for us. This can
+        // timeout, dropping everything. That is ok.
+        let write_permit = lock_timeout(
+            write_permit,
+            project.timeouts.write,
+            "write permit",
+            &meta.name,
+        )
         .await?
         .unwrap();
-        let owned_rw_lock_write_guard = meta.owned_write().await?;
+
+        // Now that we have got the permit we will try to acquire the write lock. This can timeout,
+        // dropping everything. That is ok.
+        let guard = lock_timeout(
+            Arc::clone(&meta.contents).write_owned(),
+            meta.project.timeouts.write,
+            "write lock",
+            &meta.name,
+        )
+        .await?;
         drop(write_permit);
-        if check_time == owned_rw_lock_write_guard.last_updated() {
-            Ok(owned_rw_lock_write_guard)
-        } else {
-            Err(GenericDatabaseError::aborted("contention"))
+
+        // Make sure nobody touched our document in the mean time, otherwise we have to report
+        // contention to our client.
+        if check_time != guard.last_updated() {
+            return Err(GenericDatabaseError::aborted("contention"));
         }
+
+        Ok(OwnedDocumentContentsWriteGuard {
+            guard,
+            acquire_time: Timestamp::now(),
+        })
     }
 }
 
 impl Deref for OwnedDocumentContentsReadGuard {
+    type Target = DocumentContents;
+
+    fn deref(&self) -> &Self::Target {
+        self.guard.deref()
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct OwnedDocumentContentsWriteGuard {
+    guard: OwnedRwLockWriteGuard<DocumentContents>,
+    pub(crate) acquire_time: Timestamp,
+}
+
+impl OwnedDocumentContentsWriteGuard {
+    /// Add a new version with the given `update_time`, if the given `fields` are identical to the
+    /// last version, it will return [`Err`] with the update time ([`Timestamp`]) of the last
+    /// version.
+    #[instrument(level = Level::DEBUG, skip_all, fields(
+        doc_name = %self.name,
+        time = display(&update_time),
+    ))]
+    pub(crate) async fn maybe_update(
+        &mut self,
+        fields: HashMap<String, Value>,
+        update_time: Timestamp,
+    ) -> Result<(Timestamp, Option<DocumentVersion>)> {
+        trace!(?fields);
+        // Check if the fields are exactly equal to the last version, in that case, do not generate
+        // a new version.
+        if let Some(last) = self
+            .versions
+            .last()
+            .and_then(DocumentVersion::stored_document)
+        {
+            trace!("fields are equal to previous version");
+            if last.fields == fields {
+                return Ok((last.update_time, None));
+            }
+        }
+        let create_time = self.create_time().unwrap_or(update_time);
+        let version = DocumentVersion::Stored(Arc::new(StoredDocumentVersion {
+            name: self.name.clone(),
+            create_time,
+            update_time,
+            fields,
+        }));
+        self.maybe_add_version(&version)?;
+        return Ok((update_time, Some(version)));
+    }
+
+    pub(crate) async fn delete(&mut self, delete_time: Timestamp) -> Result<DocumentVersion> {
+        let version = DocumentVersion::Deleted(Arc::new(DeletedDocumentVersion {
+            name: self.name.clone(),
+            delete_time,
+        }));
+        self.maybe_add_version(&version)?;
+        Ok(version)
+    }
+
+    fn maybe_add_version(&mut self, version: &DocumentVersion) -> Result<()> {
+        if version.update_time() < self.acquire_time {
+            return Err(GenericDatabaseError::internal(
+                "lock should always be acquired before claiming write/update time",
+            ));
+        }
+        if let Some(last) = self.guard.versions.last_mut() {
+            // This should never fail because of the check against the acquire time above.
+            assert!(
+                last.update_time() <= version.update_time(),
+                "update time should be monotonically increasing"
+            );
+            // In transactions, we may get multiple updates to the same document, this should result
+            // in only one added version.
+            if last.update_time() == version.update_time() {
+                last.clone_from(version);
+                return Ok(());
+            }
+        }
+        self.guard.versions.push(version.clone());
+        Ok(())
+    }
+}
+
+impl Deref for OwnedDocumentContentsWriteGuard {
     type Target = DocumentContents;
 
     fn deref(&self) -> &Self::Target {
@@ -392,7 +496,8 @@ impl From<precondition::ConditionType> for DocumentPrecondition {
 async fn lock_timeout<F: Future>(
     future: F,
     time: Duration,
-    id: impl FnOnce() -> String,
+    kind: &str,
+    doc_name: &DocumentRef,
 ) -> Result<F::Output> {
     let future_with_timeout = async {
         timeout(time, future).await.map_err(|_: Elapsed| {
@@ -402,7 +507,7 @@ async fn lock_timeout<F: Future>(
     let mut future_with_timeout = pin!(future_with_timeout);
     tokio::select! {
         result = &mut future_with_timeout => return result,
-        _ = sleep(Duration::from_secs(1)) => warn!("waiting more than 1 second on: {}", id()),
+        _ = sleep(Duration::from_secs(1)) => warn!("waiting more than 1 second on a {kind} for {doc_name}"),
     }
     future_with_timeout.await
 }
