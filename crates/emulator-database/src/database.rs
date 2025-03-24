@@ -22,8 +22,7 @@ use tracing::{debug, field::display, instrument, Level, Span};
 use self::{
     collection::Collection,
     document::{
-        DocumentContents, DocumentMeta, DocumentVersion, OwnedDocumentContentsWriteGuard,
-        StoredDocumentVersion,
+        DocumentMeta, DocumentVersion, OwnedDocumentContentsWriteGuard, StoredDocumentVersion,
     },
     event::DatabaseEvent,
     field_path::FieldPath,
@@ -120,18 +119,6 @@ impl FirestoreDatabase {
             .get_doc(name)
             .await;
         Ok(meta)
-    }
-
-    pub async fn get_doc_meta_mut_no_txn(
-        &self,
-        name: &DocumentRef,
-    ) -> Result<OwnedDocumentContentsWriteGuard> {
-        self.get_doc_meta(name)
-            .await?
-            .read_owned()
-            .await?
-            .upgrade()
-            .await
     }
 
     /// Get all the collections that reside directly under the given parent. This means that:
@@ -308,6 +295,21 @@ impl FirestoreDatabase {
         Ok((read_time, result))
     }
 
+    pub async fn write(self: &Arc<Self>, write: Write) -> Result<WriteResult> {
+        let name = get_doc_name_from_write(&write)?;
+        let mut guard = self.get_doc_meta(&name).await?.write_owned().await?;
+        let update_time = guard.acquire_time;
+        let (result, new_version) = self.perform_write(write, &mut guard, update_time).await?;
+        if let Some(new_version) = new_version {
+            self.send_event(DatabaseEvent {
+                database: Arc::downgrade(self),
+                update_time,
+                updates: [(name.clone(), new_version)].into(),
+            });
+        }
+        Ok(result)
+    }
+
     #[instrument(level = Level::DEBUG, skip_all, err)]
     pub async fn commit(
         self: &Arc<Self>,
@@ -362,10 +364,10 @@ impl FirestoreDatabase {
     }
 
     #[instrument(level = Level::DEBUG, skip_all, err)]
-    pub async fn perform_write(
+    async fn perform_write(
         &self,
         write: Write,
-        contents: &mut DocumentContents,
+        document: &mut OwnedDocumentContentsWriteGuard,
         commit_time: Timestamp,
     ) -> Result<(WriteResult, Option<DocumentVersion>)> {
         let Write {
@@ -382,17 +384,17 @@ impl FirestoreDatabase {
             .and_then(|cd| cd.condition_type)
             .map(Into::into);
         if let Some(condition) = condition {
-            contents.check_precondition(condition)?;
+            document.check_precondition(condition)?;
         }
         let mut transform_results = vec![];
 
         use write::Operation::*;
-        let document_version = match operation {
+        let (update_time, document_version) = match operation {
             Update(doc) => {
-                debug!(name = %contents.name, "Update");
+                debug!(name = %document.name, "Update");
 
                 let mut fields = if let Some(mask) = update_mask {
-                    apply_updates(contents, mask, &doc.fields)?
+                    apply_updates(document, mask, &doc.fields)?
                 } else {
                     doc.fields
                 };
@@ -408,24 +410,20 @@ impl FirestoreDatabase {
                         commit_time,
                     )?);
                 }
-                contents.maybe_add_version(fields, commit_time).await
+                document.maybe_update(fields, commit_time).await?
             }
             Delete(_) => {
-                debug!(name = %contents.name, "Delete");
+                debug!(name = %document.name, "Delete");
 
                 unimplemented_option!(update_mask);
                 unimplemented_collection!(update_transforms);
-                Ok(contents.delete(commit_time).await)
+                (commit_time, Some(document.delete(commit_time).await?))
             }
             Transform(_) => unimplemented!("transform"),
         };
-        let (update_time, document_version) = match document_version {
-            Ok(version) => (Some(commit_time), Some(version)),
-            Err(time) => (Some(time), None),
-        };
         Ok((
             WriteResult {
-                update_time,
+                update_time: Some(update_time),
                 transform_results,
             },
             document_version,
@@ -478,11 +476,11 @@ impl Drop for FirestoreDatabase {
 }
 
 fn apply_updates(
-    contents: &mut DocumentContents,
+    document: &mut OwnedDocumentContentsWriteGuard,
     mask: DocumentMask,
     updated_values: &HashMap<String, Value>,
 ) -> Result<HashMap<String, Value>, GenericDatabaseError> {
-    let mut fields = contents
+    let mut fields = document
         .current_version()
         .map(|v| v.fields.clone())
         .unwrap_or_default();
@@ -555,7 +553,7 @@ fn apply_transform(
     Ok(result)
 }
 
-pub fn get_doc_name_from_write(write: &Write) -> Result<DocumentRef> {
+fn get_doc_name_from_write(write: &Write) -> Result<DocumentRef> {
     let operation = write
         .operation
         .as_ref()
