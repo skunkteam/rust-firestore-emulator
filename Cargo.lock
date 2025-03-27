@@ -578,7 +578,6 @@ dependencies = [
  "googletest",
  "itertools",
  "rstest",
- "serde",
  "serde_with",
  "string_cache",
  "thiserror 2.0.12",

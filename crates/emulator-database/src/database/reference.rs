@@ -1,6 +1,5 @@
 use std::{fmt::Display, str::FromStr};
 
-use serde::Deserialize;
 use serde_with::{DeserializeFromStr, SerializeDisplay};
 use string_cache::DefaultAtom;
 
@@ -217,7 +216,9 @@ impl From<CollectionRef> for Ref {
     }
 }
 
-#[derive(Clone, Debug, Hash, PartialEq, Eq, PartialOrd, Ord, Deserialize)]
+#[derive(
+    Clone, Debug, Hash, PartialEq, Eq, PartialOrd, Ord, DeserializeFromStr, SerializeDisplay,
+)]
 pub struct RootRef {
     pub project_id:  DefaultAtom,
     pub database_id: DefaultAtom,
@@ -253,7 +254,9 @@ impl RootRef {
     }
 }
 
-#[derive(Clone, Debug, Hash, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(
+    Clone, Debug, Hash, PartialEq, Eq, PartialOrd, Ord, DeserializeFromStr, SerializeDisplay,
+)]
 pub struct CollectionRef {
     pub root_ref:      RootRef,
     pub collection_id: DefaultAtom,
@@ -408,7 +411,9 @@ impl CollectionRef {
     }
 }
 
-#[derive(Clone, Debug, Hash, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(
+    Clone, Debug, Hash, PartialEq, Eq, PartialOrd, Ord, DeserializeFromStr, SerializeDisplay,
+)]
 pub struct DocumentRef {
     pub collection_ref: CollectionRef,
     pub document_id:    DefaultAtom,
