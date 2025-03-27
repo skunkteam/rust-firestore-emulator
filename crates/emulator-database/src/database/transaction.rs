@@ -148,8 +148,11 @@ impl ReadWriteTransaction {
         &self,
         name: &DocumentRef,
     ) -> Result<OwnedDocumentContentsWriteGuard> {
-        let mut guards = self.guards.lock().await;
-        let read_guard = match guards.remove(name) {
+        let read_guard = {
+            let mut guards = self.guards.lock().await;
+            guards.remove(name)
+        };
+        let read_guard = match read_guard {
             Some(guard) => Arc::into_inner(guard).ok_or_else(|| {
                 GenericDatabaseError::aborted("concurrent reads during txn commit in same txn")
             })?,
