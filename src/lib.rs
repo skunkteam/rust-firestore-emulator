@@ -23,7 +23,7 @@ pub async fn run(
         .with_state(())
         // convert it into a service that is compatible with tonic's GRPC services:
         .into_service()
-        .map_response(|r| r.map(tonic::body::boxed))
+        .map_response(|r| r.map(tonic::body::Body::new))
         .map_err(Into::into);
 
     let server = Server::builder()
@@ -45,7 +45,7 @@ pub async fn run(
 
     server
         .serve_with_incoming_shutdown(
-            TcpIncoming::from_listener(listener, true, None).unwrap(),
+            TcpIncoming::from(listener).with_nodelay(Some(true)),
             shutdown,
         )
         .await?;

@@ -30,7 +30,7 @@ impl<S: Tracing + 'static> Clone for TracingState<S> {
 pub(crate) fn router(tracing: &'static impl Tracing) -> Router {
     Router::new()
         .route(
-            "/:name",
+            "/{name}",
             post(start_capture_or_poll_logs).delete(stop_capture),
         )
         .with_state(TracingState {

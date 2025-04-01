@@ -13,7 +13,7 @@ use crate::error::{RestError, Result};
 pub(crate) fn router() -> Router<&'static FirestoreProject> {
     Router::new()
         .route("/", get(list_databases))
-        .route("/*ref", get(get_by_ref).delete(delete_by_ref))
+        .route("/{*ref}", get(get_by_ref).delete(delete_by_ref))
 }
 
 async fn list_databases(State(project): State<&FirestoreProject>) -> impl IntoResponse {
