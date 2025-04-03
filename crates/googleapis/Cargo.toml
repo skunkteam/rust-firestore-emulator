@@ -38,4 +38,5 @@ unused_macro_rules = "warn"
 
 [lints.clippy]
 doc_lazy_continuation = "allow"
+doc_overindented_list_items = "allow"
 large_enum_variant = "allow"
