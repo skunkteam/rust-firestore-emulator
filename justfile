@@ -83,3 +83,15 @@ sdk-test: (build "--no-default-features")
 # Watch code and execute just command on change, e.g. `just watch test googleapis`
 watch *cmd:
     cargo watch --ignore test-suite --clear --shell 'just {{ cmd }}'
+
+# Update the googleapis submodule to their latest commit and patch the commit hash in flake.nix.
+# Also staging changes in git to ensure things stay in sync. 
+update-submodule:
+    #!/usr/bin/env sh
+    git submodule update --remote
+    git add './crates/googleapis/include'
+    # Get the commit hash of the current version of the submodule:
+    rev=$(git submodule status | awk '{print $1}') 
+    # Regex search and replace the commit hash in the flake inputs section:
+    sed -i -E 's,(url = "github:googleapis/googleapis/).+(";),\1'"$(echo $rev)"'\2,' 'flake.nix'
+    git add './flake.*'
