@@ -8,6 +8,7 @@ doctest = false
 
 [dependencies]
 base64 = { workspace = true }
+itertools = { workspace = true }
 prost = { workspace = true }
 serde = { workspace = true, features = ["serde_derive"] }
 thiserror = { workspace = true }
@@ -38,4 +39,5 @@ unused_macro_rules = "warn"
 
 [lints.clippy]
 doc_lazy_continuation = "allow"
+doc_overindented_list_items = "allow"
 large_enum_variant = "allow"

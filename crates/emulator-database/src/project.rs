@@ -65,12 +65,12 @@ impl FirestoreProject {
         )
     }
 
-    pub async fn database_names(&self) -> Vec<String> {
+    pub async fn database_names(&self) -> Vec<RootRef> {
         self.databases
             .read()
             .await
             .values()
-            .map(|db| db.name.to_string())
+            .map(|db| db.name.clone())
             .collect()
     }
 

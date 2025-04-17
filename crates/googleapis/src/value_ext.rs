@@ -1,5 +1,6 @@
 use std::{cmp, collections::HashMap, iter::Sum, ops::Add};
 
+use itertools::Itertools;
 use prost::bytes::Bytes;
 
 use crate::google::{
@@ -197,7 +198,9 @@ impl Ord for Value {
             }
             (ValueType::GeoPointValue(a), ValueType::GeoPointValue(b)) => a.cmp(b),
             (ValueType::ArrayValue(a), ValueType::ArrayValue(b)) => a.values.cmp(&b.values),
-            (ValueType::MapValue(_a), ValueType::MapValue(_b)) => todo!("ordering for MapValues"),
+            (ValueType::MapValue(a), ValueType::MapValue(b)) => {
+                a.fields.iter().sorted().cmp(b.fields.iter().sorted())
+            }
             // Only the above types should need to be compared here, because of the type ordering
             // above.
             _ => unreachable!("logic error in Ord implementation of Value"),
