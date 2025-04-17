@@ -8,6 +8,7 @@ doctest = false
 
 [dependencies]
 base64 = { workspace = true }
+itertools = { workspace = true }
 prost = { workspace = true }
 serde = { workspace = true, features = ["serde_derive"] }
 thiserror = { workspace = true }
