@@ -69,7 +69,7 @@ const arrays: Data[] = [
     { type: 'array', ordered: [1, 2, 3, 1] },
     { type: 'array', ordered: [2] },
 ];
-const maps: Data[] = fs.notImplementedInRust || [
+const maps: Data[] = [
     { type: 'map', ordered: { a: 'aaa', b: 'baz' } },
     { type: 'map', ordered: { a: 'foo', b: 'bar' } },
     { type: 'map', ordered: { a: 'foo', b: 'bar', c: 'qux' } },
@@ -219,7 +219,7 @@ describe.each([
                 'boolean',
                 'bytes',
                 'date',
-                ...(fs.notImplementedInRust || ['map']),
+                'map',
                 'none',
                 'null',
                 'number',
@@ -238,7 +238,7 @@ describe.each([
                 'bytes',
                 'ref',
                 'array',
-                ...(fs.notImplementedInRust || ['map']),
+                'map',
             ]);
         });
 
@@ -252,7 +252,7 @@ describe.each([
                 { type: 'boolean', data: booleans },
                 { type: 'date', data: dates },
                 { type: 'array', data: arrays },
-                ...(fs.notImplementedInRust || [{ type: 'map', data: maps }]),
+                { type: 'map', data: maps },
             ] as const)('$type', async ({ data, whereClauseValue = data[0].ordered }) => {
                 const saneData = data.map(sanitizeData);
                 expect(await getData(collection.where('ordered', '>', whereClauseValue))).toEqual(saneData.slice(1));
@@ -270,7 +270,7 @@ describe.each([
                 { type: 'boolean', data: booleans },
                 { type: 'date', data: dates },
                 { type: 'array', data: arrays },
-                ...(fs.notImplementedInRust || [{ type: 'map', data: maps }]),
+                { type: 'map', data: maps },
             ] as const)('$type', async ({ data, itemToExclude = data[0] }) => {
                 expect(await getData(collection.where('ordered', '!=', itemToExclude.ordered))).toEqual(
                     without(storedTestData, itemToExclude, nullType, nothing).map(sanitizeData),
@@ -288,7 +288,7 @@ describe.each([
                 { type: 'boolean', data: booleans },
                 { type: 'date', data: dates },
                 { type: 'array', data: arrays },
-                ...(fs.notImplementedInRust || [{ type: 'map', data: maps }]),
+                { type: 'map', data: maps },
             ] as const)('$type', async ({ data, itemToUse = data[0] }) => {
                 expect(await getData(collection.where('ordered', '==', itemToUse.ordered))).toEqual([sanitizeData(itemToUse)]);
             });
