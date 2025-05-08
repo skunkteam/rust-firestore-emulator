@@ -2,9 +2,9 @@ import { MaybeFinalState, atom, error, final } from '@skunkteam/sherlock';
 import { fromPromise } from '@skunkteam/sherlock-utils';
 import assert from 'assert';
 import { AsyncLocalStorage } from 'async_hooks';
-import { range } from 'lodash';
 import { setTimeout as time } from 'timers/promises';
 import { fs } from './utils';
+import { readDataRef } from './utils/firestore';
 
 describe('concurrent tests', () => {
     // no concurrent tests with the Java Emulator..
@@ -634,15 +634,32 @@ describe('concurrent tests', () => {
                 });
 
             describe('queries', () => {
-                concurrent('update after reading a query', async () => {
-                    const testName = 'update';
-
+                async function setupQueryTest(testName: string) {
                     const [docRef1, docRef2] = refs();
 
-                    await docRef1.create(fs.writeData({ testName }));
-                    await docRef2.create(fs.writeData({ testName }));
+                    const testData = fs.writeData({ testName });
+                    await fs.firestore.batch().create(docRef1, testData).create(docRef2, testData).commit();
 
-                    const query = fs.collection.where('testName', '==', testName);
+                    const baseQuery = fs.collection.where('testName', '==', testName);
+
+                    return { docRef1, docRef2, testName, queryDocsInTest };
+
+                    async function queryDocsInTest(
+                        txn: FirebaseFirestore.Transaction,
+                        opts: { exclude?: FirebaseFirestore.DocumentReference } = {},
+                    ) {
+                        const excludeId = opts.exclude?.id;
+                        const query = excludeId ? baseQuery.where(fs.exported.FieldPath.documentId(), '!=', excludeId) : baseQuery;
+
+                        const snaps = await txn.get(query);
+                        // Sanity check
+                        if (excludeId) expect(snaps.docs).not.toPartiallyContain({ id: excludeId });
+                        return snaps;
+                    }
+                }
+
+                concurrent('update after reading a query', async () => {
+                    const { docRef1, docRef2, queryDocsInTest } = await setupQueryTest('update');
 
                     const test = new ConcurrentTest();
 
@@ -651,7 +668,7 @@ describe('concurrent tests', () => {
                             await fs.firestore.runTransaction(async txn => {
                                 test.event('transaction started');
 
-                                const snaps = await txn.get(query);
+                                const snaps = await queryDocsInTest(txn);
                                 expect(snaps.size).toBe(2);
                                 test.event('transaction locked the query');
                                 await time(250);
@@ -663,6 +680,7 @@ describe('concurrent tests', () => {
                         },
                         async () => {
                             await test.when('transaction locked the query');
+                            // Note that both these `update`s wait for the transaction above to be completed
                             await Promise.all([
                                 docRef1.update({ simple: 'also update docRef1' }),
                                 docRef2.update({ simple: 'this is the only update for docRef2' }),
@@ -681,14 +699,7 @@ describe('concurrent tests', () => {
                 });
 
                 concurrent('delete after reading a query', async () => {
-                    const testName = 'delete';
-
-                    const [docRef1, docRef2] = refs();
-
-                    await docRef1.create(fs.writeData({ testName }));
-                    await docRef2.create(fs.writeData({ testName }));
-
-                    const query = fs.collection.where('testName', '==', testName);
+                    const { docRef1, queryDocsInTest } = await setupQueryTest('delete');
 
                     const test = new ConcurrentTest();
 
@@ -697,7 +708,7 @@ describe('concurrent tests', () => {
                             await fs.firestore.runTransaction(async txn => {
                                 test.event('transaction started');
 
-                                const snaps = await txn.get(query);
+                                const snaps = await queryDocsInTest(txn);
                                 expect(snaps.size).toBe(2);
                                 test.event('transaction locked the query');
                                 await time(250);
@@ -709,7 +720,7 @@ describe('concurrent tests', () => {
                         },
                         async () => {
                             await test.when('transaction locked the query');
-                            await docRef1.delete();
+                            await docRef1.delete(); // Note that this `delete` waits for the transaction above to be completed
                             test.event('docRef1 deleted outside the query');
                         },
                     );
@@ -723,6 +734,121 @@ describe('concurrent tests', () => {
                     ]);
                 });
 
+                concurrent('conditional write based on query (contested doc is read first in the secondary transaction)', async () => {
+                    const { docRef1, docRef2, testName, queryDocsInTest } = await setupQueryTest('multi');
+
+                    const test = new ConcurrentTest();
+
+                    await test.run(
+                        async () => {
+                            await test.when('txn 2: read own document');
+                            await fs.firestore.runTransaction(async txn => {
+                                test.event('txn 1: started');
+
+                                // First Transaction Try:
+                                //   `snaps` should contain `docRef2` which will include the document in the transaction
+                                // Second Transaction Try:
+                                //   `docRef2` will have changed it's `testName`, so it won't be in the result anymore
+                                const snaps = await queryDocsInTest(txn, { exclude: docRef1 });
+                                if (snaps.size) {
+                                    test.event('txn 1: found contested document');
+                                    // in the time between these events, `docRef2` is updated, which will make the transaction retry
+                                    await test.when('txn 2: completed');
+                                    txn.update(docRef1, { testName: 'other name' });
+                                } else {
+                                    test.event('txn 1: did not find any document');
+                                }
+                            });
+                            test.event('txn 1: completed');
+                        },
+                        async () => {
+                            await fs.firestore.runTransaction(async txn => {
+                                test.event('txn 2: started');
+                                // Read docRef2 before Txn1 queries this document, to get 'first rights' on this document
+                                await txn.get(docRef2);
+                                test.event('txn 2: read own document');
+
+                                await test.when('txn 1: found contested document');
+                                // Update `docRef2` after it is 'found' in the query in the first transaction
+                                txn.update(docRef2, { testName: 'some other name' });
+                                test.event('txn 2: updated contested document');
+                            });
+                            test.event('txn 2: completed');
+                        },
+                    );
+                    // the `update` of `docRef1` did not go through, because `docRef2` was altered before the transaction was committed
+                    expect(await readDataRef(docRef1)).toEqual({ testName });
+                    expect(await readDataRef(docRef2)).toEqual({ testName: 'some other name' });
+
+                    expect(test.log).toEqual([
+                        ' <<1>> | WAITING UNTIL: txn 2: read own document',
+                        '       | <<2>> | EVENT: txn 2: started',
+                        '       | <<2>> | EVENT: txn 2: read own document',
+                        '       | <<2>> | WAITING UNTIL: txn 1: found contested document',
+                        ' <<1>> | EVENT: txn 1: started',
+                        ' <<1>> | EVENT: txn 1: found contested document',
+                        ' <<1>> | WAITING UNTIL: txn 2: completed',
+                        '       | <<2>> | EVENT: txn 2: updated contested document',
+                        '       | <<2>> | EVENT: txn 2: completed',
+                        // txn 1 is retried, because the document in the query changed
+                        ' <<1>> | EVENT: txn 1: started',
+                        ' <<1>> | EVENT: txn 1: did not find any document',
+                        ' <<1>> | EVENT: txn 1: completed',
+                    ]);
+                });
+
+                concurrent('conditional write based on query  (contested doc is read first in the query)', async () => {
+                    const { docRef1, docRef2, queryDocsInTest } = await setupQueryTest('multi2');
+
+                    const test = new ConcurrentTest();
+
+                    await test.run(
+                        async () => {
+                            await fs.firestore.runTransaction(async txn => {
+                                test.event('txn 1: started');
+
+                                // This query is the first to lock `docRef2`
+                                const snaps = await queryDocsInTest(txn, { exclude: docRef1 });
+                                assert(snaps.size, '`docRef2` should be found in the query');
+
+                                test.event('txn 1: found contested document');
+                                await test.when('txn 2: called `update` on contested document');
+
+                                txn.update(docRef1, { testName: 'other name' });
+                            });
+                            test.event('txn 1: completed');
+                        },
+                        async () => {
+                            // Transaction 2 will start after Transaction 1 has already locked `docRef2`
+                            await test.when('txn 1: found contested document');
+                            await fs.firestore.runTransaction(async txn => {
+                                test.event('txn 2: started');
+                                await txn.get(docRef2);
+                                test.event('txn 2: read own document');
+
+                                txn.update(docRef2, { testName: 'some other name' });
+                                // Note that this does not mean that the `update` is committed yet!!
+                                test.event('txn 2: called `update` on contested document');
+                            });
+                            test.event('txn 2: completed');
+                        },
+                    );
+                    expect(await readDataRef(docRef1)).toEqual({ testName: 'other name' });
+                    expect(await readDataRef(docRef2)).toEqual({ testName: 'some other name' });
+
+                    expect(test.log).toEqual([
+                        '       | <<2>> | WAITING UNTIL: txn 1: found contested document',
+                        ' <<1>> | EVENT: txn 1: started',
+                        ' <<1>> | EVENT: txn 1: found contested document',
+                        ' <<1>> | WAITING UNTIL: txn 2: called `update` on contested document',
+                        '       | <<2>> | EVENT: txn 2: started',
+                        '       | <<2>> | EVENT: txn 2: read own document',
+                        '       | <<2>> | EVENT: txn 2: called `update` on contested document',
+                        ' <<1>> | EVENT: txn 1: completed',
+                        '       | <<2>> | EVENT: txn 2: completed',
+                    ]);
+                });
+
                 fs.notImplementedInJava || // Timeout
                     fs.notImplementedInRust || // Timeout
                     concurrent('create after reading a query', async () => {
@@ -731,7 +857,6 @@ describe('concurrent tests', () => {
                         const [docRef1, docRef2] = refs();
 
                         await docRef1.create(fs.writeData({ testName }));
-                        // await docRef2.create(fs.writeData({ testName }));
 
                         const query = fs.collection.where('testName', '==', testName);
 
@@ -839,8 +964,8 @@ describe('concurrent tests', () => {
     });
 });
 
-function refs(): Array<FirebaseFirestore.DocumentReference<FirebaseFirestore.DocumentData>> {
-    return range(2).map(() => fs.collection.doc());
+function refs() {
+    return [fs.collection.doc(), fs.collection.doc()] as const;
 }
 
 async function getData(promisedSnap: FirebaseFirestore.DocumentSnapshot | Promise<FirebaseFirestore.DocumentSnapshot>) {

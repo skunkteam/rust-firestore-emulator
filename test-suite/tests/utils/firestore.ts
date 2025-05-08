@@ -36,5 +36,9 @@ export function readData<T = FirebaseFirestore.DocumentData>(data: FirebaseFires
     expect(ttl).toBeInstanceOf(exported.Timestamp);
     return realData as T;
 }
+export async function readDataRef<T = FirebaseFirestore.DocumentData>(ref: FirebaseFirestore.DocumentReference) {
+    const snap = await ref.get();
+    return readData<T>(snap.data());
+}
 
 afterAll(async () => await firestore.recursiveDelete(collection));
