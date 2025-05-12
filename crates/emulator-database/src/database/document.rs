@@ -7,18 +7,13 @@ use std::{
     time::Duration,
 };
 
+use fifo_rwlock::{FifoRwLock, OwnedReadGuard, OwnedWriteGuard, ReadGuard};
 use futures::Future;
 use googleapis::google::{
     firestore::v1::{precondition, Document, Value},
     protobuf::Timestamp,
 };
-use tokio::{
-    sync::{
-        oneshot, OwnedRwLockReadGuard, OwnedRwLockWriteGuard, OwnedSemaphorePermit, RwLock,
-        RwLockReadGuard, Semaphore,
-    },
-    time::{error::Elapsed, sleep, timeout},
-};
+use tokio::time::{error::Elapsed, sleep, timeout};
 use tracing::{debug, instrument, trace, warn, Level};
 
 use super::reference::DocumentRef;
@@ -35,16 +30,12 @@ use crate::{error::Result, FirestoreProject, GenericDatabaseError};
 /// for transactions that lock documents early on, if they wouldn't have the earliest rights to
 /// write then we would have far more contention during transactions.
 pub(crate) struct DocumentMeta {
-    project: &'static FirestoreProject,
+    project:  &'static FirestoreProject,
     /// The resource name of the document, for example
     /// `projects/{project_id}/databases/{database_id}/documents/{document_path}`.
     pub name: DocumentRef,
     /// The actual contents (full history), protected by a RWLock.
-    contents: Arc<RwLock<DocumentContents>>,
-    /// The authority that determines who is allowed to write to this document. Hands out write
-    /// permits one at a time using a fair queue. Readers get in line for this shop and get out of
-    /// line whenever they did not need to upgrade to a write lock.
-    write_permit_shop: Arc<Semaphore>,
+    contents: Arc<FifoRwLock<DocumentContents>>,
 }
 
 impl Debug for DocumentMeta {
@@ -59,9 +50,8 @@ impl DocumentMeta {
     pub(crate) fn new(project: &'static FirestoreProject, name: DocumentRef) -> Self {
         Self {
             project,
-            contents: Arc::new(RwLock::new(DocumentContents::new(name.clone()))),
+            contents: Arc::new(FifoRwLock::new(DocumentContents::new(name.clone()))),
             name,
-            write_permit_shop: Arc::new(Semaphore::new(1)),
         }
     }
 
@@ -78,31 +68,16 @@ impl DocumentMeta {
 
     /// Get a read lock that can be held indefinitely. Can be upgraded to a write lock if needed.
     pub(crate) async fn read_owned(self: &Arc<Self>) -> Result<OwnedDocumentContentsReadGuard> {
-        let (mut tx, rx) = oneshot::channel();
-
-        // Put an assistent in the queue for the permit counter, we may want one in the future.
-        let write_permit_shop = Arc::clone(&self.write_permit_shop);
-        tokio::spawn(async {
-            tokio::select! {
-                Ok(permit) = write_permit_shop.acquire_owned() => {
-                    let _unused: Result<_, _> = tx.send(permit);
-                }
-
-                _ = tx.closed() => ()
-            }
-        });
-
         Ok(OwnedDocumentContentsReadGuard {
             project: self.project,
-            meta: Arc::clone(self),
-            guard: lock_timeout(
-                Arc::clone(&self.contents).read_owned(),
+            meta:    Arc::clone(self),
+            guard:   lock_timeout(
+                self.contents.read_owned(),
                 self.project.timeouts.read,
                 "read lock",
                 &self.name,
             )
             .await?,
-            write_permit: rx,
         })
     }
 
@@ -110,28 +85,14 @@ impl DocumentMeta {
     pub(crate) async fn write_owned(self: &Arc<Self>) -> Result<OwnedDocumentContentsWriteGuard> {
         // Using maximum timeout here, because there is no chance of failing because of contention,
         // the only way this fails is because of a timeout.
-        let timeout = self.project.timeouts.write.max(self.project.timeouts.read);
 
-        // Get in line for the permit counter, we want one asap.
-        let write_permit = lock_timeout(
-            self.write_permit_shop.acquire(),
-            timeout,
-            "write permit",
-            &self.name,
-        )
-        .await?
-        .unwrap();
-
-        // Now that we have got the permit we will try to acquire the write lock. This can timeout,
-        // dropping everything. That is ok.
         let guard = lock_timeout(
-            Arc::clone(&self.contents).write_owned(),
-            timeout,
+            self.contents.write_owned(),
+            self.project.timeouts.write,
             "write lock",
             &self.name,
         )
         .await?;
-        drop(write_permit);
 
         Ok(OwnedDocumentContentsWriteGuard {
             guard,
@@ -217,14 +178,13 @@ impl DocumentContents {
     }
 }
 
-pub(crate) type DocumentContentsReadGuard<'a> = RwLockReadGuard<'a, DocumentContents>;
+pub(crate) type DocumentContentsReadGuard<'a> = ReadGuard<'a, DocumentContents>;
 
 #[derive(Debug)]
 pub(crate) struct OwnedDocumentContentsReadGuard {
     project: &'static FirestoreProject,
-    meta: Arc<DocumentMeta>,
-    guard: OwnedRwLockReadGuard<DocumentContents>,
-    write_permit: oneshot::Receiver<OwnedSemaphorePermit>,
+    meta:    Arc<DocumentMeta>,
+    guard:   OwnedReadGuard<DocumentContents>,
 }
 
 impl OwnedDocumentContentsReadGuard {
@@ -237,36 +197,20 @@ impl OwnedDocumentContentsReadGuard {
             project,
             meta,
             guard,
-            write_permit,
         } = self;
 
         // Remember what the current last version is of the document, and then release the read
         // lock. We know that this current last version is also the version that our consumer has
         // seen, because they had a read lock all along.
         let check_time = guard.last_updated();
-        drop(guard);
 
-        // Now wait until our assistent tells us they have acquired a write permit for us. This can
-        // timeout, dropping everything. That is ok.
-        let write_permit = lock_timeout(
-            write_permit,
-            project.timeouts.write,
-            "write permit",
-            &meta.name,
-        )
-        .await?
-        .unwrap();
-
-        // Now that we have got the permit we will try to acquire the write lock. This can timeout,
-        // dropping everything. That is ok.
         let guard = lock_timeout(
-            Arc::clone(&meta.contents).write_owned(),
-            meta.project.timeouts.write,
+            guard.upgrade(),
+            project.timeouts.write,
             "write lock",
             &meta.name,
         )
         .await?;
-        drop(write_permit);
 
         // Make sure nobody touched our document in the mean time, otherwise we have to report
         // contention to our client.
@@ -291,7 +235,7 @@ impl Deref for OwnedDocumentContentsReadGuard {
 
 #[derive(Debug)]
 pub(crate) struct OwnedDocumentContentsWriteGuard {
-    guard: OwnedRwLockWriteGuard<DocumentContents>,
+    guard: OwnedWriteGuard<DocumentContents>,
     pub(crate) acquire_time: Timestamp,
 }
 

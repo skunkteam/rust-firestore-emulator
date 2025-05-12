@@ -573,6 +573,7 @@ name = "emulator-database"
 version = "0.2.0"
 dependencies = [
  "async-trait",
+ "fifo-rwlock",
  "futures",
  "googleapis",
  "googletest",
@@ -669,6 +670,15 @@ name = "fastrand"
 version = "2.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "37909eebbb50d72f9059c3b6d82c0463f2ff062c9e95845c43a6c9c0355411be"
+
+[[package]]
+name = "fifo-rwlock"
+version = "0.2.0"
+dependencies = [
+ "futures",
+ "tokio",
+ "tokio-test",
+]
 
 [[package]]
 name = "firestore-emulator"
@@ -2501,6 +2511,19 @@ dependencies = [
  "pin-project-lite",
  "tokio",
  "tokio-util",
+]
+
+[[package]]
+name = "tokio-test"
+version = "0.4.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2468baabc3311435b55dd935f702f42cd1b8abb7e754fb7dfb16bd36aa88f9f7"
+dependencies = [
+ "async-stream",
+ "bytes",
+ "futures-core",
+ "tokio",
+ "tokio-stream",
 ]
 
 [[package]]
