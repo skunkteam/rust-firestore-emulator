@@ -18,7 +18,7 @@ ui = ["emulator-http/ui"]
 members = ["crates/*"]
 
 [workspace.package]
-version = "0.2.0"
+version = "0.2.1"
 
 [workspace.dependencies]
 async-trait = "0.1.88"
@@ -45,6 +45,7 @@ tikv-jemallocator = "0.6.0"
 time = "0.3.41"
 tokio = "1.44.2"
 tokio-stream = "0.1.17"
+tokio-test = "0.4.4"
 tonic = "0.13"
 tonic-build = "0.13"
 tower = "0.5"

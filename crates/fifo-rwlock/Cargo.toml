@@ -1,0 +1,27 @@
+[package]
+name = "fifo-rwlock"
+version = { workspace = true }
+edition = "2021"
+
+[dependencies]
+tokio = { workspace = true, features = ["sync"] }
+
+[dev-dependencies]
+futures = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+tokio-test = { workspace = true }
+
+# Do not use workspace lints here, because we need unsafe code in this lib
+[lints.rust]
+explicit_outlives_requirements = "forbid"
+let_underscore_drop = "warn"
+missing_copy_implementations = "warn"
+missing_debug_implementations = "warn"
+non_ascii_idents = "forbid"
+single_use_lifetimes = "warn"
+unit_bindings = "warn"
+unreachable_pub = "warn"
+unused_crate_dependencies = "warn"
+unused_lifetimes = "warn"
+unused_macro_rules = "warn"
+unused_qualifications = "warn"

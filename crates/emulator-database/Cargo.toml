@@ -5,6 +5,7 @@ edition = "2021"
 
 [dependencies]
 async-trait = { workspace = true }
+fifo-rwlock = { path = "../fifo-rwlock" }
 futures = { workspace = true }
 googleapis = { path = "../googleapis" }
 itertools = { workspace = true }
