@@ -4,13 +4,13 @@
 use std::mem;
 
 use emulator_database::{
+    FirestoreProject,
     projection::{Project, Projection},
     query::{Query, QueryBuilder},
     read_consistency::ReadConsistency,
     reference::{DocumentRef, Ref},
-    FirestoreProject,
 };
-use futures::{future::join_all, stream::BoxStream, TryStreamExt};
+use futures::{TryStreamExt, future::join_all, stream::BoxStream};
 use googleapis::google::{
     firestore::v1::{
         firestore_server::{Firestore, FirestoreServer},
@@ -21,9 +21,9 @@ use googleapis::google::{
 };
 use itertools::Itertools;
 use tokio::sync::mpsc;
-use tokio_stream::{once, wrappers::ReceiverStream, StreamExt};
-use tonic::{async_trait, codec::CompressionEncoding, Code, Request, Response, Result, Status};
-use tracing::{debug, debug_span, field::display, instrument, Instrument, Level, Span};
+use tokio_stream::{StreamExt, once, wrappers::ReceiverStream};
+use tonic::{Code, Request, Response, Result, Status, async_trait, codec::CompressionEncoding};
+use tracing::{Instrument, Level, Span, debug, debug_span, field::display, instrument};
 use utils::error_in_stream;
 
 #[macro_use]
@@ -572,7 +572,7 @@ impl Firestore for FirestoreEmulator {
         let database = self.project.database(&database.parse()?).await;
 
         let (status, write_results): (Vec<_>, Vec<_>) =
-            join_all(writes.into_iter().map(|write| async {
+            join_all(writes.into_iter().map(async |write| {
                 let result = database
                     .write(write)
                     .await

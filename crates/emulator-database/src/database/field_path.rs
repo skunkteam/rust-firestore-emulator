@@ -4,7 +4,7 @@ use googleapis::google::firestore::v1::*;
 use itertools::{Itertools, PeekingNext};
 
 use super::document::StoredDocumentVersion;
-use crate::{error::Result, GenericDatabaseError};
+use crate::{GenericDatabaseError, error::Result};
 
 /// The virtual field-name that represents the document-name.
 pub const DOC_NAME: &str = "__name__";

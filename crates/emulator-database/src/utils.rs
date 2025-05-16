@@ -3,7 +3,6 @@ use std::{
     hash::{BuildHasher, Hash},
 };
 
-use async_trait::async_trait;
 use tokio::sync::{RwLock, RwLockReadGuard};
 
 #[macro_export]
@@ -55,27 +54,30 @@ macro_rules! unimplemented_bool {
     };
 }
 
-#[async_trait]
 pub(crate) trait RwLockHashMapExt<Q: ?Sized, V> {
-    async fn get_or_insert(
-        &self,
+    async fn get_or_insert<'a>(
+        &'a self,
         key: &Q,
         default: impl FnOnce() -> V + Send,
-    ) -> RwLockReadGuard<V>;
+    ) -> RwLockReadGuard<'a, V>
+    where
+        V: 'a;
 }
 
-#[async_trait]
 impl<K, V, S> RwLockHashMapExt<K, V> for RwLock<HashMap<K, V, S>>
 where
     K: Clone + Eq + Hash + Sync + Send,
     V: Clone + Sync + Send,
     S: BuildHasher + Sync + Send,
 {
-    async fn get_or_insert(
-        &self,
+    async fn get_or_insert<'a>(
+        &'a self,
         key: &K,
         default: impl FnOnce() -> V + Send,
-    ) -> RwLockReadGuard<V> {
+    ) -> RwLockReadGuard<'a, V>
+    where
+        V: 'a,
+    {
         let lock = self.read().await;
         if let Ok(guard) = RwLockReadGuard::try_map(lock, |lock| lock.get(key)) {
             return guard;

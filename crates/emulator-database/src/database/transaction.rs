@@ -1,22 +1,22 @@
 use std::{
-    collections::{hash_map::Entry, HashMap},
+    collections::{HashMap, hash_map::Entry},
     fmt::Display,
     sync::{
-        atomic::{self, AtomicUsize},
         Arc, Weak,
+        atomic::{self, AtomicUsize},
     },
 };
 
 use googleapis::google::protobuf::Timestamp;
 use tokio::sync::{Mutex, RwLock};
-use tracing::{instrument, Level};
+use tracing::{Level, instrument};
 
 use super::{
+    FirestoreDatabase,
     document::{OwnedDocumentContentsReadGuard, OwnedDocumentContentsWriteGuard},
     reference::DocumentRef,
-    FirestoreDatabase,
 };
-use crate::{document::StoredDocumentVersion, error::Result, GenericDatabaseError};
+use crate::{GenericDatabaseError, document::StoredDocumentVersion, error::Result};
 
 #[derive(Debug)]
 pub(crate) struct RunningTransactions {

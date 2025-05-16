@@ -4,10 +4,10 @@ use std::{
 };
 
 use axum::{
+    Router,
     body::Bytes,
     extract::{Path, State},
     routing::post,
-    Router,
 };
 use emulator_tracing::{DynamicSubscriber, Tracing};
 

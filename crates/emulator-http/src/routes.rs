@@ -1,9 +1,9 @@
 #[cfg(feature = "ui")]
 use axum::response::Html;
 use axum::{
-    http::{header, HeaderValue},
-    routing::get,
     Router,
+    http::{HeaderValue, header},
+    routing::get,
 };
 use emulator_database::FirestoreProject;
 use emulator_tracing::Tracing;
@@ -48,17 +48,17 @@ impl RouterBuilder {
         let router = router
             .route(
                 "/lit-html.js",
-                get(|| async {
+                get(async || {
                     (
                         [(header::CONTENT_TYPE, "text/javascript")],
                         include_str!("../../../ui/lit-html.js"),
                     )
                 }),
             )
-            .fallback(get(|| async { Html(HTML) }));
+            .fallback(get(async || Html(HTML)));
 
         #[cfg(not(feature = "ui"))]
-        let router = router.fallback(get(|| async { "OK" }));
+        let router = router.fallback(get(async || "OK"));
 
         router
             .layer(SetResponseHeaderLayer::overriding(

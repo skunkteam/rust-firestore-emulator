@@ -3,11 +3,11 @@ use std::{collections::HashMap, ops::Deref, sync::Arc};
 use googleapis::google::firestore::v1::{ListenRequest, ListenResponse};
 use tokio::sync::RwLock;
 use tokio_stream::Stream;
-use tracing::{debug, instrument, Level};
+use tracing::{Level, debug, instrument};
 
 use crate::{
-    config::FirestoreConfig, error::Result, listener::Listener, reference::RootRef,
-    timeouts::Timeouts, utils::RwLockHashMapExt, FirestoreDatabase,
+    FirestoreDatabase, config::FirestoreConfig, error::Result, listener::Listener,
+    reference::RootRef, timeouts::Timeouts, utils::RwLockHashMapExt,
 };
 
 pub struct FirestoreProject {

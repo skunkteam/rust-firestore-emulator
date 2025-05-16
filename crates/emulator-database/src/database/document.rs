@@ -10,14 +10,14 @@ use std::{
 use fifo_rwlock::{FifoRwLock, OwnedReadGuard, OwnedWriteGuard, ReadGuard};
 use futures::Future;
 use googleapis::google::{
-    firestore::v1::{precondition, Document, Value},
+    firestore::v1::{Document, Value, precondition},
     protobuf::Timestamp,
 };
 use tokio::time::{error::Elapsed, sleep, timeout};
-use tracing::{debug, instrument, trace, warn, Level};
+use tracing::{Level, debug, instrument, trace, warn};
 
 use super::reference::DocumentRef;
-use crate::{error::Result, FirestoreProject, GenericDatabaseError};
+use crate::{FirestoreProject, GenericDatabaseError, error::Result};
 
 /// DocumentMeta is the representation of one document in Firestore. Or more accurately, one
 /// document name or "spot" if you will, the document itself may or may not exist at any point in

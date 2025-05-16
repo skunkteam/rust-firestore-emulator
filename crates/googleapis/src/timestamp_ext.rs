@@ -1,7 +1,7 @@
 use std::{fmt, sync::Mutex};
 
 use thiserror::Error;
-use time::{format_description::well_known::Iso8601, Duration, OffsetDateTime};
+use time::{Duration, OffsetDateTime, format_description::well_known::Iso8601};
 
 use crate::google::protobuf::Timestamp;
 

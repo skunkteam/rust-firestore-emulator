@@ -7,8 +7,8 @@ use std::{
 
 use googleapis::google::{
     firestore::v1::{
-        structured_query::{self, CollectionSelector},
         Cursor, Document, StructuredQuery,
+        structured_query::{self, CollectionSelector},
     },
     protobuf::Timestamp,
 };
@@ -17,15 +17,15 @@ use string_cache::DefaultAtom;
 
 use self::filter::Filter;
 use super::{
+    FirestoreDatabase,
     collection::Collection,
     document::StoredDocumentVersion,
     field_path::FieldReference,
     projection::{Project, Projection},
     read_consistency::ReadConsistency,
     reference::{CollectionRef, Ref},
-    FirestoreDatabase,
 };
-use crate::{error::Result, reference::DocumentRef, unimplemented_option, GenericDatabaseError};
+use crate::{GenericDatabaseError, error::Result, reference::DocumentRef, unimplemented_option};
 
 mod filter;
 

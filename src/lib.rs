@@ -4,9 +4,9 @@ use emulator_database::FirestoreProject;
 use emulator_tracing::Tracing;
 use http::header::CONTENT_TYPE;
 use tokio::net::TcpListener;
-use tonic::transport::{server::TcpIncoming, Server};
+use tonic::transport::{Server, server::TcpIncoming};
 use tower::ServiceExt;
-use tracing::{enabled, info, Level};
+use tracing::{Level, enabled, info};
 
 mod multiplex;
 

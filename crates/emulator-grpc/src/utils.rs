@@ -1,4 +1,4 @@
-use futures::{stream::BoxStream, Future, Stream};
+use futures::{Future, Stream, stream::BoxStream};
 use tokio_stream::once;
 use tonic::{Response, Result};
 

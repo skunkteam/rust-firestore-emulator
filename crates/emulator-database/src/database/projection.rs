@@ -1,8 +1,8 @@
-use googleapis::google::firestore::v1::{structured_query, Document, DocumentMask};
+use googleapis::google::firestore::v1::{Document, DocumentMask, structured_query};
 use itertools::Itertools;
 
 use super::field_path::FieldReference;
-use crate::{document::StoredDocumentVersion, GenericDatabaseError};
+use crate::{GenericDatabaseError, document::StoredDocumentVersion};
 
 #[derive(Debug)]
 pub struct Projection {
