@@ -572,7 +572,7 @@ impl Firestore for FirestoreEmulator {
         let database = self.project.database(&database.parse()?).await;
 
         let (status, write_results): (Vec<_>, Vec<_>) =
-            join_all(writes.into_iter().map(|write| async {
+            join_all(writes.into_iter().map(async |write| {
                 let result = database
                     .write(write)
                     .await
