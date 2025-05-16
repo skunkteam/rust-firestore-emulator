@@ -2,30 +2,31 @@ use std::{
     collections::HashMap,
     marker::Unpin,
     sync::{
-        atomic::{self, AtomicUsize},
         Arc,
+        atomic::{self, AtomicUsize},
     },
 };
 
 use googleapis::google::{
     firestore::v1::{
+        DocumentChange, DocumentDelete, ListenRequest, ListenResponse, Target, TargetChange,
         listen_request,
         listen_response::ResponseType,
         target::{self, query_target},
         target_change::TargetChangeType,
-        DocumentChange, DocumentDelete, ListenRequest, ListenResponse, Target, TargetChange,
     },
     protobuf::Timestamp,
 };
 use itertools::Itertools;
 use tokio::sync::mpsc;
 use tokio_stream::{
-    wrappers::{errors::BroadcastStreamRecvError, BroadcastStream, ReceiverStream},
     StreamExt, StreamMap, StreamNotifyClose,
+    wrappers::{BroadcastStream, ReceiverStream, errors::BroadcastStreamRecvError},
 };
-use tracing::{debug, error, instrument, Level};
+use tracing::{Level, debug, error, instrument};
 
 use crate::{
+    FirestoreDatabase, FirestoreProject, GenericDatabaseError,
     database::{read_consistency::ReadConsistency, reference::Ref},
     document::DocumentVersion,
     error::Result,
@@ -33,7 +34,7 @@ use crate::{
     query::Query,
     reference::{DocumentRef, RootRef},
     required_option, unimplemented, unimplemented_bool, unimplemented_collection,
-    unimplemented_option, FirestoreDatabase, FirestoreProject, GenericDatabaseError,
+    unimplemented_option,
 };
 
 const TARGET_ID: i32 = 1;

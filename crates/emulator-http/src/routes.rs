@@ -1,9 +1,9 @@
 #[cfg(feature = "ui")]
 use axum::response::Html;
 use axum::{
-    http::{header, HeaderValue},
-    routing::get,
     Router,
+    http::{HeaderValue, header},
+    routing::get,
 };
 use emulator_database::FirestoreProject;
 use emulator_tracing::Tracing;

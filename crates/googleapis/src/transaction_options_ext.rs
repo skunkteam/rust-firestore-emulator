@@ -1,6 +1,6 @@
 use crate::google::firestore::v1::{
-    transaction_options::{Mode, ReadWrite},
     TransactionOptions,
+    transaction_options::{Mode, ReadWrite},
 };
 
 impl TransactionOptions {

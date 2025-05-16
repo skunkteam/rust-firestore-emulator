@@ -1,11 +1,11 @@
 use axum::{
+    Json, Router,
     extract::{Path, State},
     http::StatusCode,
     response::{IntoResponse, Response},
     routing::get,
-    Json, Router,
 };
-use emulator_database::{read_consistency::ReadConsistency, reference::Ref, FirestoreProject};
+use emulator_database::{FirestoreProject, read_consistency::ReadConsistency, reference::Ref};
 use serde_json::json;
 
 use crate::error::{RestError, Result};

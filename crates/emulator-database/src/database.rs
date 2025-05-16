@@ -1,12 +1,12 @@
 use std::{
-    collections::{hash_map::Entry, BTreeSet, HashMap},
+    collections::{BTreeSet, HashMap, hash_map::Entry},
     sync::{Arc, Weak},
 };
 
 use googleapis::google::{
     firestore::v1::{
         document_transform::field_transform::{ServerValue, TransformType},
-        structured_aggregation_query::{aggregation, Aggregation},
+        structured_aggregation_query::{Aggregation, aggregation},
         *,
     },
     protobuf::Timestamp,
@@ -14,10 +14,10 @@ use googleapis::google::{
 use itertools::Itertools;
 use string_cache::DefaultAtom;
 use tokio::sync::{
-    broadcast::{self, Receiver},
     RwLock,
+    broadcast::{self, Receiver},
 };
-use tracing::{debug, field::display, instrument, Level, Span};
+use tracing::{Level, Span, debug, field::display, instrument};
 
 use self::{
     collection::Collection,
@@ -32,8 +32,8 @@ use self::{
     transaction::{RunningTransactions, TransactionId},
 };
 use crate::{
-    database::field_path::FieldReference, error::Result, unimplemented, unimplemented_collection,
-    unimplemented_option, utils::RwLockHashMapExt, FirestoreProject, GenericDatabaseError,
+    FirestoreProject, GenericDatabaseError, database::field_path::FieldReference, error::Result,
+    unimplemented, unimplemented_collection, unimplemented_option, utils::RwLockHashMapExt,
 };
 
 mod collection;

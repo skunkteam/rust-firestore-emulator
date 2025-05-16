@@ -3,17 +3,18 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use bytes::{buf::Writer, BufMut, Bytes, BytesMut};
+use bytes::{BufMut, Bytes, BytesMut, buf::Writer};
 use metadata_filter::Filter;
 use thiserror::Error;
 use time::{
-    error::IndeterminateOffset, format_description::FormatItem, macros::format_description,
-    UtcOffset,
+    UtcOffset, error::IndeterminateOffset, format_description::FormatItem,
+    macros::format_description,
 };
 use tracing_subscriber::{
-    fmt::{format::FmtSpan, time::OffsetTime, writer::MutexGuardWriter, MakeWriter},
+    EnvFilter, Layer, Registry,
+    fmt::{MakeWriter, format::FmtSpan, time::OffsetTime, writer::MutexGuardWriter},
     prelude::*,
-    reload, EnvFilter, Layer, Registry,
+    reload,
 };
 
 mod metadata_filter;

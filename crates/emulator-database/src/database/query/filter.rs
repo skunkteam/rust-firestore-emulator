@@ -1,12 +1,13 @@
 use std::iter;
 
-use googleapis::google::firestore::v1::{structured_query, Value};
+use googleapis::google::firestore::v1::{Value, structured_query};
 use itertools::Itertools;
 
 use crate::{
+    GenericDatabaseError,
     database::{document::StoredDocumentVersion, field_path::FieldReference},
     error::Result,
-    unimplemented, GenericDatabaseError,
+    unimplemented,
 };
 
 #[derive(Debug)]

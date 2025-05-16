@@ -4,7 +4,7 @@ use itertools::Itertools;
 use prost::bytes::Bytes;
 
 use crate::google::{
-    firestore::v1::{value::ValueType, ArrayValue, MapValue, Value},
+    firestore::v1::{ArrayValue, MapValue, Value, value::ValueType},
     protobuf::Timestamp,
     r#type::LatLng,
 };

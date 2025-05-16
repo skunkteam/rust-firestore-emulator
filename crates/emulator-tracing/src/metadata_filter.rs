@@ -3,7 +3,7 @@ use std::{str::FromStr, sync::LazyLock};
 use ctreg::regex;
 use itertools::Itertools;
 use thiserror::Error;
-use tracing::{level_filters::LevelFilter, Metadata};
+use tracing::{Metadata, level_filters::LevelFilter};
 
 static DIRECTIVE_RE: LazyLock<DirectiveRe> = LazyLock::new(DirectiveRe::new);
 regex! {
