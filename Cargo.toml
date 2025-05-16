@@ -2,8 +2,8 @@
 name = "firestore-emulator"
 description = "Google Cloud Firestore emulator with focus on stability"
 version = { workspace = true }
-edition = "2021"
-rust-version = "1.82"
+edition = "2024"
+rust-version = "1.87"
 
 [features]
 default = ["ui"]
