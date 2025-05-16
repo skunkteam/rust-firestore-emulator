@@ -4,7 +4,6 @@ version = { workspace = true }
 edition = "2024"
 
 [dependencies]
-async-trait = { workspace = true }
 fifo-rwlock = { path = "../fifo-rwlock" }
 futures = { workspace = true }
 googleapis = { path = "../googleapis" }
