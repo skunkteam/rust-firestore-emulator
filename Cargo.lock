@@ -564,7 +564,7 @@ checksum = "48c757948c5ede0e46177b7add2e67155f70e33c07fea8284df6576da70b3719"
 
 [[package]]
 name = "emulator-database"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "fifo-rwlock",
  "futures",
@@ -583,7 +583,7 @@ dependencies = [
 
 [[package]]
 name = "emulator-grpc"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "emulator-database",
  "futures",
@@ -597,7 +597,7 @@ dependencies = [
 
 [[package]]
 name = "emulator-http"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "axum 0.8.4",
  "emulator-database",
@@ -611,7 +611,7 @@ dependencies = [
 
 [[package]]
 name = "emulator-tracing"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "bytes",
  "console-subscriber",
@@ -666,7 +666,7 @@ checksum = "37909eebbb50d72f9059c3b6d82c0463f2ff062c9e95845c43a6c9c0355411be"
 
 [[package]]
 name = "fifo-rwlock"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "futures",
  "tokio",
@@ -675,7 +675,7 @@ dependencies = [
 
 [[package]]
 name = "firestore-emulator"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "clap",
  "color-eyre",
@@ -870,7 +870,7 @@ checksum = "a8d1add55171497b4705a648c6b583acafb01d58050a51727785f0b2c8e0a2b2"
 
 [[package]]
 name = "googleapis"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "base64 0.22.1",
  "googletest",
