@@ -537,7 +537,7 @@ impl Firestore for FirestoreEmulator {
             .await?
             .into_iter()
             .collect_vec();
-        unimplemented_bool!(collection_ids.len() as i32 > page_size);
+        unimplemented_bool!(page_size != 0 && page_size < collection_ids.len() as i32);
         unimplemented_collection!(page_token);
         unimplemented_option!(consistency_selector);
 
