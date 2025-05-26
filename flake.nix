@@ -17,7 +17,7 @@
       # for some reason the `crates/googleapis/include` submodule folder doesn't get copied into
       # the nix store when building.
       # Use `just update-submodule` to simultaneously update the git submodule and this commit hash.
-      url = "github:googleapis/googleapis/3776db131e34e42ec8d287203020cb4282166aa5";
+      url = "github:googleapis/googleapis/9bed6f077867e387960082891ec0e1b8bb254a47";
       flake = false;
     };
   };
