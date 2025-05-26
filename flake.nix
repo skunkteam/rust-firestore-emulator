@@ -42,6 +42,8 @@
             "rust-src"
             "rust-std"
             "rust-analyzer"
+            "cargo"
+            "clippy"
           ];
         };
         # Initialize the naersk builder to use our specific toolchain:
