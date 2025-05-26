@@ -11,7 +11,25 @@
       "source.fixAll": "explicit"
     }
   },
-  "rust-analyzer.rustfmt.extraArgs": ["+nightly"],
+  "rust-analyzer.rustfmt.extraArgs": [
+    "+nightly"
+  ],
   "rust-analyzer.cargo.buildScripts.enable": true,
-  "rewrap.wrappingColumn": 100
+  "rewrap.wrappingColumn": 100,
+  "rust-analyzer.server.path": "rust-analyzer",
+  "rust-analyzer.check.command": "clippy",
+  "nix.enableLanguageServer": true,
+  "nix.serverPath": "nixd",
+  "nix.serverSettings": {
+    "nixd": {
+      "formatting": {
+        "command": [
+          "nixfmt"
+        ]
+      }
+    }
+  },
+  "[nix]": {
+    "editor.defaultFormatter": "jnoortheen.nix-ide"
+  }
 }

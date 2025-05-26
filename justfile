@@ -86,6 +86,7 @@ watch *cmd:
 
 # Update the googleapis submodule to their latest commit and patch the commit hash in flake.nix.
 # Also staging changes in git to ensure things stay in sync. 
+# TODO: prolly wanna have a separate command to sync the flake input with the current revision.
 update-submodule:
     #!/usr/bin/env sh
     git submodule update --remote
