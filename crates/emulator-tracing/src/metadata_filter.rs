@@ -102,10 +102,10 @@ impl Directive {
 
         // Does this directive have a target filter, and does it match the
         // metadata's target?
-        if let Some(ref target) = self.target {
-            if !meta.target().starts_with(target) {
-                return false;
-            }
+        if let Some(ref target) = self.target
+            && !meta.target().starts_with(target)
+        {
+            return false;
         }
 
         true

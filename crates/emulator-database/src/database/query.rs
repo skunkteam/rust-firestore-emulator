@@ -417,17 +417,15 @@ impl Query {
                 if !self.includes_document(&version)? {
                     continue;
                 }
-                if let Some(cursor) = &self.start_at {
-                    let exclude = self.doc_on_left_of_cursor(&version, cursor);
-                    if exclude {
-                        continue;
-                    }
+                if let Some(cursor) = &self.start_at
+                    && self.doc_on_left_of_cursor(&version, cursor)
+                {
+                    continue;
                 }
-                if let Some(cursor) = &self.end_at {
-                    let include = self.doc_on_left_of_cursor(&version, cursor);
-                    if !include {
-                        continue;
-                    }
+                if let Some(cursor) = &self.end_at
+                    && !self.doc_on_left_of_cursor(&version, cursor)
+                {
+                    continue;
                 }
                 buffer.push(version);
             }
@@ -548,10 +546,10 @@ impl Query {
         if !self.includes_collection(&doc.name.collection_ref) {
             return Ok(false);
         }
-        if let Some(filter) = &self.filter {
-            if !filter.eval(doc)? {
-                return Ok(false);
-            }
+        if let Some(filter) = &self.filter
+            && !filter.eval(doc)?
+        {
+            return Ok(false);
         }
         for order_by in &self.order_by {
             if order_by.field.get_value(doc).is_none() {

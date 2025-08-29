@@ -56,7 +56,7 @@ impl DocumentMeta {
     }
 
     /// Get a quick temporary read lock.
-    pub(crate) async fn read(&self) -> Result<DocumentContentsReadGuard> {
+    pub(crate) async fn read(&self) -> Result<DocumentContentsReadGuard<'_>> {
         lock_timeout(
             self.contents.read(),
             self.project.timeouts.read,
