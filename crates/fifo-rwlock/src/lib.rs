@@ -100,7 +100,7 @@ impl<T> FifoRwLock<T> {
     /// Returns a [`ReadGuard`] when successful. The future returned by this method is
     /// cancellation-safe: if it's dropped before the lock is acquired, the request is removed from
     /// the queue.
-    pub async fn read(&self) -> ReadGuard<T> {
+    pub async fn read(&self) -> ReadGuard<'_, T> {
         // Create a oneshot channel. The sender (`tx`) is given to the queue entry, and the receiver
         // (`rx`) is awaited by this task.
         let (tx, rx) = oneshot::channel();
