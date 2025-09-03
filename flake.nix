@@ -93,8 +93,8 @@
         # For example: `nix run . -- --host-port 127.0.0.1:8080` to start the emulator on localhost.
         defaultPackage = rust-builder.buildPackage {
           src = ./.;
-          # naersk can't deal with `version = { workspace = true}` for the root package, so extract it
-          # manually:
+          # naersk can't deal with `version = { workspace = true }` for the root package, so
+          # extract it manually:
           version = with builtins; (fromTOML (readFile ./Cargo.toml)).workspace.package.version;
           nativeBuildInputs = buildInputs;
           # Workaround - build.rs refers to git submodule path `./crates/googleapis/include`, but this
