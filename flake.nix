@@ -9,26 +9,22 @@
     flake-utils.url = "github:numtide/flake-utils";
     nixpkgs.url = "github:nixos/nixpkgs/nixos-unstable";
     naersk = {
-      url = "github:nix-community/naersk"; # For building rust crates as nix derivations.
+      url = "github:nix-community/naersk"; # For building rust crates as Nix derivations.
       inputs.nixpkgs.follows = "nixpkgs";
     };
-    googleapis = {
-      # The git submodule as flake input. Necessary as workaround to build the emulator, because
-      # for some reason the `crates/googleapis/include` submodule folder doesn't get copied into
-      # the nix store when building.
-      # Use `just update-submodule` to simultaneously update the git submodule and this commit hash.
-      url = "github:googleapis/googleapis/9bed6f077867e387960082891ec0e1b8bb254a47";
-      flake = false;
-    };
+    # `self` refers to the copy of this git repository in the Nix Store. By setting
+    # `self.submodules` to `true`, we ensure the `googleapis` git submodule gets copied into the Nix
+    # store at the expected path.
+    self.submodules = true;
   };
 
   outputs =
     {
+      self,
       nixpkgs,
       flake-utils,
       rust-overlay,
       naersk,
-      googleapis,
       ...
     }:
     flake-utils.lib.eachDefaultSystem (
@@ -84,28 +80,23 @@
           ];
         };
 
-        # Nix derivation for building the firestore-emulator using naersk.
+        # Nix derivation for building the firestore-emulator using Naersk.
         #
-        # `nix build` produces a symlink `./result` that points to the nix store directory containing
-        # the built firestore-emulator binary under `./result/bin/firestore-emulator`
+        # `nix build` produces a symlink `./result` that points to the Nix store directory
+        # containing the built firestore-emulator binary under `./result/bin/firestore-emulator`
         #
-        # `nix run . -- ARGS` runs the firestore-emulator binary with the provided arguments.
-        # For example: `nix run . -- --host-port 127.0.0.1:8080` to start the emulator on localhost.
+        # Locally, `nix run . -- ARGS` runs the firestore-emulator binary with the provided
+        # arguments. For example: `nix run . -- --host-port 127.0.0.1:8080` to start the emulator on
+        # localhost.
+        #
+        # You can even run the emulator without manually doing a local checkout of this repository
+        # with `nix run github:skunkteam/rust-firestore-emulator -- ARGS`.
         defaultPackage = rust-builder.buildPackage {
-          src = ./.;
-          # naersk can't deal with `version = { workspace = true }` for the root package, so
-          # extract it manually:
+          src = self;
+          # Naersk can't deal with `version = { workspace = true }` for the root package, so extract
+          # it manually:
           version = with builtins; (fromTOML (readFile ./Cargo.toml)).workspace.package.version;
           nativeBuildInputs = buildInputs;
-          # Workaround - build.rs refers to git submodule path `./crates/googleapis/include`, but this
-          # doesn't get copied over to the nix store for some reason. This patch replaces the reference
-          # to local directory `include` by the absolute path to the nix store in the build.rs source
-          # code before building.
-          patchPhase = ''
-            runHook prePatch
-            sed -i 's:"include:"${googleapis}:g' crates/googleapis/build.rs
-            runHook postPatch
-          '';
         };
       }
     );
