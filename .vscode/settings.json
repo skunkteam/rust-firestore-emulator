@@ -11,9 +11,7 @@
       "source.fixAll": "explicit"
     }
   },
-  "rust-analyzer.rustfmt.extraArgs": [
-    "+nightly"
-  ],
+  "rust-analyzer.rustfmt.extraArgs": ["+nightly"],
   "rust-analyzer.cargo.buildScripts.enable": true,
   "rewrap.wrappingColumn": 100,
   "rust-analyzer.server.path": "rust-analyzer",
@@ -23,13 +21,14 @@
   "nix.serverSettings": {
     "nixd": {
       "formatting": {
-        "command": [
-          "nixfmt"
-        ]
+        "command": ["nixfmt"]
       }
     }
   },
   "[nix]": {
     "editor.defaultFormatter": "jnoortheen.nix-ide"
+  },
+  "[jsonc]": {
+    "editor.defaultFormatter": "esbenp.prettier-vscode"
   }
 }

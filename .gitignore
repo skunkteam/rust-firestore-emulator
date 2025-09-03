@@ -4,3 +4,6 @@ lcov.info
 *.profraw
 *_git2_*
 /.jj
+/.direnv
+# Symlink into Nix store after successful `nix build`:
+/result

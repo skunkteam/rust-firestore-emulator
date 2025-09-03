@@ -51,24 +51,25 @@
           cargo = rust-toolchain;
           rustc = rust-toolchain;
         };
+        # Packages necessary for building the firestore-emulator crate.
+        buildInputs = with pkgs; [
+          openssl
+          pkg-config
+          rust-toolchain
+          protobuf
+        ];
       in
       {
         # Define the development environment with the necessary dependencies and rust toolchain:
         devShells.default = pkgs.mkShell {
+          # Made available in the shell's PATH.
+          inherit buildInputs;
           name = "rust-shell";
 
           # These will be set as environment variables in the shell:
           RUST_BACKTRACE = 1;
           RUST_SRC_PATH = "${rust-toolchain}/lib/rustlib/src";
 
-          # Packages necessary for building the firestore-emulator crate. Made available in the
-          # shell's PATH.
-          buildInputs = with pkgs; [
-            openssl
-            pkg-config
-            rust-toolchain
-            protobuf
-          ];
           # Other project dependencies to be made avaible in PATH:
           packages = with pkgs; [
             # Nix language server and formatter.
@@ -78,6 +79,8 @@
             just
             cargo-tarpaulin
             cargo-nextest
+            # Misc.
+            git
           ];
         };
 
@@ -93,12 +96,7 @@
           # naersk can't deal with `version = { workspace = true}` for the root package, so extract it
           # manually:
           version = with builtins; (fromTOML (readFile ./Cargo.toml)).workspace.package.version;
-          nativeBuildInputs = with pkgs; [
-            protobuf
-            openssl
-            pkg-config
-            rust-toolchain
-          ];
+          nativeBuildInputs = buildInputs;
           # Workaround - build.rs refers to git submodule path `./crates/googleapis/include`, but this
           # doesn't get copied over to the nix store for some reason. This patch replaces the reference
           # to local directory `include` by the absolute path to the nix store in the build.rs source
