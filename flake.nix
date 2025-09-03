@@ -65,6 +65,7 @@
           # These will be set as environment variables in the shell:
           RUST_BACKTRACE = 1;
           RUST_SRC_PATH = "${rust-toolchain}/lib/rustlib/src";
+          NIX_PATH = "nixpkgs=${nixpkgs}";
 
           # Other project dependencies to be made avaible in PATH:
           packages = with pkgs; [
