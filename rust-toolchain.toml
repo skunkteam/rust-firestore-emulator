@@ -1,0 +1,4 @@
+[toolchain]
+channel = "1.90.0"
+profile = "default" # Includes components: rustc, rust-std, cargo, rust-docs, rustfmt, and clippy.
+components = ["rust-src", "rust-analyzer"] # Additional components.

@@ -32,16 +32,7 @@
       let
         overlays = [ (import rust-overlay) ];
         pkgs = import nixpkgs { inherit system overlays; };
-        rust-toolchain = pkgs.rust-bin.stable.latest.default.override {
-          # Additional rustup components to include in this toolchain:
-          extensions = [
-            "rust-src"
-            "rust-std"
-            "rust-analyzer"
-            "cargo"
-            "clippy"
-          ];
-        };
+        rust-toolchain = pkgs.rust-bin.fromRustupToolchainFile ./rust-toolchain.toml;
         # Initialize the naersk builder to use our specific toolchain:
         rust-builder = pkgs.callPackage naersk {
           cargo = rust-toolchain;
@@ -51,7 +42,6 @@
         buildInputs = with pkgs; [
           openssl
           pkg-config
-          rust-toolchain
           protobuf
         ];
       in
@@ -62,11 +52,6 @@
           inherit buildInputs;
           name = "rust-shell";
 
-          # These will be set as environment variables in the shell:
-          RUST_BACKTRACE = 1;
-          RUST_SRC_PATH = "${rust-toolchain}/lib/rustlib/src";
-          NIX_PATH = "nixpkgs=${nixpkgs}";
-
           # Other project dependencies to be made avaible in PATH:
           packages = with pkgs; [
             # Nix language server and formatter.
@@ -76,6 +61,7 @@
             just
             cargo-tarpaulin
             cargo-nextest
+            rustup
             # Misc.
             git
           ];

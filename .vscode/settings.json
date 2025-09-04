@@ -1,34 +1,20 @@
 {
+  "[jsonc]": {
+    "editor.defaultFormatter": "esbenp.prettier-vscode"
+  },
+  "[typescript]": {
+    "editor.codeActionsOnSave": {
+      "source.fixAll": "explicit",
+      "source.organizeImports": "explicit"
+    },
+    "editor.defaultFormatter": "esbenp.prettier-vscode",
+    "editor.formatOnSave": true
+  },
   "files.readonlyInclude": {
     "googleapis/**": true,
     "target/**": true
   },
-  "[typescript]": {
-    "editor.defaultFormatter": "esbenp.prettier-vscode",
-    "editor.formatOnSave": true,
-    "editor.codeActionsOnSave": {
-      "source.organizeImports": "explicit",
-      "source.fixAll": "explicit"
-    }
-  },
-  "rust-analyzer.rustfmt.extraArgs": ["+nightly"],
-  "rust-analyzer.cargo.buildScripts.enable": true,
   "rewrap.wrappingColumn": 100,
-  "rust-analyzer.server.path": "rust-analyzer",
-  "rust-analyzer.check.command": "clippy",
-  "nix.enableLanguageServer": true,
-  "nix.serverPath": "nixd",
-  "nix.serverSettings": {
-    "nixd": {
-      "formatting": {
-        "command": ["nixfmt"]
-      }
-    }
-  },
-  "[nix]": {
-    "editor.defaultFormatter": "jnoortheen.nix-ide"
-  },
-  "[jsonc]": {
-    "editor.defaultFormatter": "esbenp.prettier-vscode"
-  }
+  "rust-analyzer.cargo.buildScripts.enable": true,
+  "rust-analyzer.rustfmt.extraArgs": ["+nightly"]
 }

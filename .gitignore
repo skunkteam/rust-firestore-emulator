@@ -7,3 +7,5 @@ lcov.info
 /.direnv
 # Symlink into Nix store after successful `nix build`:
 /result
+# For personal .envrc files
+.envrc
