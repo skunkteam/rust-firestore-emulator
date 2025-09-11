@@ -40,6 +40,12 @@ impl Value {
         }
     }
 
+    pub fn boolean(value: bool) -> Self {
+        Self {
+            value_type: Some(ValueType::BooleanValue(value)),
+        }
+    }
+
     pub fn double(value: f64) -> Self {
         Self {
             value_type: Some(ValueType::DoubleValue(value)),

@@ -337,7 +337,7 @@ impl FirestoreDatabase {
         }
 
         if let Some(txn) = rw_txn {
-            txn.drop_remaining_guards().await;
+            txn.drop_read_guards().await;
         }
 
         let time = Timestamp::now();

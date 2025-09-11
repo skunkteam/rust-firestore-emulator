@@ -1,6 +1,7 @@
 use std::net::SocketAddr;
 
 use clap::Parser;
+use color_eyre::{Section, eyre::Context};
 use emulator_database::{FirestoreConfig, FirestoreProject};
 use emulator_tracing::DefaultTracing;
 use firestore_emulator::run;
@@ -46,6 +47,9 @@ async fn main() -> color_eyre::Result<()> {
 
     let ctrl_c_listener = async { ctrl_c().await.expect("failed to listen for ctrl-c event") };
 
-    let listener = TcpListener::bind(host_port).await.unwrap();
+    let listener = TcpListener::bind(host_port)
+        .await
+        .wrap_err("Could not start listener on provided address")
+        .suggestion("Use \"--host-port 127.0.0.1:0\" to listen to a random port on localhost.")?;
     run(project, listener, ctrl_c_listener, tracing).await
 }

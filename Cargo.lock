@@ -577,6 +577,7 @@ dependencies = [
  "thiserror 2.0.12",
  "tokio",
  "tokio-stream",
+ "tokio-test",
  "tonic 0.13.1",
  "tracing",
 ]
