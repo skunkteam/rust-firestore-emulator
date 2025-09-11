@@ -8,7 +8,7 @@ use std::{
 };
 
 use googleapis::google::protobuf::Timestamp;
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::{Mutex, MutexGuard, RwLock};
 use tracing::{Level, instrument};
 
 use super::{
@@ -16,7 +16,11 @@ use super::{
     document::{OwnedDocumentContentsReadGuard, OwnedDocumentContentsWriteGuard},
     reference::DocumentRef,
 };
-use crate::{GenericDatabaseError, document::StoredDocumentVersion, error::Result};
+use crate::{
+    GenericDatabaseError,
+    document::{DocumentMeta, StoredDocumentVersion},
+    error::Result,
+};
 
 #[derive(Debug)]
 pub(crate) struct RunningTransactions {
@@ -133,17 +137,40 @@ impl ReadWriteTransaction {
         }
     }
 
+    /// Acquires a lock on the document (if needed) and returns the latest version of that document.
+    /// The guard is stored with the transaction and can only be released by dropping the
+    /// transaction, using [`Self::take_write_guard`] or [`Self::drop_read_guards`].
+    ///
+    /// If the guard should not be kept inside the transaction (if the lock is preliminary), then
+    /// use the combination of [`RWTransactionQuerySupport::get_read_guard`] and
+    /// [`RWTransactionQuerySupport::manage_read_guard`] on the result of [`Self::query_support`].
     pub(crate) async fn read_doc(
         &self,
         name: &DocumentRef,
     ) -> Result<Option<Arc<StoredDocumentVersion>>> {
-        Ok(self.read_guard(name).await?.current_version().cloned())
+        Ok(self
+            .managed_read_guard(name)
+            .await?
+            .current_version()
+            .cloned())
     }
 
-    pub(crate) async fn drop_remaining_guards(&self) {
+    /// Returns a handle that can be used to temporarily lock documents in order to evaluate whether
+    /// they should be included in a query result.
+    pub(crate) async fn query_support(&self) -> RWTransactionQuerySupport<'_> {
+        RWTransactionQuerySupport {
+            guards_guard: self.guards.lock().await,
+        }
+    }
+
+    /// Drops all read guards that are kept by this transaction. This does not include guards that
+    /// have been upgraded to write guards, using [`Self::take_write_guard`].
+    pub(crate) async fn drop_read_guards(&self) {
         self.guards.lock().await.clear();
     }
 
+    /// Upgrade the read guard for the document with the given `name` to a write guard. Write guards
+    /// are not kept with the transaction, unlike read guards.
     pub(crate) async fn take_write_guard(
         &self,
         name: &DocumentRef,
@@ -162,7 +189,10 @@ impl ReadWriteTransaction {
     }
 
     #[instrument(level = Level::DEBUG, skip_all)]
-    async fn read_guard(&self, name: &DocumentRef) -> Result<Arc<OwnedDocumentContentsReadGuard>> {
+    async fn managed_read_guard(
+        &self,
+        name: &DocumentRef,
+    ) -> Result<Arc<OwnedDocumentContentsReadGuard>> {
         let mut guards = self.guards.lock().await;
         if let Some(guard) = guards.get(name) {
             return Ok(Arc::clone(guard));
@@ -180,6 +210,33 @@ impl ReadWriteTransaction {
             .await?
             .read_owned()
             .await
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct RWTransactionQuerySupport<'a> {
+    guards_guard: MutexGuard<'a, HashMap<DocumentRef, Arc<OwnedDocumentContentsReadGuard>>>,
+}
+
+impl RWTransactionQuerySupport<'_> {
+    /// Acquires a read lock on the document or returns the already present guard in this
+    /// transaction. It does not, however, keep the guard inside the transaction when newly
+    /// acquired. If the guard should be stored with this transaction use
+    /// [`Self::manage_read_guard`] to add it.
+    pub(crate) async fn get_read_guard(
+        &self,
+        meta: &Arc<DocumentMeta>,
+    ) -> Result<Arc<OwnedDocumentContentsReadGuard>> {
+        if let Some(guard) = self.guards_guard.get(&meta.name) {
+            return Ok(Arc::clone(guard));
+        }
+        Ok(meta.read_owned().await?.into())
+    }
+
+    /// Add the given read guard to this transaction, must be a guard that was returned by
+    /// [`Self::manage_read_guard`].
+    pub(crate) fn manage_read_guard(&mut self, guard: Arc<OwnedDocumentContentsReadGuard>) {
+        self.guards_guard.insert(guard.name.clone(), guard);
     }
 }
 

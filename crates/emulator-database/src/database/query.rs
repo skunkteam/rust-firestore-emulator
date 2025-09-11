@@ -25,9 +25,18 @@ use super::{
     read_consistency::ReadConsistency,
     reference::{CollectionRef, Ref},
 };
-use crate::{GenericDatabaseError, error::Result, reference::DocumentRef, unimplemented_option};
+use crate::{
+    GenericDatabaseError,
+    database::transaction::RWTransactionQuerySupport,
+    document::{DocumentMeta, OwnedDocumentContentsReadGuard},
+    error::Result,
+    reference::DocumentRef,
+    unimplemented_option,
+};
 
 mod filter;
+#[cfg(test)]
+mod tests;
 
 #[derive(Debug)]
 pub struct QueryBuilder {
@@ -394,44 +403,32 @@ impl Query {
         // First collect all Arc<Collection>s in a Vec to release the collection lock asap.
         let collections = self.applicable_collections(db).await;
 
-        let (txn, read_time) = match self.consistency {
+        let txn; // If we find a transaction, we borrow from it.
+        let mut lock_strategy = match self.consistency {
+            ReadConsistency::Default => LockStrategy::ReadTime(Timestamp::now()),
+            ReadConsistency::ReadTime(timestamp) => LockStrategy::ReadTime(timestamp),
             ReadConsistency::Transaction(transaction_id) => {
-                let txn = db.transactions.get(transaction_id).await?;
-                let read_time = txn.read_time().unwrap_or_else(Timestamp::now);
-                (Some(txn), read_time)
+                txn = db.transactions.get(transaction_id).await?;
+                if let Some(rw_txn) = txn.as_read_write() {
+                    LockStrategy::PessimisticTransaction(rw_txn.query_support().await)
+                } else {
+                    LockStrategy::ReadTime(txn.read_time().unwrap_or_else(Timestamp::now))
+                }
             }
-            ReadConsistency::Default => (None, Timestamp::now()),
-            ReadConsistency::ReadTime(timestamp) => (None, timestamp),
         };
 
         let mut buffer = vec![];
         for col in collections {
             for meta in col.docs().await {
-                let version = match &txn {
-                    Some(txn) => txn.read_doc(&meta.name).await?,
-                    None => meta.read().await?.version_at_time(read_time).cloned(),
-                };
-                let Some(version) = version else {
-                    continue;
-                };
-                if !self.includes_document(&version)? {
-                    continue;
-                }
-                if let Some(cursor) = &self.start_at
-                    && self.doc_on_left_of_cursor(&version, cursor)
+                if let Some(doc) = lock_strategy.read(&meta).await?
+                    && self.includes_document(&doc.version)?
                 {
-                    continue;
+                    buffer.push(doc);
                 }
-                if let Some(cursor) = &self.end_at
-                    && !self.doc_on_left_of_cursor(&version, cursor)
-                {
-                    continue;
-                }
-                buffer.push(version);
             }
         }
 
-        buffer.sort_unstable_by(|a, b| self.order_by_cmp(a, b));
+        buffer.sort_unstable_by(|a, b| self.order_by_cmp(&a.version, &b.version));
 
         if self.offset > 0 {
             buffer.drain(0..self.offset.min(buffer.len()));
@@ -441,7 +438,14 @@ impl Query {
             buffer.truncate(limit)
         }
 
-        Ok((read_time, buffer))
+        // Now make sure that the transaction (if any and if needed) acquires a lock to all
+        // resulting documents.
+        let result = buffer
+            .into_iter()
+            .map(|doc| lock_strategy.confirm(doc))
+            .collect();
+
+        Ok((lock_strategy.read_time(), result))
     }
 
     /// Get the names of missing documents that match this query. A document is missing if it does
@@ -556,6 +560,16 @@ impl Query {
                 return Ok(false);
             }
         }
+        if let Some(cursor) = &self.start_at
+            && self.doc_on_left_of_cursor(doc, cursor)
+        {
+            return Ok(false);
+        }
+        if let Some(cursor) = &self.end_at
+            && !self.doc_on_left_of_cursor(doc, cursor)
+        {
+            return Ok(false);
+        }
         Ok(true)
     }
 
@@ -589,7 +603,7 @@ impl Query {
     }
 
     /// Returns true when the given document is "on the left" of the given cursor.
-    fn doc_on_left_of_cursor(&self, doc: &Arc<StoredDocumentVersion>, cursor: &Cursor) -> bool {
+    fn doc_on_left_of_cursor(&self, doc: &StoredDocumentVersion, cursor: &Cursor) -> bool {
         use cmp::Ordering::*;
         for (order, cursor_value) in self.order_by.iter().zip(&cursor.values) {
             let doc_value = order.field.get_value(doc).expect(
@@ -644,4 +658,58 @@ impl From<structured_query::Direction> for Direction {
             structured_query::Direction::Descending => Direction::Descending,
         }
     }
+}
+
+#[derive(Debug)]
+enum LockStrategy<'a> {
+    PessimisticTransaction(RWTransactionQuerySupport<'a>),
+    ReadTime(Timestamp),
+}
+
+impl LockStrategy<'_> {
+    async fn read(&self, meta: &Arc<DocumentMeta>) -> Result<Option<LockStrategyDocument>> {
+        Ok(match self {
+            LockStrategy::PessimisticTransaction(txn) => {
+                let read_guard = txn.get_read_guard(meta).await?;
+                read_guard
+                    .current_version()
+                    .cloned()
+                    .map(|version| LockStrategyDocument {
+                        version,
+                        guard: Some(read_guard),
+                    })
+            }
+            LockStrategy::ReadTime(read_time) => {
+                let read_guard = meta.read().await?;
+                read_guard
+                    .version_at_time(*read_time)
+                    .cloned()
+                    .map(|version| LockStrategyDocument {
+                        version,
+                        guard: None,
+                    })
+            }
+        })
+    }
+
+    fn confirm(&mut self, doc: LockStrategyDocument) -> Arc<StoredDocumentVersion> {
+        if let LockStrategy::PessimisticTransaction(txn) = self
+            && let Some(guard) = doc.guard
+        {
+            txn.manage_read_guard(guard);
+        }
+        doc.version
+    }
+
+    fn read_time(self) -> Timestamp {
+        match self {
+            LockStrategy::PessimisticTransaction(_) => Timestamp::now(),
+            LockStrategy::ReadTime(timestamp) => timestamp,
+        }
+    }
+}
+
+struct LockStrategyDocument {
+    version: Arc<StoredDocumentVersion>,
+    guard:   Option<Arc<OwnedDocumentContentsReadGuard>>,
 }
