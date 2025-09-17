@@ -8,6 +8,7 @@ tokio = { workspace = true, features = ["sync"] }
 
 [dev-dependencies]
 futures = { workspace = true }
+static_assertions = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 tokio-test = { workspace = true }
 

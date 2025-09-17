@@ -208,29 +208,21 @@ unsafe impl<T> Send for OwnedWriteGuard<T> where T: Send + Sync {}
 
 #[test]
 fn bounds() {
+    use static_assertions::{assert_impl_all, assert_not_impl_any};
     use tokio_test::{assert_ready, task::spawn};
 
-    fn check_send<T: Send>() {}
-    fn check_sync<T: Sync>() {}
-    fn check_unpin<T: Unpin>() {}
+    assert_impl_all!(FifoRwLock<u32>: Send, Sync, Unpin);
+    assert_impl_all!(ReadGuard<'_, u32>: Send, Sync, Unpin);
+    assert_impl_all!(OwnedReadGuard<u32>: Send, Sync, Unpin);
+    assert_impl_all!(OwnedWriteGuard<u32>: Send, Sync, Unpin);
+
+    assert_not_impl_any!(FifoRwLock<*const u32>: Send, Sync);
+    assert_not_impl_any!(ReadGuard<'_, *const u32>: Send, Sync);
+    assert_not_impl_any!(OwnedReadGuard<*const u32>: Send, Sync);
+    assert_not_impl_any!(OwnedWriteGuard<*const u32>: Send, Sync);
+
     // This has to take a value, since the async fn's return type is unnameable.
     fn check_send_sync_val<T: Send + Sync>(_t: T) {}
-
-    check_send::<FifoRwLock<u32>>();
-    check_sync::<FifoRwLock<u32>>();
-    check_unpin::<FifoRwLock<u32>>();
-
-    check_send::<ReadGuard<'_, u32>>();
-    check_sync::<ReadGuard<'_, u32>>();
-    check_unpin::<ReadGuard<'_, u32>>();
-
-    check_send::<OwnedReadGuard<u32>>();
-    check_sync::<OwnedReadGuard<u32>>();
-    check_unpin::<OwnedReadGuard<u32>>();
-
-    check_send::<OwnedWriteGuard<u32>>();
-    check_sync::<OwnedWriteGuard<u32>>();
-    check_unpin::<OwnedWriteGuard<u32>>();
 
     let rwlock = Arc::new(FifoRwLock::new(0));
     check_send_sync_val(rwlock.read_owned());
