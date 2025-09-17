@@ -703,6 +703,11 @@ impl LockStrategy<'_> {
 
     fn read_time(self) -> Timestamp {
         match self {
+            // Using `Timestamp::now()` is correct here, even if this may be much later than the
+            // actual time the documents were read. We can simply take Timestamp::now,
+            // because the documents are locked and cannot change while being locked. So
+            // we are sure that the documents are unchanged and are still the same at
+            // this particular point in time.
             LockStrategy::PessimisticTransaction(_) => Timestamp::now(),
             LockStrategy::ReadTime(timestamp) => timestamp,
         }
