@@ -11,8 +11,8 @@ ui = []
 
 [dependencies]
 axum = { workspace = true }
-emulator-database = { path = "../emulator-database" }
-emulator-tracing = { path = "../emulator-tracing" }
+emulator-database = { workspace = true }
+emulator-tracing = { workspace = true }
 serde_json = { workspace = true }
 tower-http = { workspace = true, features = ["set-header", "trace"] }
 
