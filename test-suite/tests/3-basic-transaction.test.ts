@@ -942,6 +942,7 @@ describe('concurrent tests', () => {
                                 txn.update(docRef2, { testName: 'some other name' });
                                 // Note that this does not mean that the `update` is committed yet!!
                                 test.event('txn 2: called `update` on contested document');
+                                await test.when('txn 1: completed');
                             });
                             test.event('txn 2: completed');
                         },
@@ -957,6 +958,7 @@ describe('concurrent tests', () => {
                         '       | <<2>> | EVENT: txn 2: started',
                         '       | <<2>> | EVENT: txn 2: read own document',
                         '       | <<2>> | EVENT: txn 2: called `update` on contested document',
+                        '       | <<2>> | WAITING UNTIL: txn 1: completed',
                         ' <<1>> | EVENT: txn 1: completed',
                         '       | <<2>> | EVENT: txn 2: completed',
                     ]);
