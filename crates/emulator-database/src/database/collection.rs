@@ -19,7 +19,7 @@ pub(crate) struct Collection {
 
 impl Collection {
     #[instrument(level = Level::DEBUG, skip_all)]
-    pub fn new(project: &'static FirestoreProject, name: CollectionRef) -> Self {
+    pub(super) fn new(project: &'static FirestoreProject, name: CollectionRef) -> Self {
         Self {
             project,
             name,
