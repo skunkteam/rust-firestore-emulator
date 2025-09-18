@@ -12,11 +12,12 @@ itertools = { workspace = true }
 prost = { workspace = true }
 serde = { workspace = true, features = ["serde_derive"] }
 thiserror = { workspace = true }
+tonic-prost = { workspace = true }
 time = { workspace = true, features = ["formatting", "macros"] }
 tonic = { workspace = true }
 
 [build-dependencies]
-tonic-build = { workspace = true }
+tonic-prost-build = { workspace = true }
 
 [dev-dependencies]
 googletest = { workspace = true }
