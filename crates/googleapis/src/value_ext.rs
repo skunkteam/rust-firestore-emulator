@@ -1,7 +1,7 @@
 use std::{cmp, collections::HashMap, iter::Sum, ops::Add};
 
 use itertools::Itertools;
-use prost::bytes::Bytes;
+use tonic_prost::prost::bytes::Bytes;
 
 use crate::google::{
     firestore::v1::{ArrayValue, MapValue, Value, value::ValueType},

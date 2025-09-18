@@ -1,13 +1,13 @@
 fn main() {
-    tonic_build::configure()
+    tonic_prost_build::configure()
         .build_client(false)
         .include_file("googleapis.rs")
         .compile_well_known_types(true)
-        .bytes(["bytes_value"])
+        .bytes("bytes_value")
         .type_attribute(".google.type.LatLng", "#[derive(serde::Serialize)]")
         .type_attribute(
             ".google.protobuf.Timestamp",
-            "#[derive(Eq, PartialOrd, Ord, serde::Serialize)]",
+            "#[derive(PartialOrd, Ord, serde::Serialize)]",
         )
         .type_attribute(
             ".google.firestore.v1.Document",
