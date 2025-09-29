@@ -1,0 +1,8 @@
+{
+  "recommendations": [
+    "esbenp.prettier-vscode",
+    "jnoortheen.nix-ide",
+    "rust-lang.rust-analyzer",
+    "dnut.rewrap-revived"
+  ]
+}

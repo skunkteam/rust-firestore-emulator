@@ -1,17 +1,20 @@
 {
+  "[jsonc]": {
+    "editor.defaultFormatter": "esbenp.prettier-vscode"
+  },
+  "[typescript]": {
+    "editor.codeActionsOnSave": {
+      "source.fixAll": "explicit",
+      "source.organizeImports": "explicit"
+    },
+    "editor.defaultFormatter": "esbenp.prettier-vscode",
+    "editor.formatOnSave": true
+  },
   "files.readonlyInclude": {
     "googleapis/**": true,
     "target/**": true
   },
-  "[typescript]": {
-    "editor.defaultFormatter": "esbenp.prettier-vscode",
-    "editor.formatOnSave": true,
-    "editor.codeActionsOnSave": {
-      "source.organizeImports": "explicit",
-      "source.fixAll": "explicit"
-    }
-  },
-  "rust-analyzer.rustfmt.extraArgs": ["+nightly"],
+  "rewrap.wrappingColumn": 100,
   "rust-analyzer.cargo.buildScripts.enable": true,
-  "rewrap.wrappingColumn": 100
+  "rust-analyzer.rustfmt.extraArgs": ["+nightly"]
 }
