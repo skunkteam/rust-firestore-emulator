@@ -119,30 +119,31 @@ describe('concurrent tests', () => {
         });
 
         // Note: Very slow on Cloud Firestore!!
-        concurrent(
-            'chaos',
-            async () => {
-                const [docRef1, docRef2] = refs();
+        fs.notImplementedInJava ||
+            concurrent(
+                'chaos',
+                async () => {
+                    const [docRef1, docRef2] = refs();
 
-                await runTxn('outer', [docRef1], async () => {
-                    // Will need a retry because of `docRef1`,
-                    const { innerTxnCompleted: first } = await innerTxn('innerFirst', [docRef2, docRef1]);
-                    // Somehow only needs one try, even though `docRef2` could have been locked by 'innerFirst'
-                    const { innerTxnCompleted: second } = await innerTxn('innerSecond', [docRef2]);
+                    await runTxn('outer', [docRef1], async () => {
+                        // Will need a retry because of `docRef1`,
+                        const { innerTxnCompleted: first } = await innerTxn('innerFirst', [docRef2, docRef1]);
+                        // Somehow only needs one try, even though `docRef2` could have been locked by 'innerFirst'
+                        const { innerTxnCompleted: second } = await innerTxn('innerSecond', [docRef2]);
 
-                    return { awaitAfterTxn: Promise.all([first, second]) };
-                });
-                expect(await getData(docRef1.get())).toEqual({
-                    outer: { tries: 1 },
-                    innerFirst: { tries: expect.toBeOneOf([2, 3, 4]) },
-                });
-                expect(await getData(docRef2.get())).toEqual({
-                    innerFirst: { tries: expect.toBeOneOf([2, 3, 4]) },
-                    innerSecond: { tries: 1 },
-                });
-            },
-            45_000,
-        );
+                        return { awaitAfterTxn: Promise.all([first, second]) };
+                    });
+                    expect(await getData(docRef1.get())).toEqual({
+                        outer: { tries: 1 },
+                        innerFirst: { tries: expect.toBeOneOf([2, 3, 4]) },
+                    });
+                    expect(await getData(docRef2.get())).toEqual({
+                        innerFirst: { tries: expect.toBeOneOf([2, 3, 4]) },
+                        innerSecond: { tries: 1 },
+                    });
+                },
+                45_000,
+            );
 
         concurrent('only read locked document', async () => {
             const [docRef1, docRef2] = refs();
