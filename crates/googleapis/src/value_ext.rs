@@ -150,6 +150,10 @@ impl Value {
             ValueType::GeoPointValue(_) => 9,
             ValueType::ArrayValue(_) => 10,
             ValueType::MapValue(_) => 11,
+            // The following are not allowed to be used when writing documents.
+            ValueType::FieldReferenceValue(_) => usize::MAX - 2,
+            ValueType::FunctionValue(_) => usize::MAX - 1,
+            ValueType::PipelineValue(_) => usize::MAX,
         }
     }
 }
@@ -164,53 +168,73 @@ impl PartialOrd for Value {
 
 impl Ord for Value {
     fn cmp(&self, other: &Self) -> cmp::Ordering {
-        let type_order = self.value_type_order().cmp(&other.value_type_order());
-        if type_order != cmp::Ordering::Equal {
-            return type_order;
-        }
-        // See: https://cloud.google.com/firestore/docs/concepts/data-types#data_types
-        match (self.value_type(), other.value_type()) {
-            (ValueType::NullValue(_), ValueType::NullValue(_)) => cmp::Ordering::Equal,
-            (ValueType::BooleanValue(a), ValueType::BooleanValue(b)) => a.cmp(b),
-            (ValueType::DoubleValue(a), ValueType::DoubleValue(b)) => a.total_cmp(b),
-            (ValueType::DoubleValue(a), ValueType::IntegerValue(b)) => a.total_cmp(&(*b as f64)),
-            (ValueType::IntegerValue(a), ValueType::DoubleValue(b)) => (*a as f64).total_cmp(b),
-            (ValueType::IntegerValue(a), ValueType::IntegerValue(b)) => a.cmp(b),
-            (ValueType::TimestampValue(a), ValueType::TimestampValue(b)) => a.cmp(b),
-            (ValueType::StringValue(a), ValueType::StringValue(b)) => a.cmp(b),
-            (ValueType::BytesValue(a), ValueType::BytesValue(b)) => a.cmp(b),
-            (ValueType::ReferenceValue(a), ValueType::ReferenceValue(b)) => {
-                /// Datastore allowed numeric IDs where Firestore only allows strings. Numeric
-                /// IDs are exposed to Firestore as `__idNUM__`, so this is the lowest possible
-                /// negative numeric value expressed in that format. It should be lower than
-                /// everything else.
-                ///
-                /// This constant is used to specify startAt/endAt values when querying for all
-                /// descendants in a single collection.
-                const REFERENCE_NAME_MIN_ID: &str = "__id-9223372036854775808__";
-
-                fn process_numeric_ids(s: &str) -> &str {
-                    // TODO: Maybe support all numeric IDs? We need this one at least, because it is
-                    // used by the JavaScript SDK, but we could try to support all numeric IDs here
-                    // for fun and profit.
-                    match s {
-                        REFERENCE_NAME_MIN_ID => "",
-                        _ => s,
+        self.value_type_order()
+            .cmp(&other.value_type_order())
+            .then_with(|| {
+                // See: https://cloud.google.com/firestore/docs/concepts/data-types#data_types
+                match (self.value_type(), other.value_type()) {
+                    (ValueType::NullValue(_), ValueType::NullValue(_)) => cmp::Ordering::Equal,
+                    (ValueType::BooleanValue(a), ValueType::BooleanValue(b)) => a.cmp(b),
+                    (ValueType::DoubleValue(a), ValueType::DoubleValue(b)) => a.total_cmp(b),
+                    (ValueType::DoubleValue(a), ValueType::IntegerValue(b)) => {
+                        a.total_cmp(&(*b as f64))
                     }
+                    (ValueType::IntegerValue(a), ValueType::DoubleValue(b)) => {
+                        (*a as f64).total_cmp(b)
+                    }
+                    (ValueType::IntegerValue(a), ValueType::IntegerValue(b)) => a.cmp(b),
+                    (ValueType::TimestampValue(a), ValueType::TimestampValue(b)) => a.cmp(b),
+                    (ValueType::StringValue(a), ValueType::StringValue(b)) => a.cmp(b),
+                    (ValueType::BytesValue(a), ValueType::BytesValue(b)) => a.cmp(b),
+                    (ValueType::ReferenceValue(a), ValueType::ReferenceValue(b)) => {
+                        /// Datastore allowed numeric IDs where Firestore only allows strings.
+                        /// Numeric IDs are exposed to Firestore as
+                        /// `__idNUM__`, so this is the lowest possible
+                        /// negative numeric value expressed in that format. It should be lower than
+                        /// everything else.
+                        ///
+                        /// This constant is used to specify startAt/endAt values when querying for
+                        /// all descendants in a single collection.
+                        const REFERENCE_NAME_MIN_ID: &str = "__id-9223372036854775808__";
+
+                        fn process_numeric_ids(s: &str) -> &str {
+                            // TODO: Maybe support all numeric IDs? We need this one at least,
+                            // because it is used by the JavaScript SDK,
+                            // but we could try to support all numeric IDs here
+                            // for fun and profit.
+                            match s {
+                                REFERENCE_NAME_MIN_ID => "",
+                                _ => s,
+                            }
+                        }
+                        let a = a.split('/').map(process_numeric_ids);
+                        let b = b.split('/').map(process_numeric_ids);
+                        a.cmp(b)
+                    }
+                    (ValueType::GeoPointValue(a), ValueType::GeoPointValue(b)) => a.cmp(b),
+                    (ValueType::ArrayValue(a), ValueType::ArrayValue(b)) => a.values.cmp(&b.values),
+                    (ValueType::MapValue(a), ValueType::MapValue(b)) => {
+                        a.fields.iter().sorted().cmp(b.fields.iter().sorted())
+                    }
+                    // The following are not allowed to be used when writing documents. Let's not
+                    // break if we ever encounter this, but log a warning instead.
+                    (ValueType::FieldReferenceValue(_), ValueType::FieldReferenceValue(_)) => {
+                        eprintln!("Unexpected request to compare a FieldReferenceValue!");
+                        cmp::Ordering::Equal
+                    }
+                    (ValueType::FunctionValue(_), ValueType::FunctionValue(_)) => {
+                        eprintln!("Unexpected request to compare a FunctionValue!");
+                        cmp::Ordering::Equal
+                    }
+                    (ValueType::PipelineValue(_), ValueType::PipelineValue(_)) => {
+                        eprintln!("Unexpected request to compare a PipelineValue!");
+                        cmp::Ordering::Equal
+                    }
+                    // Only the above types should need to be compared here, because of the type
+                    // ordering above.
+                    _ => unreachable!("logic error in Ord implementation of Value"),
                 }
-                let a = a.split('/').map(process_numeric_ids);
-                let b = b.split('/').map(process_numeric_ids);
-                a.cmp(b)
-            }
-            (ValueType::GeoPointValue(a), ValueType::GeoPointValue(b)) => a.cmp(b),
-            (ValueType::ArrayValue(a), ValueType::ArrayValue(b)) => a.values.cmp(&b.values),
-            (ValueType::MapValue(a), ValueType::MapValue(b)) => {
-                a.fields.iter().sorted().cmp(b.fields.iter().sorted())
-            }
-            // Only the above types should need to be compared here, because of the type ordering
-            // above.
-            _ => unreachable!("logic error in Ord implementation of Value"),
-        }
+            })
     }
 }
 
