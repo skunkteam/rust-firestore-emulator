@@ -15,6 +15,7 @@ thiserror = { workspace = true }
 tonic-prost = { workspace = true }
 time = { workspace = true, features = ["formatting", "macros"] }
 tonic = { workspace = true }
+tracing = { workspace = true }
 
 [build-dependencies]
 tonic-prost-build = { workspace = true }

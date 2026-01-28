@@ -2,6 +2,7 @@ use std::{cmp, collections::HashMap, iter::Sum, ops::Add};
 
 use itertools::Itertools;
 use tonic_prost::prost::bytes::Bytes;
+use tracing::warn;
 
 use crate::google::{
     firestore::v1::{ArrayValue, MapValue, Value, value::ValueType},
@@ -219,15 +220,15 @@ impl Ord for Value {
                     // The following are not allowed to be used when writing documents. Let's not
                     // break if we ever encounter this, but log a warning instead.
                     (ValueType::FieldReferenceValue(_), ValueType::FieldReferenceValue(_)) => {
-                        eprintln!("Unexpected request to compare a FieldReferenceValue!");
+                        warn!("Unexpected request to compare a FieldReferenceValue!");
                         cmp::Ordering::Equal
                     }
                     (ValueType::FunctionValue(_), ValueType::FunctionValue(_)) => {
-                        eprintln!("Unexpected request to compare a FunctionValue!");
+                        warn!("Unexpected request to compare a FunctionValue!");
                         cmp::Ordering::Equal
                     }
                     (ValueType::PipelineValue(_), ValueType::PipelineValue(_)) => {
-                        eprintln!("Unexpected request to compare a PipelineValue!");
+                        warn!("Unexpected request to compare a PipelineValue!");
                         cmp::Ordering::Equal
                     }
                     // Only the above types should need to be compared here, because of the type
