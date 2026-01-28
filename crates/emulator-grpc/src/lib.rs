@@ -220,7 +220,7 @@ impl Firestore for FirestoreEmulator {
         &self,
         _request: Request<CreateDocumentRequest>,
     ) -> Result<Response<Document>> {
-        unimplemented!("CreateDocument")
+        unimplemented!("CreateDocument");
     }
 
     /// Lists documents.
@@ -293,7 +293,7 @@ impl Firestore for FirestoreEmulator {
         &self,
         _request: Request<UpdateDocumentRequest>,
     ) -> Result<Response<Document>> {
-        unimplemented!("update_document")
+        unimplemented!("update_document");
     }
 
     /// Deletes a document.
@@ -302,7 +302,7 @@ impl Firestore for FirestoreEmulator {
         &self,
         _request: Request<DeleteDocumentRequest>,
     ) -> Result<Response<Empty>> {
-        unimplemented!("delete_document")
+        unimplemented!("delete_document");
     }
 
     /// Starts a new transaction.
@@ -402,6 +402,17 @@ impl Firestore for FirestoreEmulator {
         .await
     }
 
+    /// Server streaming response type for the ExecutePipeline method.
+    type ExecutePipelineStream = BoxStream<'static, Result<ExecutePipelineResponse>>;
+
+    /// Executes a pipeline query.
+    async fn execute_pipeline(
+        &self,
+        _request: Request<ExecutePipelineRequest>,
+    ) -> Result<Response<Self::ExecutePipelineStream>, Status> {
+        unimplemented!("execute_pipeline");
+    }
+
     /// Server streaming response type for the RunAggregationQuery method.
     type RunAggregationQueryStream = BoxStream<'static, Result<RunAggregationQueryResponse>>;
 
@@ -483,7 +494,7 @@ impl Firestore for FirestoreEmulator {
         &self,
         _request: Request<PartitionQueryRequest>,
     ) -> Result<Response<PartitionQueryResponse>> {
-        unimplemented!("partition_query")
+        unimplemented!("partition_query");
     }
 
     /// Server streaming response type for the Write method.

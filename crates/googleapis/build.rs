@@ -21,6 +21,14 @@ fn main() {
             ".google.firestore.v1.MapValue",
             "#[derive(serde::Serialize)]",
         )
+        .type_attribute(
+            ".google.firestore.v1.Function",
+            "#[derive(serde::Serialize)]",
+        )
+        .type_attribute(
+            ".google.firestore.v1.Pipeline",
+            "#[derive(serde::Serialize)]",
+        )
         .type_attribute(".google.firestore.v1.Value", "#[derive(serde::Serialize)]")
         .message_attribute(".google.firestore.v1.Value", "#[serde(transparent)]")
         .enum_attribute(".google.firestore.v1.Value", "#[serde(untagged)]")
