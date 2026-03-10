@@ -4,14 +4,15 @@
     "description": "Tests for firebase (emulator)",
     "private": true,
     "scripts": {
-        "test": "jest",
-        "test:java-emulator": "f() { firebase emulators:exec --only firestore \"jest --maxConcurrency 1$(printf ' %q' \"$@\")\"; }; f",
-        "test:rust-emulator": "f() { export RUST_EMULATOR=true; export FIRESTORE_EMULATOR_HOST=127.0.0.1:8080; RUST_LOG=\"${RUST_LOG:=OFF}\" ../target/debug/firestore-emulator & PID=$!; jest \"$@\"; RET=$?; kill -INT $PID; return $RET; }; f",
+        "test": "NODE_OPTIONS='--experimental-vm-modules' jest",
+        "test:java-emulator": "f() { firebase emulators:exec --only firestore \"NODE_OPTIONS='--experimental-vm-modules' jest --maxConcurrency 1$(printf ' %q' \"$@\")\"; }; f",
+        "test:rust-emulator": "f() { export FIRESTORE_EMULATOR_HOST=127.0.0.1:8080; RUST_LOG=\"${RUST_LOG:=OFF}\" ../target/debug/firestore-emulator & PID=$!; RUST_EMULATOR=true NODE_OPTIONS='--experimental-vm-modules' jest \"$@\"; RET=$?; kill -INT $PID; return $RET; }; f",
         "build:rust": "cd .. && cargo build",
         "lint": "eslint tests && prettier -c tests"
     },
     "license": "UNLICENSED",
     "dependencies": {
+        "@google-cloud/firestore": "^8.3.0",
         "@skunkteam/sherlock": "^8.0.0",
         "@skunkteam/sherlock-utils": "^8.0.0",
         "@types/lodash": "^4.17.24",
