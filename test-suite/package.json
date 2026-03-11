@@ -17,8 +17,6 @@
         "@skunkteam/sherlock-utils": "^8.0.0",
         "@types/lodash": "^4.17.24",
         "@types/ms": "^2.1.0",
-        "firebase": "^12.10.0",
-        "firebase-admin": "^13.7.0",
         "lodash": "^4.17.21",
         "ms": "^2.1.3"
     },
