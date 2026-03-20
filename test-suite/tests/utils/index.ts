@@ -1,10 +1,10 @@
 export * from './common';
+export * from './concurrent';
 export {
     connection,
     editions,
     enterpriseEdition,
     enterpriseEditionPessimistic,
-    notImplementedInCloud,
     notImplementedInJava,
     notImplementedInRust,
     readData,

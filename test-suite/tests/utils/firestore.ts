@@ -14,7 +14,6 @@ export const connection = process.env.FIRESTORE_EMULATOR_HOST
     : 'CLOUD FIRESTORE';
 export const notImplementedInRust = connection === 'RUST EMULATOR' ? [] : undefined;
 export const notImplementedInJava = connection === 'JAVA EMULATOR' ? [] : undefined;
-export const notImplementedInCloud = connection === 'CLOUD FIRESTORE' ? [] : undefined;
 
 // create a separate collection for each test, use TTL on the field `ttl` to delete every document in the collection group `collection`
 // after a set time as a fallback, if the tests did not get the chance to delete itself
