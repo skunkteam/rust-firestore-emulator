@@ -128,5 +128,143 @@ suite('$description', fs => {
             expect(results[0].sumMissing).toBeNull();
             expect(results[0].avgMissing).toBeNull();
         });
+
+        describe('extended pipeline stages', () => {
+            test('addFields, removeFields, select', async () => {
+                const pipe = fs.firestore
+                    .pipeline()
+                    .collection(cityRef)
+                    .where(Pipelines.field('city').equal('Haarlem'))
+                    .limit(1)
+                    .addFields(
+                        Pipelines.stringConcat(Pipelines.constant('City: '), Pipelines.field('city')).as('newName')
+                    )
+                    .select(Pipelines.field('newName').as('selectedName'), 'area')
+                    .removeFields('area');
+                
+                const snap = await pipe.execute();
+                const res = snap.results[0].data();
+                expect(res).toEqual({ selectedName: 'City: Haarlem' });
+            });
+
+            test('offset and limit', async () => {
+                const pipe = fs.firestore
+                    .pipeline()
+                    .collection(cityRef)
+                    .sort(Pipelines.ascending('city'))
+                    .offset(2)
+                    .limit(2);
+                
+                const snap = await pipe.execute();
+                const results = snap.results.map(r => r.data());
+                expect(results).toHaveLength(2);
+                expect(results[0].city).toBe('Haarlem');
+                expect(results[1].city).toBe('Rotterdam');
+            });
+
+            test('distinct', async () => {
+                const pipe = fs.firestore
+                    .pipeline()
+                    .collection(cityRef)
+                    .distinct(Pipelines.stringConcat(Pipelines.constant('Region: '), Pipelines.field('region')).as('regionPrefix'));
+                
+                const snap = await pipe.execute();
+                const results = snap.results.map(r => r.data());
+                expect(results).toHaveLength(3);
+                const regions = results.map(r => r.regionPrefix).sort();
+                expect(regions).toEqual(['Region: Noord-Holland', 'Region: Utrecht', 'Region: Zuid-Holland']);
+            });
+        });
+
+        describe('expression groups', () => {
+            test('math expressions', async () => {
+                const pipe = fs.firestore
+                    .pipeline()
+                    .collection(cityRef)
+                    .where(Pipelines.field('city').equal('Haarlem')) // population: 160000, area: 32
+                    .limit(1)
+                    .select(
+                        Pipelines.add(Pipelines.field('population'), Pipelines.constant(5)).as('add'),
+                        Pipelines.subtract(Pipelines.field('population'), Pipelines.constant(5)).as('sub'),
+                        Pipelines.multiply(Pipelines.field('area'), Pipelines.constant(2)).as('mul'),
+                        Pipelines.divide(Pipelines.field('population'), Pipelines.constant(2)).as('div'),
+                        Pipelines.mod(Pipelines.field('population'), Pipelines.constant(3)).as('mod'),
+                        Pipelines.abs(Pipelines.constant(-10)).as('abs'),
+                        Pipelines.ceil(Pipelines.constant(1.5)).as('ceil'),
+                        Pipelines.pow(Pipelines.field('area'), Pipelines.constant(2)).as('pow'),
+                        Pipelines.log10(Pipelines.constant(100)).as('log10'),
+                        Pipelines.ln(Pipelines.constant(Math.E)).as('ln'),
+                        Pipelines.round(Pipelines.constant(1.5)).as('round'),
+                        Pipelines.sqrt(Pipelines.constant(9)).as('sqrt')
+                    );
+                const snap = await pipe.execute();
+                const res = snap.results[0].data();
+                expect(res.add).toBe(160005);
+                expect(res.sub).toBe(159995);
+                expect(res.mul).toBe(64);
+                expect(res.div).toBe(80000);
+                expect(res.mod).toBe(160000 % 3);
+                expect(res.abs).toBe(10);
+                expect(res.ceil).toBe(2);
+                expect(res.pow).toBe(1024);
+                expect(res.log10).toBe(2);
+                expect(res.ln).toBeCloseTo(1);
+                expect(res.round).toBe(2);
+                expect(res.sqrt).toBe(3);
+            });
+
+            test('string operations', async () => {
+                const pipe = fs.firestore
+                    .pipeline()
+                    .collection(cityRef)
+                    .where(Pipelines.field('city').equal('Haarlem'))
+                    .limit(1)
+                    .select(
+                        Pipelines.toUpper(Pipelines.field('city')).as('upper'),
+                        Pipelines.toLower(Pipelines.field('city')).as('lower'),
+                        Pipelines.stringConcat(Pipelines.field('city'), Pipelines.constant(' test')).as('concat')
+                    );
+                const snap = await pipe.execute();
+                const res = snap.results[0].data();
+                expect(res.upper).toBe('HAARLEM');
+                expect(res.lower).toBe('haarlem');
+                expect(res.concat).toBe('Haarlem test');
+            });
+            test('logic operations', async () => {
+                const pipe = fs.firestore
+                    .pipeline()
+                    .collection(cityRef)
+                    .where(Pipelines.field('city').equal('Haarlem'))
+                    .limit(1)
+                    .select(
+                        Pipelines.isAbsent(Pipelines.field('missingField')).as('isMissingFieldAbsent'),
+                        Pipelines.isAbsent(Pipelines.field('city')).as('isCityAbsent'),
+                        Pipelines.isError(Pipelines.divide(Pipelines.constant(1), Pipelines.constant(0))).as('divByZeroError'),
+                        Pipelines.isError(Pipelines.divide(Pipelines.constant(1), Pipelines.constant(2))).as('divByTwoError')
+                    );
+                const snap = await pipe.execute();
+                const res = snap.results[0].data();
+                expect(res.isMissingFieldAbsent).toBe(true);
+                expect(res.isCityAbsent).toBe(false);
+                expect(res.divByZeroError).toBe(true);
+                expect(res.divByTwoError).toBe(false);
+            });
+        });
+
+        describe('extended aggregations', () => {
+            test('minimum and maximum', async () => {
+                const pipe = fs.firestore
+                    .pipeline()
+                    .collection(cityRef)
+                    .aggregate(
+                        Pipelines.minimum('population').as('minPop'),
+                        Pipelines.maximum('population').as('maxPop'),
+                    );
+                const snap = await pipe.execute();
+                const res = snap.results[0].data();
+                expect(res.minPop).toBe(160000);
+                expect(res.maxPop).toBe(900000);
+            });
+        });
     });
 });
