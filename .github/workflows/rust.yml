@@ -67,7 +67,7 @@ jobs:
       - run: cargo build --no-default-features
       - uses: actions/setup-node@v6
         with:
-          node-version: 20
+          node-version: 22
           cache: npm
           cache-dependency-path: test-suite/package-lock.json
       - name: Run compatibility test suite
