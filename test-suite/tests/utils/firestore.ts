@@ -1,4 +1,4 @@
-import { Firestore, Timestamp } from '@google-cloud/firestore';
+import { DocumentData, DocumentReference, Firestore, Timestamp, WithFieldValue } from '@google-cloud/firestore';
 import assert from 'assert';
 import ms from 'ms';
 
@@ -50,20 +50,20 @@ export const editions = [
     ...(notImplementedInRust || notImplementedInJava || [enterpriseEdition, enterpriseEditionPessimistic]),
 ] as const;
 
-export function writeData<T = Record<string, unknown>>(data: FirebaseFirestore.WithFieldValue<T>): T;
+export function writeData<T = Record<string, unknown>>(data: WithFieldValue<T>): T;
 export function writeData(): Record<string, unknown>;
 export function writeData(data: Record<string, unknown> = {}) {
     const ttl = Timestamp.fromMillis(Date.now() + ms('1h'));
     return { ...data, ttl };
 }
-export function readData<T = FirebaseFirestore.DocumentData>(data: FirebaseFirestore.DocumentData | undefined) {
+export function readData<T = DocumentData>(data: DocumentData | undefined) {
     assert(data, 'expected to receive data');
     // Remove the `ttl` value from the data, we are not interested in that one..
     const { ttl, ...realData } = data;
     expect(ttl).toBeInstanceOf(Timestamp);
     return realData as T;
 }
-export async function readDataRef<T = FirebaseFirestore.DocumentData>(ref: FirebaseFirestore.DocumentReference) {
+export async function readDataRef<T = DocumentData>(ref: DocumentReference) {
     const snap = await ref.get();
     return readData<T>(snap.data());
 }

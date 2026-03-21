@@ -1,5 +1,34 @@
-import * as Pipelines from '@google-cloud/firestore/pipelines';
-import assert from 'node:assert';
+import { CollectionReference, DocumentData } from '@google-cloud/firestore';
+import {
+    abs,
+    add,
+    ascending,
+    average,
+    ceil,
+    charLength,
+    constant,
+    countAll,
+    divide,
+    Expression,
+    field,
+    isAbsent,
+    isError,
+    ln,
+    log10,
+    maximum,
+    minimum,
+    mod,
+    multiply,
+    pow,
+    round,
+    split,
+    sqrt,
+    stringConcat,
+    subtract,
+    sum,
+    toLower,
+    toUpper,
+} from '@google-cloud/firestore/pipelines';
 import { editions, writeData } from './utils';
 
 const enterpriseDatabases = editions.filter(e => e.enterprise);
@@ -7,13 +36,13 @@ const suite = enterpriseDatabases.length ? describe.each(enterpriseDatabases) : 
 
 suite('$description', fs => {
     describe('pipeline operations', () => {
-        let cityRef: FirebaseFirestore.CollectionReference;
-        let emptyRef: FirebaseFirestore.CollectionReference;
+        let cityRef: CollectionReference;
+        let emptyRef: CollectionReference;
 
         beforeAll(async () => {
             cityRef = fs.collection.doc().collection('cities');
             emptyRef = fs.collection.doc().collection('empty');
-            const cities: FirebaseFirestore.DocumentData[] = [
+            const cities: DocumentData[] = [
                 { city: 'Amersfoort', population: 160000, area: 63, region: 'Utrecht' },
                 { city: 'Utrecht', population: 360000, area: 99, region: 'Utrecht' },
                 { city: 'Amsterdam', population: 900000, area: 219, region: 'Noord-Holland' },
@@ -27,20 +56,19 @@ suite('$description', fs => {
             const pipe = fs.firestore
                 .pipeline()
                 .collection(cityRef)
-                .aggregate(
-                    Pipelines.countAll().as('totalCount'),
-                    Pipelines.sum('population').as('totalPop'),
-                    Pipelines.average('area').as('avgArea'),
-                );
+                .aggregate(countAll().as('totalCount'), sum('population').as('totalPop'), average('area').as('avgArea'));
 
             const snap = await pipe.execute();
             expect(snap).toBeDefined();
             const results = snap.results.map(r => r.data());
 
-            expect(results).toHaveLength(1);
-            expect(results[0].totalCount).toBe(5);
-            expect(results[0].totalPop).toBe(2230000);
-            expect(results[0].avgArea).toBeCloseTo(147.4, 1);
+            expect(results).toEqual([
+                {
+                    totalCount: 5,
+                    totalPop: 2230000,
+                    avgArea: expect.closeTo(147.4, 1),
+                },
+            ]);
         });
 
         test('grouping by region', async () => {
@@ -48,52 +76,42 @@ suite('$description', fs => {
                 .pipeline()
                 .collection(cityRef)
                 .aggregate({
-                    accumulators: [Pipelines.countAll().as('count'), Pipelines.sum('population').as('pop')],
+                    accumulators: [countAll().as('count'), sum('population').as('pop')],
                     groups: ['region'],
                 });
 
             const snap = await pipe.execute();
             const results = snap.results.map(r => r.data());
 
-            expect(results).toHaveLength(3);
-            const utrecht = results.find(r => r.region === 'Utrecht');
-            assert(utrecht);
-            expect(utrecht.count).toBe(2);
-            expect(utrecht.pop).toBe(520000);
-
-            const noordHolland = results.find(r => r.region === 'Noord-Holland');
-            assert(noordHolland);
-            expect(noordHolland.count).toBe(2);
-            expect(noordHolland.pop).toBe(1060000);
-
-            const zuidHolland = results.find(r => r.region === 'Zuid-Holland');
-            assert(zuidHolland);
-            expect(zuidHolland.count).toBe(1);
-            expect(zuidHolland.pop).toBe(650000);
+            expect(results).toIncludeSameMembers([
+                { region: 'Utrecht', count: 2, pop: 520000 },
+                { region: 'Noord-Holland', count: 2, pop: 1060000 },
+                { region: 'Zuid-Holland', count: 1, pop: 650000 },
+            ]);
         });
 
         test('where clause before aggregate', async () => {
             const pipe = fs.firestore
                 .pipeline()
                 .collection(cityRef)
-                .where(Pipelines.field('population').greaterThan(200000))
-                .aggregate(Pipelines.countAll().as('totalCount'), Pipelines.sum('population').as('totalPop'));
+                .where(field('population').greaterThan(200000))
+                .aggregate(countAll().as('totalCount'), sum('population').as('totalPop'));
 
             const snap = await pipe.execute();
             const results = snap.results.map(r => r.data());
 
-            expect(results).toHaveLength(1);
-            expect(results[0].totalCount).toBe(3); // Utrecht, Amsterdam, Rotterdam
-            expect(results[0].totalPop).toBe(1910000);
+            expect(results).toEqual([{
+                totalCount: 3, // Utrecht, Amsterdam, Rotterdam
+                totalPop: 1910000
+            }]);
         });
 
         test('limit clause before aggregate', async () => {
-            const pipe = fs.firestore.pipeline().collection(cityRef).limit(2).aggregate(Pipelines.countAll().as('totalCount'));
+            const pipe = fs.firestore.pipeline().collection(cityRef).limit(2).aggregate(countAll().as('totalCount'));
             const snap = await pipe.execute();
             const results = snap.results.map(r => r.data());
 
-            expect(results).toHaveLength(1);
-            expect(results[0].totalCount).toBe(2);
+            expect(results).toEqual([{ totalCount: 2 }]);
         });
 
         test('limit negative edge case', async () => {
@@ -105,33 +123,31 @@ suite('$description', fs => {
             const pipe = fs.firestore
                 .pipeline()
                 .collection(emptyRef)
-                .aggregate(
-                    Pipelines.countAll().as('totalCount'),
-                    Pipelines.sum('population').as('totalPop'),
-                    Pipelines.average('area').as('avgArea'),
-                );
+                .aggregate(countAll().as('totalCount'), sum('population').as('totalPop'), average('area').as('avgArea'));
 
             const snap = await pipe.execute();
             const results = snap.results.map(r => r.data());
 
-            expect(results).toHaveLength(1);
-            expect(results[0].totalCount).toBe(0);
-            expect(results[0].totalPop).toBeNull();
-            expect(results[0].avgArea).toBeNull();
+            expect(results).toEqual([{
+                totalCount: 0,
+                totalPop: null,
+                avgArea: null
+            }]);
         });
 
         test('aggregate on missing fields', async () => {
             const pipe = fs.firestore
                 .pipeline()
                 .collection(cityRef)
-                .aggregate(Pipelines.sum('nonExistingField').as('sumMissing'), Pipelines.average('nonExistingField').as('avgMissing'));
+                .aggregate(sum('nonExistingField').as('sumMissing'), average('nonExistingField').as('avgMissing'));
 
             const snap = await pipe.execute();
             const results = snap.results.map(r => r.data());
 
-            expect(results).toHaveLength(1);
-            expect(results[0].sumMissing).toBeNull();
-            expect(results[0].avgMissing).toBeNull();
+            expect(results).toEqual([{
+                sumMissing: null,
+                avgMissing: null
+            }]);
         });
 
         describe('extended pipeline stages', () => {
@@ -139,10 +155,10 @@ suite('$description', fs => {
                 const pipe = fs.firestore
                     .pipeline()
                     .collection(cityRef)
-                    .where(Pipelines.field('city').equal('Haarlem'))
+                    .where(field('city').equal('Haarlem'))
                     .limit(1)
-                    .addFields(Pipelines.stringConcat(Pipelines.constant('City: '), Pipelines.field('city')).as('newName'))
-                    .select(Pipelines.field('newName').as('selectedName'), 'area')
+                    .addFields(stringConcat(constant('City: '), field('city')).as('newName'))
+                    .select(field('newName').as('selectedName'), 'area')
                     .removeFields('area');
 
                 const snap = await pipe.execute();
@@ -151,7 +167,7 @@ suite('$description', fs => {
             });
 
             test('offset and limit', async () => {
-                const pipe = fs.firestore.pipeline().collection(cityRef).sort(Pipelines.ascending('city')).offset(2).limit(2);
+                const pipe = fs.firestore.pipeline().collection(cityRef).sort(ascending('city')).offset(2).limit(2);
 
                 const snap = await pipe.execute();
                 const results = snap.results.map(r => r.data());
@@ -164,7 +180,7 @@ suite('$description', fs => {
                 const pipe = fs.firestore
                     .pipeline()
                     .collection(cityRef)
-                    .distinct(Pipelines.stringConcat(Pipelines.constant('Region: '), Pipelines.field('region')).as('regionPrefix'));
+                    .distinct(stringConcat(constant('Region: '), field('region')).as('regionPrefix'));
 
                 const snap = await pipe.execute();
                 const results = snap.results.map(r => r.data());
@@ -186,7 +202,7 @@ suite('$description', fs => {
                     .pipeline()
                     .collection(cityRef)
                     .aggregate({
-                        accumulators: [Pipelines.countAll().as('count')],
+                        accumulators: [countAll().as('count')],
                         groups: ['missingField'],
                     });
                 const snap = await pipe.execute();
@@ -201,91 +217,97 @@ suite('$description', fs => {
                 const pipe = fs.firestore
                     .pipeline()
                     .collection(cityRef)
-                    .where(Pipelines.field('city').equal('Haarlem')) // population: 160000, area: 32
+                    .where(field('city').equal('Haarlem')) // population: 160000, area: 32
                     .limit(1)
                     .select(
-                        Pipelines.add(Pipelines.field('population'), Pipelines.constant(5)).as('add'),
-                        Pipelines.subtract(Pipelines.field('population'), Pipelines.constant(5)).as('sub'),
-                        Pipelines.multiply(Pipelines.field('area'), Pipelines.constant(2)).as('mul'),
-                        Pipelines.divide(Pipelines.field('population'), Pipelines.constant(2)).as('div'),
-                        Pipelines.mod(Pipelines.field('population'), Pipelines.constant(3)).as('mod'),
-                        Pipelines.abs(Pipelines.constant(-10)).as('abs'),
-                        Pipelines.ceil(Pipelines.constant(1.5)).as('ceil'),
-                        Pipelines.pow(Pipelines.field('area'), Pipelines.constant(2)).as('pow'),
-                        Pipelines.log10(Pipelines.constant(100)).as('log10'),
-                        Pipelines.ln(Pipelines.constant(Math.E)).as('ln'),
-                        Pipelines.round(Pipelines.constant(1.5)).as('round'),
-                        Pipelines.sqrt(Pipelines.constant(9)).as('sqrt'),
+                        add(field('population'), constant(5)).as('add'),
+                        subtract(field('population'), constant(5)).as('sub'),
+                        multiply(field('area'), constant(2)).as('mul'),
+                        divide(field('population'), constant(2)).as('div'),
+                        mod(field('population'), constant(3)).as('mod'),
+                        abs(constant(-10)).as('abs'),
+                        ceil(constant(1.5)).as('ceil'),
+                        pow(field('area'), constant(2)).as('pow'),
+                        log10(constant(100)).as('log10'),
+                        ln(constant(Math.E)).as('ln'),
+                        round(constant(1.5)).as('round'),
+                        sqrt(constant(9)).as('sqrt'),
                     );
                 const snap = await pipe.execute();
                 const res = snap.results[0].data();
-                expect(res.add).toBe(160005);
-                expect(res.sub).toBe(159995);
-                expect(res.mul).toBe(64);
-                expect(res.div).toBe(80000);
-                expect(res.mod).toBe(160000 % 3);
-                expect(res.abs).toBe(10);
-                expect(res.ceil).toBe(2);
-                expect(res.pow).toBe(1024);
-                expect(res.log10).toBe(2);
-                expect(res.ln).toBeCloseTo(1);
-                expect(res.round).toBe(2);
-                expect(res.sqrt).toBe(3);
+                expect(res).toEqual({
+                    add: 160005,
+                    sub: 159995,
+                    mul: 64,
+                    div: 80000,
+                    mod: 160000 % 3,
+                    abs: 10,
+                    ceil: 2,
+                    pow: 1024,
+                    log10: 2,
+                    ln: expect.closeTo(1),
+                    round: 2,
+                    sqrt: 3,
+                });
             });
 
             test('string operations', async () => {
                 const pipe = fs.firestore
                     .pipeline()
                     .collection(cityRef)
-                    .where(Pipelines.field('city').equal('Haarlem'))
+                    .where(field('city').equal('Haarlem'))
                     .limit(1)
                     .select(
-                        Pipelines.toUpper(Pipelines.field('city')).as('upper'),
-                        Pipelines.toLower(Pipelines.field('city')).as('lower'),
-                        Pipelines.stringConcat(Pipelines.field('city'), Pipelines.constant(' test')).as('concat'),
+                        toUpper(field('city')).as('upper'),
+                        toLower(field('city')).as('lower'),
+                        stringConcat(field('city'), constant(' test')).as('concat'),
                     );
                 const snap = await pipe.execute();
                 const res = snap.results[0].data();
-                expect(res.upper).toBe('HAARLEM');
-                expect(res.lower).toBe('haarlem');
-                expect(res.concat).toBe('Haarlem test');
+                expect(res).toEqual({
+                    upper: 'HAARLEM',
+                    lower: 'haarlem',
+                    concat: 'Haarlem test'
+                });
             });
             test('logic operations', async () => {
                 const pipe = fs.firestore
                     .pipeline()
                     .collection(cityRef)
-                    .where(Pipelines.field('city').equal('Haarlem'))
+                    .where(field('city').equal('Haarlem'))
                     .limit(1)
                     .select(
-                        Pipelines.isAbsent(Pipelines.field('missingField')).as('isMissingFieldAbsent'),
-                        Pipelines.isAbsent(Pipelines.field('city')).as('isCityAbsent'),
-                        Pipelines.isError(Pipelines.divide(Pipelines.constant(1), Pipelines.constant(0))).as('divByZeroError'),
-                        Pipelines.isError(Pipelines.divide(Pipelines.constant(1), Pipelines.constant(2))).as('divByTwoError'),
+                        isAbsent(field('missingField')).as('isMissingFieldAbsent'),
+                        isAbsent(field('city')).as('isCityAbsent'),
+                        isError(divide(constant(1), constant(0))).as('divByZeroError'),
+                        isError(divide(constant(1), constant(2))).as('divByTwoError'),
                     );
                 const snap = await pipe.execute();
                 const res = snap.results[0].data();
-                expect(res.isMissingFieldAbsent).toBe(true);
-                expect(res.isCityAbsent).toBe(false);
-                expect(res.divByZeroError).toBe(true);
-                expect(res.divByTwoError).toBe(false);
+                expect(res).toEqual({
+                    isMissingFieldAbsent: true,
+                    isCityAbsent: false,
+                    divByZeroError: true,
+                    divByTwoError: false
+                });
             });
 
             test('math edge cases', async () => {
-                const expressions: Record<string, Pipelines.Expression> = {
-                    divZero: Pipelines.divide(Pipelines.constant(1), Pipelines.constant(0)),
-                    modZero: Pipelines.mod(Pipelines.constant(1), Pipelines.constant(0)),
-                    sqrtNeg: Pipelines.sqrt(Pipelines.constant(-9)),
-                    lnZero: Pipelines.ln(Pipelines.constant(0)),
-                    log10Neg: Pipelines.log10(Pipelines.constant(-1)),
-                    addStringNum: Pipelines.add(Pipelines.constant('String'), Pipelines.constant(5)),
-                    divZeroField: Pipelines.divide(Pipelines.constant(1), Pipelines.field('zero')),
+                const expressions: Record<string, Expression> = {
+                    divZero: divide(constant(1), constant(0)),
+                    modZero: mod(constant(1), constant(0)),
+                    sqrtNeg: sqrt(constant(-9)),
+                    lnZero: ln(constant(0)),
+                    log10Neg: log10(constant(-1)),
+                    addStringNum: add(constant('String'), constant(5)),
+                    divZeroField: divide(constant(1), field('zero')),
                 };
 
                 for (const expr of Object.values(expressions)) {
                     const pipe = fs.firestore
                         .pipeline()
                         .collection(cityRef)
-                        .where(Pipelines.field('city').equal('Haarlem'))
+                        .where(field('city').equal('Haarlem'))
                         .limit(1)
                         .select(expr.as('res'));
                     await expect(pipe.execute()).rejects.toThrow(/3 INVALID_ARGUMENT/);
@@ -295,30 +317,27 @@ suite('$description', fs => {
                 const isErrorPipe = fs.firestore
                     .pipeline()
                     .collection(cityRef)
-                    .where(Pipelines.field('city').equal('Haarlem'))
+                    .where(field('city').equal('Haarlem'))
                     .limit(1)
-                    .select(Pipelines.isError(expressions.divZeroField).as('isErrorDivField'));
+                    .select(isError(expressions.divZeroField).as('isErrorDivField'));
                 const isErrorSnap = await isErrorPipe.execute();
                 expect(isErrorSnap.results[0].data()).toEqual({ isErrorDivField: true });
 
                 const validMissingPipe = fs.firestore
                     .pipeline()
                     .collection(cityRef)
-                    .where(Pipelines.field('city').equal('Haarlem'))
+                    .where(field('city').equal('Haarlem'))
                     .limit(1)
-                    .select(
-                        Pipelines.add(Pipelines.field('missing'), Pipelines.constant(10)).as('addMissingNum'),
-                        Pipelines.abs(Pipelines.field('missing')).as('absMissing'),
-                    );
+                    .select(add(field('missing'), constant(10)).as('addMissingNum'), abs(field('missing')).as('absMissing'));
                 const validMissingSnap = await validMissingPipe.execute();
                 expect(validMissingSnap.results[0].data()).toEqual({ addMissingNum: null, absMissing: null });
             });
 
             test('string edge cases', async () => {
-                const expressions: Record<string, Pipelines.Expression> = {
-                    toUpperNum: Pipelines.toUpper(Pipelines.constant(123)),
-                    charLenNum: Pipelines.charLength(Pipelines.constant(123)),
-                    toUpperNumField: Pipelines.toUpper(Pipelines.field('population')),
+                const expressions: Record<string, Expression> = {
+                    toUpperNum: toUpper(constant(123)),
+                    charLenNum: charLength(constant(123)),
+                    toUpperNumField: toUpper(field('population')),
                 };
 
                 for (const expr of Object.values(expressions)) {
@@ -329,13 +348,13 @@ suite('$description', fs => {
                 const validPipe = fs.firestore
                     .pipeline()
                     .collection(cityRef)
-                    .where(Pipelines.field('city').equal('Haarlem'))
+                    .where(field('city').equal('Haarlem'))
                     .limit(1)
                     .select(
-                        Pipelines.stringConcat(Pipelines.constant('a'), Pipelines.constant(null)).as('concatNull'),
-                        Pipelines.stringConcat(Pipelines.constant('a'), Pipelines.field('missing')).as('concatMissing'),
-                        Pipelines.split(Pipelines.constant('a,b'), Pipelines.constant(null)).as('splitNull'),
-                        Pipelines.isError(expressions.toUpperNumField).as('isErrorUpperNumField'),
+                        stringConcat(constant('a'), constant(null)).as('concatNull'),
+                        stringConcat(constant('a'), field('missing')).as('concatMissing'),
+                        split(constant('a,b'), constant(null)).as('splitNull'),
+                        isError(expressions.toUpperNumField).as('isErrorUpperNumField'),
                     );
                 const validSnap = await validPipe.execute();
                 expect(validSnap.results[0].data()).toEqual({
@@ -347,19 +366,15 @@ suite('$description', fs => {
             });
 
             test('array edge cases', async () => {
-                const pipeArrStr = fs.firestore
-                    .pipeline()
-                    .collection(cityRef)
-                    .limit(1)
-                    .select(Pipelines.field('city').arrayLength().as('arrLenStr'));
+                const pipeArrStr = fs.firestore.pipeline().collection(cityRef).limit(1).select(field('city').arrayLength().as('arrLenStr'));
                 await expect(pipeArrStr.execute()).rejects.toThrow(/3 INVALID_ARGUMENT/);
 
                 const pipeValid = fs.firestore
                     .pipeline()
                     .collection(cityRef)
-                    .where(Pipelines.field('city').equal('Haarlem'))
+                    .where(field('city').equal('Haarlem'))
                     .limit(1)
-                    .select(Pipelines.field('arr').arrayConcat([2]).as('concatArrNum'));
+                    .select(field('arr').arrayConcat([2]).as('concatArrNum'));
                 const validSnap = await pipeValid.execute();
                 expect(validSnap.results[0].data()).toEqual({ concatArrNum: [1, 2, 2] });
             });
@@ -370,11 +385,10 @@ suite('$description', fs => {
                 const pipe = fs.firestore
                     .pipeline()
                     .collection(cityRef)
-                    .aggregate(Pipelines.minimum('population').as('minPop'), Pipelines.maximum('population').as('maxPop'));
+                    .aggregate(minimum('population').as('minPop'), maximum('population').as('maxPop'));
                 const snap = await pipe.execute();
                 const res = snap.results[0].data();
-                expect(res.minPop).toBe(160000);
-                expect(res.maxPop).toBe(900000);
+                expect(res).toEqual({ minPop: 160000, maxPop: 900000 });
             });
         });
     });
