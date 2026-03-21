@@ -1,7 +1,7 @@
 #![allow(unused_crate_dependencies)]
 
 use axum::http::StatusCode;
-use emulator_database::{config::FirestoreConfig, FirestoreProject};
+use emulator_database::{FirestoreProject, config::FirestoreConfig};
 use emulator_http::RouterBuilder;
 use reqwest::Client;
 use serde_json::json;
@@ -34,9 +34,8 @@ async fn test_database_admin_api() {
     assert_eq!(body["concurrencyMode"], "PESSIMISTIC");
 
     // 2. PATCH - Change to ENTERPRISE
-    let patch_url = format!("{}?updateMask=databaseEdition", url);
     let res = client
-        .patch(&patch_url)
+        .patch(&url)
         .json(&json!({
             "databaseEdition": "ENTERPRISE"
         }))
@@ -48,10 +47,31 @@ async fn test_database_admin_api() {
     assert_eq!(body["databaseEdition"], "ENTERPRISE");
     assert_eq!(body["concurrencyMode"], "OPTIMISTIC");
 
-    // 3. GET - Should now be ENTERPRISE
+    // 3. GET - Should now be ENTERPRISE and OPTIMISTIC
     let res = client.get(&url).send().await.unwrap();
     assert_eq!(res.status(), StatusCode::OK);
     let body: serde_json::Value = res.json().await.unwrap();
     assert_eq!(body["databaseEdition"], "ENTERPRISE");
     assert_eq!(body["concurrencyMode"], "OPTIMISTIC");
+
+    // 4. PATCH - Change to PESSIMISTIC
+    let res = client
+        .patch(&url)
+        .json(&json!({
+            "concurrencyMode": "PESSIMISTIC"
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let body: serde_json::Value = res.json().await.unwrap();
+    assert_eq!(body["databaseEdition"], "ENTERPRISE");
+    assert_eq!(body["concurrencyMode"], "PESSIMISTIC");
+
+    // 5. GET - Should now be ENTERPRISE and PESSIMISTIC
+    let res = client.get(&url).send().await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let body: serde_json::Value = res.json().await.unwrap();
+    assert_eq!(body["databaseEdition"], "ENTERPRISE");
+    assert_eq!(body["concurrencyMode"], "PESSIMISTIC");
 }

@@ -130,7 +130,7 @@ describe.each(editions)('$description', fs => {
             orderByDocId: collectionGroupQuery.orderBy('path'),
             getDocId: (snap: QueryDocumentSnapshot) => snap.ref.path,
         },
-    ])('on $description', ({ collection, createRef, orderByDocId, getDocId }) => {
+    ] as const)('on $description', ({ description, collection, createRef, orderByDocId, getDocId }) => {
         beforeAll(async () => {
             await Promise.all(
                 storedTestData.map(async data => {
@@ -376,12 +376,18 @@ describe.each(editions)('$description', fs => {
         });
 
         describe('paginating results', () => {
-            if (!fs.enterprise)
-                test('documents should implicitly be ordered by name', async () => {
-                    const implicit = await getData(collection);
-                    const explicit = await getData(orderByDocId);
-                    expect(implicit).toEqual(explicit);
-                });
+            fs.enterprise && description === 'collection'
+                ? test('document should not implicitly be ordered by name', async () => {
+                      const implicit = await getData(collection);
+                      const explicit = await getData(orderByDocId);
+                      expect(implicit).toIncludeSameMembers(explicit);
+                      expect(implicit).not.toEqual(explicit);
+                  })
+                : test('documents should implicitly be ordered by name', async () => {
+                      const implicit = await getData(collection);
+                      const explicit = await getData(orderByDocId);
+                      expect(implicit).toEqual(explicit);
+                  });
 
             describe.each([
                 {

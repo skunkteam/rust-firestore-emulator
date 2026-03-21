@@ -29,9 +29,10 @@ import {
     toLower,
     toUpper,
 } from '@google-cloud/firestore/pipelines';
-import { editions, writeData } from './utils';
+import { connection, editions, writeData } from './utils';
 
-const enterpriseDatabases = editions.filter(e => e.enterprise);
+// TODO: exclude pipelines from Rust emulator tests for now...
+const enterpriseDatabases = editions.filter(e => e.enterprise && connection !== 'RUST EMULATOR');
 const suite = enterpriseDatabases.length ? describe.each(enterpriseDatabases) : describe.skip.each(editions);
 
 suite('$description', fs => {
@@ -100,10 +101,12 @@ suite('$description', fs => {
             const snap = await pipe.execute();
             const results = snap.results.map(r => r.data());
 
-            expect(results).toEqual([{
-                totalCount: 3, // Utrecht, Amsterdam, Rotterdam
-                totalPop: 1910000
-            }]);
+            expect(results).toEqual([
+                {
+                    totalCount: 3, // Utrecht, Amsterdam, Rotterdam
+                    totalPop: 1910000,
+                },
+            ]);
         });
 
         test('limit clause before aggregate', async () => {
@@ -128,11 +131,13 @@ suite('$description', fs => {
             const snap = await pipe.execute();
             const results = snap.results.map(r => r.data());
 
-            expect(results).toEqual([{
-                totalCount: 0,
-                totalPop: null,
-                avgArea: null
-            }]);
+            expect(results).toEqual([
+                {
+                    totalCount: 0,
+                    totalPop: null,
+                    avgArea: null,
+                },
+            ]);
         });
 
         test('aggregate on missing fields', async () => {
@@ -144,10 +149,12 @@ suite('$description', fs => {
             const snap = await pipe.execute();
             const results = snap.results.map(r => r.data());
 
-            expect(results).toEqual([{
-                sumMissing: null,
-                avgMissing: null
-            }]);
+            expect(results).toEqual([
+                {
+                    sumMissing: null,
+                    avgMissing: null,
+                },
+            ]);
         });
 
         describe('extended pipeline stages', () => {
@@ -267,7 +274,7 @@ suite('$description', fs => {
                 expect(res).toEqual({
                     upper: 'HAARLEM',
                     lower: 'haarlem',
-                    concat: 'Haarlem test'
+                    concat: 'Haarlem test',
                 });
             });
             test('logic operations', async () => {
@@ -288,7 +295,7 @@ suite('$description', fs => {
                     isMissingFieldAbsent: true,
                     isCityAbsent: false,
                     divByZeroError: true,
-                    divByTwoError: false
+                    divByTwoError: false,
                 });
             });
 

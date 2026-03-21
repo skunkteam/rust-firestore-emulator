@@ -47,8 +47,27 @@ export const enterpriseEditionPessimistic = {
 
 export const editions = [
     standardEdition,
-    ...(notImplementedInRust || notImplementedInJava || [enterpriseEdition, enterpriseEditionPessimistic]),
+    ...(notImplementedInJava || []),
+    ...(notImplementedInJava || [enterpriseEdition, enterpriseEditionPessimistic]),
 ] as const;
+
+if (connection === 'RUST EMULATOR') {
+    beforeAll(async () => {
+        for (const edition of editions) {
+            const databaseId = edition.firestore.databaseId;
+            const databaseEdition = edition.enterprise ? 'ENTERPRISE' : 'STANDARD';
+            const concurrencyMode = edition.concurrencyMode.toUpperCase();
+            const url = `http://${process.env.FIRESTORE_EMULATOR_HOST}/v1/projects/${projectId}/databases/${databaseId}`;
+            const res = await fetch(url, {
+                method: 'PATCH',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ databaseEdition, concurrencyMode }),
+            });
+            const body = await res.text();
+            if (!res.ok) throw new Error(body);
+        }
+    });
+}
 
 export function writeData<T = Record<string, unknown>>(data: WithFieldValue<T>): T;
 export function writeData(): Record<string, unknown>;
