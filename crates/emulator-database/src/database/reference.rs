@@ -162,6 +162,18 @@ impl FromStr for Ref {
             // Next up is an alternating path of collection name and document name, we can
             // determine whether this is a collection or a document by counting the slashes.
             let s = s.strip_prefix('/')?;
+
+            let is_invalid_id = |id: &str| {
+                id.is_empty()
+                    || id == "."
+                    || id == ".."
+                    || (id.starts_with("__") && id.ends_with("__") && id.len() >= 5)
+                    || id.len() > 1500
+            };
+            if s.split('/').any(is_invalid_id) {
+                return None;
+            }
+
             let slashes = s.chars().filter(|ch| *ch == '/').count();
             if slashes % 2 == 0 {
                 Some(Ref::Collection(CollectionRef::new(root_ref, s)))
