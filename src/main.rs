@@ -25,6 +25,13 @@ struct Args {
     /// unit-tests. Enable this feature to simulate the Cloud Firestore more accurately.
     #[arg(long, env)]
     long_contention_timeout: bool,
+
+    /// Default to Enterprise Edition for all new databases.
+    ///
+    /// The Firestore emulator can simulate both the Standard and Enterprise editions.
+    /// Enable this flag to default new databases to the Enterprise edition.
+    #[arg(long, env = "FIRESTORE_EMULATOR_DEFAULT_ENTERPRISE")]
+    default_enterprise: bool,
 }
 
 #[tokio::main]
@@ -36,11 +43,13 @@ async fn main() -> color_eyre::Result<()> {
     let Args {
         host_port,
         long_contention_timeout,
+        default_enterprise,
     } = Args::parse();
 
     // Create a new Firestore Project.
     let project = Box::new(FirestoreProject::new(FirestoreConfig {
         long_contention_timeout,
+        default_enterprise,
     }));
     // Make it live for the remainder of the program's life. ('static)
     let project = Box::leak(project);

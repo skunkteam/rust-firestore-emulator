@@ -53,16 +53,22 @@ const MAX_EVENT_BACKLOG: usize = 1024;
 pub struct FirestoreDatabase {
     project: &'static FirestoreProject,
     pub name: RootRef,
+    pub enterprise_edition: bool,
     collections: RwLock<HashMap<DefaultAtom, Arc<Collection>>>,
     transactions: RunningTransactions,
     events: broadcast::Sender<Arc<DatabaseEvent>>,
 }
 
 impl FirestoreDatabase {
-    pub fn new(project: &'static FirestoreProject, name: RootRef) -> Arc<Self> {
+    pub fn new(
+        project: &'static FirestoreProject,
+        name: RootRef,
+        enterprise_edition: bool,
+    ) -> Arc<Self> {
         Arc::new_cyclic(|database| FirestoreDatabase {
             project,
             name,
+            enterprise_edition,
             collections: Default::default(),
             transactions: RunningTransactions::new(Weak::clone(database)),
             events: broadcast::channel(MAX_EVENT_BACKLOG).0,
