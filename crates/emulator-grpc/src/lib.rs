@@ -151,6 +151,10 @@ impl Firestore for FirestoreEmulator {
             let (tx, rx) = mpsc::channel(16);
             tokio::spawn(
                 async move {
+                    let read_time = database
+                        .get_read_time(read_consistency)
+                        .await
+                        .unwrap_or_else(|_| Timestamp::now());
                     for name in documents {
                         use batch_get_documents_response::Result::*;
                         let msg = match database.get_doc(&name, read_consistency).await {
@@ -159,7 +163,7 @@ impl Firestore for FirestoreEmulator {
                                     None => Missing(name.to_string()),
                                     Some(doc) => Found(projection.project(&doc)),
                                 }),
-                                read_time:   Some(Timestamp::now()),
+                                read_time:   Some(read_time),
                                 transaction: mem::take(&mut new_transaction),
                             }),
                             Err(err) => Err(Status::from(err)),
@@ -250,6 +254,10 @@ impl Firestore for FirestoreEmulator {
         let parent: Ref = parent.parse()?;
         let database = self.project.database(parent.root()).await;
 
+        if show_missing && database.enterprise_edition() {
+            return Err(Status::invalid_argument("showMissing is not supported"));
+        }
+
         let mut query = QueryBuilder::from(
             parent.clone(),
             vec![CollectionSelector {
@@ -257,6 +265,7 @@ impl Firestore for FirestoreEmulator {
                 collection_id:   collection_id.clone(),
             }],
         )
+        .enterprise_edition(database.enterprise_edition())
         .select(mask.map(|mask| mask.try_into()).transpose()?)
         .consistency(consistency_selector.try_into()?)
         .build()?;
@@ -374,7 +383,12 @@ impl Firestore for FirestoreEmulator {
                 }
                 s => (vec![], s.try_into()?),
             };
-            let mut query = Query::from_structured(parent, query, read_consistency)?;
+            let mut query = Query::from_structured(
+                parent,
+                query,
+                read_consistency,
+                database.enterprise_edition(),
+            )?;
             let (read_time, docs) = database.run_query(&mut query).await?;
             // The docs of RunQueryResponse::read_time say:
             // If the query returns no results, a response with `read_time` and

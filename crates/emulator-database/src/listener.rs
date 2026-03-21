@@ -167,8 +167,12 @@ impl Listener {
                         required_option!(query_type);
                         let query_target::QueryType::StructuredQuery(query) = query_type;
                         let parent: Ref = parent.parse()?;
-                        let query =
-                            Query::from_structured(parent, query, ReadConsistency::Default)?;
+                        let query = Query::from_structured(
+                            parent,
+                            query,
+                            ReadConsistency::Default,
+                            database.enterprise_edition(),
+                        )?;
                         self.set_query(&database, query).await?;
                     }
                     target::TargetType::Documents(target::DocumentsTarget { documents }) => {

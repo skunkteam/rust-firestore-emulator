@@ -1,8 +1,8 @@
 use std::{
-    collections::{HashMap, hash_map::Entry},
+    collections::{HashMap, HashSet, hash_map::Entry},
     fmt::Display,
     sync::{
-        Arc, Weak,
+        Arc, LazyLock, Weak,
         atomic::{self, AtomicUsize},
     },
 };
@@ -18,6 +18,7 @@ use super::{
 };
 use crate::{
     GenericDatabaseError,
+    database::query::Query,
     document::{DocumentMeta, StoredDocumentVersion},
     error::Result,
 };
@@ -42,11 +43,12 @@ impl RunningTransactions {
         })
     }
 
-    pub(crate) async fn start_read_write(&self) -> TransactionId {
+    pub(crate) async fn start_read_write(&self, optimistic_concurrency: bool) -> TransactionId {
         let id = TransactionId::new();
         let txn = Arc::new(Transaction::ReadWrite(ReadWriteTransaction::new(
             id,
             Weak::clone(&self.database),
+            optimistic_concurrency,
         )));
         self.txns.write().await.insert(id, txn);
         id
@@ -63,7 +65,11 @@ impl RunningTransactions {
         id
     }
 
-    pub(crate) async fn start_read_write_with_id(&self, id: TransactionId) -> Result<()> {
+    pub(crate) async fn start_read_write_with_id(
+        &self,
+        id: TransactionId,
+        optimistic_concurrency: bool,
+    ) -> Result<()> {
         id.check()?;
         match self.txns.write().await.entry(id) {
             Entry::Occupied(_) => Err(GenericDatabaseError::failed_precondition(
@@ -73,6 +79,7 @@ impl RunningTransactions {
                 let txn = Arc::new(Transaction::ReadWrite(ReadWriteTransaction::new(
                     id,
                     Weak::clone(&self.database),
+                    optimistic_concurrency,
                 )));
                 e.insert(txn);
                 Ok(())
@@ -114,29 +121,22 @@ impl Transaction {
 
     pub(crate) fn read_time(&self) -> Option<Timestamp> {
         match self {
-            Transaction::ReadWrite(_) => None,
+            Transaction::ReadWrite(txn) => match &txn.mode {
+                ConcurrencyMode::Pessimistic(_) => None,
+                ConcurrencyMode::Optimistic(state) => Some(*state.read_time),
+            },
             Transaction::ReadOnly(txn) => txn.read_time,
         }
     }
 }
 
 #[derive(Debug)]
-pub(crate) struct ReadWriteTransaction {
-    #[allow(dead_code)] // For logging
-    pub(crate) id: TransactionId,
+pub(crate) struct PessimisticState {
     database: Weak<FirestoreDatabase>,
-    guards: Mutex<HashMap<DocumentRef, Arc<OwnedDocumentContentsReadGuard>>>,
+    guards:   Mutex<HashMap<DocumentRef, Arc<OwnedDocumentContentsReadGuard>>>,
 }
 
-impl ReadWriteTransaction {
-    fn new(id: TransactionId, database: Weak<FirestoreDatabase>) -> Self {
-        ReadWriteTransaction {
-            id,
-            database,
-            guards: Default::default(),
-        }
-    }
-
+impl PessimisticState {
     /// Acquires a lock on the document (if needed) and returns the latest version of that document.
     /// The guard is stored with the transaction and can only be released by dropping the
     /// transaction, using [`Self::take_write_guard`] or [`Self::drop_read_guards`].
@@ -157,8 +157,8 @@ impl ReadWriteTransaction {
 
     /// Returns a handle that can be used to temporarily lock documents in order to evaluate whether
     /// they should be included in a query result.
-    pub(crate) async fn query_support(&self) -> RWTransactionQuerySupport<'_> {
-        RWTransactionQuerySupport {
+    pub(crate) async fn query_support(&self) -> PessimisticTransactionQuerySupport<'_> {
+        PessimisticTransactionQuerySupport {
             guards_guard: self.guards.lock().await,
         }
     }
@@ -214,11 +214,182 @@ impl ReadWriteTransaction {
 }
 
 #[derive(Debug)]
-pub(crate) struct RWTransactionQuerySupport<'a> {
-    guards_guard: MutexGuard<'a, HashMap<DocumentRef, Arc<OwnedDocumentContentsReadGuard>>>,
+pub(crate) struct OptimisticState {
+    database: Weak<FirestoreDatabase>,
+    pub(crate) observed_docs: Mutex<HashSet<DocumentRef>>,
+    pub(crate) executed_queries: Mutex<Vec<Query>>,
+    pub(crate) read_time: LazyLock<Timestamp>,
 }
 
-impl RWTransactionQuerySupport<'_> {
+impl OptimisticState {
+    /// Acquires a lock on the document (if needed) and returns the latest version of that document.
+    /// The guard is stored with the transaction and can only be released by dropping the
+    /// transaction, using [`Self::take_write_guard`] or [`Self::drop_read_guards`].
+    ///
+    /// If the guard should not be kept inside the transaction (if the lock is preliminary), then
+    /// use the combination of [`RWTransactionQuerySupport::get_read_guard`] and
+    /// [`RWTransactionQuerySupport::manage_read_guard`] on the result of [`Self::query_support`].
+    pub(crate) async fn read_doc(
+        &self,
+        name: &DocumentRef,
+    ) -> Result<Option<Arc<StoredDocumentVersion>>> {
+        let db = self
+            .database
+            .upgrade()
+            .ok_or_else(|| GenericDatabaseError::aborted("database was dropped"))?;
+        let meta = db.get_doc_meta(name).await?;
+        let read_guard = meta.read().await?;
+        let rt = *self.read_time;
+        let version = read_guard.version_at_time(rt).cloned();
+        self.observed_docs.lock().await.insert(name.clone());
+        Ok(version)
+    }
+
+    pub(crate) async fn get_write_guard(
+        &self,
+        name: &DocumentRef,
+    ) -> Result<OwnedDocumentContentsWriteGuard> {
+        self.database
+            .upgrade()
+            .ok_or_else(|| GenericDatabaseError::aborted("database was dropped"))?
+            .get_doc_meta(name)
+            .await?
+            .write_owned()
+            .await
+    }
+
+    pub(crate) async fn check_concurrency_violations(&self) -> Result<()> {
+        let db = self
+            .database
+            .upgrade()
+            .ok_or_else(|| GenericDatabaseError::aborted("database was dropped"))?;
+        let rt = *self.read_time;
+
+        // VERIFY OBSERVED DOCS
+        {
+            let observed = self.observed_docs.lock().await;
+            for name in observed.iter() {
+                let meta = db.get_doc_meta(name).await?;
+                let rg = meta.read().await?;
+                let check_time = rg.last_updated();
+                if check_time.is_some_and(|time| time > rt) {
+                    return Err(GenericDatabaseError::aborted(
+                        "contention: document modified",
+                    ));
+                }
+            }
+        }
+
+        // VERIFY QUERIES
+        {
+            let mut executed_queries = self.executed_queries.lock().await;
+            for query in executed_queries.iter_mut() {
+                let (_, result_docs) = query.once(&db).await?;
+                for doc in result_docs {
+                    if doc.update_time > rt {
+                        return Err(GenericDatabaseError::aborted(
+                            "contention: query result changed",
+                        ));
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug)]
+pub(crate) enum ConcurrencyMode {
+    Pessimistic(PessimisticState),
+    Optimistic(OptimisticState),
+}
+
+impl ConcurrencyMode {
+    fn new(database: Weak<FirestoreDatabase>, optimistic_concurrency: bool) -> Self {
+        if optimistic_concurrency {
+            ConcurrencyMode::Optimistic(OptimisticState {
+                database,
+                observed_docs: Default::default(),
+                executed_queries: Default::default(),
+                read_time: LazyLock::new(Timestamp::now),
+            })
+        } else {
+            ConcurrencyMode::Pessimistic(PessimisticState {
+                database,
+                guards: Default::default(),
+            })
+        }
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct ReadWriteTransaction {
+    #[allow(dead_code)] // For logging
+    pub(crate) id: TransactionId,
+    pub(crate) mode: ConcurrencyMode,
+}
+
+impl ReadWriteTransaction {
+    fn new(
+        id: TransactionId,
+        database: Weak<FirestoreDatabase>,
+        optimistic_concurrency: bool,
+    ) -> Self {
+        ReadWriteTransaction {
+            id,
+            mode: ConcurrencyMode::new(database, optimistic_concurrency),
+        }
+    }
+
+    /// Acquires a lock on the document (if needed) and returns the latest version of that document.
+    /// The guard is stored with the transaction and can only be released by dropping the
+    /// transaction, using [`Self::take_write_guard`] or [`Self::drop_read_guards`].
+    ///
+    /// If the guard should not be kept inside the transaction (if the lock is preliminary), then
+    /// use the combination of [`RWTransactionQuerySupport::get_read_guard`] and
+    /// [`RWTransactionQuerySupport::manage_read_guard`] on the result of [`Self::query_support`].
+    pub(crate) async fn read_doc(
+        &self,
+        name: &DocumentRef,
+    ) -> Result<Option<Arc<StoredDocumentVersion>>> {
+        match &self.mode {
+            ConcurrencyMode::Pessimistic(state) => state.read_doc(name).await,
+            ConcurrencyMode::Optimistic(state) => state.read_doc(name).await,
+        }
+    }
+
+    pub(crate) async fn check_concurrency_violations(&self) -> Result<()> {
+        match &self.mode {
+            ConcurrencyMode::Pessimistic(_) => Ok(()),
+            ConcurrencyMode::Optimistic(state) => state.check_concurrency_violations().await,
+        }
+    }
+
+    pub(crate) async fn get_write_guard(
+        &self,
+        name: &DocumentRef,
+    ) -> Result<OwnedDocumentContentsWriteGuard> {
+        match &self.mode {
+            ConcurrencyMode::Pessimistic(state) => state.take_write_guard(name).await,
+            ConcurrencyMode::Optimistic(state) => state.get_write_guard(name).await,
+        }
+    }
+
+    pub(crate) async fn prepare_commit(&self) {
+        match &self.mode {
+            ConcurrencyMode::Pessimistic(state) => state.drop_read_guards().await,
+            ConcurrencyMode::Optimistic(_) => (),
+        }
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct PessimisticTransactionQuerySupport<'a> {
+    pub(crate) guards_guard:
+        MutexGuard<'a, HashMap<DocumentRef, Arc<OwnedDocumentContentsReadGuard>>>,
+}
+
+impl PessimisticTransactionQuerySupport<'_> {
     /// Acquires a read lock on the document or returns the already present guard in this
     /// transaction. It does not, however, keep the guard inside the transaction when newly
     /// acquired. If the guard should be stored with this transaction use
@@ -234,7 +405,7 @@ impl RWTransactionQuerySupport<'_> {
     }
 
     /// Add the given read guard to this transaction, must be a guard that was returned by
-    /// [`Self::manage_read_guard`].
+    /// [`Self::get_read_guard`].
     pub(crate) fn manage_read_guard(&mut self, guard: Arc<OwnedDocumentContentsReadGuard>) {
         self.guards_guard.insert(guard.name.clone(), guard);
     }
