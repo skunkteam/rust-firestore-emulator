@@ -11,6 +11,7 @@ use tower_http::{set_header::SetResponseHeaderLayer, trace::TraceLayer};
 
 mod emulator;
 mod logging;
+mod projects;
 
 #[cfg(feature = "ui")]
 const HTML: &str = concat!(
@@ -31,6 +32,7 @@ impl RouterBuilder {
         Self(
             Router::new()
                 .nest("/emulator/v1", emulator::router())
+                .nest("/v1/projects", projects::router())
                 .with_state(project),
         )
     }

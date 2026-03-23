@@ -1,6 +1,6 @@
 use std::{
     collections::{BTreeSet, HashMap, hash_map::Entry},
-    sync::{Arc, Weak},
+    sync::{Arc, Weak, atomic::AtomicBool},
 };
 
 use googleapis::google::{
@@ -53,7 +53,7 @@ const MAX_EVENT_BACKLOG: usize = 1024;
 pub struct FirestoreDatabase {
     project: &'static FirestoreProject,
     pub name: RootRef,
-    pub enterprise_edition: bool,
+    pub enterprise_edition: AtomicBool,
     collections: RwLock<HashMap<DefaultAtom, Arc<Collection>>>,
     transactions: RunningTransactions,
     events: broadcast::Sender<Arc<DatabaseEvent>>,
@@ -68,7 +68,7 @@ impl FirestoreDatabase {
         Arc::new_cyclic(|database| FirestoreDatabase {
             project,
             name,
-            enterprise_edition,
+            enterprise_edition: AtomicBool::new(enterprise_edition),
             collections: Default::default(),
             transactions: RunningTransactions::new(Weak::clone(database)),
             events: broadcast::channel(MAX_EVENT_BACKLOG).0,
