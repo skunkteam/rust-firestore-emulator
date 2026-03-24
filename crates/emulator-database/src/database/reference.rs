@@ -190,16 +190,10 @@ impl FromStr for Ref {
             // - Maximum size for a document name   6 KiB
             // - Constraints on collection IDs
             //    - Must be valid UTF-8 characters
-            //    - Must be no longer than 1,500 bytes
             //    - Cannot contain a forward slash (/)
-            //    - Cannot solely consist of a single period (.) or double periods (..)
-            //    - Cannot match the regular expression __.*__
             // - Constraints on document IDs
             //    - Must be valid UTF-8 characters
-            //    - Must be no longer than 1,500 bytes
             //    - Cannot contain a forward slash (/)
-            //    - Cannot solely consist of a single period (.) or double periods (..)
-            //    - Cannot match the regular expression __.*__
             //    - (If you import Datastore entities into a Firestore database, numeric entity IDs
             //      are exposed as __id[0-9]+__)
         }

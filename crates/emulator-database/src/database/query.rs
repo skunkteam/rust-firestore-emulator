@@ -72,6 +72,16 @@ impl QueryBuilder {
         }
     }
 
+    pub fn from_collection(collection: CollectionRef) -> Self {
+        Self::from(
+            Ref::Root(collection.root_ref),
+            vec![CollectionSelector {
+                collection_id:   collection.collection_id.to_string(),
+                all_descendants: false,
+            }],
+        )
+    }
+
     /// Determines whether the query corresponds to an Enterprise Edition database.
     pub fn enterprise_edition(mut self, enterprise_edition: bool) -> Self {
         self.enterprise_edition = enterprise_edition;

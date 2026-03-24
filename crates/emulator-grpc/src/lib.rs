@@ -4,11 +4,11 @@
 use std::mem;
 
 use emulator_database::{
-    FirestoreProject,
+    FirestoreProject, pipeline,
     projection::{Project, Projection},
     query::{Query, QueryBuilder},
     read_consistency::ReadConsistency,
-    reference::{DocumentRef, Ref},
+    reference::{DocumentRef, Ref, RootRef},
 };
 use futures::{TryStreamExt, future::join_all, stream::BoxStream};
 use googleapis::google::{
@@ -254,9 +254,9 @@ impl Firestore for FirestoreEmulator {
         let parent: Ref = parent.parse()?;
         let database = self.project.database(parent.root()).await;
 
-        if show_missing && database.enterprise_edition() {
-            return Err(Status::invalid_argument("showMissing is not supported"));
-        }
+        // if show_missing && database.enterprise_edition() {
+        //     return Err(Status::invalid_argument("showMissing is not supported"));
+        // }
 
         let mut query = QueryBuilder::from(
             parent.clone(),
@@ -435,9 +435,11 @@ impl Firestore for FirestoreEmulator {
             let execute_pipeline_request::PipelineType::StructuredPipeline(pipeline) =
                 mandatory!(pipeline_type);
 
-            let root_ref: Ref = database.parse()?;
-            let database = self.project.database(root_ref.root()).await;
+            let root_ref: RootRef = database.parse()?;
+            let database = self.project.database(&root_ref).await;
 
+            // TODO: Deze code komt een paar keer in vergelijkbare vorm terug. Kijken of we dit
+            // herbruikbaar kunnen maken.
             let (mut new_transaction, read_consistency) = match consistency_selector {
                 Some(execute_pipeline_request::ConsistencySelector::NewTransaction(txn_opts)) => {
                     let id = database.new_txn(txn_opts).await?;
@@ -447,19 +449,14 @@ impl Firestore for FirestoreEmulator {
                 s => (vec![], s.try_into()?),
             };
 
-            let docs = emulator_database::pipeline::execute(
-                &database,
-                root_ref,
-                pipeline,
-                read_consistency,
-            )
-            .await?;
+            let results =
+                pipeline::execute(&database, &root_ref, pipeline, read_consistency).await?;
 
             let read_time = database.get_read_time(read_consistency).await?;
 
             let response = ExecutePipelineResponse {
                 transaction: mem::take(&mut new_transaction),
-                results: docs,
+                results,
                 execution_time: Some(read_time),
                 explain_stats: None,
             };
