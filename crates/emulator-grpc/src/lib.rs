@@ -420,11 +420,53 @@ impl Firestore for FirestoreEmulator {
     type ExecutePipelineStream = BoxStream<'static, Result<ExecutePipelineResponse>>;
 
     /// Executes a pipeline query.
+    #[instrument(level = Level::DEBUG, skip_all, err)]
     async fn execute_pipeline(
         &self,
-        _request: Request<ExecutePipelineRequest>,
+        request: Request<ExecutePipelineRequest>,
     ) -> Result<Response<Self::ExecutePipelineStream>, Status> {
-        unimplemented!("execute_pipeline");
+        let ExecutePipelineRequest {
+            database,
+            pipeline_type,
+            consistency_selector,
+        } = request.into_inner();
+
+        error_in_stream(async {
+            let execute_pipeline_request::PipelineType::StructuredPipeline(pipeline) =
+                mandatory!(pipeline_type);
+
+            let root_ref: Ref = database.parse()?;
+            let database = self.project.database(root_ref.root()).await;
+
+            let (mut new_transaction, read_consistency) = match consistency_selector {
+                Some(execute_pipeline_request::ConsistencySelector::NewTransaction(txn_opts)) => {
+                    let id = database.new_txn(txn_opts).await?;
+                    debug!("started new transaction");
+                    (id.into(), ReadConsistency::Transaction(id))
+                }
+                s => (vec![], s.try_into()?),
+            };
+
+            let docs = emulator_database::pipeline::execute(
+                &database,
+                root_ref,
+                pipeline,
+                read_consistency,
+            )
+            .await?;
+
+            let read_time = database.get_read_time(read_consistency).await?;
+
+            let response = ExecutePipelineResponse {
+                transaction: mem::take(&mut new_transaction),
+                results: docs,
+                execution_time: Some(read_time),
+                explain_stats: None,
+            };
+
+            Ok(once(Ok(response)))
+        })
+        .await
     }
 
     /// Server streaming response type for the RunAggregationQuery method.

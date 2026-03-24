@@ -45,6 +45,7 @@ pub mod event;
 pub mod field_path;
 pub mod projection;
 pub mod query;
+pub mod pipeline;
 pub mod read_consistency;
 pub mod reference;
 pub(crate) mod timeouts;

@@ -1,7 +1,7 @@
 use googleapis::google::{
     firestore::v1::{
-        batch_get_documents_request, get_document_request, list_documents_request,
-        run_aggregation_query_request, run_query_request,
+        batch_get_documents_request, execute_pipeline_request, get_document_request,
+        list_documents_request, run_aggregation_query_request, run_query_request,
     },
     protobuf::Timestamp,
 };
@@ -56,3 +56,4 @@ impl_try_from_consistency_selector!(get_document_request);
 impl_try_from_consistency_selector!(list_documents_request);
 impl_try_from_consistency_selector!(run_query_request);
 impl_try_from_consistency_selector!(run_aggregation_query_request);
+impl_try_from_consistency_selector!(execute_pipeline_request);
