@@ -162,6 +162,18 @@ impl FromStr for Ref {
             // Next up is an alternating path of collection name and document name, we can
             // determine whether this is a collection or a document by counting the slashes.
             let s = s.strip_prefix('/')?;
+
+            let is_invalid_id = |id: &str| {
+                id.is_empty()
+                    || id == "."
+                    || id == ".."
+                    || (id.starts_with("__") && id.ends_with("__") && id.len() >= 5)
+                    || id.len() > 1500
+            };
+            if s.split('/').any(is_invalid_id) {
+                return None;
+            }
+
             let slashes = s.chars().filter(|ch| *ch == '/').count();
             if slashes % 2 == 0 {
                 Some(Ref::Collection(CollectionRef::new(root_ref, s)))
@@ -178,16 +190,10 @@ impl FromStr for Ref {
             // - Maximum size for a document name   6 KiB
             // - Constraints on collection IDs
             //    - Must be valid UTF-8 characters
-            //    - Must be no longer than 1,500 bytes
             //    - Cannot contain a forward slash (/)
-            //    - Cannot solely consist of a single period (.) or double periods (..)
-            //    - Cannot match the regular expression __.*__
             // - Constraints on document IDs
             //    - Must be valid UTF-8 characters
-            //    - Must be no longer than 1,500 bytes
             //    - Cannot contain a forward slash (/)
-            //    - Cannot solely consist of a single period (.) or double periods (..)
-            //    - Cannot match the regular expression __.*__
             //    - (If you import Datastore entities into a Firestore database, numeric entity IDs
             //      are exposed as __id[0-9]+__)
         }

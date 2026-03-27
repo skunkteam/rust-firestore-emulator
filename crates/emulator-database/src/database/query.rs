@@ -27,7 +27,9 @@ use super::{
 };
 use crate::{
     GenericDatabaseError,
-    database::transaction::RWTransactionQuerySupport,
+    database::transaction::{
+        ConcurrencyMode, OptimisticState, PessimisticTransactionQuerySupport, Transaction,
+    },
     document::{DocumentMeta, OwnedDocumentContentsReadGuard},
     error::Result,
     reference::DocumentRef,
@@ -41,6 +43,7 @@ mod tests;
 #[derive(Debug)]
 pub struct QueryBuilder {
     parent: Ref,
+    enterprise_edition: bool,
     select: Option<Projection>,
     from: Vec<CollectionSelector>,
     filter: Option<Filter>,
@@ -56,6 +59,7 @@ impl QueryBuilder {
     pub fn from(parent: Ref, from: Vec<CollectionSelector>) -> Self {
         Self {
             parent,
+            enterprise_edition: false,
             select: None,
             from,
             filter: None,
@@ -66,6 +70,22 @@ impl QueryBuilder {
             limit: None,
             consistency: ReadConsistency::Default,
         }
+    }
+
+    pub fn from_collection(collection: CollectionRef) -> Self {
+        Self::from(
+            Ref::Root(collection.root_ref),
+            vec![CollectionSelector {
+                collection_id:   collection.collection_id.to_string(),
+                all_descendants: false,
+            }],
+        )
+    }
+
+    /// Determines whether the query corresponds to an Enterprise Edition database.
+    pub fn enterprise_edition(mut self, enterprise_edition: bool) -> Self {
+        self.enterprise_edition = enterprise_edition;
+        self
     }
 
     /// Optional sub-set of the fields to return.
@@ -199,6 +219,7 @@ impl QueryBuilder {
         let mut query = Query {
             parent: self.parent,
             select: self.select,
+            enterprise_edition: self.enterprise_edition,
             from: self.from,
             filter: self.filter,
             order_by: self.order_by,
@@ -209,15 +230,18 @@ impl QueryBuilder {
             consistency: self.consistency,
             collection_cache: Default::default(),
         };
-        query.validate()?;
+        query.validate(self.enterprise_edition)?;
         Ok(query)
     }
 }
 
 /// A Firestore query.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct Query {
     parent: Ref,
+
+    /// Determines whether the query corresponds to an Enterprise Edition database
+    enterprise_edition: bool,
 
     /// Optional sub-set of the fields to return.
     ///
@@ -318,6 +342,7 @@ impl Query {
         parent: Ref,
         query: StructuredQuery,
         consistency: ReadConsistency,
+        enterprise_edition: bool,
     ) -> Result<Box<Self>> {
         let StructuredQuery {
             select,
@@ -336,6 +361,7 @@ impl Query {
         let mut query = Box::new(Self {
             parent,
             select: select.map(Projection::try_from).transpose()?,
+            enterprise_edition,
             from,
             filter: filter.map(TryInto::try_into).transpose()?,
             order_by: order_by.into_iter().map(TryInto::try_into).try_collect()?,
@@ -346,11 +372,11 @@ impl Query {
             consistency,
             collection_cache: Default::default(),
         });
-        query.validate()?;
+        query.validate(enterprise_edition)?;
         Ok(query)
     }
 
-    fn validate(&mut self) -> Result<()> {
+    fn validate(&mut self, enterprise_edition: bool) -> Result<()> {
         if matches!(self.parent, Ref::Collection(_)) {
             return Err(GenericDatabaseError::invalid_argument(
                 "parent must point to a Document or Root",
@@ -362,7 +388,7 @@ impl Query {
                 "Query FROM is mandatory",
             ));
         }
-        if let Some(filter) = &self.filter {
+        if !enterprise_edition && let Some(filter) = &self.filter {
             // Ensure order_by is consistent
             if self.order_by.is_empty() {
                 self.order_by
@@ -383,7 +409,10 @@ impl Query {
                 })?;
         }
 
-        if !self.order_by.iter().any(|o| o.field.is_document_name()) {
+        let has_all_descendants = self.from.iter().any(|selector| selector.all_descendants);
+        if (!enterprise_edition || has_all_descendants)
+            && !self.order_by.iter().any(|o| o.field.is_document_name())
+        {
             self.order_by.push(Order {
                 field:     FieldReference::DocumentName,
                 direction: Direction::Ascending,
@@ -394,6 +423,10 @@ impl Query {
 
     pub fn reset_on_update(&self) -> bool {
         self.order_by.iter().any(|o| !o.field.is_document_name())
+    }
+
+    pub fn reset_consistency_to_default(&mut self) {
+        self.consistency = ReadConsistency::Default;
     }
 
     pub async fn once(
@@ -409,11 +442,7 @@ impl Query {
             ReadConsistency::ReadTime(timestamp) => LockStrategy::ReadTime(timestamp),
             ReadConsistency::Transaction(transaction_id) => {
                 txn = db.transactions.get(transaction_id).await?;
-                if let Some(rw_txn) = txn.as_read_write() {
-                    LockStrategy::PessimisticTransaction(rw_txn.query_support().await)
-                } else {
-                    LockStrategy::ReadTime(txn.read_time().unwrap_or_else(Timestamp::now))
-                }
+                LockStrategy::from_transaction(&txn).await
             }
         };
 
@@ -439,11 +468,9 @@ impl Query {
         }
 
         // Now make sure that the transaction (if any and if needed) acquires a lock to all
-        // resulting documents.
-        let result = buffer
-            .into_iter()
-            .map(|doc| lock_strategy.confirm(doc))
-            .collect();
+        // resulting documents or remember which results were served in case of optimistic
+        // concurrency.
+        let result = lock_strategy.confirm_all(buffer.into_iter(), self).await;
 
         Ok((lock_strategy.read_time(), result))
     }
@@ -551,7 +578,7 @@ impl Query {
             return Ok(false);
         }
         if let Some(filter) = &self.filter
-            && !filter.eval(doc)?
+            && !filter.eval(doc, self.enterprise_edition)?
         {
             return Ok(false);
         }
@@ -584,12 +611,8 @@ impl Query {
     ) -> cmp::Ordering {
         use cmp::Ordering::*;
         for order in &self.order_by {
-            let a = order.field.get_value(a).expect(
-                "fields used in order_by MUST also be used in filter, so cannot be empty here",
-            );
-            let b = order.field.get_value(b).expect(
-                "fields used in order_by MUST also be used in filter, so cannot be empty here",
-            );
+            let a = order.field.get_value(a);
+            let b = order.field.get_value(b);
             let result = match a.cmp(&b) {
                 result @ (Less | Greater) => result,
                 Equal => continue,
@@ -622,7 +645,7 @@ impl Query {
     }
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct Order {
     field:     FieldReference,
     direction: Direction,
@@ -662,43 +685,77 @@ impl From<structured_query::Direction> for Direction {
 
 #[derive(Debug)]
 enum LockStrategy<'a> {
-    PessimisticTransaction(RWTransactionQuerySupport<'a>),
+    PessimisticTransaction(PessimisticTransactionQuerySupport<'a>),
+    OptimisticTransaction(&'a OptimisticState),
     ReadTime(Timestamp),
 }
 
-impl LockStrategy<'_> {
-    async fn read(&self, meta: &Arc<DocumentMeta>) -> Result<Option<LockStrategyDocument>> {
-        Ok(match self {
-            LockStrategy::PessimisticTransaction(txn) => {
-                let read_guard = txn.get_read_guard(meta).await?;
-                read_guard
-                    .current_version()
-                    .cloned()
-                    .map(|version| LockStrategyDocument {
-                        version,
-                        guard: Some(read_guard),
-                    })
+impl<'a> LockStrategy<'a> {
+    async fn from_transaction(txn: &'a Transaction) -> Self {
+        if let Some(rw_txn) = txn.as_read_write() {
+            match &rw_txn.mode {
+                ConcurrencyMode::Pessimistic(state) => {
+                    Self::PessimisticTransaction(state.query_support().await)
+                }
+                ConcurrencyMode::Optimistic(state) => Self::OptimisticTransaction(state),
             }
-            LockStrategy::ReadTime(read_time) => {
-                let read_guard = meta.read().await?;
-                read_guard
-                    .version_at_time(*read_time)
-                    .cloned()
-                    .map(|version| LockStrategyDocument {
-                        version,
-                        guard: None,
-                    })
-            }
-        })
+        } else {
+            Self::ReadTime(txn.read_time().unwrap_or_else(Timestamp::now))
+        }
     }
 
-    fn confirm(&mut self, doc: LockStrategyDocument) -> Arc<StoredDocumentVersion> {
-        if let LockStrategy::PessimisticTransaction(txn) = self
-            && let Some(guard) = doc.guard
-        {
-            txn.manage_read_guard(guard);
+    async fn read(&self, meta: &Arc<DocumentMeta>) -> Result<Option<LockStrategyDocument>> {
+        let read_time = match self {
+            LockStrategy::PessimisticTransaction(txn) => {
+                let read_guard = txn.get_read_guard(meta).await?;
+                return Ok(read_guard.current_version().cloned().map(|version| {
+                    LockStrategyDocument {
+                        version,
+                        guard: Some(read_guard),
+                    }
+                }));
+            }
+            LockStrategy::OptimisticTransaction(state) => *state.read_time,
+            LockStrategy::ReadTime(rt) => *rt,
+        };
+        let read_guard = meta.read().await?;
+        Ok(read_guard
+            .version_at_time(read_time)
+            .cloned()
+            .map(|version| LockStrategyDocument {
+                version,
+                guard: None,
+            }))
+    }
+
+    async fn confirm_all(
+        &mut self,
+        docs: impl Iterator<Item = LockStrategyDocument>,
+        query: &Query,
+    ) -> Vec<Arc<StoredDocumentVersion>> {
+        let result = docs
+            .map(|doc| {
+                if let LockStrategy::PessimisticTransaction(txn) = self
+                    && let Some(guard) = doc.guard
+                {
+                    txn.manage_read_guard(guard);
+                }
+                doc.version
+            })
+            .collect_vec();
+
+        if let Self::OptimisticTransaction(state) = self {
+            state
+                .observed_docs
+                .lock()
+                .await
+                .extend(result.iter().map(|d| d.name.clone()));
+            let mut verification_query = query.clone();
+            verification_query.reset_consistency_to_default();
+            state.executed_queries.lock().await.push(verification_query);
         }
-        doc.version
+
+        result
     }
 
     fn read_time(self) -> Timestamp {
@@ -709,6 +766,7 @@ impl LockStrategy<'_> {
             // we are sure that the documents are unchanged and are still the same at
             // this particular point in time.
             LockStrategy::PessimisticTransaction(_) => Timestamp::now(),
+            LockStrategy::OptimisticTransaction(state) => *state.read_time,
             LockStrategy::ReadTime(timestamp) => timestamp,
         }
     }

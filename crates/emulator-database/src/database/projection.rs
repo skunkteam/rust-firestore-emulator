@@ -4,7 +4,7 @@ use itertools::Itertools;
 use super::field_path::FieldReference;
 use crate::{GenericDatabaseError, document::StoredDocumentVersion};
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct Projection {
     fields: Vec<FieldReference>,
 }
