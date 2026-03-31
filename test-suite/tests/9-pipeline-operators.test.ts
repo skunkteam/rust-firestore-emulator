@@ -260,7 +260,17 @@ suite('$description', fs => {
                         field('population').subtract(5).as('sub'),
                         field('area').multiply(2).as('mul'),
                         field('population').divide(2).as('div'),
-                        field('area').divide(5).as('integer_div'),
+
+                        // Note the danger of using the JavaScript SDK combined with server-side
+                        // computation, JavaScript only has one numeric type (float64) while
+                        // Firestore has two (integer and float). The SDK automatically detects
+                        // integers and uses the integer type in communication with Firestore.
+                        // This can lead to unexpected results if you are not careful. For example:
+                        field('area').divide(5.0).as('integer_div'), // yields 6
+                        field('area').add(0.5).subtract(0.5).divide(5.0).as('floating_div'), // yields 6.4
+                        constant(1.0).type().as('integer_type'),
+                        constant(1.1).type().as('float_type'),
+
                         field('population').mod(3).as('mod'),
                         constant(-10).abs().as('abs'),
                         constant(1.5).ceil().as('ceil'),
@@ -286,7 +296,12 @@ suite('$description', fs => {
                     sub: 159995,
                     mul: 64,
                     div: 80000,
+
                     integer_div: 6, // Would be 6.4 if division was floating point
+                    floating_div: 6.4,
+                    integer_type: 'int64',
+                    float_type: 'float64',
+
                     mod: 160000 % 3,
                     abs: 10,
                     ceil: 2,
