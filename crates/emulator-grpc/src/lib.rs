@@ -254,10 +254,6 @@ impl Firestore for FirestoreEmulator {
         let parent: Ref = parent.parse()?;
         let database = self.project.database(parent.root()).await;
 
-        // if show_missing && database.enterprise_edition() {
-        //     return Err(Status::invalid_argument("showMissing is not supported"));
-        // }
-
         let mut query = QueryBuilder::from(
             parent.clone(),
             vec![CollectionSelector {
