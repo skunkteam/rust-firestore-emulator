@@ -10,7 +10,7 @@ use crate::{
     unimplemented,
 };
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub enum Filter {
     Composite(CompositeFilter),
     Field(FieldFilter),
@@ -40,11 +40,11 @@ impl Filter {
         }
     }
 
-    pub fn eval(&self, version: &StoredDocumentVersion) -> Result<bool> {
+    pub fn eval(&self, version: &StoredDocumentVersion, is_enterprise: bool) -> Result<bool> {
         match self {
-            Filter::Composite(f) => f.eval(version),
-            Filter::Field(f) => f.eval(version),
-            Filter::Unary(f) => Ok(f.eval(version)),
+            Filter::Composite(f) => f.eval(version, is_enterprise),
+            Filter::Field(f) => f.eval(version, is_enterprise),
+            Filter::Unary(f) => Ok(f.eval(version, is_enterprise)),
         }
     }
 
@@ -86,16 +86,16 @@ impl TryFrom<structured_query::Filter> for Filter {
     }
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct CompositeFilter {
     pub op:      CompositeOperator,
     pub filters: Vec<Filter>,
 }
 
 impl CompositeFilter {
-    fn eval(&self, version: &StoredDocumentVersion) -> Result<bool> {
+    fn eval(&self, version: &StoredDocumentVersion, is_enterprise: bool) -> Result<bool> {
         for filter in &self.filters {
-            let filter_result = filter.eval(version)?;
+            let filter_result = filter.eval(version, is_enterprise)?;
             match (&self.op, filter_result) {
                 (CompositeOperator::And, true) | (CompositeOperator::Or, false) => continue,
                 (_, result) => return Ok(result),
@@ -151,7 +151,7 @@ impl TryFrom<structured_query::composite_filter::Operator> for CompositeOperator
     }
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct FieldFilter {
     pub field: FieldReference,
     pub op:    FieldOperator,
@@ -159,15 +159,16 @@ pub struct FieldFilter {
 }
 
 impl FieldFilter {
-    fn eval(&self, version: &StoredDocumentVersion) -> Result<bool> {
+    fn eval(&self, version: &StoredDocumentVersion, is_enterprise: bool) -> Result<bool> {
+        use FieldOperator::*;
         let Some(value) = self.field.get_value(version) else {
-            return Ok(false);
+            // If the field is missing, it only evaluates to true for `!=` in Enterprise Edition
+            return Ok(is_enterprise && matches!(self.op, NotEqual));
         };
         let value = value.as_ref();
         if self.op.needs_type_compat() && !value.is_compatible_with(&self.value) {
             return Ok(false);
         }
-        use FieldOperator::*;
         Ok(match self.op {
             LessThan => value < &self.value,
             LessThanOrEqual => value <= &self.value,
@@ -178,7 +179,7 @@ impl FieldFilter {
             #[allow(clippy::double_comparisons)]
             Equal => value <= &self.value && value >= &self.value,
 
-            NotEqual => !value.is_null() && value != &self.value,
+            NotEqual => (is_enterprise || !value.is_null()) && value != &self.value,
             ArrayContains => value
                 .as_array()
                 .is_some_and(|arr| arr.contains(&self.value)),
@@ -332,23 +333,25 @@ impl TryFrom<structured_query::field_filter::Operator> for FieldOperator {
     }
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct UnaryFilter {
     pub field: FieldReference,
     pub op:    UnaryOperator,
 }
 
 impl UnaryFilter {
-    fn eval(&self, version: &StoredDocumentVersion) -> bool {
+    fn eval(&self, version: &StoredDocumentVersion, is_enterprise: bool) -> bool {
+        use UnaryOperator::*;
         let Some(value) = self.field.get_value(version) else {
-            return false;
+            // If the field is missing, it only evaluates to true for `!=` in Enterprise Edition
+            return is_enterprise && matches!(self.op, IsNotNan | IsNotNull);
         };
         let value = value.as_ref();
         match self.op {
-            UnaryOperator::IsNan => value.is_nan(),
-            UnaryOperator::IsNull => value.is_null(),
-            UnaryOperator::IsNotNan => !value.is_null() && !value.is_nan(),
-            UnaryOperator::IsNotNull => !value.is_null(),
+            IsNan => value.is_nan(),
+            IsNull => value.is_null(),
+            IsNotNan => (is_enterprise || !value.is_null()) && !value.is_nan(),
+            IsNotNull => !value.is_null(),
         }
     }
 }

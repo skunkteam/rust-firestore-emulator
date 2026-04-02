@@ -1,5 +1,5 @@
 import { DocumentReference, FieldValue, Timestamp } from '@google-cloud/firestore';
-import { editions, notImplementedInJava, notImplementedInRust, readData, writeData } from './utils';
+import { editions, notImplementedInJava, readData, writeData } from './utils';
 
 describe.each(editions)('$description', fs => {
     let docRef: DocumentReference;
@@ -220,10 +220,9 @@ describe.each(editions)('$description', fs => {
                     errorMsg: 'Did not receive document for ',
                 },
                 // This rule is not enforced on the java-emulator
-                ...(notImplementedInJava ||
-                    notImplementedInRust || [
-                        { rule: 'must be no longer than 1,500 bytes', valid: ['a'.repeat(1500)], invalid: ['a'.repeat(1501)] },
-                    ]),
+                ...(notImplementedInJava || [
+                    { rule: 'must be no longer than 1,500 bytes', valid: ['a'.repeat(1500)], invalid: ['a'.repeat(1501)] },
+                ]),
                 {
                     rule: 'cannot contain a forward slash (/)',
                     valid: ['canContain\\', 'canContain\\/collection/myDoc'],
@@ -231,23 +230,19 @@ describe.each(editions)('$description', fs => {
                     errorMsg: 'Your path does not contain an even number of components.',
                     sync: true,
                 },
-                ...(notImplementedInRust || [
-                    {
-                        rule: 'cannot solely consist of a single period (.) or double periods (..)',
-                        valid: ['.a.', 'a.', '..a', 'a..'],
-                        invalid: ['.', '..'],
-                        errorMsg: '3 INVALID_ARGUMENT',
-                    },
-                ]),
-                ...(notImplementedInRust || [
-                    {
-                        // in practice .* seems to be more like .+
-                        rule: 'cannot match the regular expression __.*__',
-                        valid: ['__foo_', '_bar__', '_'.repeat(4)],
-                        invalid: ['__foo__', '_'.repeat(5)],
-                        errorMsg: '3 INVALID_ARGUMENT',
-                    },
-                ]),
+                {
+                    rule: 'cannot solely consist of a single period (.) or double periods (..)',
+                    valid: ['.a.', 'a.', '..a', 'a..'],
+                    invalid: ['.', '..'],
+                    errorMsg: '3 INVALID_ARGUMENT',
+                },
+                {
+                    // in practice .* seems to be more like .+
+                    rule: 'cannot match the regular expression __.*__',
+                    valid: ['__foo_', '_bar__', '_'.repeat(4)],
+                    invalid: ['__foo__', '_'.repeat(5)],
+                    errorMsg: '3 INVALID_ARGUMENT',
+                },
             ])('$rule', ({ valid, invalid, errorMsg, sync }) => {
                 test.each(valid.map(valid => ({ key: valid, description: describe(valid) })))('valid: $description', async ({ key }) => {
                     const ref = fs.collection.doc(key);

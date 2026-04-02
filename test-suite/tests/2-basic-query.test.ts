@@ -130,7 +130,7 @@ describe.each(editions)('$description', fs => {
             orderByDocId: collectionGroupQuery.orderBy('path'),
             getDocId: (snap: QueryDocumentSnapshot) => snap.ref.path,
         },
-    ])('on $description', ({ collection, createRef, orderByDocId, getDocId }) => {
+    ] as const)('on $description', ({ description, collection, createRef, orderByDocId, getDocId }) => {
         beforeAll(async () => {
             await Promise.all(
                 storedTestData.map(async data => {
@@ -376,12 +376,18 @@ describe.each(editions)('$description', fs => {
         });
 
         describe('paginating results', () => {
-            if (!fs.enterprise)
-                test('documents should implicitly be ordered by name', async () => {
-                    const implicit = await getData(collection);
-                    const explicit = await getData(orderByDocId);
-                    expect(implicit).toEqual(explicit);
-                });
+            fs.enterprise && description === 'collection'
+                ? test('document should not implicitly be ordered by name', async () => {
+                      const implicit = await getData(collection);
+                      const explicit = await getData(orderByDocId);
+                      expect(implicit).toIncludeSameMembers(explicit);
+                      expect(implicit).not.toEqual(explicit);
+                  })
+                : test('documents should implicitly be ordered by name', async () => {
+                      const implicit = await getData(collection);
+                      const explicit = await getData(orderByDocId);
+                      expect(implicit).toEqual(explicit);
+                  });
 
             describe.each([
                 {
@@ -514,23 +520,18 @@ describe.each(editions)('$description', fs => {
     describe('list', () => {
         const data = writeData({ prop: 'foo' });
 
-        fs.enterprise
-            ? test('does not support listDocuments', async () => {
-                  const scope = fs.collection.doc().collection('collection');
-                  await expect(scope.listDocuments()).rejects.toThrow('3 INVALID_ARGUMENT: showMissing is not supported');
-              })
-            : test('listDocuments', async () => {
-                  const scope = fs.collection.doc().collection('collection');
+        test('listDocuments', async () => {
+            const scope = fs.collection.doc().collection('collection');
 
-                  expect(await scope.listDocuments()).toBeEmpty();
-                  // Create three different docs in the given collection
-                  await scope.doc('foo').create(data);
-                  await scope.doc('bar').create(data);
-                  // This one is only a nested collection, this is a so called "missing doc"
-                  await scope.doc('baz').collection('subFoo').doc().collection('really nested').doc().create(data);
+            expect(await scope.listDocuments()).toBeEmpty();
+            // Create three different docs in the given collection
+            await scope.doc('foo').create(data);
+            await scope.doc('bar').create(data);
+            // This one is only a nested collection, this is a so called "missing doc"
+            await scope.doc('baz').collection('subFoo').doc().collection('really nested').doc().create(data);
 
-                  expect((await scope.listDocuments()).map(c => c.id)).toIncludeSameMembers(['foo', 'bar', 'baz']);
-              });
+            expect((await scope.listDocuments()).map(c => c.id)).toIncludeSameMembers(['foo', 'bar', 'baz']);
+        });
 
         test('listCollections', async () => {
             const scope = fs.collection.doc();

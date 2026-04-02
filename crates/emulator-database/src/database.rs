@@ -1,6 +1,9 @@
 use std::{
     collections::{BTreeSet, HashMap, hash_map::Entry},
-    sync::{Arc, Weak},
+    sync::{
+        Arc, Weak,
+        atomic::{self, AtomicBool},
+    },
 };
 
 use googleapis::google::{
@@ -40,6 +43,7 @@ mod collection;
 pub(crate) mod document;
 pub mod event;
 pub mod field_path;
+pub mod pipeline;
 pub mod projection;
 pub mod query;
 pub mod read_consistency;
@@ -53,16 +57,24 @@ const MAX_EVENT_BACKLOG: usize = 1024;
 pub struct FirestoreDatabase {
     project: &'static FirestoreProject,
     pub name: RootRef,
+    enterprise_edition: AtomicBool,
+    optimistic_concurrency: AtomicBool,
     collections: RwLock<HashMap<DefaultAtom, Arc<Collection>>>,
     transactions: RunningTransactions,
     events: broadcast::Sender<Arc<DatabaseEvent>>,
 }
 
 impl FirestoreDatabase {
-    pub fn new(project: &'static FirestoreProject, name: RootRef) -> Arc<Self> {
+    pub fn new(
+        project: &'static FirestoreProject,
+        name: RootRef,
+        enterprise_edition: bool,
+    ) -> Arc<Self> {
         Arc::new_cyclic(|database| FirestoreDatabase {
             project,
             name,
+            enterprise_edition: AtomicBool::new(enterprise_edition),
+            optimistic_concurrency: AtomicBool::new(enterprise_edition),
             collections: Default::default(),
             transactions: RunningTransactions::new(Weak::clone(database)),
             events: broadcast::channel(MAX_EVENT_BACKLOG).0,
@@ -202,7 +214,8 @@ impl FirestoreDatabase {
         consistency: ReadConsistency,
     ) -> Result<(Timestamp, HashMap<String, Value>)> {
         unimplemented_option!(query.select);
-        let mut query = Query::from_structured(parent, query, consistency)?;
+        let mut query =
+            Query::from_structured(parent, query, consistency, self.enterprise_edition())?;
         debug!(?query);
         let (read_time, docs) = query.once(self).await?;
         let result = aggregations
@@ -319,6 +332,13 @@ impl FirestoreDatabase {
         let txn = self.transactions.get(transaction).await?;
         let rw_txn = txn.as_read_write();
 
+        // No write-skew possible when no writes, do not abort even if things changed.
+        if let Some(rw_txn) = rw_txn
+            && !writes.is_empty()
+        {
+            rw_txn.check_concurrency_violations().await?;
+        }
+
         let mut write_results = vec![];
         let mut updates = HashMap::new();
         let mut write_guard_cache = HashMap::<DocumentRef, OwnedDocumentContentsWriteGuard>::new();
@@ -332,12 +352,12 @@ impl FirestoreDatabase {
                         "Cannot modify entities in a read-only transaction",
                     )
                 })?;
-                entry.insert(txn.take_write_guard(&name).await?);
+                entry.insert(txn.get_write_guard(&name).await?);
             }
         }
 
         if let Some(txn) = rw_txn {
-            txn.drop_read_guards().await;
+            txn.prepare_commit().await;
         }
 
         let time = Timestamp::now();
@@ -430,27 +450,43 @@ impl FirestoreDatabase {
         ))
     }
 
+    pub async fn get_read_time(&self, consistency: ReadConsistency) -> Result<Timestamp> {
+        match consistency {
+            ReadConsistency::Default => Ok(Timestamp::now()),
+            ReadConsistency::Transaction(id) => {
+                let txn = self.transactions.get(id).await?;
+                Ok(txn.read_time().unwrap_or_else(Timestamp::now))
+            }
+            ReadConsistency::ReadTime(time) => Ok(time),
+        }
+    }
+
     pub async fn new_txn(&self, transaction_options: TransactionOptions) -> Result<TransactionId> {
         use transaction_options::*;
-        match transaction_options.mode {
-            None => Ok(self.transactions.start_read_only(None).await),
-            Some(Mode::ReadOnly(ro)) => Ok(self
-                .transactions
-                .start_read_only(
-                    ro.consistency_selector
-                        .map(|read_only::ConsistencySelector::ReadTime(read_time)| read_time),
-                )
-                .await),
-            Some(Mode::ReadWrite(rw)) => {
-                if rw.retry_transaction.is_empty() {
-                    Ok(self.transactions.start_read_write().await)
-                } else {
-                    let id = rw.retry_transaction.try_into()?;
-                    self.transactions.start_read_write_with_id(id).await?;
-                    Ok(id)
-                }
+        let id = match transaction_options.mode {
+            None => self.transactions.start_read_only(None).await,
+            Some(Mode::ReadOnly(ro)) => {
+                self.transactions
+                    .start_read_only(
+                        ro.consistency_selector
+                            .map(|read_only::ConsistencySelector::ReadTime(read_time)| read_time),
+                    )
+                    .await
             }
-        }
+            Some(Mode::ReadWrite(rw)) if rw.retry_transaction.is_empty() => {
+                self.transactions
+                    .start_read_write(self.optimistic_concurrency())
+                    .await
+            }
+            Some(Mode::ReadWrite(rw)) => {
+                let id = rw.retry_transaction.try_into()?;
+                self.transactions
+                    .start_read_write_with_id(id, self.optimistic_concurrency())
+                    .await?;
+                id
+            }
+        };
+        Ok(id)
     }
 
     pub async fn rollback(&self, transaction: TransactionId) -> Result<()> {
@@ -466,6 +502,24 @@ impl FirestoreDatabase {
 
     pub fn subscribe(&self) -> Receiver<Arc<DatabaseEvent>> {
         self.events.subscribe()
+    }
+
+    pub fn enterprise_edition(&self) -> bool {
+        self.enterprise_edition.load(atomic::Ordering::Relaxed)
+    }
+
+    pub fn set_enterprise_edition(&self, enterprise_edition: bool) {
+        self.enterprise_edition
+            .store(enterprise_edition, atomic::Ordering::Relaxed);
+    }
+
+    pub fn optimistic_concurrency(&self) -> bool {
+        self.optimistic_concurrency.load(atomic::Ordering::Relaxed)
+    }
+
+    pub fn set_optimistic_concurrency(&self, optimistic_concurrency: bool) {
+        self.optimistic_concurrency
+            .store(optimistic_concurrency, atomic::Ordering::Relaxed);
     }
 }
 

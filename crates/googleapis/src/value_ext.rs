@@ -5,7 +5,7 @@ use tonic_prost::prost::bytes::Bytes;
 use tracing::warn;
 
 use crate::google::{
-    firestore::v1::{ArrayValue, MapValue, Value, value::ValueType},
+    firestore::v1::{ArrayValue, Function, MapValue, Value, value::ValueType},
     protobuf::Timestamp,
     r#type::LatLng,
 };
@@ -53,6 +53,12 @@ impl Value {
         }
     }
 
+    pub fn string(value: impl Into<String>) -> Self {
+        Self {
+            value_type: Some(ValueType::StringValue(value.into())),
+        }
+    }
+
     pub fn timestamp(value: Timestamp) -> Self {
         Self {
             value_type: Some(ValueType::TimestampValue(value)),
@@ -62,6 +68,27 @@ impl Value {
     pub fn bytes(value: impl Into<Bytes>) -> Self {
         Self {
             value_type: Some(ValueType::BytesValue(value.into())),
+        }
+    }
+
+    pub fn as_field_reference(&self) -> Option<&str> {
+        match self.value_type() {
+            ValueType::FieldReferenceValue(reference) => Some(reference),
+            _ => None,
+        }
+    }
+
+    pub fn as_function_value(&self) -> Option<&Function> {
+        match self.value_type() {
+            ValueType::FunctionValue(f) => Some(f),
+            _ => None,
+        }
+    }
+
+    pub fn as_reference(&self) -> Option<&str> {
+        match self.value_type() {
+            ValueType::ReferenceValue(reference) => Some(reference),
+            _ => None,
         }
     }
 
@@ -75,6 +102,13 @@ impl Value {
     pub fn as_map_mut(&mut self) -> Option<&mut HashMap<String, Self>> {
         match self.value_type_mut() {
             ValueType::MapValue(MapValue { fields }) => Some(fields),
+            _ => None,
+        }
+    }
+
+    pub fn as_string(&self) -> Option<&str> {
+        match self.value_type() {
+            ValueType::StringValue(s) => Some(s),
             _ => None,
         }
     }
@@ -93,10 +127,24 @@ impl Value {
         }
     }
 
+    pub fn as_boolean(&self) -> Option<bool> {
+        match self.value_type() {
+            ValueType::BooleanValue(b) => Some(*b),
+            _ => None,
+        }
+    }
+
     pub fn as_double(&self) -> Option<f64> {
         match self.value_type() {
             ValueType::DoubleValue(d) => Some(*d),
             ValueType::IntegerValue(i) => Some(*i as f64),
+            _ => None,
+        }
+    }
+
+    pub fn as_integer(&self) -> Option<i64> {
+        match self.value_type() {
+            ValueType::IntegerValue(i) => Some(*i),
             _ => None,
         }
     }

@@ -4,11 +4,11 @@
 use std::mem;
 
 use emulator_database::{
-    FirestoreProject,
+    FirestoreProject, pipeline,
     projection::{Project, Projection},
     query::{Query, QueryBuilder},
     read_consistency::ReadConsistency,
-    reference::{DocumentRef, Ref},
+    reference::{DocumentRef, Ref, RootRef},
 };
 use futures::{TryStreamExt, future::join_all, stream::BoxStream};
 use googleapis::google::{
@@ -151,6 +151,10 @@ impl Firestore for FirestoreEmulator {
             let (tx, rx) = mpsc::channel(16);
             tokio::spawn(
                 async move {
+                    let read_time = database
+                        .get_read_time(read_consistency)
+                        .await
+                        .unwrap_or_else(|_| Timestamp::now());
                     for name in documents {
                         use batch_get_documents_response::Result::*;
                         let msg = match database.get_doc(&name, read_consistency).await {
@@ -159,7 +163,7 @@ impl Firestore for FirestoreEmulator {
                                     None => Missing(name.to_string()),
                                     Some(doc) => Found(projection.project(&doc)),
                                 }),
-                                read_time:   Some(Timestamp::now()),
+                                read_time:   Some(read_time),
                                 transaction: mem::take(&mut new_transaction),
                             }),
                             Err(err) => Err(Status::from(err)),
@@ -257,6 +261,7 @@ impl Firestore for FirestoreEmulator {
                 collection_id:   collection_id.clone(),
             }],
         )
+        .enterprise_edition(database.enterprise_edition())
         .select(mask.map(|mask| mask.try_into()).transpose()?)
         .consistency(consistency_selector.try_into()?)
         .build()?;
@@ -374,7 +379,12 @@ impl Firestore for FirestoreEmulator {
                 }
                 s => (vec![], s.try_into()?),
             };
-            let mut query = Query::from_structured(parent, query, read_consistency)?;
+            let mut query = Query::from_structured(
+                parent,
+                query,
+                read_consistency,
+                database.enterprise_edition(),
+            )?;
             let (read_time, docs) = database.run_query(&mut query).await?;
             // The docs of RunQueryResponse::read_time say:
             // If the query returns no results, a response with `read_time` and
@@ -406,11 +416,50 @@ impl Firestore for FirestoreEmulator {
     type ExecutePipelineStream = BoxStream<'static, Result<ExecutePipelineResponse>>;
 
     /// Executes a pipeline query.
+    #[instrument(level = Level::DEBUG, skip_all, err)]
     async fn execute_pipeline(
         &self,
-        _request: Request<ExecutePipelineRequest>,
+        request: Request<ExecutePipelineRequest>,
     ) -> Result<Response<Self::ExecutePipelineStream>, Status> {
-        unimplemented!("execute_pipeline");
+        let ExecutePipelineRequest {
+            database,
+            pipeline_type,
+            consistency_selector,
+        } = request.into_inner();
+
+        error_in_stream(async {
+            let execute_pipeline_request::PipelineType::StructuredPipeline(pipeline) =
+                mandatory!(pipeline_type);
+
+            let root_ref: RootRef = database.parse()?;
+            let database = self.project.database(&root_ref).await;
+
+            // TODO: Deze code komt een paar keer in vergelijkbare vorm terug. Kijken of we dit
+            // herbruikbaar kunnen maken.
+            let (mut new_transaction, read_consistency) = match consistency_selector {
+                Some(execute_pipeline_request::ConsistencySelector::NewTransaction(txn_opts)) => {
+                    let id = database.new_txn(txn_opts).await?;
+                    debug!("started new transaction");
+                    (id.into(), ReadConsistency::Transaction(id))
+                }
+                s => (vec![], s.try_into()?),
+            };
+
+            let results =
+                pipeline::execute(&database, &root_ref, pipeline, read_consistency).await?;
+
+            let read_time = database.get_read_time(read_consistency).await?;
+
+            let response = ExecutePipelineResponse {
+                transaction: mem::take(&mut new_transaction),
+                results,
+                execution_time: Some(read_time),
+                explain_stats: None,
+            };
+
+            Ok(once(Ok(response)))
+        })
+        .await
     }
 
     /// Server streaming response type for the RunAggregationQuery method.

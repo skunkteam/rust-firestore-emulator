@@ -12,6 +12,7 @@ use crate::{
 
 pub struct FirestoreProject {
     pub(crate) timeouts: Timeouts,
+    pub(crate) default_enterprise: bool,
     databases: RwLock<HashMap<RootRef, Arc<FirestoreDatabase>>>,
 }
 
@@ -34,6 +35,7 @@ impl FirestoreProject {
         };
         Self {
             timeouts,
+            default_enterprise: config.default_enterprise,
             databases: Default::default(),
         }
     }
@@ -59,7 +61,9 @@ impl FirestoreProject {
     pub async fn database(&'static self, name: &RootRef) -> Arc<FirestoreDatabase> {
         Arc::clone(
             self.databases
-                .get_or_insert(name, || FirestoreDatabase::new(self, name.clone()))
+                .get_or_insert(name, || {
+                    FirestoreDatabase::new(self, name.clone(), self.default_enterprise)
+                })
                 .await
                 .deref(),
         )
