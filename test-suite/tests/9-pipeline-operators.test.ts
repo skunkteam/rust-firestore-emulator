@@ -87,16 +87,16 @@ suite('$description', fs => {
                 .collection(cityRef)
                 .aggregate({
                     accumulators: [p.countAll().as('count'), p.sum('population').as('pop')],
-                    groups: ['region'],
+                    groups: [p.field('region').stringConcat('.').as('region')],
                 });
 
             const snap = await pipe.execute();
             const results = snap.results.map(r => r.data());
 
             expect(results).toIncludeSameMembers([
-                { region: 'Utrecht', count: 2, pop: 520000 },
-                { region: 'Noord-Holland', count: 2, pop: 1060000 },
-                { region: 'Zuid-Holland', count: 1, pop: 650000 },
+                { region: 'Utrecht.', count: 2, pop: 520000 },
+                { region: 'Noord-Holland.', count: 2, pop: 1060000 },
+                { region: 'Zuid-Holland.', count: 1, pop: 650000 },
             ]);
         });
 

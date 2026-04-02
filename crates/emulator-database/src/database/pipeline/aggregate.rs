@@ -3,11 +3,15 @@ use std::collections::{BTreeMap, HashMap};
 use googleapis::google::firestore::v1::{
     Document, Function, Value, pipeline::Stage, value::ValueType,
 };
+use itertools::Itertools;
 
 use super::get_document_value;
 use crate::{
-    GenericDatabaseError, database::field_path::FieldReference, error::Result,
-    pipeline::get_exact_expr_args, unimplemented_collection,
+    GenericDatabaseError,
+    database::field_path::FieldReference,
+    error::Result,
+    pipeline::{expressions, get_exact_expr_args},
+    unimplemented_collection,
 };
 
 pub(super) fn execute(
@@ -32,22 +36,13 @@ pub(super) fn execute(
         )
     })?;
 
-    let groups_arg = args.get(1).and_then(|v| v.as_map());
-    let mut group_by_fields: Vec<(String, FieldReference)> = vec![];
-
-    if let Some(groups_map) = groups_arg {
-        assert_eq!(args.len(), 2, "aggregate stage expects at most 2 arguments");
-        for (alias, value) in groups_map {
-            let f = value.as_field_reference().ok_or_else(|| {
-                GenericDatabaseError::invalid_argument(
-                    "group by value must be a FieldReferenceValue",
-                )
-            })?;
-            group_by_fields.push((alias.clone(), f.parse()?));
-        }
-    }
+    let mut group_by_fields = args
+        .get(1)
+        .and_then(|v| v.as_map())
+        .map(|v| v.iter().collect_vec())
+        .unwrap_or_default();
     // Sort to ensure stable group key ordering
-    group_by_fields.sort_by(|a, b| a.0.cmp(&b.0));
+    group_by_fields.sort_by(|a, b| a.0.cmp(b.0));
 
     let mut buckets: BTreeMap<Vec<Value>, Vec<Document>> = BTreeMap::new();
 
@@ -57,7 +52,7 @@ pub(super) fn execute(
         for doc in docs {
             let mut key = Vec::with_capacity(group_by_fields.len());
             for (_, field_ref) in &group_by_fields {
-                let val = get_document_value(field_ref, &doc).unwrap_or_else(Value::null);
+                let val = expressions::evaluate(field_ref, &doc)?;
                 key.push(val);
             }
             buckets.entry(key).or_default().push(doc);
@@ -70,7 +65,7 @@ pub(super) fn execute(
         let mut result_fields = HashMap::new();
 
         for (i, (alias, _)) in group_by_fields.iter().enumerate() {
-            result_fields.insert(alias.clone(), group_key[i].clone());
+            result_fields.insert(alias.to_string(), group_key[i].clone());
         }
 
         for (alias, value) in aggregations {
