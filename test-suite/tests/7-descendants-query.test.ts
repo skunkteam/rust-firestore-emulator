@@ -128,7 +128,11 @@ describe.each(editions)('$description - query with allDescendants', fs => {
                     // rust emulator does not care about indices and does not recognize this to be unsupported (yet)
                     return expect((await querySnap).data()).toEqual({ avg: type === 'without' ? 16 / 4 : 11 / 3 });
                 }
-                await expect(querySnap).rejects.toThrow('3 INVALID_ARGUMENT: collection group queries are only allowed at the root parent');
+                await expect(querySnap).rejects.toThrow(
+                    connection === 'JAVA EMULATOR'
+                        ? `9 FAILED_PRECONDITION: collection group queries are only allowed if they're at the root or they're an ascending primary key scan`
+                        : '3 INVALID_ARGUMENT: collection group queries are only allowed at the root parent',
+                );
             });
 
             test.concurrent('count', async () => {
@@ -184,12 +188,12 @@ describe.each(editions)('$description - query with allDescendants', fs => {
                     return;
                 }
                 await expect(querySnap).rejects.toThrow(
-                    type === 'without'
-                        ? '3 INVALID_ARGUMENT: kind is required for all orders except __key__ ascending'
-                        : // Throws error suggesting a collectionGroup index for `children` on `__name__` (descending) even when the index exists.
-                          connection === 'JAVA EMULATOR'
-                          ? `9 FAILED_PRECONDITION: collection group queries are only allowed if they're at the root or they're an ascending primary key scan`
-                          : '9 FAILED_PRECONDITION: The query requires an index.',
+                    connection === 'JAVA EMULATOR'
+                        ? `9 FAILED_PRECONDITION: collection group queries are only allowed if they're at the root or they're an ascending primary key scan`
+                        : type === 'without'
+                          ? '3 INVALID_ARGUMENT: kind is required for all orders except __key__ ascending'
+                          : // Throws error suggesting a collectionGroup index for `children` on `__name__` (descending) even when the index exists.
+                            '9 FAILED_PRECONDITION: The query requires an index.',
                 );
             });
 
@@ -222,12 +226,12 @@ describe.each(editions)('$description - query with allDescendants', fs => {
                     return;
                 }
                 await expect(querySnap).rejects.toThrow(
-                    type === 'without'
-                        ? '3 INVALID_ARGUMENT: kind is required for all orders except __key__ ascending'
-                        : // Throws error suggesting a collectionGroup index for `children` on `__name__` (descending) even when the index exists.
-                          connection === 'JAVA EMULATOR'
-                          ? `9 FAILED_PRECONDITION: collection group queries are only allowed if they're at the root or they're an ascending primary key scan`
-                          : '9 FAILED_PRECONDITION: The query requires an index.',
+                    connection === 'JAVA EMULATOR'
+                        ? `9 FAILED_PRECONDITION: collection group queries are only allowed if they're at the root or they're an ascending primary key scan`
+                        : type === 'without'
+                          ? '3 INVALID_ARGUMENT: kind is required for all orders except __key__ ascending'
+                          : // Throws error suggesting a collectionGroup index for `children` on `__name__` (descending) even when the index exists.
+                            '9 FAILED_PRECONDITION: The query requires an index.',
                 );
             });
 
@@ -239,7 +243,11 @@ describe.each(editions)('$description - query with allDescendants', fs => {
                     expectQuerySnap(await querySnap, [child, grandchild, ...(type === 'without' ? [sibling] : []), nibling]);
                     return;
                 }
-                await expect(querySnap).rejects.toThrow('3 INVALID_ARGUMENT: collection group queries are only allowed at the root parent');
+                await expect(querySnap).rejects.toThrow(
+                    connection === 'JAVA EMULATOR'
+                        ? `9 FAILED_PRECONDITION: collection group queries are only allowed if they're at the root or they're an ascending primary key scan`
+                        : '3 INVALID_ARGUMENT: collection group queries are only allowed at the root parent',
+                );
             });
 
             test.concurrent('select', async () => {
@@ -280,7 +288,11 @@ describe.each(editions)('$description - query with allDescendants', fs => {
                     expectQuerySnap(await querySnap, [grandchild]);
                     return;
                 }
-                await expect(querySnap).rejects.toThrow('3 INVALID_ARGUMENT: collection group queries are only allowed at the root parent');
+                await expect(querySnap).rejects.toThrow(
+                    connection === 'JAVA EMULATOR'
+                        ? `9 FAILED_PRECONDITION: collection group queries are only allowed if they're at the root or they're an ascending primary key scan`
+                        : '3 INVALID_ARGUMENT: collection group queries are only allowed at the root parent',
+                );
             });
 
             // withConverter strips the `kindless` and thus re-introduces a collectionId filter with a fake name, so we skip this test

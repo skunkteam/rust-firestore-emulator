@@ -11,7 +11,7 @@ import {
     Timestamp,
 } from '@google-cloud/firestore';
 import { differenceWith, isEqual, omit, orderBy, sortedUniq, uniq } from 'lodash';
-import { editions, readData, writeData } from './utils';
+import { connection, editions, readData, writeData } from './utils';
 
 describe.each(editions)('$description', fs => {
     interface Data {
@@ -370,7 +370,9 @@ describe.each(editions)('$description', fs => {
                 fs.enterprise
                     ? await expect(promise).resolves.toEqual([])
                     : await expect(promise).rejects.toThrow(
-                          "3 INVALID_ARGUMENT: A maximum of 1 'ARRAY_CONTAINS' filter is allowed per disjunction.",
+                          connection === 'JAVA EMULATOR'
+                              ? '9 FAILED_PRECONDITION: Only a single array-contains clause is allowed in a query'
+                              : "3 INVALID_ARGUMENT: A maximum of 1 'ARRAY_CONTAINS' filter is allowed per disjunction.",
                       );
             });
         });
