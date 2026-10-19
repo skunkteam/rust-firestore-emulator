@@ -10,6 +10,13 @@ use crate::google::{
     r#type::LatLng,
 };
 
+// In the Firestore v1 protobuf API, `VectorValue` does not have a dedicated `ValueType` variant.
+// Instead, it is encoded on the wire as a `MapValue` containing exactly two keys:
+// `"__type__": "__vector__"` and `"value": [<DoubleValue>, ...]`.
+const RESERVED_MAP_KEY: &str = "__type__";
+const RESERVED_MAP_KEY_VECTOR_VALUE: &str = "__vector__";
+const VECTOR_MAP_VECTORS_KEY: &str = "value";
+
 impl Value {
     pub fn reference(reference: String) -> Self {
         Self {
@@ -27,6 +34,19 @@ impl Value {
         Self {
             value_type: Some(ValueType::MapValue(MapValue { fields })),
         }
+    }
+
+    pub fn vector(values: impl IntoIterator<Item = f64>) -> Self {
+        Self::map(HashMap::from([
+            (
+                RESERVED_MAP_KEY.to_string(),
+                Self::string(RESERVED_MAP_KEY_VECTOR_VALUE),
+            ),
+            (
+                VECTOR_MAP_VECTORS_KEY.to_string(),
+                Self::array(values.into_iter().map(Self::double).collect()),
+            ),
+        ]))
     }
 
     pub fn null() -> Self {
@@ -92,18 +112,52 @@ impl Value {
         }
     }
 
+    /// Returns the underlying map fields, unless this `MapValue` encodes a `VectorValue`
+    /// (which Firestore treats as an atomic scalar rather than a traversable map).
     pub fn as_map(&self) -> Option<&HashMap<String, Self>> {
         match self.value_type() {
-            ValueType::MapValue(MapValue { fields }) => Some(fields),
+            ValueType::MapValue(MapValue { fields }) if !self.is_vector() => Some(fields),
             _ => None,
         }
     }
 
     pub fn as_map_mut(&mut self) -> Option<&mut HashMap<String, Self>> {
+        if self.is_vector() {
+            return None;
+        }
         match self.value_type_mut() {
             ValueType::MapValue(MapValue { fields }) => Some(fields),
             _ => None,
         }
+    }
+
+    fn vector_values(&self) -> Option<&[Self]> {
+        let ValueType::MapValue(MapValue { fields }) = self.value_type() else {
+            return None;
+        };
+        if fields.len() != 2
+            || fields.get(RESERVED_MAP_KEY)?.as_string()? != RESERVED_MAP_KEY_VECTOR_VALUE
+        {
+            return None;
+        }
+        let values = fields.get(VECTOR_MAP_VECTORS_KEY)?.as_array()?;
+        values
+            .iter()
+            .all(|el| matches!(el.value_type(), ValueType::DoubleValue(_)))
+            .then_some(values)
+    }
+
+    pub fn as_vector(&self) -> Option<Vec<f64>> {
+        Some(
+            self.vector_values()?
+                .iter()
+                .map(|v| v.as_double().unwrap())
+                .collect(),
+        )
+    }
+
+    pub fn is_vector(&self) -> bool {
+        self.vector_values().is_some()
     }
 
     pub fn as_string(&self) -> Option<&str> {
@@ -198,7 +252,8 @@ impl Value {
             ValueType::ReferenceValue(_) => 8,
             ValueType::GeoPointValue(_) => 9,
             ValueType::ArrayValue(_) => 10,
-            ValueType::MapValue(_) => 11,
+            ValueType::MapValue(_) if self.is_vector() => 11,
+            ValueType::MapValue(_) => 12,
             // The following are not allowed to be used when writing documents.
             ValueType::FieldReferenceValue(_) => usize::MAX - 2,
             ValueType::FunctionValue(_) => usize::MAX - 1,
@@ -263,7 +318,16 @@ impl Ord for Value {
                     (ValueType::GeoPointValue(a), ValueType::GeoPointValue(b)) => a.cmp(b),
                     (ValueType::ArrayValue(a), ValueType::ArrayValue(b)) => a.values.cmp(&b.values),
                     (ValueType::MapValue(a), ValueType::MapValue(b)) => {
-                        a.fields.iter().sorted().cmp(b.fields.iter().sorted())
+                        if let (Some(a_vals), Some(b_vals)) =
+                            (self.vector_values(), other.vector_values())
+                        {
+                            a_vals
+                                .len()
+                                .cmp(&b_vals.len())
+                                .then_with(|| a_vals.cmp(b_vals))
+                        } else {
+                            a.fields.iter().sorted().cmp(b.fields.iter().sorted())
+                        }
                     }
                     // The following are not allowed to be used when writing documents. Let's not
                     // break if we ever encounter this, but log a warning instead.
@@ -396,6 +460,29 @@ mod tests {
             .map(Value::reference)
             .tuple_windows()
         {
+            expect_that!(a, lt(&b));
+        }
+    }
+
+    #[gtest]
+    fn vector_extraction_and_ordering() {
+        let v1 = Value::vector([10.0]);
+        let v2 = Value::vector([1.0, 2.0]);
+        let v3 = Value::vector([1.0, 3.0]);
+        let arr = Value::array(vec![Value::double(100.0)]);
+        let map = Value::map([("a".to_string(), Value::string("b"))].into());
+
+        expect_that!(v2.as_vector(), some(eq(&vec![1.0, 2.0])));
+        expect_that!(v2.as_map(), none());
+        expect_that!(v2.clone().as_map_mut(), none());
+        expect_that!(map.as_vector(), none());
+        expect_that!(map.as_map(), some(anything()));
+        expect_that!(v1.is_compatible_with(&v2), is_true());
+        expect_that!(v1.is_compatible_with(&map), is_false());
+
+        // Type ordering: Array < Vector < Map, and Vector orders by length first, then elements.
+        let ordered = [arr, v1, v2, v3, map];
+        for (a, b) in ordered.into_iter().tuple_windows() {
             expect_that!(a, lt(&b));
         }
     }

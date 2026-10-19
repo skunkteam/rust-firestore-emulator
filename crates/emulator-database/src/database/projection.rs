@@ -1,4 +1,6 @@
-use googleapis::google::firestore::v1::{Document, DocumentMask, structured_query};
+use std::collections::HashMap;
+
+use googleapis::google::firestore::v1::{Document, DocumentMask, Value, structured_query};
 use itertools::Itertools;
 
 use super::field_path::FieldReference;
@@ -9,29 +11,35 @@ pub struct Projection {
     fields: Vec<FieldReference>,
 }
 
+impl Projection {
+    pub fn mask(&self, source: &HashMap<String, Value>) -> HashMap<String, Value> {
+        let mut fields = HashMap::default();
+        for field in &self.fields {
+            match field {
+                FieldReference::DocumentName => continue,
+                FieldReference::FieldPath(path) => {
+                    if let Some(val) = path.get_value(source) {
+                        path.set_value(&mut fields, val.clone());
+                    }
+                }
+            }
+        }
+        fields
+    }
+}
+
 pub trait Project {
     fn project(&self, version: &StoredDocumentVersion) -> Document;
 }
 
 impl Project for Projection {
     fn project(&self, version: &StoredDocumentVersion) -> Document {
-        let mut doc = Document {
-            fields: Default::default(),
+        Document {
+            fields: self.mask(&version.fields),
             create_time: Some(version.create_time),
             update_time: Some(version.update_time),
             name: version.name.to_string(),
-        };
-        for field in &self.fields {
-            match field {
-                FieldReference::DocumentName => continue,
-                FieldReference::FieldPath(path) => {
-                    if let Some(val) = path.get_value(&version.fields) {
-                        path.set_value(&mut doc.fields, val.clone());
-                    }
-                }
-            }
         }
-        doc
     }
 }
 

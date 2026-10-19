@@ -7,7 +7,7 @@ use std::{
 
 use googleapis::google::{
     firestore::v1::{
-        Cursor, Document, StructuredQuery,
+        Cursor, Document, StructuredQuery, Value,
         structured_query::{self, CollectionSelector},
     },
     protobuf::Timestamp,
@@ -16,6 +16,7 @@ use itertools::Itertools;
 use string_cache::DefaultAtom;
 
 use self::filter::Filter;
+pub use self::find_nearest::{DistanceMeasure, FindNearest};
 use super::{
     FirestoreDatabase,
     collection::Collection,
@@ -33,10 +34,10 @@ use crate::{
     document::{DocumentMeta, OwnedDocumentContentsReadGuard},
     error::Result,
     reference::DocumentRef,
-    unimplemented_option,
 };
 
 mod filter;
+mod find_nearest;
 #[cfg(test)]
 mod tests;
 
@@ -52,6 +53,7 @@ pub struct QueryBuilder {
     end_at: Option<Cursor>,
     offset: usize,
     limit: Option<usize>,
+    find_nearest: Option<FindNearest>,
     consistency: ReadConsistency,
 }
 
@@ -68,6 +70,7 @@ impl QueryBuilder {
             end_at: None,
             offset: 0,
             limit: None,
+            find_nearest: None,
             consistency: ReadConsistency::Default,
         }
     }
@@ -209,6 +212,14 @@ impl QueryBuilder {
         self
     }
 
+    /// Optional nearest-neighbors vector search configuration.
+    ///
+    /// Subsequent calls will replace previously set values.
+    pub fn find_nearest(mut self, find_nearest: FindNearest) -> Self {
+        self.find_nearest = Some(find_nearest);
+        self
+    }
+
     pub fn consistency(mut self, consistency: ReadConsistency) -> Self {
         self.consistency = consistency;
         self
@@ -227,6 +238,7 @@ impl QueryBuilder {
             end_at: self.end_at,
             offset: self.offset,
             limit: self.limit,
+            find_nearest: self.find_nearest,
             consistency: self.consistency,
             collection_cache: Default::default(),
         };
@@ -332,6 +344,9 @@ pub struct Query {
     /// Applies after all other constraints.
     limit: Option<usize>,
 
+    /// Nearest-neighbors vector search parameters, if requested.
+    find_nearest: Option<FindNearest>,
+
     consistency: ReadConsistency,
 
     collection_cache: HashMap<DefaultAtom, bool>,
@@ -356,8 +371,6 @@ impl Query {
             find_nearest,
         } = query;
 
-        unimplemented_option!(find_nearest);
-
         let mut query = Box::new(Self {
             parent,
             select: select.map(Projection::try_from).transpose()?,
@@ -369,6 +382,7 @@ impl Query {
             end_at,
             offset: offset as usize,
             limit: limit.map(|v| v.value as usize),
+            find_nearest: find_nearest.map(TryInto::try_into).transpose()?,
             consistency,
             collection_cache: Default::default(),
         });
@@ -388,9 +402,23 @@ impl Query {
                 "Query FROM is mandatory",
             ));
         }
+        if let Some(find_nearest) = &self.find_nearest {
+            find_nearest.validate()?;
+            if self.start_at.is_some() || self.end_at.is_some() {
+                return Err(GenericDatabaseError::invalid_argument(
+                    "cursors are not supported with find_nearest",
+                ));
+            }
+            if !self.order_by.is_empty() {
+                return Err(GenericDatabaseError::invalid_argument(
+                    "order_by is not supported with find_nearest",
+                ));
+            }
+        }
         if !enterprise_edition && let Some(filter) = &self.filter {
-            // Ensure order_by is consistent
-            if self.order_by.is_empty() {
+            // Ensure order_by is consistent (unless `find_nearest` is used, which imposes its own
+            // distance-based ordering).
+            if self.order_by.is_empty() && self.find_nearest.is_none() {
                 self.order_by
                     .extend(filter.get_inequality_fields().map(|field| Order {
                         field:     field.clone(),
@@ -410,7 +438,8 @@ impl Query {
         }
 
         let has_all_descendants = self.from.iter().any(|selector| selector.all_descendants);
-        if (!enterprise_edition || has_all_descendants)
+        if self.find_nearest.is_none()
+            && (!enterprise_edition || has_all_descendants)
             && !self.order_by.iter().any(|o| o.field.is_document_name())
         {
             self.order_by.push(Order {
@@ -422,7 +451,7 @@ impl Query {
     }
 
     pub fn reset_on_update(&self) -> bool {
-        self.order_by.iter().any(|o| !o.field.is_document_name())
+        self.find_nearest.is_some() || self.order_by.iter().any(|o| !o.field.is_document_name())
     }
 
     pub fn reset_consistency_to_default(&mut self) {
@@ -450,14 +479,32 @@ impl Query {
         for col in collections {
             for meta in col.docs().await {
                 if let Some(doc) = lock_strategy.read(&meta).await?
-                    && self.includes_document(&doc.version)?
+                    && self.matches_filters(&doc.version)?
                 {
                     buffer.push(doc);
                 }
             }
         }
 
-        buffer.sort_unstable_by(|a, b| self.order_by_cmp(&a.version, &b.version));
+        if let Some(find_nearest) = &self.find_nearest {
+            let mut scored: Vec<_> = buffer
+                .into_iter()
+                .filter_map(|doc| match find_nearest.eval_distance(&doc.version) {
+                    Ok(Some(distance)) => Some(Ok((doc, distance))),
+                    Ok(None) => None,
+                    Err(err) => Some(Err(err)),
+                })
+                .try_collect()?;
+            scored.sort_unstable_by(|(a_doc, a_dist), (b_doc, b_dist)| {
+                find_nearest
+                    .cmp_distance(*a_dist, *b_dist)
+                    .then_with(|| a_doc.version.name.cmp(&b_doc.version.name))
+            });
+            scored.truncate(find_nearest.limit);
+            buffer = scored.into_iter().map(|(doc, _)| doc).collect();
+        } else {
+            buffer.sort_unstable_by(|a, b| self.order_by_cmp(&a.version, &b.version));
+        }
 
         if self.offset > 0 {
             buffer.drain(0..self.offset.min(buffer.len()));
@@ -491,6 +538,7 @@ impl Query {
             self.end_at.is_some().then_some("end_at"),
             (self.offset > 0).then_some("offset"),
             self.limit.is_some().then_some("limit"),
+            self.find_nearest.is_some().then_some("find_nearest"),
         ]
         .into_iter()
         .flatten()
@@ -573,7 +621,7 @@ impl Query {
         included
     }
 
-    pub fn includes_document(&mut self, doc: &StoredDocumentVersion) -> Result<bool> {
+    fn matches_filters(&mut self, doc: &StoredDocumentVersion) -> Result<bool> {
         if !self.includes_collection(&doc.name.collection_ref) {
             return Ok(false);
         }
@@ -600,8 +648,35 @@ impl Query {
         Ok(true)
     }
 
+    pub fn includes_document(&mut self, doc: &StoredDocumentVersion) -> Result<bool> {
+        if !self.matches_filters(doc)? {
+            return Ok(false);
+        }
+        if let Some(find_nearest) = &self.find_nearest
+            && find_nearest.eval_distance(doc)?.is_none()
+        {
+            return Ok(false);
+        }
+        Ok(true)
+    }
+
     pub fn project(&self, version: &StoredDocumentVersion) -> Document {
-        self.select.project(version)
+        if let Some(find_nearest) = &self.find_nearest
+            && let Some(distance_result_field) = &find_nearest.distance_result_field
+            && let Ok(Some(distance)) = find_nearest.eval_distance(version)
+        {
+            let mut doc = version.to_document();
+            // Populate `distance_result_field` before applying `select` projection: in Cloud
+            // Firestore, a `.select(...)` mask also filters out `distance_result_field` unless
+            // it is explicitly included in the selected fields.
+            distance_result_field.set_value(&mut doc.fields, Value::double(distance));
+            if let Some(projection) = &self.select {
+                doc.fields = projection.mask(&doc.fields);
+            }
+            doc
+        } else {
+            self.select.project(version)
+        }
     }
 
     fn order_by_cmp(

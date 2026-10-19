@@ -47,9 +47,11 @@ impl FromStr for FieldReference {
     type Err = GenericDatabaseError;
 
     fn from_str(path: &str) -> Result<Self, Self::Err> {
-        match path {
-            DOC_NAME => Ok(Self::DocumentName),
-            path => Ok(Self::FieldPath((path.parse())?)),
+        let path: FieldPath = path.parse()?;
+        if path.is_document_name() {
+            Ok(Self::DocumentName)
+        } else {
+            Ok(Self::FieldPath(path))
         }
     }
 }
@@ -78,6 +80,12 @@ impl Display for FieldReference {
 pub struct FieldPath(Vec<String>);
 
 impl FieldPath {
+    /// Returns `true` if this field path refers to the reserved document name (`__name__`).
+    #[must_use]
+    pub fn is_document_name(&self) -> bool {
+        self.0 == [DOC_NAME]
+    }
+
     /// Walk the path as represented by this [`FieldPath`] into the given object fields and return
     /// the value found at the end of the path, if any. Also returns [`None`] if any intermediate
     /// value was absent or not an object.
@@ -300,6 +308,41 @@ mod tests {
         assert_that!(
             parse_field_path(input),
             err(eq(&GenericDatabaseError::invalid_argument(msg)))
+        );
+    }
+
+    #[gtest]
+    fn vector_is_not_traversed_or_mutated_as_map() {
+        let mut fields = HashMap::from([("embedding".to_string(), Value::vector([1.0, 2.0]))]);
+
+        let root_path: FieldPath = "embedding".parse().unwrap();
+        let internal_val_path: FieldPath = "embedding.value".parse().unwrap();
+        let internal_type_path: FieldPath = "embedding.__type__".parse().unwrap();
+        let nested_path: FieldPath = "embedding.nested".parse().unwrap();
+
+        // Reading nested paths through a vector returns None rather than leaking internal map keys
+        expect_that!(
+            root_path.get_value(&fields),
+            some(predicate(Value::is_vector))
+        );
+        expect_that!(internal_val_path.get_value(&fields), none());
+        expect_that!(internal_type_path.get_value(&fields), none());
+
+        // Deleting a nested key inside a vector is a no-op and keeps the vector intact
+        expect_that!(internal_val_path.delete_value(&mut fields), none());
+        expect_that!(
+            root_path.get_value(&fields),
+            some(predicate(Value::is_vector))
+        );
+
+        // Setting a nested path replaces the vector with a clean map instead of mutating it
+        // in-place
+        nested_path.set_value(&mut fields, Value::string("hello"));
+        expect_that!(
+            fields.get("embedding"),
+            some(eq(&Value::map(
+                [("nested".to_string(), Value::string("hello"))].into()
+            )))
         );
     }
 }

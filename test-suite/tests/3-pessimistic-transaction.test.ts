@@ -1,7 +1,16 @@
 import { DocumentReference, DocumentSnapshot, FieldPath, FieldValue, Transaction } from '@google-cloud/firestore';
 import assert from 'assert';
 import { setTimeout as time } from 'timers/promises';
-import { ConcurrentTest, editions, notImplementedInJava, notImplementedInRust, readData, readDataRef, writeData } from './utils';
+import {
+    ConcurrentTest,
+    connection,
+    editions,
+    notImplementedInJava,
+    notImplementedInRust,
+    readData,
+    readDataRef,
+    writeData,
+} from './utils';
 
 describe.each(editions.filter(e => e.concurrencyMode === 'pessimistic'))('$description - concurrent tests', fs => {
     test.concurrent('simple txn', async () => {
@@ -470,7 +479,7 @@ describe.each(editions.filter(e => e.concurrencyMode === 'pessimistic'))('$descr
                     },
                 );
 
-                expect(test.log.slice(0, -2)).toEqual([
+                expect(test.log.slice(0, -3)).toEqual([
                     //<<1>> | <<2>> | <<3>> |
                     '       | <<2>> | WAITING UNTIL: create outside txn succeeded',
                     '       |       | <<3>> | WAITING UNTIL: in txn A: read doc 1',
@@ -482,15 +491,23 @@ describe.each(editions.filter(e => e.concurrencyMode === 'pessimistic'))('$descr
                     '       |       | <<3>> | WAITING UNTIL: started updates outside of txn',
                     ' <<1>> | EVENT: started updates outside of txn',
                     '       |       | <<3>> | EVENT: end txn B',
-                    '       | <<2>> | EVENT: end txn A',
                 ]);
                 // Regular updates suffer from contention (in the current version of the SDK), so
                 // they need to be retried and then the order cannot be guaranteed anymore.
-                // These last two might come back in different order...
-                expect(test.log.slice(-2)).toIncludeSameMembers([
-                    ' <<1>> | EVENT: finished first update outside txn',
-                    ' <<1>> | EVENT: finished second update outside txn',
-                ]);
+                // These last two (or three on Java emulator) might come back in different order...
+                if (connection === 'JAVA EMULATOR') {
+                    expect(test.log.slice(-3)).toIncludeSameMembers([
+                        '       | <<2>> | EVENT: end txn A',
+                        ' <<1>> | EVENT: finished first update outside txn',
+                        ' <<1>> | EVENT: finished second update outside txn',
+                    ]);
+                } else {
+                    expect(test.log.at(-3)).toBe('       | <<2>> | EVENT: end txn A');
+                    expect(test.log.slice(-2)).toIncludeSameMembers([
+                        ' <<1>> | EVENT: finished first update outside txn',
+                        ' <<1>> | EVENT: finished second update outside txn',
+                    ]);
+                }
                 const { log } = await getData(ref1.get());
                 assert(Array.isArray(log));
                 expect(log.slice(0, -2)).toEqual(['created outside txn', 'updated inside txn A']);
@@ -535,14 +552,16 @@ describe.each(editions.filter(e => e.concurrencyMode === 'pessimistic'))('$descr
                     },
                 );
 
-                expect(test.log).toEqual([
+                expect(test.log.slice(0, 4)).toEqual([
                     '       | <<2>> | WAITING UNTIL: txn A got lock on doc',
                     ' <<1>> | EVENT: txn A got lock on doc',
                     ' <<1>> | WAITING UNTIL: batch write waiting on lock',
                     '       | <<2>> | EVENT: batch write waiting on lock',
-                    ' <<1>> | EVENT: transaction completed',
-                    '       | <<2>> | EVENT: batch write finished',
                 ]);
+                const completionEvents = [' <<1>> | EVENT: transaction completed', '       | <<2>> | EVENT: batch write finished'];
+                connection === 'JAVA EMULATOR'
+                    ? expect(test.log.slice(4)).toIncludeSameMembers(completionEvents)
+                    : expect(test.log.slice(4)).toEqual(completionEvents);
 
                 const finalSnap = await ref.get();
                 expect(readData(finalSnap.data())).toEqual({
@@ -620,89 +639,93 @@ describe.each(editions.filter(e => e.concurrencyMode === 'pessimistic'))('$descr
                     ]);
                 });
 
-            test.concurrent('deadlock', async () => {
-                const test = new ConcurrentTest({ timeout: 40_000 });
+            test.concurrent(
+                'deadlock',
+                async () => {
+                    const test = new ConcurrentTest({ timeout: 40_000 });
 
-                const [ref1, ref2] = refs();
+                    const [ref1, ref2] = refs();
 
-                let txnBFailedInFirstGet = false;
+                    let txnBFailedInFirstGet = false;
 
-                await test.run(
-                    async () => {
-                        let attempt = 0;
-                        await fs.firestore.runTransaction(async txn => {
-                            test.event(`txn A attempt ${++attempt} started`);
+                    await test.run(
+                        async () => {
+                            let attempt = 0;
+                            await fs.firestore.runTransaction(async txn => {
+                                test.event(`txn A attempt ${++attempt} started`);
 
-                            await txn.get(ref1);
-                            test.event('in txn A: read doc 1');
+                                await txn.get(ref1);
+                                test.event('in txn A: read doc 1');
 
-                            if (attempt === 1) await test.when('in txn B: read doc 2');
-                            await txn.get(ref2);
-                            test.event('in txn A: read doc 2');
+                                if (attempt === 1) await test.when('in txn B: read doc 2');
+                                await txn.get(ref2);
+                                test.event('in txn A: read doc 2');
 
-                            txn.set(ref1, writeData({ txnA: 'written' }));
-                            txn.set(ref2, writeData({ txnA: 'written' }));
-                        });
-                    },
-                    async () => {
-                        let attempt = 0;
-                        await fs.firestore.runTransaction(async txn => {
-                            test.event(`txn B attempt ${++attempt} started`);
-
-                            if (attempt === 1) await test.when('in txn A: read doc 1');
-                            await txn.get(ref2);
-                            test.event('in txn B: read doc 2');
-
-                            if (attempt === 1) await test.when('in txn A: read doc 2');
-                            await txn.get(ref1).catch(e => {
-                                // Sometimes the get fails, sometimes it succeeds and the txn fails;
-                                // we can detect that here.
-                                txnBFailedInFirstGet ||= attempt === 1;
-                                throw e;
+                                txn.set(ref1, writeData({ txnA: 'written' }));
+                                txn.set(ref2, writeData({ txnA: 'written' }));
                             });
+                        },
+                        async () => {
+                            let attempt = 0;
+                            await fs.firestore.runTransaction(async txn => {
+                                test.event(`txn B attempt ${++attempt} started`);
 
-                            test.event('in txn B: read doc 1');
+                                if (attempt === 1) await test.when('in txn A: read doc 1');
+                                await txn.get(ref2);
+                                test.event('in txn B: read doc 2');
 
-                            txn.set(ref1, writeData({ txnB: 'written' }));
-                            txn.set(ref2, writeData({ txnB: 'written' }));
-                        });
-                    },
-                );
+                                if (attempt === 1) await test.when('in txn A: read doc 2');
+                                await txn.get(ref1).catch(e => {
+                                    // Sometimes the get fails, sometimes it succeeds and the txn fails;
+                                    // we can detect that here.
+                                    txnBFailedInFirstGet ||= attempt === 1;
+                                    throw e;
+                                });
 
-                const retry = test.log.splice(-3, 3);
-                // If `txn.get(ref1)` did not fail, then txn B tried to read doc 1 in attempt 1,
-                // otherwise it did not.
-                const secondReadInFirstAttempt = !txnBFailedInFirstGet && test.log.pop();
+                                test.event('in txn B: read doc 1');
 
-                expect(test.log).toEqual([
-                    ' <<1>> | EVENT: txn A attempt 1 started',
-                    '       | <<2>> | EVENT: txn B attempt 1 started',
-                    '       | <<2>> | WAITING UNTIL: in txn A: read doc 1',
-                    ' <<1>> | EVENT: in txn A: read doc 1',
-                    ' <<1>> | WAITING UNTIL: in txn B: read doc 2',
-                    '       | <<2>> | EVENT: in txn B: read doc 2',
-                    '       | <<2>> | WAITING UNTIL: in txn A: read doc 2',
-                    ' <<1>> | EVENT: in txn A: read doc 2',
-                ]);
+                                txn.set(ref1, writeData({ txnB: 'written' }));
+                                txn.set(ref2, writeData({ txnB: 'written' }));
+                            });
+                        },
+                    );
 
-                if (secondReadInFirstAttempt) expect(secondReadInFirstAttempt).toBe('       | <<2>> | EVENT: in txn B: read doc 1');
+                    const retry = test.log.splice(-3, 3);
+                    // If `txn.get(ref1)` did not fail, then txn B tried to read doc 1 in attempt 1,
+                    // otherwise it did not.
+                    const secondReadInFirstAttempt = !txnBFailedInFirstGet && test.log.pop();
 
-                // Somehow in cloud Firestore, txn B is retried, but in our emulator txn A is
-                // retried. I'm not sure what logic is applied in the cloud, but this does not seem
-                // to be an issue currently.
-                expect(retry).toBeOneOf([
-                    [
-                        ' <<1>> | EVENT: txn A attempt 2 started',
+                    expect(test.log).toEqual([
+                        ' <<1>> | EVENT: txn A attempt 1 started',
+                        '       | <<2>> | EVENT: txn B attempt 1 started',
+                        '       | <<2>> | WAITING UNTIL: in txn A: read doc 1',
                         ' <<1>> | EVENT: in txn A: read doc 1',
-                        ' <<1>> | EVENT: in txn A: read doc 2',
-                    ],
-                    [
-                        '       | <<2>> | EVENT: txn B attempt 2 started',
+                        ' <<1>> | WAITING UNTIL: in txn B: read doc 2',
                         '       | <<2>> | EVENT: in txn B: read doc 2',
-                        '       | <<2>> | EVENT: in txn B: read doc 1',
-                    ],
-                ]);
-            });
+                        '       | <<2>> | WAITING UNTIL: in txn A: read doc 2',
+                        ' <<1>> | EVENT: in txn A: read doc 2',
+                    ]);
+
+                    if (secondReadInFirstAttempt) expect(secondReadInFirstAttempt).toBe('       | <<2>> | EVENT: in txn B: read doc 1');
+
+                    // Somehow in cloud Firestore, txn B is retried, but in our emulator txn A is
+                    // retried. I'm not sure what logic is applied in the cloud, but this does not seem
+                    // to be an issue currently.
+                    expect(retry).toBeOneOf([
+                        [
+                            ' <<1>> | EVENT: txn A attempt 2 started',
+                            ' <<1>> | EVENT: in txn A: read doc 1',
+                            ' <<1>> | EVENT: in txn A: read doc 2',
+                        ],
+                        [
+                            '       | <<2>> | EVENT: txn B attempt 2 started',
+                            '       | <<2>> | EVENT: in txn B: read doc 2',
+                            '       | <<2>> | EVENT: in txn B: read doc 1',
+                        ],
+                    ]);
+                },
+                45_000,
+            );
 
             // Skip these tests because queries seem to behave differently in Enterprise Edition
             // (as if they automatically opt into optimistic concurrency).
@@ -830,13 +853,18 @@ describe.each(editions.filter(e => e.concurrencyMode === 'pessimistic'))('$descr
                             },
                         );
 
-                        expect(test.log).toEqual([
+                        expect(test.log.slice(0, 3)).toEqual([
                             '       | <<2>> | WAITING UNTIL: transaction locked the query',
                             ' <<1>> | EVENT: transaction started',
                             ' <<1>> | EVENT: transaction locked the query',
+                        ]);
+                        const completionEvents = [
                             ' <<1>> | EVENT: transaction completed',
                             '       | <<2>> | EVENT: both docs updated outside the query',
-                        ]);
+                        ];
+                        connection === 'JAVA EMULATOR'
+                            ? expect(test.log.slice(3)).toIncludeSameMembers(completionEvents)
+                            : expect(test.log.slice(3)).toEqual(completionEvents);
                     });
 
                     test.concurrent('delete after reading a query', async () => {
@@ -866,13 +894,18 @@ describe.each(editions.filter(e => e.concurrencyMode === 'pessimistic'))('$descr
                             },
                         );
 
-                        expect(test.log).toEqual([
+                        expect(test.log.slice(0, 3)).toEqual([
                             '       | <<2>> | WAITING UNTIL: transaction locked the query',
                             ' <<1>> | EVENT: transaction started',
                             ' <<1>> | EVENT: transaction locked the query',
+                        ]);
+                        const completionEvents = [
                             ' <<1>> | EVENT: transaction completed',
                             '       | <<2>> | EVENT: docRef1 deleted outside the query',
-                        ]);
+                        ];
+                        connection === 'JAVA EMULATOR'
+                            ? expect(test.log.slice(3)).toIncludeSameMembers(completionEvents)
+                            : expect(test.log.slice(3)).toEqual(completionEvents);
                     });
 
                     notImplementedInJava ||
