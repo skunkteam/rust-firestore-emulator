@@ -19,7 +19,7 @@ use itertools::Itertools;
 use tokio_test::{assert_ready, assert_ready_ok, task::spawn};
 
 use crate::{
-    FirestoreConfig, FirestoreDatabase, FirestoreProject,
+    FirestoreConfig, FirestoreDatabase, FirestoreProject, GenericDatabaseError,
     database::{projection::Projection, transaction::TransactionId},
     document::DocumentMeta,
     query::{
@@ -132,13 +132,10 @@ async fn correct_locking_in_txn_with_cursors() -> Result<()> {
 
     let txn_id = start_rw_txn(&database);
 
-    let mut query = QueryBuilder::from(
-        database.name.clone().into(),
-        vec![CollectionSelector {
-            all_descendants: false,
-            collection_id:   collection_id.to_string(),
-        }],
-    )
+    let mut query = QueryBuilder::from(database.name.clone().into(), vec![CollectionSelector {
+        all_descendants: false,
+        collection_id:   collection_id.to_string(),
+    }])
     .consistency(ReadConsistency::Transaction(txn_id))
     .filter(Filter::Field(FieldFilter {
         field: "even".parse()?,
@@ -181,13 +178,10 @@ async fn correct_locking_in_txn_with_offset_and_limit() -> Result<()> {
 
     let txn_id = start_rw_txn(&database);
 
-    let mut query = QueryBuilder::from(
-        database.name.clone().into(),
-        vec![CollectionSelector {
-            all_descendants: false,
-            collection_id:   collection_id.to_string(),
-        }],
-    )
+    let mut query = QueryBuilder::from(database.name.clone().into(), vec![CollectionSelector {
+        all_descendants: false,
+        collection_id:   collection_id.to_string(),
+    }])
     .consistency(ReadConsistency::Transaction(txn_id))
     .filter(Filter::Field(FieldFilter {
         field: "even".parse()?,
@@ -221,13 +215,10 @@ async fn correct_locking_in_txn_with_find_nearest() -> Result<()> {
 
     let txn_id = start_rw_txn(&database);
 
-    let mut query = QueryBuilder::from(
-        database.name.clone().into(),
-        vec![CollectionSelector {
-            all_descendants: false,
-            collection_id:   collection_id.to_string(),
-        }],
-    )
+    let mut query = QueryBuilder::from(database.name.clone().into(), vec![CollectionSelector {
+        all_descendants: false,
+        collection_id:   collection_id.to_string(),
+    }])
     .consistency(ReadConsistency::Transaction(txn_id))
     .find_nearest(FindNearest {
         vector_field: "embedding".parse()?,
@@ -498,8 +489,12 @@ async fn find_nearest_threshold_prefilter_and_skipped_documents() -> Result<()> 
     let mut cosine_query = QueryBuilder::from(database.name.clone().into(), from.clone())
         .filter(Filter::Field(FieldFilter {
             field: "title".parse()?,
-            op:    FieldOperator::NotEqual,
-            value: Value::string("zero-vec"),
+            op:    FieldOperator::In,
+            value: Value::array(vec![
+                Value::string("doc0"),
+                Value::string("doc1"),
+                Value::string("doc2"),
+            ]),
         }))
         .find_nearest(FindNearest {
             vector_field: "vectorQueryFields.nested".parse()?,
@@ -664,12 +659,10 @@ fn find_nearest_validation_errors() -> Result<()> {
     }
 
     // Empty query_vector, > 2048 dimensions, and non-finite elements (NaN / Infinity)
-    for bad_vec in [
-        vec![],
-        vec![1.0; 2049],
-        vec![1.0, f64::NAN],
-        vec![1.0, f64::INFINITY],
-    ] {
+    for bad_vec in [vec![], vec![1.0; 2049], vec![1.0, f64::NAN], vec![
+        1.0,
+        f64::INFINITY,
+    ]] {
         let mut fn_cfg = valid_fn.clone();
         fn_cfg.query_vector = Some(Value::vector(bad_vec));
         assert_that!(
@@ -785,6 +778,333 @@ fn find_nearest_validation_errors() -> Result<()> {
             err(anything())
         );
     }
+
+    Ok(())
+}
+
+#[gtest]
+#[tokio::test]
+async fn array_contains_any_basic_nested_and_numeric_equivalence() -> Result<()> {
+    let database = fresh_database()?;
+    let col_id = "array-contains-any-col";
+
+    let nested_buckets = |buckets: Vec<Value>| {
+        Value::map(
+            [(
+                "nested".to_string(),
+                Value::map([("buckets".to_string(), Value::array(buckets))].into()),
+            )]
+            .into(),
+        )
+    };
+
+    // Doc 0: matches multiple filter values [10, 42] -> returned at most once
+    // Doc 1: matches via DoubleValue(1337.0) against IntegerValue(1337), and -0.0 against 0.0 / 0
+    // Doc 2: disjoint array [99, 100]
+    // Doc 3: empty array []
+    // Doc 4: scalar integer instead of array
+    // Doc 5: null value
+    // Doc 6: missing field
+    insert_docs(&database, col_id, 0..7, |i| match i {
+        0 => vec![
+            (
+                "buckets",
+                Value::array(vec![
+                    Value::integer(10),
+                    Value::integer(42),
+                    Value::integer(10),
+                ]),
+            ),
+            (
+                "queryFields",
+                nested_buckets(vec![Value::integer(10), Value::integer(42)]),
+            ),
+            ("scalar", Value::double(42.0)),
+        ],
+        1 => vec![
+            (
+                "buckets",
+                Value::array(vec![Value::double(1337.0), Value::double(-0.0)]),
+            ),
+            (
+                "queryFields",
+                nested_buckets(vec![Value::double(1337.0), Value::integer(7)]),
+            ),
+            ("scalar", Value::integer(1337)),
+        ],
+        2 => vec![
+            (
+                "buckets",
+                Value::array(vec![Value::integer(99), Value::integer(100)]),
+            ),
+            ("queryFields", nested_buckets(vec![Value::integer(99)])),
+        ],
+        3 => vec![
+            ("buckets", Value::array(vec![])),
+            ("queryFields", nested_buckets(vec![])),
+        ],
+        4 => vec![
+            ("buckets", Value::integer(42)),
+            ("queryFields", Value::integer(42)),
+        ],
+        5 => vec![("buckets", Value::null()), ("queryFields", Value::null())],
+        _ => vec![("other", Value::string("missing"))],
+    })?;
+
+    let from = vec![CollectionSelector {
+        all_descendants: false,
+        collection_id:   col_id.to_string(),
+    }];
+
+    // 1. Top-level `buckets` array-contains-any [10, 42, 1337] (also checks deduplication and
+    //    int/double equivalence)
+    let mut top_query = QueryBuilder::from(database.name.clone().into(), from.clone())
+        .filter(Filter::Field(FieldFilter {
+            field: "buckets".parse()?,
+            op:    FieldOperator::ArrayContainsAny,
+            value: Value::array(vec![
+                Value::integer(10),
+                Value::integer(42),
+                Value::integer(1337),
+            ]),
+        }))
+        .build()?;
+    let (_, docs) = assert_ready_ok!(spawn(top_query.once(&database)).poll());
+    let ids: Vec<_> = docs.iter().map(|d| d.name.document_id.as_ref()).collect();
+    assert_that!(ids, eq(&vec!["document-0", "document-1"]));
+
+    // 2. Nested `queryFields.nested.buckets` array-contains-any [42, 1337]
+    let mut nested_query = QueryBuilder::from(database.name.clone().into(), from.clone())
+        .filter(Filter::Field(FieldFilter {
+            field: "queryFields.nested.buckets".parse()?,
+            op:    FieldOperator::ArrayContainsAny,
+            value: Value::array(vec![Value::integer(42), Value::integer(1337)]),
+        }))
+        .build()?;
+    let (_, docs) = assert_ready_ok!(spawn(nested_query.once(&database)).poll());
+    let ids: Vec<_> = docs.iter().map(|d| d.name.document_id.as_ref()).collect();
+    assert_that!(ids, eq(&vec!["document-0", "document-1"]));
+
+    // 3. Numeric equivalence (including -0.0 == +0.0 == 0) for `ArrayContains`, `In`, and
+    //    `NotEqual`
+    for zero_val in [Value::double(0.0), Value::integer(0)] {
+        let mut zero_query = QueryBuilder::from(database.name.clone().into(), from.clone())
+            .filter(Filter::Field(FieldFilter {
+                field: "buckets".parse()?,
+                op:    FieldOperator::ArrayContains,
+                value: zero_val,
+            }))
+            .build()?;
+        let (_, docs) = assert_ready_ok!(spawn(zero_query.once(&database)).poll());
+        let ids: Vec<_> = docs.iter().map(|d| d.name.document_id.as_ref()).collect();
+        assert_that!(ids, eq(&vec!["document-1"]));
+    }
+
+    let mut in_query = QueryBuilder::from(database.name.clone().into(), from.clone())
+        .filter(Filter::Field(FieldFilter {
+            field: "scalar".parse()?,
+            op:    FieldOperator::In,
+            value: Value::array(vec![Value::integer(42), Value::double(1337.0)]),
+        }))
+        .build()?;
+    let (_, docs) = assert_ready_ok!(spawn(in_query.once(&database)).poll());
+    let ids: Vec<_> = docs.iter().map(|d| d.name.document_id.as_ref()).collect();
+    assert_that!(ids, eq(&vec!["document-0", "document-1"]));
+
+    let mut neq_query = QueryBuilder::from(database.name.clone().into(), from)
+        .filter(Filter::Field(FieldFilter {
+            field: "scalar".parse()?,
+            op:    FieldOperator::NotEqual,
+            value: Value::integer(42),
+        }))
+        .build()?;
+    let (_, docs) = assert_ready_ok!(spawn(neq_query.once(&database)).poll());
+    let ids: Vec<_> = docs.iter().map(|d| d.name.document_id.as_ref()).collect();
+    // document-0 has DoubleValue(42.0), which is numerically equal to IntegerValue(42) and must be
+    // excluded
+    assert_that!(ids, eq(&vec!["document-1"]));
+
+    Ok(())
+}
+
+#[gtest]
+fn array_contains_any_and_in_validation() -> Result<()> {
+    let parent: crate::reference::Ref = "projects/p/databases/d".parse::<RootRef>()?.into();
+    let from = vec![CollectionSelector {
+        all_descendants: false,
+        collection_id:   "col".to_string(),
+    }];
+
+    for (op, op_name) in [
+        (FieldOperator::ArrayContainsAny, "ARRAY_CONTAINS_ANY"),
+        (FieldOperator::In, "IN"),
+    ] {
+        // Non-ArrayValue operands must fail with INVALID_ARGUMENT
+        for non_array in [
+            Value::null(),
+            Value::integer(42),
+            Value::string("not-an-array"),
+        ] {
+            let res = QueryBuilder::from(parent.clone(), from.clone())
+                .filter(Filter::Field(FieldFilter {
+                    field: "buckets".parse()?,
+                    op,
+                    value: non_array,
+                }))
+                .build();
+            assert_that!(
+                res,
+                err(eq(&GenericDatabaseError::invalid_argument(format!(
+                    "'{op_name}' requires an ArrayValue",
+                ))))
+            );
+        }
+
+        // Empty array (0 elements) must fail with INVALID_ARGUMENT
+        let empty_res = QueryBuilder::from(parent.clone(), from.clone())
+            .filter(Filter::Field(FieldFilter {
+                field: "buckets".parse()?,
+                op,
+                value: Value::array(vec![]),
+            }))
+            .build();
+        assert_that!(
+            empty_res,
+            err(eq(&GenericDatabaseError::invalid_argument(format!(
+                "'{op_name}' requires a non-empty ArrayValue",
+            ))))
+        );
+
+        // Boundary valid: 1 element and 30 elements must succeed
+        for valid_len in [1, 30] {
+            let values = (0..valid_len).map(Value::integer).collect();
+            let valid_res = QueryBuilder::from(parent.clone(), from.clone())
+                .filter(Filter::Field(FieldFilter {
+                    field: "buckets".parse()?,
+                    op,
+                    value: Value::array(values),
+                }))
+                .build();
+            assert_that!(valid_res, ok(anything()));
+        }
+
+        // Boundary invalid in Standard edition: 31 elements must fail with INVALID_ARGUMENT,
+        // while Enterprise edition allows > 30 elements.
+        let too_many: Vec<_> = (0..31).map(Value::integer).collect();
+        let too_many_standard = QueryBuilder::from(parent.clone(), from.clone())
+            .filter(Filter::Field(FieldFilter {
+                field: "buckets".parse()?,
+                op,
+                value: Value::array(too_many.clone()),
+            }))
+            .build();
+        assert_that!(
+            too_many_standard,
+            err(eq(&GenericDatabaseError::invalid_argument(format!(
+                "'{op_name}' supports up to 30 comparison values",
+            ))))
+        );
+
+        let too_many_enterprise = QueryBuilder::from(parent.clone(), from.clone())
+            .enterprise_edition(true)
+            .filter(Filter::Field(FieldFilter {
+                field: "buckets".parse()?,
+                op,
+                value: Value::array(too_many),
+            }))
+            .build();
+        assert_that!(too_many_enterprise, ok(anything()));
+    }
+
+    Ok(())
+}
+
+#[gtest]
+#[tokio::test]
+async fn array_contains_any_combined_with_find_nearest() -> Result<()> {
+    let database = fresh_database()?;
+    let col_id = "vector-buckets-col";
+
+    let make_256_vec = |first: f64, second: f64| {
+        let mut v = vec![0.0; 256];
+        v[0] = first;
+        v[1] = second;
+        Value::vector(v)
+    };
+
+    // Doc A (0): high vector similarity (dot product 0.95), buckets [1, 2]
+    // Doc B (1): medium vector similarity (dot product 0.60), buckets [2, 3]
+    // Doc C (2): highest vector similarity (dot product 0.99), buckets [99] (disjoint!)
+    insert_docs(&database, col_id, 0..3, |i| {
+        let (vec_val, buckets) = match i {
+            0 => (make_256_vec(0.95, 0.0), vec![
+                Value::integer(1),
+                Value::integer(2),
+            ]),
+            1 => (make_256_vec(0.60, 0.0), vec![
+                Value::integer(2),
+                Value::integer(3),
+            ]),
+            _ => (make_256_vec(0.99, 0.0), vec![Value::integer(99)]),
+        };
+        [(
+            "queryFields",
+            Value::map(
+                [
+                    ("status".to_string(), Value::string("active")),
+                    (
+                        "nested".to_string(),
+                        Value::map(
+                            [
+                                ("vector".to_string(), vec_val),
+                                ("buckets".to_string(), Value::array(buckets)),
+                            ]
+                            .into(),
+                        ),
+                    ),
+                ]
+                .into(),
+            ),
+        )]
+    })?;
+
+    let mut query_vec = vec![0.0; 256];
+    query_vec[0] = 1.0;
+
+    let mut query = QueryBuilder::from(database.name.clone().into(), vec![CollectionSelector {
+        all_descendants: false,
+        collection_id:   col_id.to_string(),
+    }])
+    .filter(Filter::Composite(CompositeFilter {
+        op:      CompositeOperator::And,
+        filters: vec![
+            Filter::Field(FieldFilter {
+                field: "queryFields.status".parse()?,
+                op:    FieldOperator::Equal,
+                value: Value::string("active"),
+            }),
+            Filter::Field(FieldFilter {
+                field: "queryFields.nested.buckets".parse()?,
+                op:    FieldOperator::ArrayContainsAny,
+                value: Value::array(vec![Value::integer(1), Value::integer(2)]),
+            }),
+        ],
+    }))
+    .find_nearest(FindNearest {
+        vector_field: "queryFields.nested.vector".parse()?,
+        query_vector: query_vec,
+        distance_measure: DistanceMeasure::DotProduct,
+        limit: 10,
+        distance_result_field: Some("distance".parse()?),
+        distance_threshold: Some(0.15),
+    })
+    .build()?;
+
+    let (_, docs) = assert_ready_ok!(spawn(query.once(&database)).poll());
+    let ids: Vec<_> = docs.iter().map(|d| d.name.document_id.as_ref()).collect();
+    // Doc C (document-2) is excluded by the array-contains-any pre-filter despite having 0.99
+    // similarity
+    assert_that!(ids, eq(&vec!["document-0", "document-1"]));
 
     Ok(())
 }

@@ -151,6 +151,10 @@ impl TryFrom<structured_query::composite_filter::Operator> for CompositeOperator
     }
 }
 
+/// Maximum number of comparison values allowed in `IN` and `ARRAY_CONTAINS_ANY` filters in Cloud
+/// Firestore Standard edition.
+const MAX_DISJUNCTION_VALUES: usize = 30;
+
 #[derive(Clone, Debug)]
 pub struct FieldFilter {
     pub field: FieldReference,
@@ -159,6 +163,34 @@ pub struct FieldFilter {
 }
 
 impl FieldFilter {
+    /// Validates operator-specific operand constraints (e.g. `IN` and `ARRAY_CONTAINS_ANY` require
+    /// a non-empty `ArrayValue` and, in Standard edition, at most [`MAX_DISJUNCTION_VALUES`]
+    /// elements).
+    pub(super) fn validate(&self, is_enterprise: bool) -> Result<()> {
+        use FieldOperator::*;
+        let op_name = match self.op {
+            In => "IN",
+            ArrayContainsAny => "ARRAY_CONTAINS_ANY",
+            _ => return Ok(()),
+        };
+        let Some(arr) = self.value.as_array() else {
+            return Err(GenericDatabaseError::invalid_argument(format!(
+                "'{op_name}' requires an ArrayValue",
+            )));
+        };
+        if arr.is_empty() {
+            return Err(GenericDatabaseError::invalid_argument(format!(
+                "'{op_name}' requires a non-empty ArrayValue",
+            )));
+        }
+        if !is_enterprise && arr.len() > MAX_DISJUNCTION_VALUES {
+            return Err(GenericDatabaseError::invalid_argument(format!(
+                "'{op_name}' supports up to {MAX_DISJUNCTION_VALUES} comparison values",
+            )));
+        }
+        Ok(())
+    }
+
     fn eval(&self, version: &StoredDocumentVersion, is_enterprise: bool) -> Result<bool> {
         use FieldOperator::*;
         let Some(value) = self.field.get_value(version) else {
@@ -175,16 +207,33 @@ impl FieldFilter {
             GreaterThan => value > &self.value,
             GreaterThanOrEqual => value >= &self.value,
 
-            // Workaround for incompatible `PartialEq` implementation
-            #[allow(clippy::double_comparisons)]
-            Equal => value <= &self.value && value >= &self.value,
+            // Use `Value::is_firestore_equal` (`Ord::cmp`) rather than Prost's derived structural
+            // `PartialEq::eq` so Firestore's numeric equivalence (`IntegerValue(42)` ==
+            // `DoubleValue(42.0)`) is respected across all equality and membership operators.
+            Equal => value.is_firestore_equal(&self.value),
 
-            NotEqual => (is_enterprise || !value.is_null()) && value != &self.value,
+            NotEqual => {
+                (is_enterprise || !value.is_null()) && !value.is_firestore_equal(&self.value)
+            }
             ArrayContains => value
                 .as_array()
-                .is_some_and(|arr| arr.contains(&self.value)),
-            In => self.value.as_array().is_some_and(|arr| arr.contains(value)),
-            ArrayContainsAny => unimplemented!("ArrayContainsAny"),
+                .is_some_and(|arr| arr.iter().any(|elem| elem.is_firestore_equal(&self.value))),
+            In => self
+                .value
+                .as_array()
+                .is_some_and(|arr| arr.iter().any(|elem| elem.is_firestore_equal(value))),
+            ArrayContainsAny => {
+                value
+                    .as_array()
+                    .zip(self.value.as_array())
+                    .is_some_and(|(doc_arr, filter_arr)| {
+                        doc_arr.iter().any(|doc_elem| {
+                            filter_arr
+                                .iter()
+                                .any(|filter_elem| doc_elem.is_firestore_equal(filter_elem))
+                        })
+                    })
+            }
             NotIn => unimplemented!("NotIn"),
         })
     }
@@ -301,11 +350,7 @@ impl FieldOperator {
     pub(crate) fn needs_type_compat(&self) -> bool {
         matches!(
             self,
-            Self::LessThan
-                | Self::LessThanOrEqual
-                | Self::GreaterThan
-                | Self::GreaterThanOrEqual
-                | Self::Equal
+            Self::LessThan | Self::LessThanOrEqual | Self::GreaterThan | Self::GreaterThanOrEqual
         )
     }
 }

@@ -18,7 +18,7 @@ Because the implementation is driven by the features we consume, the emulator is
 
 - Some of the updates with Transforms (such as Maximum and Minimum)
 - Multiplexing listeners in a single stream (used by frontend Firestore SDK)
-- Some field filters (such as ArrayContainsAny and NotIn)
+- Some field filters (such as NotIn)
 - Explain options
 - and many more... search for `unimplemented` in the codebase to get an idea of the unimplemented gRPC endpoints or edge cases.
 

@@ -6,28 +6,30 @@ use itertools::Itertools;
 use super::field_path::FieldReference;
 use crate::{GenericDatabaseError, document::StoredDocumentVersion};
 
+/// A field mask projection applied to documents returned by a query (`SELECT`).
 #[derive(Clone, Debug)]
 pub struct Projection {
     fields: Vec<FieldReference>,
 }
 
 impl Projection {
+    /// Applies this projection as a field mask over `source`, returning a new map containing only
+    /// the selected field paths.
+    #[must_use]
     pub fn mask(&self, source: &HashMap<String, Value>) -> HashMap<String, Value> {
         let mut fields = HashMap::default();
         for field in &self.fields {
-            match field {
-                FieldReference::DocumentName => continue,
-                FieldReference::FieldPath(path) => {
-                    if let Some(val) = path.get_value(source) {
-                        path.set_value(&mut fields, val.clone());
-                    }
-                }
+            if let FieldReference::FieldPath(path) = field
+                && let Some(val) = path.get_value(source)
+            {
+                path.set_value(&mut fields, val.clone());
             }
         }
         fields
     }
 }
 
+/// Projects a [`StoredDocumentVersion`] into a [`Document`] with only the selected fields.
 pub trait Project {
     fn project(&self, version: &StoredDocumentVersion) -> Document;
 }

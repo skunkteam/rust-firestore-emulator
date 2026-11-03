@@ -76,13 +76,10 @@ impl QueryBuilder {
     }
 
     pub fn from_collection(collection: CollectionRef) -> Self {
-        Self::from(
-            Ref::Root(collection.root_ref),
-            vec![CollectionSelector {
-                collection_id:   collection.collection_id.to_string(),
-                all_descendants: false,
-            }],
-        )
+        Self::from(Ref::Root(collection.root_ref), vec![CollectionSelector {
+            collection_id:   collection.collection_id.to_string(),
+            all_descendants: false,
+        }])
     }
 
     /// Determines whether the query corresponds to an Enterprise Edition database.
@@ -415,26 +412,32 @@ impl Query {
                 ));
             }
         }
-        if !enterprise_edition && let Some(filter) = &self.filter {
-            // Ensure order_by is consistent (unless `find_nearest` is used, which imposes its own
-            // distance-based ordering).
-            if self.order_by.is_empty() && self.find_nearest.is_none() {
-                self.order_by
-                    .extend(filter.get_inequality_fields().map(|field| Order {
-                        field:     field.clone(),
-                        direction: Direction::Ascending,
-                    }));
+        if let Some(filter) = &self.filter {
+            for field_filter in filter.field_filters() {
+                field_filter.validate(enterprise_edition)?;
             }
 
-            filter
-                .field_filters()
-                .filter(|f| f.op.is_array_contains())
-                .at_most_one()
-                .map_err(|_| {
-                    GenericDatabaseError::invalid_argument(
-                        "A maximum of 1 'ARRAY_CONTAINS' filter is allowed per disjunction.",
-                    )
-                })?;
+            if !enterprise_edition {
+                // Ensure order_by is consistent (unless `find_nearest` is used, which imposes its
+                // own distance-based ordering).
+                if self.order_by.is_empty() && self.find_nearest.is_none() {
+                    self.order_by
+                        .extend(filter.get_inequality_fields().map(|field| Order {
+                            field:     field.clone(),
+                            direction: Direction::Ascending,
+                        }));
+                }
+
+                filter
+                    .field_filters()
+                    .filter(|f| f.op.is_array_contains())
+                    .at_most_one()
+                    .map_err(|_| {
+                        GenericDatabaseError::invalid_argument(
+                            "A maximum of 1 'ARRAY_CONTAINS' filter is allowed per disjunction.",
+                        )
+                    })?;
+            }
         }
 
         let has_all_descendants = self.from.iter().any(|selector| selector.all_descendants);
@@ -450,6 +453,10 @@ impl Query {
         Ok(())
     }
 
+    /// Returns `true` if live query listeners must re-evaluate ordering/ranking across the entire
+    /// result set on document updates (i.e. when `find_nearest` or a non-`__name__` `order_by` is
+    /// active).
+    #[must_use]
     pub fn reset_on_update(&self) -> bool {
         self.find_nearest.is_some() || self.order_by.iter().any(|o| !o.field.is_document_name())
     }
@@ -489,10 +496,11 @@ impl Query {
         if let Some(find_nearest) = &self.find_nearest {
             let mut scored: Vec<_> = buffer
                 .into_iter()
-                .filter_map(|doc| match find_nearest.eval_distance(&doc.version) {
-                    Ok(Some(distance)) => Some(Ok((doc, distance))),
-                    Ok(None) => None,
-                    Err(err) => Some(Err(err)),
+                .filter_map(|doc| {
+                    find_nearest
+                        .eval_distance(&doc.version)
+                        .map(|dist| dist.map(|d| (doc, d)))
+                        .transpose()
                 })
                 .try_collect()?;
             scored.sort_unstable_by(|(a_doc, a_dist), (b_doc, b_dist)| {
@@ -621,6 +629,8 @@ impl Query {
         included
     }
 
+    /// Checks whether `doc` satisfies the query's collection selector, `WHERE` filter, `ORDER BY`
+    /// field existence, and `start_at`/`end_at` cursors (prior to any `find_nearest` evaluation).
     fn matches_filters(&mut self, doc: &StoredDocumentVersion) -> Result<bool> {
         if !self.includes_collection(&doc.name.collection_ref) {
             return Ok(false);
@@ -648,6 +658,8 @@ impl Query {
         Ok(true)
     }
 
+    /// Checks whether `doc` is eligible for inclusion in the query results, including both
+    /// [`Query::matches_filters`] and any [`FindNearest`] vector criteria.
     pub fn includes_document(&mut self, doc: &StoredDocumentVersion) -> Result<bool> {
         if !self.matches_filters(doc)? {
             return Ok(false);
@@ -660,6 +672,10 @@ impl Query {
         Ok(true)
     }
 
+    /// Projects a [`StoredDocumentVersion`] into a [`Document`], populating
+    /// `find_nearest.distance_result_field` (if configured) before applying any `SELECT` field
+    /// mask.
+    #[must_use]
     pub fn project(&self, version: &StoredDocumentVersion) -> Document {
         if let Some(find_nearest) = &self.find_nearest
             && let Some(distance_result_field) = &find_nearest.distance_result_field

@@ -36,6 +36,8 @@ impl Value {
         }
     }
 
+    /// Creates a Firestore `VectorValue` encoded as its wire-format `MapValue`.
+    #[must_use]
     pub fn vector(values: impl IntoIterator<Item = f64>) -> Self {
         Self::map(HashMap::from([
             (
@@ -114,6 +116,7 @@ impl Value {
 
     /// Returns the underlying map fields, unless this `MapValue` encodes a `VectorValue`
     /// (which Firestore treats as an atomic scalar rather than a traversable map).
+    #[must_use]
     pub fn as_map(&self) -> Option<&HashMap<String, Self>> {
         match self.value_type() {
             ValueType::MapValue(MapValue { fields }) if !self.is_vector() => Some(fields),
@@ -121,6 +124,9 @@ impl Value {
         }
     }
 
+    /// Returns a mutable reference to the underlying map fields, unless this `MapValue` encodes a
+    /// `VectorValue` (which Firestore treats as an atomic scalar rather than a traversable map).
+    #[must_use]
     pub fn as_map_mut(&mut self) -> Option<&mut HashMap<String, Self>> {
         if self.is_vector() {
             return None;
@@ -147,6 +153,8 @@ impl Value {
             .then_some(values)
     }
 
+    /// Extracts the `f64` elements if this value is a valid Firestore `VectorValue`.
+    #[must_use]
     pub fn as_vector(&self) -> Option<Vec<f64>> {
         Some(
             self.vector_values()?
@@ -156,6 +164,8 @@ impl Value {
         )
     }
 
+    /// Returns `true` if this value is a `MapValue` encoding a Firestore `VectorValue`.
+    #[must_use]
     pub fn is_vector(&self) -> bool {
         self.vector_values().is_some()
     }
@@ -238,6 +248,14 @@ impl Value {
         self.value_type_order() == other.value_type_order()
     }
 
+    /// Returns `true` if `self` and `other` are equal according to Firestore's comparison rules
+    /// (including numeric equivalence between `IntegerValue` and `DoubleValue`, `-0.0 == +0.0`, and
+    /// `NaN == NaN`), unlike Prost's derived structural `PartialEq`.
+    #[must_use]
+    pub fn is_firestore_equal(&self, other: &Self) -> bool {
+        self.cmp(other).is_eq()
+    }
+
     fn value_type_order(&self) -> usize {
         // See: https://firebase.google.com/docs/firestore/manage-data/data-types#value_type_ordering
         match self.value_type() {
@@ -279,13 +297,11 @@ impl Ord for Value {
                 match (self.value_type(), other.value_type()) {
                     (ValueType::NullValue(_), ValueType::NullValue(_)) => cmp::Ordering::Equal,
                     (ValueType::BooleanValue(a), ValueType::BooleanValue(b)) => a.cmp(b),
-                    (ValueType::DoubleValue(a), ValueType::DoubleValue(b)) => a.total_cmp(b),
+                    (ValueType::DoubleValue(a), ValueType::DoubleValue(b)) => cmp_f64(*a, *b),
                     (ValueType::DoubleValue(a), ValueType::IntegerValue(b)) => {
-                        a.total_cmp(&(*b as f64))
+                        cmp_i64_f64(*b, *a).reverse()
                     }
-                    (ValueType::IntegerValue(a), ValueType::DoubleValue(b)) => {
-                        (*a as f64).total_cmp(b)
-                    }
+                    (ValueType::IntegerValue(a), ValueType::DoubleValue(b)) => cmp_i64_f64(*a, *b),
                     (ValueType::IntegerValue(a), ValueType::IntegerValue(b)) => a.cmp(b),
                     (ValueType::TimestampValue(a), ValueType::TimestampValue(b)) => a.cmp(b),
                     (ValueType::StringValue(a), ValueType::StringValue(b)) => a.cmp(b),
@@ -318,6 +334,9 @@ impl Ord for Value {
                     (ValueType::GeoPointValue(a), ValueType::GeoPointValue(b)) => a.cmp(b),
                     (ValueType::ArrayValue(a), ValueType::ArrayValue(b)) => a.values.cmp(&b.values),
                     (ValueType::MapValue(a), ValueType::MapValue(b)) => {
+                        // `value_type_order()` already partitions `VectorValue` (11) from regular
+                        // `MapValue` (12); Firestore orders vectors by dimension first, then
+                        // element-by-element.
                         if let (Some(a_vals), Some(b_vals)) =
                             (self.vector_values(), other.vector_values())
                         {
@@ -348,6 +367,45 @@ impl Ord for Value {
                     _ => unreachable!("logic error in Ord implementation of Value"),
                 }
             })
+    }
+}
+
+/// Compares two `f64` values according to Firestore's ordering rules: all `NaN` bit patterns are
+/// equal, and `-0.0` is equal to `+0.0`.
+fn cmp_f64(a: f64, b: f64) -> cmp::Ordering {
+    if a.is_nan() && b.is_nan() {
+        return cmp::Ordering::Equal;
+    }
+    let a = if a == 0.0 { 0.0 } else { a };
+    let b = if b == 0.0 { 0.0 } else { b };
+    a.total_cmp(&b)
+}
+
+/// Compares an `i64` and a non-`NaN` `f64` without losing precision on 64-bit integers beyond
+/// `2^53`.
+fn cmp_i64_f64(i: i64, d: f64) -> cmp::Ordering {
+    // `-2^63` (`i64::MIN as f64`) and `+2^63` (`9223372036854775808.0`) are both exact powers of 2
+    // in IEEE 754 `f64`.
+    const I64_MIN_F64: f64 = i64::MIN as f64;
+    const I64_UPPER_BOUND_F64: f64 = 9_223_372_036_854_775_808.0;
+
+    if d < I64_MIN_F64 {
+        return cmp::Ordering::Greater;
+    }
+    if d >= I64_UPPER_BOUND_F64 {
+        return cmp::Ordering::Less;
+    }
+    let fl = d.floor() as i64;
+    match i.cmp(&fl) {
+        cmp::Ordering::Less => cmp::Ordering::Less,
+        cmp::Ordering::Greater => cmp::Ordering::Greater,
+        cmp::Ordering::Equal => {
+            if d == d.floor() {
+                cmp::Ordering::Equal
+            } else {
+                cmp::Ordering::Less
+            }
+        }
     }
 }
 
@@ -485,5 +543,45 @@ mod tests {
         for (a, b) in ordered.into_iter().tuple_windows() {
             expect_that!(a, lt(&b));
         }
+    }
+
+    #[gtest]
+    fn numeric_and_nan_ordering_and_equality() {
+        let neg_zero = Value::double(-0.0);
+        let pos_zero = Value::double(0.0);
+        let int_zero = Value::integer(0);
+        expect_that!(neg_zero.is_firestore_equal(&pos_zero), is_true());
+        expect_that!(neg_zero.is_firestore_equal(&int_zero), is_true());
+        expect_that!(pos_zero.is_firestore_equal(&int_zero), is_true());
+
+        let pos_nan = Value::double(f64::NAN);
+        let neg_nan = Value::double(-f64::NAN);
+        expect_that!(pos_nan.is_firestore_equal(&neg_nan), is_true());
+
+        // Large 64-bit integers beyond 2^53 preserve exact ordering against f64
+        let ordered = [
+            Value::double(f64::NEG_INFINITY),
+            Value::double(i64::MIN as f64 - 1e10),
+            Value::integer(i64::MIN),
+            Value::integer(i64::MIN + 1),
+            Value::double(-0.5),
+            Value::integer(0),
+            Value::double(0.5),
+            Value::integer(i64::MAX - 1),
+            Value::integer(i64::MAX),
+            Value::double(9_223_372_036_854_775_808.0),
+            Value::double(f64::INFINITY),
+        ];
+        for (a, b) in ordered.into_iter().tuple_windows() {
+            expect_that!(a, lt(&b));
+        }
+        expect_that!(
+            Value::integer(i64::MIN).is_firestore_equal(&Value::double(i64::MIN as f64)),
+            is_true()
+        );
+        expect_that!(
+            Value::integer(i64::MAX).is_firestore_equal(&Value::double(i64::MAX as f64)),
+            is_false()
+        );
     }
 }

@@ -215,8 +215,8 @@ pub(super) fn evaluate(
         | "less_than_or_equal" => {
             let [a, b] = get_exact_expr_args(&args, name)?;
             let res = match name.as_str() {
-                "equal" => a == b,
-                "not_equal" => a != b,
+                "equal" => a.is_firestore_equal(b),
+                "not_equal" => !a.is_firestore_equal(b),
                 "greater_than" => a > b,
                 "greater_than_or_equal" => a >= b,
                 "less_than" => a < b,

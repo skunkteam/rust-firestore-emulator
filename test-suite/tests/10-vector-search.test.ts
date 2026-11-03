@@ -58,6 +58,8 @@ describe.each(editions)('$description - vector search', fs => {
         }
     });
 
+    // Cloud Firestore (Standard edition) vector index required on `collection` (COLLECTION):
+    // - embedding VECTOR<2> (flat)
     describe('findNearest queries', () => {
         const subCol = fs.collection.doc().collection('collection');
         const seedDocs: Array<{ id: string } & Record<string, unknown>> = [
@@ -213,9 +215,11 @@ describe.each(editions)('$description - vector search', fs => {
             expect(dotSnap.docs.map(d => d.id)).toEqual(['doc-diag', 'doc-origin-y']);
         });
 
+        // Cloud Firestore (Standard edition) composite vector index required on `collection` (COLLECTION):
+        // - tags CONTAINS, category ASCENDING, vectorQueryFields.nested VECTOR<3> (flat)
         // Java emulator does not resolve nested FieldPaths for vectorField in findNearest
         notImplementedInJava ||
-            test.concurrent('combines pre-filters (where == and array-contains) and nested vectorField', async () => {
+            test.concurrent('combines pre-filters (where ==, array-contains, and array-contains-any) and nested vectorField', async () => {
                 const vectorPath = new FieldPath('vectorQueryFields', 'nested');
                 const snap = await subCol
                     .where('category', '==', 'tech')
@@ -234,10 +238,83 @@ describe.each(editions)('$description - vector search', fs => {
                 // Query [1, 1, 0] vs doc-origin-x [1, 0, 0]: dot = 1 / sqrt(2) = 0.7071 -> dist ~ 0.29289
                 expect(snap.docs.map(d => d.id)).toEqual(['doc-diag', 'doc-origin-x']);
 
-                const firstData = snap.docs[0].data();
+                const firstData = readData<{ title: string; distance: number }>(snap.docs[0].data());
                 expect(firstData.title).toBe('Diagonal');
                 expect(typeof firstData.distance).toBe('number');
                 expect(firstData.distance).toBeCloseTo(1 - 7 / (Math.sqrt(2) * 5), 6);
+
+                // Also verify array-contains-any pre-filtering on the same indexed collection:
+                // Only doc-diag (tags: ['nl', 'b2c']) and doc-neg-x (tags: ['be', 'b2b']) match ['b2c', 'be'],
+                // while doc-origin-x (tags: ['nl', 'b2b']) is excluded despite higher similarity than doc-neg-x.
+                const anySnap = await subCol
+                    .where('category', '==', 'tech')
+                    .where('tags', 'array-contains-any', ['b2c', 'be'])
+                    .findNearest({
+                        vectorField: vectorPath,
+                        queryVector: [1, 1, 0],
+                        distanceMeasure: 'COSINE',
+                        limit: 5,
+                    })
+                    .get();
+                expect(anySnap.docs.map(d => d.id)).toEqual(['doc-diag', 'doc-neg-x']);
+            });
+
+        // Cloud Firestore (Standard edition) composite vector index required on `bucket-vectors` (COLLECTION):
+        // - queryFields.naam.buckets CONTAINS, queryFields.status ASCENDING, queryFields.naam.vector VECTOR<256> (flat)
+        // Java emulator does not resolve nested FieldPaths for vectorField in findNearest
+        notImplementedInJava ||
+            test.concurrent('combines nested array-contains-any bucket pre-filter with 256-dim findNearest', async () => {
+                const bucketCol = fs.collection.doc().collection('bucket-vectors');
+                const make256 = (first: number) => {
+                    const arr = new Array<number>(256).fill(0);
+                    arr[0] = first;
+                    return FieldValue.vector(arr);
+                };
+
+                const docs = [
+                    {
+                        id: 'doc-a',
+                        queryFields: {
+                            status: 'active',
+                            naam: { vector: make256(0.95), buckets: [1, 2] },
+                        },
+                    },
+                    {
+                        id: 'doc-b',
+                        queryFields: {
+                            status: 'active',
+                            naam: { vector: make256(0.6), buckets: [2, 3] },
+                        },
+                    },
+                    {
+                        id: 'doc-c',
+                        queryFields: {
+                            status: 'active',
+                            naam: { vector: make256(0.99), buckets: [99] },
+                        },
+                    },
+                ];
+
+                await Promise.all(docs.map(({ id, ...rest }) => bucketCol.doc(id).set(writeData(rest))));
+
+                try {
+                    const snap = await bucketCol
+                        .where('queryFields.status', '==', 'active')
+                        .where('queryFields.naam.buckets', 'array-contains-any', [1, 2])
+                        .findNearest({
+                            vectorField: 'queryFields.naam.vector',
+                            queryVector: make256(1),
+                            distanceMeasure: 'DOT_PRODUCT',
+                            distanceThreshold: 0.15,
+                            limit: 10,
+                        })
+                        .get();
+
+                    // doc-c (0.99) is excluded because its buckets [99] are disjoint from [1, 2]
+                    expect(snap.docs.map(d => d.id)).toEqual(['doc-a', 'doc-b']);
+                } finally {
+                    await Promise.all(docs.map(({ id }) => bucketCol.doc(id).delete()));
+                }
             });
 
         test.concurrent('supports select projection with findNearest', async () => {

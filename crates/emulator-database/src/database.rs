@@ -580,7 +580,10 @@ fn apply_transform(
                 match cur_value.and_then(Value::into_array) {
                     Some(mut array) => {
                         for el in elements.values {
-                            if !array.contains(&el) {
+                            if !array
+                                .iter()
+                                .any(|existing| existing.is_firestore_equal(&el))
+                            {
                                 array.push(el)
                             }
                         }
@@ -595,7 +598,8 @@ fn apply_transform(
             field_path.transform_value(fields, |cur_value| {
                 match cur_value.and_then(Value::into_array) {
                     Some(mut array) => {
-                        array.retain(|v| !elements.values.contains(v));
+                        array
+                            .retain(|v| !elements.values.iter().any(|el| el.is_firestore_equal(v)));
                         Value::array(array)
                     }
                     None => Value::array(vec![]),

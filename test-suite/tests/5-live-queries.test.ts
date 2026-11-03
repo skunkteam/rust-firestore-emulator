@@ -167,6 +167,9 @@ describe.each(editions)('$description', fs => {
                 stop();
             });
 
+            // Cloud Firestore (Standard edition) composite indexes required on `collection` (COLLECTION):
+            // - included ASCENDING, ordered ASCENDING (for the `where ==` and `where !=` variants)
+            // - number ASCENDING, ordered ASCENDING (for the `where >=` variant)
             test.concurrent('limit', async () => {
                 const coll = subCollection();
 
