@@ -30,7 +30,8 @@ describe.each(editions)('$description', fs => {
     //  8. Cloud Firestore references
     //  9. Geographical point values (Note from Google: At this time we do not recommend using this data type) NOT TESTED
     // 10. Array values
-    // 11. Map values
+    // 11. Vector values (tested in `10-vector-search.test.ts`)
+    // 12. Map values
     const numbers: Data[] = [
         { type: 'number', ordered: -500 },
         { type: 'number', ordered: Number.MIN_VALUE },
@@ -123,7 +124,10 @@ describe.each(editions)('$description', fs => {
             getDocId: (snap: QueryDocumentSnapshot) => snap.id,
         },
         {
-            // Note that these tests need custom collection group indexes in Firestore Standard edition
+            // Note: Requires single-field collection-group index exemptions on `subCollection` in Cloud Firestore Standard edition:
+            // - `ordered`: ASCENDING, DESCENDING, CONTAINS (COLLECTION & COLLECTION_GROUP)
+            // - `path`:    ASCENDING, DESCENDING (COLLECTION & COLLECTION_GROUP)
+            // - `type`:    ASCENDING, DESCENDING, CONTAINS (COLLECTION & COLLECTION_GROUP)
             description: 'collection group',
             collection: collectionGroupQuery,
             createRef: () => fs.collection.doc().collection(GROUPED_COLLECTION).doc(),
@@ -170,7 +174,9 @@ describe.each(editions)('$description', fs => {
                 expect(await getData(collection.orderBy('ordered', 'desc'))).toEqual(ordered.toReversed());
             });
 
-            // Note: This needs an index in the Cloud Firestore
+            // Note: Requires composite index in Cloud Firestore Standard edition:
+            // - `collection` (COLLECTION): `type ASCENDING, ordered DESCENDING`
+            // - `subCollection` (COLLECTION_GROUP): `type ASCENDING, ordered DESCENDING`
             test(`multiple orderBy's`, async () => {
                 expect(await getData(collection.orderBy('type').orderBy('ordered', 'desc'))).toIncludeSameMembers(
                     // Note that this still skips `nothing`, because of the missing `ordered` property.
@@ -215,6 +221,9 @@ describe.each(editions)('$description', fs => {
                       expect(secondResult).toEqual(result);
                   });
 
+            // Note: Requires composite indexes in Cloud Firestore Standard edition (on both `collection` [COLLECTION] and `subCollection` [COLLECTION_GROUP]):
+            // - `type ASCENDING, ordered ASCENDING`
+            // - `ordered ASCENDING, type ASCENDING`
             test('can apply arbitrary order-by clauses (that also filter on existence)', async () => {
                 const allResults = await getData(collection.where('type', '>', 'A'));
                 const allResultsExplicitOrderBy = await getData(collection.where('type', '>', 'A').orderBy('type'));
@@ -302,6 +311,7 @@ describe.each(editions)('$description', fs => {
             describe('inequality on type', () => {
                 test.each([
                     { type: 'number', data: numbers },
+                    { type: 'number', data: numbers, itemToExclude: numbers.find(e => e.ordered === 1) },
                     { type: 'number', data: numbers, itemToExclude: numbers.find(e => e.ordered === Number.MAX_VALUE) },
                     { type: 'string', data: strings },
                     { type: 'bytes', data: bytes },
@@ -374,6 +384,37 @@ describe.each(editions)('$description', fs => {
                               ? '9 FAILED_PRECONDITION: Only a single array-contains clause is allowed in a query'
                               : "3 INVALID_ARGUMENT: A maximum of 1 'ARRAY_CONTAINS' filter is allowed per disjunction.",
                       );
+            });
+
+            // Note: On `collection group` (`subCollection`), requires the single-field collection-group exemption
+            // `ordered` CONTAINS (COLLECTION_GROUP) in Cloud Firestore Standard edition.
+            describe('array-contains-any', () => {
+                test('matches any element without duplicating documents and ignores non-arrays', async () => {
+                    // [1, 2, 3] and [1, 2, 3, 1] contain 1 or 3; [2] does not
+                    expect(await getData(collection.where('ordered', 'array-contains-any', [1, 3]))).toIncludeSameMembers(
+                        arrays.slice(0, 2),
+                    );
+                    // Querying [1, 2, 3] matches all 3 array documents once each (no duplicates for [1, 2, 3, 1])
+                    expect(await getData(collection.where('ordered', 'array-contains-any', [1, 2, 3]))).toIncludeSameMembers(arrays);
+                    // Disjoint values return empty
+                    expect(await getData(collection.where('ordered', 'array-contains-any', [99, 100]))).toEqual([]);
+                });
+
+                test('enforces disjunction element bounds (1..=30 in Standard, >=1 in Enterprise)', async () => {
+                    // Boundary invalid in all editions: 0 elements (empty array)
+                    await expect(getData(collection.where('ordered', 'array-contains-any', []))).rejects.toThrow(/3 INVALID_ARGUMENT/);
+
+                    // Boundary valid: 30 elements
+                    const maxAllowed = [2, ...Array.from({ length: 29 }, (_, i) => i + 100)];
+                    expect(await getData(collection.where('ordered', 'array-contains-any', maxAllowed))).toIncludeSameMembers(arrays);
+
+                    // Boundary 31 elements: rejected in Standard edition, allowed in Enterprise edition
+                    const thirtyOne = [2, ...Array.from({ length: 30 }, (_, i) => i + 100)];
+                    const promise = getData(collection.where('ordered', 'array-contains-any', thirtyOne));
+                    fs.enterprise
+                        ? await expect(promise).resolves.toIncludeSameMembers(arrays)
+                        : await expect(promise).rejects.toThrow(/3 INVALID_ARGUMENT/);
+                });
             });
         });
 
@@ -547,6 +588,8 @@ describe.each(editions)('$description', fs => {
         });
     });
 
+    // Note: `biggerCities` aggregations on `area` require a composite index on `cityCollection` (COLLECTION)
+    // in Cloud Firestore Standard edition: `population ASCENDING, area ASCENDING`.
     describe('aggregation queries', () => {
         const cities = [
             { city: 'Buren', population: 27_718, area: 142.92 },

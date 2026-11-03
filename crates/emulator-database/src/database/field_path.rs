@@ -47,6 +47,8 @@ impl FromStr for FieldReference {
     type Err = GenericDatabaseError;
 
     fn from_str(path: &str) -> Result<Self, Self::Err> {
+        // Parse as a `FieldPath` first so backtick-quoted `` `__name__` `` is also recognized as
+        // `FieldReference::DocumentName`.
         let path: FieldPath = path.parse()?;
         if path.is_document_name() {
             Ok(Self::DocumentName)
@@ -88,7 +90,7 @@ impl FieldPath {
 
     /// Walk the path as represented by this [`FieldPath`] into the given object fields and return
     /// the value found at the end of the path, if any. Also returns [`None`] if any intermediate
-    /// value was absent or not an object.
+    /// value was absent or not a traversable map (e.g. a scalar or `VectorValue`).
     pub fn get_value<'a>(&self, fields: &'a HashMap<String, Value>) -> Option<&'a Value> {
         let (first, rest) = self.0.split_first()?;
         rest.iter()
@@ -96,14 +98,15 @@ impl FieldPath {
     }
 
     /// Walk the path as represented by this [`FieldPath`] into the given object, making sure all
-    /// intermediate steps are objects, setting the end of the path to the given value.
+    /// intermediate steps are traversable maps (replacing non-maps or `VectorValue`s as needed),
+    /// setting the end of the path to the given value.
     pub fn set_value(&self, fields: &mut HashMap<String, Value>, new_value: Value) {
         self.transform_value(fields, |_| new_value);
     }
 
     /// Walk the path as represented by this [`FieldPath`] into the given object and takes the value
     /// that is found at the end of the path if any. Also returns [`None`] if any intermediate
-    /// value was absent or not an object.
+    /// value was absent or not a traversable map (e.g. a scalar or `VectorValue`).
     pub fn delete_value(&self, fields: &mut HashMap<String, Value>) -> Option<Value> {
         match &self.0[..] {
             [] => unreachable!(),
@@ -131,6 +134,8 @@ impl FieldPath {
         value
     }
 
+    /// Fallible variant of [`FieldPath::transform_value`] that propagates any error returned by
+    /// `transform`.
     pub fn try_transform_value<'a, E>(
         &self,
         fields: &'a mut HashMap<String, Value>,

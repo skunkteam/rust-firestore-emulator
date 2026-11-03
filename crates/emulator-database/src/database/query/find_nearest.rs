@@ -11,10 +11,17 @@ use crate::{
 const MAX_VECTOR_DIMENSION: usize = 2048;
 const MAX_FIND_NEAREST_LIMIT: usize = 1000;
 
+/// Distance measure used to compare vectors in a [`FindNearest`] query.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DistanceMeasure {
+    /// Euclidean (L2) distance. Smaller values indicate higher similarity (sorted ascending,
+    /// `distance <= distance_threshold`).
     Euclidean,
+    /// Cosine distance (`1.0 - cosine_similarity`). Smaller values indicate higher similarity
+    /// (sorted ascending, `distance <= distance_threshold`).
     Cosine,
+    /// Dot product similarity. Larger values indicate higher similarity (sorted descending,
+    /// `distance >= distance_threshold`).
     DotProduct,
 }
 
@@ -36,17 +43,26 @@ impl TryFrom<structured_query::find_nearest::DistanceMeasure> for DistanceMeasur
     }
 }
 
+/// Nearest-neighbor vector search stage (`StructuredQuery::find_nearest`).
 #[derive(Clone, Debug)]
 pub struct FindNearest {
+    /// Path to the document field containing the target `VectorValue`.
     pub vector_field: FieldPath,
+    /// Query vector to compare against candidate documents.
     pub query_vector: Vec<f64>,
+    /// Distance metric used to score and order candidate vectors.
     pub distance_measure: DistanceMeasure,
+    /// Maximum number of nearest neighbors to return (`1..=1000`).
     pub limit: usize,
+    /// Optional document field path to populate with the computed distance in projected results.
     pub distance_result_field: Option<FieldPath>,
+    /// Optional threshold on the computed distance/similarity score.
     pub distance_threshold: Option<f64>,
 }
 
 impl FindNearest {
+    /// Validates `find_nearest` parameters (`vector_field`, `query_vector` dimensionality and
+    /// finiteness, `limit` range, non-zero magnitude for `COSINE`, and `distance_threshold`).
     pub(super) fn validate(&self) -> Result<()> {
         if self.vector_field.is_document_name() {
             return Err(GenericDatabaseError::invalid_argument(
@@ -78,7 +94,7 @@ impl FindNearest {
             ));
         }
         if self.distance_measure == DistanceMeasure::Cosine
-            && dot_product(&self.query_vector, &self.query_vector) == 0.0
+            && !self.query_vector.iter().any(|&v| v != 0.0)
         {
             return Err(GenericDatabaseError::invalid_argument(
                 "cannot compute COSINE distance with a zero-magnitude query_vector",
@@ -118,6 +134,13 @@ impl FindNearest {
                 .sum::<f64>()
                 .sqrt(),
             DistanceMeasure::Cosine => {
+                // Cloud Firestore aborts the query with `INVALID_ARGUMENT` if a candidate document
+                // matching the pre-filters has a zero-magnitude vector (`[0.0, ...]`) under COSINE.
+                if !doc_vector.iter().any(|&v| v != 0.0) {
+                    return Err(GenericDatabaseError::invalid_argument(
+                        "cosine_distance(...) result is NaN.",
+                    ));
+                }
                 let query_norm_sq = dot_product(&self.query_vector, &self.query_vector);
                 let doc_norm_sq = dot_product(&doc_vector, &doc_vector);
                 let denom = query_norm_sq.sqrt() * doc_norm_sq.sqrt();
@@ -148,6 +171,10 @@ impl FindNearest {
         Ok(Some(distance))
     }
 
+    /// Compares two distances according to this measure's ordering (ascending for
+    /// [`DistanceMeasure::Euclidean`] and [`DistanceMeasure::Cosine`]; descending for
+    /// [`DistanceMeasure::DotProduct`]).
+    #[must_use]
     pub(super) fn cmp_distance(&self, a: f64, b: f64) -> cmp::Ordering {
         match self.distance_measure {
             DistanceMeasure::Euclidean | DistanceMeasure::Cosine => a.total_cmp(&b),
