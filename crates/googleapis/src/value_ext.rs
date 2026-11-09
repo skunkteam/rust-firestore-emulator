@@ -390,13 +390,13 @@ mod tests {
             "/cola\0/docb",
             "/colb/doca",
         ];
-        for (a, b) in ordered_refs
+        for [a, b] in ordered_refs
             .into_iter()
             .map(str::to_string)
             .map(Value::reference)
-            .tuple_windows()
+            .array_windows()
         {
-            expect_that!(a, lt(&b));
+            expect_lt!(a, &b);
         }
     }
 }

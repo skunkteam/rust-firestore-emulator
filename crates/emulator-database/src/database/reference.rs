@@ -356,7 +356,7 @@ impl CollectionRef {
     pub fn strip_collection_prefix(&self, col: &CollectionRef) -> Option<&str> {
         let rest = self
             .strip_root_prefix(&col.root_ref)?
-            .strip_prefix(&*col.collection_id)?
+            .strip_prefix(col.collection_id.as_str())?
             .strip_prefix('/')?;
         Some(rest)
     }
@@ -380,7 +380,7 @@ impl CollectionRef {
     pub fn strip_document_prefix(&self, doc: &DocumentRef) -> Option<&str> {
         let rest = self
             .strip_collection_prefix(&doc.collection_ref)?
-            .strip_prefix(&*doc.document_id)?
+            .strip_prefix(doc.document_id.as_str())?
             .strip_prefix('/')?;
         Some(rest)
     }
@@ -459,83 +459,58 @@ mod tests {
 
     #[gtest]
     #[rstest]
-    #[case(
-        // With `/documents` suffix
+    #[case::root_with_documents_suffix(
         "projects/my-demo-project/databases/database/documents",
         "my-demo-project",
         "database"
     )]
-    #[case(
-        // Without `/documents` suffix
+    #[case::root_without_documents_suffix(
         "projects/demo-project/databases/(default)",
         "demo-project",
         "(default)"
     )]
-    fn parse_root_ref(#[case] input: &str, #[case] project_id: &str, #[case] database_id: &str) {
-        assert_that!(
-            input.parse::<Ref>(),
-            ok(eq(&Ref::Root(RootRef::new(project_id, database_id))))
-        )
-    }
-
-    #[gtest]
-    #[rstest]
-    #[case(
+    #[case::collection(
         "projects/proj/databases/database/documents/collection",
         "proj",
         "database",
         "collection"
     )]
-    #[case(
+    #[case::subcollection(
         "projects/demo-project/databases/(default)/documents/root/doc/sub",
         "demo-project",
         "(default)",
         "root/doc/sub"
     )]
-    fn parse_collection_refs(
-        #[case] input: &str,
-        #[case] project_id: &str,
-        #[case] database_id: &str,
-        #[case] collection_id: &str,
-    ) {
-        assert_that!(
-            input.parse::<Ref>(),
-            ok(eq(&Ref::Collection(CollectionRef::new(
-                RootRef::new(project_id, database_id),
-                collection_id
-            ))))
-        );
-    }
-
-    #[gtest]
-    #[rstest]
-    #[case(
+    #[case::document(
         "projects/proj/databases/database/documents/collection/document",
         "proj",
         "database",
         "collection",
         "document"
     )]
-    #[case(
+    #[case::subdocument(
         "projects/demo-project/databases/(default)/documents/root/doc/sub/doc",
         "demo-project",
         "(default)",
         "root/doc/sub",
         "doc"
     )]
-    fn parse_document_refs(
+    fn parse_refs(
         #[case] input: &str,
         #[case] project_id: &str,
         #[case] database_id: &str,
-        #[case] collection_id: &str,
-        #[case] doc_id: &str,
+        #[case(opt)] collection_id: Option<&str>,
+        #[case(opt)] doc_id: Option<&str>,
     ) {
-        assert_that!(
-            input.parse::<Ref>(),
-            ok(eq(&Ref::Document(DocumentRef::new(
-                CollectionRef::new(RootRef::new(project_id, database_id), collection_id),
-                doc_id
-            ))))
-        );
+        let root = RootRef::new(project_id, database_id);
+        let expected = match (collection_id, doc_id) {
+            (None, None) => Ref::Root(root),
+            (Some(col), None) => Ref::Collection(CollectionRef::new(root, col)),
+            (Some(col), Some(doc)) => {
+                Ref::Document(DocumentRef::new(CollectionRef::new(root, col), doc))
+            }
+            (None, Some(_)) => unreachable!(),
+        };
+        assert_that!(input.parse::<Ref>(), ok(eq(&expected)));
     }
 }

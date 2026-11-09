@@ -301,18 +301,18 @@ impl OptimisticState {
 #[derive(Debug)]
 pub(crate) enum ConcurrencyMode {
     Pessimistic(PessimisticState),
-    Optimistic(OptimisticState),
+    Optimistic(Box<OptimisticState>),
 }
 
 impl ConcurrencyMode {
     fn new(database: Weak<FirestoreDatabase>, optimistic_concurrency: bool) -> Self {
         if optimistic_concurrency {
-            ConcurrencyMode::Optimistic(OptimisticState {
+            ConcurrencyMode::Optimistic(Box::new(OptimisticState {
                 database,
                 observed_docs: Default::default(),
                 executed_queries: Default::default(),
                 read_time: LazyLock::new(Timestamp::now),
-            })
+            }))
         } else {
             ConcurrencyMode::Pessimistic(PessimisticState {
                 database,

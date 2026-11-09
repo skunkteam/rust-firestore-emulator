@@ -51,7 +51,7 @@ jobs:
       - name: Install Protoc
         uses: arduino/setup-protoc@v3
       - name: Linting
-        run: cargo clippy --workspace -- -D warnings
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
 
   compat-test:
     name: Compatibility test

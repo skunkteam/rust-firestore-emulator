@@ -22,7 +22,7 @@ version = "0.3.0-beta.1"
 
 [workspace.dependencies]
 axum = "0.8"
-base64 = "0.23.1"
+base64 = { version = "0.23.1", default-features = false, features = ["std"] }
 bytes = "1.12"
 clap = "4.6.7"
 color-eyre = "0.6.5"
