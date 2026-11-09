@@ -172,9 +172,9 @@ mod tests {
             .error_for_status()?;
 
         let unknown_poll_status = client.post(&poll_url).send().await?.status();
-        expect_that!(
+        expect_eq!(
             unknown_poll_status,
-            eq(404),
+            404,
             "polling on an unknown handle gives a 404"
         );
         Ok(())

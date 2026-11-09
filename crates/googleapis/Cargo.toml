@@ -22,7 +22,6 @@ tonic-prost-build = { workspace = true }
 
 [dev-dependencies]
 googletest = { workspace = true }
-itertools = { workspace = true }
 rstest = { workspace = true }
 serde_json = { workspace = true }
 

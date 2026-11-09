@@ -7,7 +7,7 @@ use googleapis::google::firestore::v1::{
     Cursor, Document, Precondition, TransactionOptions, Value, Write, precondition,
     structured_query::CollectionSelector, transaction_options, write,
 };
-use googletest::{Result, assert_that, gtest, prelude::*};
+use googletest::prelude::*;
 use itertools::Itertools;
 use tokio_test::{assert_ready, assert_ready_ok, task::spawn};
 
@@ -26,7 +26,9 @@ use crate::{
 fn fresh_database() -> Result<Arc<FirestoreDatabase>> {
     let database_ref: RootRef = "projects/my-project/databases/my-database".parse()?;
     let project = Box::leak(Box::new(FirestoreProject::new(FirestoreConfig::default())));
-    Ok(assert_ready!(spawn(project.database(&database_ref)).poll()))
+    Ok(assert_ready!(
+        spawn(project.database(&database_ref)).poll_until_idle()
+    ))
 }
 
 fn start_rw_txn(database: &Arc<FirestoreDatabase>) -> TransactionId {
@@ -36,7 +38,7 @@ fn start_rw_txn(database: &Arc<FirestoreDatabase>) -> TransactionId {
                 transaction_options::ReadWrite::default(),
             )),
         }))
-        .poll()
+        .poll_until_idle()
     )
 }
 
@@ -63,7 +65,7 @@ fn insert_docs<Id: Display, Fields: IntoIterator<Item = (&'static str, Value)>>(
             }),
             ..Default::default()
         };
-        assert_ready_ok!(spawn(database.write(write)).poll());
+        assert_ready_ok!(spawn(database.write(write)).poll_until_idle());
     }
     Ok(())
 }
@@ -89,7 +91,7 @@ fn check_matching_docs<'a, Id: Display>(
 }
 
 fn is_locked(meta: &Arc<DocumentMeta>) -> bool {
-    spawn(meta.write_owned()).poll().is_pending()
+    spawn(meta.write_owned()).poll_until_idle().is_pending()
 }
 
 type Docs = Vec<Arc<DocumentMeta>>;
@@ -99,12 +101,13 @@ fn eval_query(
     collection_id: &str,
     query: &mut Query,
 ) -> Result<(Docs, Docs)> {
-    let (_, result) = assert_ready_ok!(spawn(query.once(database)).poll());
+    let (_, result) = assert_ready_ok!(spawn(query.once(database)).poll_until_idle());
     let matched_docnames = result.iter().map(|meta| meta.name.clone()).collect_vec();
 
     let collection_ref = CollectionRef::new(database.name.clone(), collection_id);
-    let collection = assert_ready!(spawn(database.get_collection(&collection_ref)).poll());
-    let docs = assert_ready!(spawn(collection.docs()).poll());
+    let collection =
+        assert_ready!(spawn(database.get_collection(&collection_ref)).poll_until_idle());
+    let docs = assert_ready!(spawn(collection.docs()).poll_until_idle());
 
     Ok(docs
         .into_iter()

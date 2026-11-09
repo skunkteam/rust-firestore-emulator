@@ -150,8 +150,8 @@ mod tests {
     #[gtest]
     fn now_monotonically_increasing() {
         let timestamps: [Timestamp; 100] = array::from_fn(|_| Timestamp::now());
-        for (a, b) in timestamps.into_iter().tuple_windows() {
-            expect_that!(a, lt(b), "a should be strictly less than b, always");
+        for [a, b] in timestamps.into_iter().array_windows() {
+            expect_lt!(a, b, "a should be strictly less than b, always");
         }
     }
 
@@ -162,7 +162,7 @@ mod tests {
         let token = timestamp.get_token().unwrap();
         expect_that!(token, len(eq(TOKEN_LEN)));
         let timestamp2 = Timestamp::from_token(token).unwrap();
-        expect_that!(timestamp, eq(timestamp2));
+        expect_eq!(timestamp, timestamp2);
     }
 
     #[gtest]
