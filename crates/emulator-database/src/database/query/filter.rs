@@ -174,11 +174,7 @@ impl FieldFilter {
             LessThanOrEqual => value <= &self.value,
             GreaterThan => value > &self.value,
             GreaterThanOrEqual => value >= &self.value,
-
-            // Workaround for incompatible `PartialEq` implementation
-            #[allow(clippy::double_comparisons)]
-            Equal => value <= &self.value && value >= &self.value,
-
+            Equal => value == &self.value,
             NotEqual => (is_enterprise || !value.is_null()) && value != &self.value,
             ArrayContains => value
                 .as_array()
@@ -417,5 +413,68 @@ impl TryFrom<structured_query::unary_filter::Operator> for UnaryOperator {
             Other::IsNotNan => Ok(Self::IsNotNan),
             Other::IsNotNull => Ok(Self::IsNotNull),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use googleapis::google::{firestore::v1::Value, protobuf::Timestamp};
+    use googletest::prelude::*;
+
+    use super::{FieldFilter, FieldOperator};
+    use crate::database::document::StoredDocumentVersion;
+
+    #[gtest]
+    fn field_filter_cross_type_numeric_equality_and_membership() {
+        let version = StoredDocumentVersion {
+            name: "projects/p/databases/d/documents/col/doc".parse().unwrap(),
+            create_time: Timestamp::default(),
+            update_time: Timestamp::default(),
+            fields: HashMap::from([
+                ("count".to_string(), Value::integer(42)),
+                ("big".to_string(), Value::integer(i64::MAX)),
+                (
+                    "tags".to_string(),
+                    Value::array(vec![Value::integer(10), Value::double(f64::NAN)]),
+                ),
+            ]),
+        };
+
+        let eq_filter = FieldFilter {
+            field: "count".parse().unwrap(),
+            op:    FieldOperator::Equal,
+            value: Value::double(42.0),
+        };
+        expect_that!(eq_filter.eval(&version, false), ok(eq(&true)));
+
+        let ne_filter = FieldFilter {
+            field: "count".parse().unwrap(),
+            op:    FieldOperator::NotEqual,
+            value: Value::double(42.0),
+        };
+        expect_that!(ne_filter.eval(&version, false), ok(eq(&false)));
+
+        let big_filter = FieldFilter {
+            field: "big".parse().unwrap(),
+            op:    FieldOperator::Equal,
+            value: Value::double(i64::MAX as f64),
+        };
+        expect_that!(big_filter.eval(&version, false), ok(eq(&false)));
+
+        let array_contains_filter = FieldFilter {
+            field: "tags".parse().unwrap(),
+            op:    FieldOperator::ArrayContains,
+            value: Value::double(10.0),
+        };
+        expect_that!(array_contains_filter.eval(&version, false), ok(eq(&true)));
+
+        let in_filter = FieldFilter {
+            field: "count".parse().unwrap(),
+            op:    FieldOperator::In,
+            value: Value::array(vec![Value::double(42.0)]),
+        };
+        expect_that!(in_filter.eval(&version, false), ok(eq(&true)));
     }
 }
