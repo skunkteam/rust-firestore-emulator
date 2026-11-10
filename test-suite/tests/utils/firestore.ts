@@ -45,11 +45,7 @@ export const enterpriseEditionPessimistic = {
     concurrencyMode: 'pessimistic',
 } as const;
 
-export const editions = [
-    standardEdition,
-    ...(notImplementedInJava || []),
-    ...(notImplementedInJava || [enterpriseEdition, enterpriseEditionPessimistic]),
-] as const;
+export const editions = [standardEdition, ...(notImplementedInJava || [enterpriseEdition, enterpriseEditionPessimistic])] as const;
 
 if (connection === 'RUST EMULATOR') {
     beforeAll(async () => {

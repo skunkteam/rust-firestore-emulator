@@ -1,4 +1,4 @@
-import { CollectionReference, DocumentData, FieldValue, Timestamp } from '@google-cloud/firestore';
+import { CollectionReference, DocumentData, FieldValue, GeoPoint, Timestamp } from '@google-cloud/firestore';
 import * as p from '@google-cloud/firestore/pipelines';
 import { editions, notImplementedInRust, writeData } from './utils';
 
@@ -525,14 +525,23 @@ suite('$description', fs => {
             // 2. Modifiers & Core Builders
             type CoreBuilderMethods = 'as' | 'expressionType';
 
-            // 3. Broken SDK Exports
-            const brokenSDKExports = ['regexFind', 'regexFindAll'] as const;
-            type BrokenSDKExports = (typeof brokenSDKExports)[number];
-
-            // 4. Specialized Executors (Aggregates & Logic)
-            type AggregateOperators = 'count' | 'sum' | 'average' | 'minimum' | 'maximum' | 'countDistinct' | 'countAll' | 'countIf';
-            type LogicOperators = 'and' | 'or' | 'xor' | 'not' | 'conditional';
+            // 3. Specialized Executors (Aggregates & Logic)
+            type AggregateOperators =
+                | 'count'
+                | 'sum'
+                | 'average'
+                | 'minimum'
+                | 'maximum'
+                | 'countDistinct'
+                | 'countAll'
+                | 'countIf'
+                | 'first'
+                | 'last'
+                | 'arrayAgg'
+                | 'arrayAggDistinct';
+            type LogicOperators = 'and' | 'or' | 'xor' | 'nor' | 'not' | 'conditional' | 'switchOn';
             type OrderByOperators = 'ascending' | 'descending';
+            type SearchOperators = 'documentMatches' | 'score' | 'geoDistance';
 
             // Extract unhandled methods and functions
             type RelevantExpressionMethods = Exclude<
@@ -541,7 +550,7 @@ suite('$description', fs => {
             >;
             type RelevantExportedFunctions = Exclude<
                 keyof typeof p,
-                PipelineClasses | AggregateOperators | LogicOperators | OrderByOperators | BrokenSDKExports
+                PipelineClasses | AggregateOperators | LogicOperators | OrderByOperators | SearchOperators
             >;
 
             type OperatorTestCase = {
@@ -849,6 +858,159 @@ suite('$description', fs => {
                     { name: 'stringContains (true)', expr: p.constant('abc').stringContains('b'), expected: true },
                     { name: 'stringContains (false)', expr: p.constant('abc').stringContains('d'), expected: false },
                 ],
+                trunc: notImplementedInRust || { name: 'trunc', expr: p.constant(1.9).trunc(), expected: 1 },
+                ltrim: notImplementedInRust || { name: 'ltrim', expr: p.constant(' a ').ltrim(), expected: 'a ' },
+                rtrim: notImplementedInRust || { name: 'rtrim', expr: p.constant(' a ').rtrim(), expected: ' a' },
+                stringIndexOf: notImplementedInRust || {
+                    name: 'stringIndexOf',
+                    expr: p.constant('abc').stringIndexOf('b'),
+                    expected: 1,
+                },
+                stringRepeat: notImplementedInRust || {
+                    name: 'stringRepeat',
+                    expr: p.constant('ab').stringRepeat(2),
+                    expected: 'abab',
+                },
+                stringReplaceAll: notImplementedInRust || {
+                    name: 'stringReplaceAll',
+                    expr: p.constant('aba').stringReplaceAll('a', 'x'),
+                    expected: 'xbx',
+                },
+                stringReplaceOne: notImplementedInRust || {
+                    name: 'stringReplaceOne',
+                    expr: p.constant('aba').stringReplaceOne('a', 'x'),
+                    expected: 'xba',
+                },
+                ifNull: notImplementedInRust || {
+                    name: 'ifNull',
+                    expr: p.constant(null).ifNull('fallback'),
+                    expected: 'fallback',
+                },
+                coalesce: notImplementedInRust || {
+                    name: 'coalesce',
+                    expr: p.constant(null).coalesce(null, 'found'),
+                    expected: 'found',
+                },
+                isType: notImplementedInRust || {
+                    name: 'isType',
+                    expr: p.constant('str').isType('string'),
+                    expected: true,
+                },
+                getField: notImplementedInRust || {
+                    name: 'getField',
+                    expr: p.map({ a: 1 }).getField('a'),
+                    expected: 1,
+                },
+                parent: notImplementedInRust || {
+                    name: 'parent',
+                    expr: p.constant(fs.collection.doc('parent/sub/doc')).parent(),
+                    expected: fs.collection.doc('parent'),
+                },
+                arrayFilter: notImplementedInRust || {
+                    name: 'arrayFilter',
+                    expr: p.array([1, 2, 3]).arrayFilter('x', p.variable('x').greaterThan(1)),
+                    expected: [2, 3],
+                },
+                arrayTransform: notImplementedInRust || {
+                    name: 'arrayTransform',
+                    expr: p.array([1, 2]).arrayTransform('x', p.variable('x').multiply(10)),
+                    expected: [10, 20],
+                },
+                arrayTransformWithIndex: notImplementedInRust || {
+                    name: 'arrayTransformWithIndex',
+                    expr: p.array([10, 20]).arrayTransformWithIndex('x', 'i', p.variable('x').add(p.variable('i'))),
+                    expected: [10, 21],
+                },
+                arraySlice: notImplementedInRust || {
+                    name: 'arraySlice',
+                    expr: p.array([1, 2, 3]).arraySlice(1, 2),
+                    expected: [2, 3],
+                },
+                arrayFirst: notImplementedInRust || {
+                    name: 'arrayFirst',
+                    expr: p.array([1, 2]).arrayFirst(),
+                    expected: 1,
+                },
+                arrayFirstN: notImplementedInRust || {
+                    name: 'arrayFirstN',
+                    expr: p.array([1, 2, 3]).arrayFirstN(2),
+                    expected: [1, 2],
+                },
+                arrayLast: notImplementedInRust || {
+                    name: 'arrayLast',
+                    expr: p.array([1, 2]).arrayLast(),
+                    expected: 2,
+                },
+                arrayLastN: notImplementedInRust || {
+                    name: 'arrayLastN',
+                    expr: p.array([1, 2, 3]).arrayLastN(2),
+                    expected: [2, 3],
+                },
+                arrayMaximum: notImplementedInRust || {
+                    name: 'arrayMaximum',
+                    expr: p.array([1, 3, 2]).arrayMaximum(),
+                    expected: 3,
+                },
+                arrayMaximumN: notImplementedInRust || {
+                    name: 'arrayMaximumN',
+                    expr: p.array([1, 3, 2]).arrayMaximumN(2),
+                    expected: [3, 2],
+                },
+                arrayMinimum: notImplementedInRust || {
+                    name: 'arrayMinimum',
+                    expr: p.array([3, 1, 2]).arrayMinimum(),
+                    expected: 1,
+                },
+                arrayMinimumN: notImplementedInRust || {
+                    name: 'arrayMinimumN',
+                    expr: p.array([3, 1, 2]).arrayMinimumN(2),
+                    expected: [1, 2],
+                },
+                arrayIndexOf: notImplementedInRust || {
+                    name: 'arrayIndexOf',
+                    expr: p.array([1, 2, 1]).arrayIndexOf(1),
+                    expected: 0,
+                },
+                arrayLastIndexOf: notImplementedInRust || {
+                    name: 'arrayLastIndexOf',
+                    expr: p.array([1, 2, 1]).arrayLastIndexOf(1),
+                    expected: 2,
+                },
+                arrayIndexOfAll: notImplementedInRust || {
+                    name: 'arrayIndexOfAll',
+                    expr: p.array([1, 2, 1]).arrayIndexOfAll(1),
+                    expected: [0, 2],
+                },
+                mapSet: notImplementedInRust || {
+                    name: 'mapSet',
+                    expr: p.map({ a: 1 }).mapSet('b', 2),
+                    expected: { a: 1, b: 2 },
+                },
+                mapKeys: notImplementedInRust || {
+                    name: 'mapKeys',
+                    expr: p.map({ a: 1 }).mapKeys(),
+                    expected: ['a'],
+                },
+                mapValues: notImplementedInRust || {
+                    name: 'mapValues',
+                    expr: p.map({ a: 1 }).mapValues(),
+                    expected: [1],
+                },
+                mapEntries: notImplementedInRust || {
+                    name: 'mapEntries',
+                    expr: p.map({ a: 1 }).mapEntries(),
+                    expected: [{ k: 'a', v: 1 }],
+                },
+                timestampDiff: notImplementedInRust || {
+                    name: 'timestampDiff',
+                    expr: p.constant(new Date('2024-01-02T12:00:00Z')).timestampDiff(p.constant(new Date('2024-01-01T12:00:00Z')), 'day'),
+                    expected: 1,
+                },
+                timestampExtract: notImplementedInRust || {
+                    name: 'timestampExtract',
+                    expr: p.constant(new Date('2024-01-01T12:00:00Z')).timestampExtract('year'),
+                    expected: 2024,
+                },
             };
 
             const exprExportTests: Record<RelevantExportedFunctions, OperatorTestCase | OperatorTestCase[]> = {
@@ -1138,10 +1300,171 @@ suite('$description', fs => {
                     { name: 'regexContains (true)', expr: p.regexContains(p.constant('abc'), 'b'), expected: true },
                     { name: 'regexContains (false)', expr: p.regexContains(p.constant('abc'), 'd'), expected: false },
                 ],
+                regexFind: notImplementedInRust || {
+                    name: 'regexFind',
+                    expr: p.regexFind(p.constant('abc'), '[bd]'),
+                    expected: 'b',
+                },
+                regexFindAll: notImplementedInRust || {
+                    name: 'regexFindAll',
+                    expr: p.regexFindAll(p.constant('abcd'), '[bd]'),
+                    expected: ['b', 'd'],
+                },
                 stringContains: notImplementedInRust || [
                     { name: 'stringContains (true)', expr: p.stringContains(p.constant('abc'), 'b'), expected: true },
                     { name: 'stringContains (false)', expr: p.stringContains(p.constant('abc'), 'd'), expected: false },
                 ],
+                trunc: notImplementedInRust || { name: 'trunc', expr: p.trunc(p.constant(1.9)), expected: 1 },
+                rand: notImplementedInRust || { name: 'rand', expr: p.rand(), expected: expect.any(Number) },
+                ifNull: notImplementedInRust || {
+                    name: 'ifNull',
+                    expr: p.ifNull(p.constant(null), 'fallback'),
+                    expected: 'fallback',
+                },
+                coalesce: notImplementedInRust || {
+                    name: 'coalesce',
+                    expr: p.coalesce(p.constant(null), null, 'found'),
+                    expected: 'found',
+                },
+                isType: notImplementedInRust || {
+                    name: 'isType',
+                    expr: p.isType(p.constant('str'), 'string'),
+                    expected: true,
+                },
+                getField: notImplementedInRust || {
+                    name: 'getField',
+                    expr: p.getField(p.map({ a: 1 }), 'a'),
+                    expected: 1,
+                },
+                parent: notImplementedInRust || {
+                    name: 'parent',
+                    expr: p.parent(fs.collection.doc('parent/sub/doc')),
+                    expected: fs.collection.doc('parent'),
+                },
+                arrayFilter: notImplementedInRust || {
+                    name: 'arrayFilter',
+                    expr: p.arrayFilter(p.array([1, 2, 3]), 'x', p.variable('x').greaterThan(1)),
+                    expected: [2, 3],
+                },
+                arrayTransform: notImplementedInRust || {
+                    name: 'arrayTransform',
+                    expr: p.arrayTransform(p.array([1, 2]), 'x', p.variable('x').multiply(10)),
+                    expected: [10, 20],
+                },
+                arrayTransformWithIndex: notImplementedInRust || {
+                    name: 'arrayTransformWithIndex',
+                    expr: p.arrayTransformWithIndex(p.array([10, 20]), 'x', 'i', p.variable('x').add(p.variable('i'))),
+                    expected: [10, 21],
+                },
+                arraySlice: notImplementedInRust || {
+                    name: 'arraySlice',
+                    expr: p.arraySlice(p.array([1, 2, 3]), 1, 2),
+                    expected: [2, 3],
+                },
+                arrayFirst: notImplementedInRust || {
+                    name: 'arrayFirst',
+                    expr: p.arrayFirst(p.array([1, 2])),
+                    expected: 1,
+                },
+                arrayFirstN: notImplementedInRust || {
+                    name: 'arrayFirstN',
+                    expr: p.arrayFirstN(p.array([1, 2, 3]), 2),
+                    expected: [1, 2],
+                },
+                arrayLast: notImplementedInRust || {
+                    name: 'arrayLast',
+                    expr: p.arrayLast(p.array([1, 2])),
+                    expected: 2,
+                },
+                arrayLastN: notImplementedInRust || {
+                    name: 'arrayLastN',
+                    expr: p.arrayLastN(p.array([1, 2, 3]), 2),
+                    expected: [2, 3],
+                },
+                arrayMaximum: notImplementedInRust || {
+                    name: 'arrayMaximum',
+                    expr: p.arrayMaximum(p.array([1, 3, 2])),
+                    expected: 3,
+                },
+                arrayMaximumN: notImplementedInRust || {
+                    name: 'arrayMaximumN',
+                    expr: p.arrayMaximumN(p.array([1, 3, 2]), 2),
+                    expected: [3, 2],
+                },
+                arrayMinimum: notImplementedInRust || {
+                    name: 'arrayMinimum',
+                    expr: p.arrayMinimum(p.array([3, 1, 2])),
+                    expected: 1,
+                },
+                arrayMinimumN: notImplementedInRust || {
+                    name: 'arrayMinimumN',
+                    expr: p.arrayMinimumN(p.array([3, 1, 2]), 2),
+                    expected: [1, 2],
+                },
+                arrayIndexOf: notImplementedInRust || {
+                    name: 'arrayIndexOf',
+                    expr: p.arrayIndexOf(p.array([1, 2, 1]), 1),
+                    expected: 0,
+                },
+                arrayLastIndexOf: notImplementedInRust || {
+                    name: 'arrayLastIndexOf',
+                    expr: p.arrayLastIndexOf(p.array([1, 2, 1]), 1),
+                    expected: 2,
+                },
+                arrayIndexOfAll: notImplementedInRust || {
+                    name: 'arrayIndexOfAll',
+                    expr: p.arrayIndexOfAll(p.array([1, 2, 1]), 1),
+                    expected: [0, 2],
+                },
+                mapSet: notImplementedInRust || {
+                    name: 'mapSet',
+                    expr: p.mapSet(p.map({ a: 1 }), 'b', 2),
+                    expected: { a: 1, b: 2 },
+                },
+                mapKeys: notImplementedInRust || {
+                    name: 'mapKeys',
+                    expr: p.mapKeys(p.map({ a: 1 })),
+                    expected: ['a'],
+                },
+                mapValues: notImplementedInRust || {
+                    name: 'mapValues',
+                    expr: p.mapValues(p.map({ a: 1 })),
+                    expected: [1],
+                },
+                mapEntries: notImplementedInRust || {
+                    name: 'mapEntries',
+                    expr: p.mapEntries(p.map({ a: 1 })),
+                    expected: [{ k: 'a', v: 1 }],
+                },
+                timestampDiff: notImplementedInRust || {
+                    name: 'timestampDiff',
+                    expr: p.timestampDiff(
+                        p.constant(new Date('2024-01-02T12:00:00Z')),
+                        p.constant(new Date('2024-01-01T12:00:00Z')),
+                        'day',
+                    ),
+                    expected: 1,
+                },
+                timestampExtract: notImplementedInRust || {
+                    name: 'timestampExtract',
+                    expr: p.timestampExtract(p.constant(new Date('2024-01-01T12:00:00Z')), 'year'),
+                    expected: 2024,
+                },
+                variable: notImplementedInRust || {
+                    name: 'variable',
+                    expr: p.array([1]).arrayTransform('x', p.variable('x')),
+                    expected: [1],
+                },
+                currentDocument: notImplementedInRust || {
+                    name: 'currentDocument',
+                    expr: p.currentDocument().getField('city'),
+                    expected: 'Haarlem',
+                },
+                subcollection: notImplementedInRust || {
+                    name: 'subcollection',
+                    expr: p.subcollection('sub').toArrayExpression(),
+                    expected: [],
+                },
 
                 field: { name: 'field', expr: p.field('population'), expected: 160000 },
                 constant: { name: 'constant', expr: p.constant('yup'), expected: 'yup' },
@@ -1172,6 +1495,10 @@ suite('$description', fs => {
                     { name: 'xor (false, false)', expr: p.xor(p.constant(false), p.constant(false)), expected: false },
                     { name: 'xor (true, true)', expr: p.xor(p.constant(true), p.constant(true)), expected: false },
                 ],
+                nor: notImplementedInRust || [
+                    { name: 'nor (false, false)', expr: p.nor(p.constant(false), p.constant(false)), expected: true },
+                    { name: 'nor (true, false)', expr: p.nor(p.constant(true), p.constant(false)), expected: false },
+                ],
                 not: [
                     { name: 'not (true)', expr: p.constant(false).not(), expected: true },
                     { name: 'not (false)', expr: p.constant(true).not(), expected: false },
@@ -1181,6 +1508,18 @@ suite('$description', fs => {
                     expr: p.constant(true).conditional(p.constant('yes'), p.constant('no')),
                     expected: 'yes',
                 },
+                switchOn: notImplementedInRust || [
+                    {
+                        name: 'switchOn (match)',
+                        expr: p.switchOn(p.constant(true), p.constant('yes'), p.constant('no')),
+                        expected: 'yes',
+                    },
+                    {
+                        name: 'switchOn (default)',
+                        expr: p.switchOn(p.constant(false), p.constant('yes'), p.constant('no')),
+                        expected: 'no',
+                    },
+                ],
             };
 
             const allValidScalars = [
@@ -1204,9 +1543,39 @@ suite('$description', fs => {
                 });
             });
 
-            test.concurrent.each(brokenSDKExports)('Broken SDK export %s natively throws TypeError before networking', fnName => {
-                expect(p[fnName] satisfies Function).toBeUndefined();
-            });
+            const searchTests: Record<SearchOperators, { name: string; expr: p.Expression; fnName: string }> = {
+                documentMatches: {
+                    name: 'documentMatches',
+                    expr: p.documentMatches('Haarlem'),
+                    fnName: 'document_matches',
+                },
+                score: {
+                    name: 'score',
+                    expr: p.score(),
+                    fnName: 'score',
+                },
+                geoDistance: {
+                    name: 'geoDistance',
+                    expr: p.geoDistance(p.field('location'), new GeoPoint(0, 0)),
+                    fnName: 'geo_distance',
+                },
+            };
+
+            notImplementedInRust ||
+                describe.each(Object.values(searchTests))('SearchOperators: $name', ({ expr, fnName }) => {
+                    test.concurrent('is rejected outside search stage', async () => {
+                        const pipe = fs.firestore
+                            .pipeline()
+                            .collection(cityRef)
+                            .where(p.field('city').equal('Haarlem'))
+                            .limit(1)
+                            .select(expr.as('res'));
+
+                        await expect(pipe.execute()).rejects.toThrow(
+                            `3 INVALID_ARGUMENT: The '${fnName}' function can only be used in the search(...) stage.`,
+                        );
+                    });
+                });
 
             test.concurrent('all AggregateOperators', async () => {
                 const pipe = fs.firestore
@@ -1218,6 +1587,10 @@ suite('$description', fs => {
                             p.count(p.field('zero')).as('count'),
                             p.countIf(p.field('population').greaterThan(200000)).as('countIf'),
                             p.countDistinct(p.field('region')).as('countDistinct'),
+                            p.first(p.field('city')).as('first'),
+                            p.last(p.field('city')).as('last'),
+                            p.arrayAgg(p.field('region')).as('arrayAgg'),
+                            p.arrayAggDistinct(p.field('region')).as('arrayAggDistinct'),
                         ]),
                         p.sum('population').as('sum'),
                         p.average('area').as('average'),
@@ -1235,6 +1608,18 @@ suite('$description', fs => {
                         countAll: 5,
                         countIf: notImplementedInRust ? undefined : 3,
                         countDistinct: notImplementedInRust ? undefined : 3,
+                        first: notImplementedInRust
+                            ? undefined
+                            : expect.toBeOneOf(['Amersfoort', 'Utrecht', 'Amsterdam', 'Haarlem', 'Rotterdam']),
+                        last: notImplementedInRust
+                            ? undefined
+                            : expect.toBeOneOf(['Amersfoort', 'Utrecht', 'Amsterdam', 'Haarlem', 'Rotterdam']),
+                        arrayAgg: notImplementedInRust
+                            ? undefined
+                            : expect.toIncludeSameMembers(['Utrecht', 'Utrecht', 'Noord-Holland', 'Noord-Holland', 'Zuid-Holland']),
+                        arrayAggDistinct: notImplementedInRust
+                            ? undefined
+                            : expect.toIncludeSameMembers(['Utrecht', 'Noord-Holland', 'Zuid-Holland']),
                         sum: 2230000,
                         average: expect.closeTo(147.4, 1),
                         maximum: 900000,
