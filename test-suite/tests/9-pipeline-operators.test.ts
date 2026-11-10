@@ -541,6 +541,7 @@ suite('$description', fs => {
                 | 'arrayAggDistinct';
             type LogicOperators = 'and' | 'or' | 'xor' | 'nor' | 'not' | 'conditional' | 'switchOn';
             type OrderByOperators = 'ascending' | 'descending';
+            type SearchOperators = 'documentMatches' | 'score' | 'geoDistance';
 
             // Extract unhandled methods and functions
             type RelevantExpressionMethods = Exclude<
@@ -549,7 +550,7 @@ suite('$description', fs => {
             >;
             type RelevantExportedFunctions = Exclude<
                 keyof typeof p,
-                PipelineClasses | AggregateOperators | LogicOperators | OrderByOperators
+                PipelineClasses | AggregateOperators | LogicOperators | OrderByOperators | SearchOperators
             >;
 
             type OperatorTestCase = {
@@ -1464,21 +1465,6 @@ suite('$description', fs => {
                     expr: p.subcollection('sub').toArrayExpression(),
                     expected: [],
                 },
-                documentMatches: notImplementedInRust || {
-                    name: 'documentMatches',
-                    expr: p.documentMatches('Haarlem'),
-                    expected: true,
-                },
-                score: notImplementedInRust || {
-                    name: 'score',
-                    expr: p.score(),
-                    expected: 0,
-                },
-                geoDistance: notImplementedInRust || {
-                    name: 'geoDistance',
-                    expr: p.geoDistance(p.field('location'), new GeoPoint(0, 0)),
-                    expected: null,
-                },
 
                 field: { name: 'field', expr: p.field('population'), expected: 160000 },
                 constant: { name: 'constant', expr: p.constant('yup'), expected: 'yup' },
@@ -1556,6 +1542,40 @@ suite('$description', fs => {
                     expect(result.res).toEqual(expected);
                 });
             });
+
+            const searchTests: Record<SearchOperators, { name: string; expr: p.Expression; fnName: string }> = {
+                documentMatches: {
+                    name: 'documentMatches',
+                    expr: p.documentMatches('Haarlem'),
+                    fnName: 'document_matches',
+                },
+                score: {
+                    name: 'score',
+                    expr: p.score(),
+                    fnName: 'score',
+                },
+                geoDistance: {
+                    name: 'geoDistance',
+                    expr: p.geoDistance(p.field('location'), new GeoPoint(0, 0)),
+                    fnName: 'geo_distance',
+                },
+            };
+
+            notImplementedInRust ||
+                describe.each(Object.values(searchTests))('SearchOperators: $name', ({ expr, fnName }) => {
+                    test.concurrent('is rejected outside search stage', async () => {
+                        const pipe = fs.firestore
+                            .pipeline()
+                            .collection(cityRef)
+                            .where(p.field('city').equal('Haarlem'))
+                            .limit(1)
+                            .select(expr.as('res'));
+
+                        await expect(pipe.execute()).rejects.toThrow(
+                            `3 INVALID_ARGUMENT: The '${fnName}' function can only be used in the search(...) stage.`,
+                        );
+                    });
+                });
 
             test.concurrent('all AggregateOperators', async () => {
                 const pipe = fs.firestore
