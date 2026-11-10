@@ -2,7 +2,7 @@
     "compilerOptions": {
         "rootDir": ".",
         "declaration": false,
-        "moduleResolution": "node",
+        "moduleResolution": "bundler",
         "importHelpers": true,
         "target": "es2024",
         "module": "esnext",
