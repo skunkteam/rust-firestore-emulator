@@ -259,11 +259,10 @@ impl OwnedDocumentContentsWriteGuard {
             .versions
             .last()
             .and_then(DocumentVersion::stored_document)
+            && Value::fields_storage_eq(&last.fields, &fields)
         {
             trace!("fields are equal to previous version");
-            if last.fields == fields {
-                return Ok((last.update_time, None));
-            }
+            return Ok((last.update_time, None));
         }
         let create_time = self.create_time().unwrap_or(update_time);
         let version = DocumentVersion::Stored(Arc::new(StoredDocumentVersion {
@@ -454,4 +453,102 @@ async fn lock_timeout<F: Future>(
         _ = sleep(Duration::from_secs(1)) => warn!("waiting more than 1 second on a {kind} for {doc_name}"),
     }
     future_with_timeout.await
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{collections::HashMap, sync::Arc};
+
+    use fifo_rwlock::FifoRwLock;
+    use googleapis::google::{firestore::v1::Value, protobuf::Timestamp};
+    use googletest::prelude::*;
+
+    use super::{DocumentContents, OwnedDocumentContentsWriteGuard};
+    use crate::reference::DocumentRef;
+
+    #[gtest]
+    #[tokio::test]
+    async fn maybe_update_distinguishes_integer_and_double_and_preserves_nan_noop() {
+        let name: DocumentRef = "projects/p/databases/d/documents/col/doc".parse().unwrap();
+        let contents = Arc::new(FifoRwLock::new(DocumentContents::new(name)));
+        let t0 = Timestamp {
+            seconds: 100,
+            nanos:   0,
+        };
+        let mut guard = OwnedDocumentContentsWriteGuard {
+            guard: contents.write_owned().await,
+            acquire_time: t0,
+        };
+
+        let initial_fields = HashMap::from([
+            ("score".to_string(), Value::integer(1)),
+            (
+                "nested".to_string(),
+                Value::map(HashMap::from([(
+                    "items".to_string(),
+                    Value::array(vec![Value::integer(5)]),
+                )])),
+            ),
+            ("nan_val".to_string(), Value::double(f64::NAN)),
+        ]);
+
+        let t1 = Timestamp {
+            seconds: 101,
+            nanos:   0,
+        };
+        let (_, v1) = guard
+            .maybe_update(initial_fields.clone(), t1)
+            .await
+            .unwrap();
+        expect_that!(v1, some(anything()));
+
+        // Re-writing the exact same fields (including NaN) is a no-op.
+        let t2 = Timestamp {
+            seconds: 102,
+            nanos:   0,
+        };
+        let (ts, v2) = guard.maybe_update(initial_fields, t2).await.unwrap();
+        expect_eq!(ts, t1);
+        expect_that!(v2, none());
+
+        // Changing top-level integer 1 to double 1.0 creates a new version.
+        let top_level_double = HashMap::from([
+            ("score".to_string(), Value::double(1.0)),
+            (
+                "nested".to_string(),
+                Value::map(HashMap::from([(
+                    "items".to_string(),
+                    Value::array(vec![Value::integer(5)]),
+                )])),
+            ),
+            ("nan_val".to_string(), Value::double(f64::NAN)),
+        ]);
+        let t3 = Timestamp {
+            seconds: 103,
+            nanos:   0,
+        };
+        let (ts, v3) = guard.maybe_update(top_level_double, t3).await.unwrap();
+        expect_eq!(ts, t3);
+        expect_that!(v3, some(anything()));
+
+        // Changing nested integer 5 to double 5.0 creates a new version.
+        let nested_double = HashMap::from([
+            ("score".to_string(), Value::double(1.0)),
+            (
+                "nested".to_string(),
+                Value::map(HashMap::from([(
+                    "items".to_string(),
+                    Value::array(vec![Value::double(5.0)]),
+                )])),
+            ),
+            ("nan_val".to_string(), Value::double(f64::NAN)),
+        ]);
+        let t4 = Timestamp {
+            seconds: 104,
+            nanos:   0,
+        };
+        let (ts, v4) = guard.maybe_update(nested_double, t4).await.unwrap();
+        expect_eq!(ts, t4);
+        expect_that!(v4, some(anything()));
+    }
 }
