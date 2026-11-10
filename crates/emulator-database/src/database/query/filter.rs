@@ -174,12 +174,17 @@ impl FieldFilter {
             LessThanOrEqual => value <= &self.value,
             GreaterThan => value > &self.value,
             GreaterThanOrEqual => value >= &self.value,
-            Equal => value == &self.value,
+            Equal => {
+                (is_enterprise || (!value.is_null() && !value.is_nan())) && value == &self.value
+            }
             NotEqual => (is_enterprise || !value.is_null()) && value != &self.value,
             ArrayContains => value
                 .as_array()
                 .is_some_and(|arr| arr.contains(&self.value)),
-            In => self.value.as_array().is_some_and(|arr| arr.contains(value)),
+            In => {
+                (is_enterprise || (!value.is_null() && !value.is_nan()))
+                    && self.value.as_array().is_some_and(|arr| arr.contains(value))
+            }
             ArrayContainsAny => unimplemented!("ArrayContainsAny"),
             NotIn => unimplemented!("NotIn"),
         })
@@ -476,5 +481,19 @@ mod tests {
             value: Value::array(vec![Value::double(42.0)]),
         };
         expect_that!(in_filter.eval(&version, false), ok(eq(&true)));
+
+        let nan_version = StoredDocumentVersion {
+            name: "projects/p/databases/d/documents/col/nan".parse().unwrap(),
+            create_time: Timestamp::default(),
+            update_time: Timestamp::default(),
+            fields: HashMap::from([("val".to_string(), Value::double(f64::NAN))]),
+        };
+        let nan_in_filter = FieldFilter {
+            field: "val".parse().unwrap(),
+            op:    FieldOperator::In,
+            value: Value::array(vec![Value::double(f64::NAN)]),
+        };
+        expect_that!(nan_in_filter.eval(&nan_version, false), ok(eq(&false)));
+        expect_that!(nan_in_filter.eval(&nan_version, true), ok(eq(&true)));
     }
 }

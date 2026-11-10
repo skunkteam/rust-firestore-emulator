@@ -49,6 +49,31 @@ describe.each(editions)('$description', fs => {
             stop();
         });
 
+        test.concurrent(
+            'updates when changing numeric representation (-0.0 to 0 or double 1.0 to int 1), but not on identical NaN',
+            async () => {
+                const doc = fs.collection.doc();
+                const { stop, getCurrent, getNext } = listen(doc);
+
+                await getCurrent();
+
+                const initialData = writeData({ score: -0, nanVal: NaN });
+                const [firstSnap, { writeTime: createTime }] = await Promise.all([getNext(), doc.create(initialData)]);
+                expect(firstSnap.updateTime).toEqual(createTime);
+
+                // Re-writing the exact same fields (including NaN and -0) is a no-op
+                const { writeTime: noopTime } = await doc.set(initialData);
+                expect(noopTime).toEqual(createTime);
+
+                // Overwriting -0 (doubleValue: -0.0) with 0 (integerValue: 0) changes storage representation and triggers an update
+                const [secondSnap, { writeTime: intZeroTime }] = await Promise.all([getNext(), doc.set({ ...initialData, score: 0 })]);
+                expect(intZeroTime).not.toEqual(createTime);
+                expect(secondSnap.updateTime).toEqual(intZeroTime);
+
+                stop();
+            },
+        );
+
         test.concurrent('create, listen, update, stop', async () => {
             const doc = fs.collection.doc();
 

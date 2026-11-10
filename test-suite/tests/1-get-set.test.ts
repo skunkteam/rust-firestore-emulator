@@ -180,6 +180,15 @@ describe.each(editions)('$description', fs => {
                     } else {
                         expect(await getDoc()).toEqual({ arr: [{ first: 'value' }, 'second', { third: 3 }] });
                     }
+
+                    // Cross-type numeric (0 vs -0) and NaN deduplication
+                    await updateFn({ arr: [0, NaN, { nested: -0 }] });
+                    await updateFn({ arr: FieldValue.arrayUnion(-0, NaN, { nested: 0 }, 42) });
+                    if (setOperation) {
+                        expect(await getDoc()).toEqual({ arr: [-0, NaN, { nested: 0 }, 42] });
+                    } else {
+                        expect(await getDoc()).toEqual({ arr: [0, NaN, { nested: -0 }, 42] });
+                    }
                 });
 
                 test('arrayRemove', async () => {
@@ -190,6 +199,11 @@ describe.each(editions)('$description', fs => {
 
                     await updateFn({ arr: FieldValue.arrayRemove('third', { first: 'foo' }, 'nope') });
                     expect(await getDoc()).toEqual({ arr: setOperation ? [] : [{ second: 'bar' }] });
+
+                    // Cross-type numeric (-0 removed by 0) and NaN removal
+                    await updateFn({ arr: [-0, NaN, { nested: -0 }, 42] });
+                    await updateFn({ arr: FieldValue.arrayRemove(0, NaN, { nested: 0 }) });
+                    expect(await getDoc()).toEqual({ arr: setOperation ? [] : [42] });
                 });
             });
         });

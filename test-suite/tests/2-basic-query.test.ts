@@ -6,6 +6,7 @@ import {
     DocumentReference,
     FieldPath,
     FieldValue,
+    GeoPoint,
     Query,
     QueryDocumentSnapshot,
     Timestamp,
@@ -302,6 +303,7 @@ describe.each(editions)('$description', fs => {
             describe('inequality on type', () => {
                 test.each([
                     { type: 'number', data: numbers },
+                    { type: 'number', data: numbers, itemToExclude: numbers.find(e => e.ordered === 1) },
                     { type: 'number', data: numbers, itemToExclude: numbers.find(e => e.ordered === Number.MAX_VALUE) },
                     { type: 'string', data: strings },
                     { type: 'bytes', data: bytes },
@@ -623,6 +625,91 @@ describe.each(editions)('$description', fs => {
             const snap = await aggregate.get();
             return snap.data();
         }
+    });
+
+    describe('value comparison edge cases', () => {
+        test('cross-type numeric, -0/+0, NaN, and GeoPoint comparisons in where filters', async () => {
+            const subCol = fs.collection.doc().collection('comparisonEdgeCases');
+            const docIntZero = subCol.doc('int-zero');
+            const docNegZero = subCol.doc('neg-zero');
+            const docIntOne = subCol.doc('int-one');
+            const docDoubleOne = subCol.doc('double-one');
+            const docNan = subCol.doc('nan');
+            const docGeo = subCol.doc('geo');
+
+            await Promise.all([
+                docIntZero.set(writeData({ val: 0, arr: [0] })),
+                // -0 is encoded by @google-cloud/firestore as doubleValue: -0.0
+                docNegZero.set(writeData({ val: -0, arr: [-0] })),
+                docIntOne.set(writeData({ val: 1, arr: [1] })),
+                docDoubleOne
+                    .set(writeData({ val: 0.5, arr: [-0, { nested: NaN }] }))
+                    .then(() => docDoubleOne.update({ val: FieldValue.increment(0.5) })),
+                docNan.set(writeData({ val: NaN, arr: [{ nested: NaN }] })),
+                docGeo.set(writeData({ geo: new GeoPoint(52.0907, 5.1214) })),
+            ]);
+
+            const ids = async (q: Query) => (await q.get()).docs.map(d => d.id);
+            const missingValIds = fs.enterprise ? ['geo'] : [];
+
+            // 0 (int) and -0.0 (double) compare equal under ==, !=, in, and array-contains
+            expect(await ids(subCol.where('val', '==', 0))).toIncludeSameMembers(['int-zero', 'neg-zero']);
+            expect(await ids(subCol.where('val', '==', -0))).toIncludeSameMembers(['int-zero', 'neg-zero']);
+            expect(await ids(subCol.where('val', '!=', -0))).toIncludeSameMembers(['int-one', 'double-one', 'nan', ...missingValIds]);
+
+            // 1 (int) and 1.0 (double) compare equal under ==, !=, and in
+            expect(await ids(subCol.where('val', '==', 1))).toIncludeSameMembers(['int-one', 'double-one']);
+            expect(await ids(subCol.where('val', '!=', 1))).toIncludeSameMembers(['int-zero', 'neg-zero', 'nan', ...missingValIds]);
+            expect(await ids(subCol.where('val', 'in', [-0, 1]))).toIncludeSameMembers(['int-zero', 'neg-zero', 'int-one', 'double-one']);
+
+            // NaN matches NaN in == (UnaryFilter IS_NAN), in (Enterprise edition only), and nested array-contains
+            expect(await ids(subCol.where('val', '==', NaN))).toEqual(['nan']);
+            expect(await ids(subCol.where('val', 'in', [NaN]))).toEqual(fs.enterprise ? ['nan'] : []);
+            expect(await ids(subCol.where('arr', 'array-contains', { nested: NaN }))).toIncludeSameMembers(['double-one', 'nan']);
+
+            // array-contains matches across 0 (int) and -0.0 (double)
+            expect(await ids(subCol.where('arr', 'array-contains', -0))).toIncludeSameMembers(['int-zero', 'neg-zero', 'double-one']);
+            expect(await ids(subCol.where('arr', 'array-contains', 0))).toIncludeSameMembers(['int-zero', 'neg-zero', 'double-one']);
+
+            // GeoPoint equality and inequality
+            expect(await ids(subCol.where('geo', '==', new GeoPoint(52.0907, 5.1214)))).toEqual(['geo']);
+            expect(await ids(subCol.where('geo', '!=', new GeoPoint(52.0907, 5.1214)))).toIncludeSameMembers(
+                fs.enterprise ? ['int-zero', 'neg-zero', 'int-one', 'double-one', 'nan'] : [],
+            );
+        });
+
+        test('exact 64-bit integer vs float64 precision above 2^53', async () => {
+            const subCol = fs.collection.doc().collection('precisionEdgeCases');
+            // 9007199254740992 (2^53) is outside Number.isSafeInteger, so @google-cloud/firestore encodes it as doubleValue,
+            // whereas BigInt values are encoded as integerValue.
+            const twoPow53Double = 9007199254740992;
+            const twoPow53Int = 9007199254740992n;
+            const twoPow53PlusOneInt = 9007199254740993n;
+            const maxInt64 = 9223372036854775807n;
+            const twoPow63Double = 9223372036854775808;
+
+            await Promise.all([
+                subCol.doc('double-2p53').set(writeData({ val: twoPow53Double })),
+                subCol.doc('int-2p53').set(writeData({ val: twoPow53Int })),
+                subCol.doc('int-2p53-plus-1').set(writeData({ val: twoPow53PlusOneInt })),
+                subCol.doc('int-max').set(writeData({ val: maxInt64 })),
+                subCol.doc('double-2p63').set(writeData({ val: twoPow63Double })),
+            ]);
+
+            const ids = async (q: Query) => (await q.get()).docs.map(d => d.id);
+
+            // 2^53 as double equals 2^53 as int64, but does NOT equal 2^53 + 1 as int64
+            expect(await ids(subCol.where('val', '==', twoPow53Double))).toIncludeSameMembers(['double-2p53', 'int-2p53']);
+            expect(await ids(subCol.where('val', '==', twoPow53PlusOneInt))).toEqual(['int-2p53-plus-1']);
+
+            // i64::MAX (2^63 - 1) is strictly less than 2^63 as double
+            expect(await ids(subCol.where('val', '==', maxInt64))).toEqual(['int-max']);
+            expect(await ids(subCol.where('val', '==', twoPow63Double))).toEqual(['double-2p63']);
+
+            const orderedIds = await ids(subCol.orderBy('val', 'asc'));
+            expect(orderedIds.slice(0, 2)).toIncludeSameMembers(['double-2p53', 'int-2p53']);
+            expect(orderedIds.slice(2)).toEqual(['int-2p53-plus-1', 'int-max', 'double-2p63']);
+        });
     });
 
     async function getData(query: Query) {
