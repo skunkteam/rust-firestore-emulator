@@ -18,7 +18,7 @@ ui = ["emulator-http/ui"]
 members = ["crates/*"]
 
 [workspace.package]
-version = "0.3.0-beta.1"
+version = "0.3.0-beta.2"
 
 [workspace.dependencies]
 axum = "0.8"
