@@ -625,12 +625,15 @@ dependencies = [
  "axum",
  "emulator-database",
  "emulator-tracing",
+ "googleapis",
  "googletest",
  "reqwest",
  "serde",
  "serde_json",
  "tokio",
+ "tokio-stream",
  "tower-http 0.7.1",
+ "tracing",
 ]
 
 [[package]]

@@ -1,12 +1,11 @@
 # googleapis Source (`src`)
 
 ## Overview
-Core library implementation for the `googleapis` crate. It includes the `tonic`/`prost`-generated Google Firestore v1 and protobuf well-known types (`tonic::include_proto!("googleapis")`) and extends generated types (`Timestamp`, `TransactionOptions`, `Value`, and `LatLng`) with constructors, accessors, total ordering, arithmetic aggregations, token serialization, and custom `serde` serializers.
+Core library implementation for the `googleapis` crate. It includes the `tonic`/`prost`-generated Google Firestore v1 and protobuf well-known types (`tonic::include_proto!("googleapis")`) and extends generated types (`Timestamp`, `TransactionOptions`, `Value`, `Document`, `Precondition`, `StructuredQuery`, and `LatLng`) with constructors, accessors, total ordering, arithmetic aggregations, token serialization, and canonical Proto3 JSON (`serde`) serialization and deserialization.
 
 ## Interface
 - `[lib.rs:googleapis]`: `tonic::include_proto!("googleapis")` re-exporting generated `google` protobuf modules (`google::firestore::v1`, `google::protobuf`, `google::r#type`, `google::rpc`, `google::api`).
-- `[ser.rs:as_base64]`: `pub(crate) fn as_base64<T: AsRef<[u8]>, S: Serializer>(v: T, s: S) -> Result<S::Ok, S::Error>` — serializes `bytes_value` fields as unpadded standard base64 (`BASE64_STANDARD_NO_PAD`).
-- `[ser.rs:as_null]`: `pub(crate) fn as_null<T, S: Serializer>(_v: T, s: S) -> Result<S::Ok, S::Error>` — serializes Firestore `null_value` fields as unit/`null`.
+- `[ser.rs]`: Canonical Proto3 JSON `serde::Serialize` and `serde::Deserialize` implementations for `google::protobuf::Timestamp`, `google::firestore::v1::Value`, `Precondition`, `StructuredQuery` (and nested `Filter`, `CompositeFilter`, `FieldFilter`, `UnaryFilter`, `Order`), `RunQueryRequest`, `RunQueryResponse`, and `ListCollectionIdsRequest` (alongside `build.rs`-derived `Serialize`/`Deserialize` on `Document`, `DocumentMask`, `ArrayValue`, `MapValue`, `LatLng`, `Cursor`, `ListDocumentsResponse`, and `ListCollectionIdsResponse`).
 - `[timestamp_ext.rs:InvalidTokenError]`: `pub struct InvalidTokenError` (implements `std::error::Error` and `From<InvalidTokenError> for String`).
 - `[timestamp_ext.rs:TimestampOutOfRangeError]`: `pub struct TimestampOutOfRangeError(#[from] time::error::ComponentRange)` (implements `std::error::Error` and `From<TimestampOutOfRangeError> for String`).
 - `[timestamp_ext.rs:Timestamp]`:
@@ -23,6 +22,8 @@ Core library implementation for the `googleapis` crate. It includes the `tonic`/
 - `[value_ext.rs:LatLng]`: Trait implementations `Eq`, `PartialOrd`, and `Ord` using `f64::total_cmp` on `latitude` then `longitude`.
 
 ## Invariants
+- `[ser.rs:Value]`: Enforces single-key ProtoJSON objects (`nullValue`, `booleanValue`, `integerValue` as decimal string, `doubleValue` with `"NaN"`/`"Infinity"`/`"-Infinity"` support, RFC 3339 `timestampValue`, `stringValue`, padded Base64 `bytesValue`, `referenceValue`, `geoPointValue`, `arrayValue`, `mapValue`, `fieldReferenceValue`); rejects empty `{}` or multi-key objects during deserialization so `Value { value_type: None }` is never produced.
+- `[ser.rs:Filter]`: Requires `filter_type`, `field`, `op`, `value`, and `operand_type` on deserialized `Filter`, `FieldFilter`, and `UnaryFilter` nodes so downstream query compilation never encounters missing optional fields.
 - `[timestamp_ext.rs:Timestamp::now]`: Guarantees strictly monotonically increasing timestamps across all calls within the process execution; if `OffsetDateTime::now_utc()` is less than or equal to the previous timestamp, `nanos` is incremented by `1`.
 - `[timestamp_ext.rs:Timestamp::from_token]` / `[timestamp_ext.rs:Timestamp::get_token]`: Tokens must be exactly 16-byte native-endian `i128` Unix nanosecond representations within `time::OffsetDateTime`'s valid range.
 - `[value_ext.rs:Value::value_type]` / `[value_ext.rs:Value::value_type_mut]` / `[value_ext.rs:Value::into_value_type]`: Assume `self.value_type` is `Some(...)` and panic with `"missing value_type in value"` if `None`.

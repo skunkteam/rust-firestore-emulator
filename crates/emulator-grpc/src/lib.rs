@@ -6,15 +6,14 @@ use std::mem;
 use emulator_database::{
     FirestoreProject, pipeline,
     projection::{Project, Projection},
-    query::{Query, QueryBuilder},
+    query::Query,
     read_consistency::ReadConsistency,
-    reference::{DocumentRef, Ref, RootRef},
+    reference::{CollectionRef, DocumentRef, Ref, RootRef},
 };
 use futures::{TryStreamExt, future::join_all, stream::BoxStream};
 use googleapis::google::{
     firestore::v1::{
         firestore_server::{Firestore, FirestoreServer},
-        structured_query::CollectionSelector,
         *,
     },
     protobuf::{Empty, Timestamp},
@@ -222,9 +221,39 @@ impl Firestore for FirestoreEmulator {
     #[instrument(level = Level::DEBUG, skip_all, err)]
     async fn create_document(
         &self,
-        _request: Request<CreateDocumentRequest>,
+        request: Request<CreateDocumentRequest>,
     ) -> Result<Response<Document>> {
-        unimplemented!("CreateDocument");
+        let CreateDocumentRequest {
+            parent,
+            collection_id,
+            document_id,
+            document,
+            mask,
+        } = request.into_inner();
+
+        if collection_id.is_empty() || collection_id.contains('/') {
+            return Err(Status::invalid_argument(
+                "collection_id must be a single non-empty segment",
+            ));
+        }
+        let doc = mandatory!(document);
+        if !doc.name.is_empty() {
+            return Err(Status::invalid_argument(
+                "document.name must not be set on CreateDocument",
+            ));
+        }
+        let parent_ref: Ref = parent.parse()?;
+        if matches!(parent_ref, Ref::Collection(_)) {
+            return Err(Status::invalid_argument(
+                "parent must be a database root or document path",
+            ));
+        }
+        let col_ref: CollectionRef = format!("{parent_ref}/{collection_id}").parse()?;
+        let database = self.project.database(&col_ref.root_ref).await;
+        let created = database
+            .create_doc(&col_ref, &document_id, doc.fields, mask)
+            .await?;
+        Ok(Response::new(created))
     }
 
     /// Lists documents.
@@ -244,51 +273,24 @@ impl Firestore for FirestoreEmulator {
             consistency_selector,
         } = request.into_inner();
 
-        unimplemented_collection!(order_by);
-        unimplemented_collection!(page_token);
-        if show_missing && collection_id.is_empty() {
-            // This assumption is used with the `strip_prefix` later on.
-            unimplemented!("show_missing without a collection parent");
-        }
-
         let parent: Ref = parent.parse()?;
         let database = self.project.database(parent.root()).await;
-
-        let mut query = QueryBuilder::from(
-            parent.clone(),
-            vec![CollectionSelector {
-                all_descendants: collection_id.is_empty(),
-                collection_id:   collection_id.clone(),
-            }],
-        )
-        .enterprise_edition(database.enterprise_edition())
-        .select(mask.map(|mask| mask.try_into()).transpose()?)
-        .consistency(consistency_selector.try_into()?)
-        .build()?;
-
-        let (_, found_docs) = query.once(&database).await?;
-        let mut documents = found_docs.iter().map(|v| query.project(v)).collect_vec();
-
-        if show_missing {
-            documents.extend(
-                query
-                    .missing_docs(&database)
-                    .await?
-                    .into_iter()
-                    .map(|name| Document {
-                        name,
-                        ..Default::default()
-                    }),
-            );
-        }
-
-        if page_size > 0 && documents.len() > page_size as usize {
-            unimplemented!("resultset greater than page_size");
-        }
+        let (documents, next_page_token) = database
+            .list_docs(
+                parent,
+                collection_id,
+                page_size,
+                page_token,
+                order_by,
+                mask,
+                show_missing,
+                consistency_selector.try_into()?,
+            )
+            .await?;
 
         Ok(Response::new(ListDocumentsResponse {
             documents,
-            next_page_token: Default::default(),
+            next_page_token,
         }))
     }
 
@@ -296,18 +298,45 @@ impl Firestore for FirestoreEmulator {
     #[instrument(level = Level::DEBUG, skip_all, err)]
     async fn update_document(
         &self,
-        _request: Request<UpdateDocumentRequest>,
+        request: Request<UpdateDocumentRequest>,
     ) -> Result<Response<Document>> {
-        unimplemented!("update_document");
+        let UpdateDocumentRequest {
+            document,
+            update_mask,
+            mask,
+            current_document,
+        } = request.into_inner();
+
+        let doc = mandatory!(document);
+        let doc_ref: DocumentRef = doc.name.parse()?;
+        let database = self
+            .project
+            .database(&doc_ref.collection_ref.root_ref)
+            .await;
+        let updated = database
+            .update_doc(&doc_ref, doc.fields, update_mask, current_document, mask)
+            .await?;
+        Ok(Response::new(updated))
     }
 
     /// Deletes a document.
     #[instrument(level = Level::DEBUG, skip_all, err)]
     async fn delete_document(
         &self,
-        _request: Request<DeleteDocumentRequest>,
+        request: Request<DeleteDocumentRequest>,
     ) -> Result<Response<Empty>> {
-        unimplemented!("delete_document");
+        let DeleteDocumentRequest {
+            name,
+            current_document,
+        } = request.into_inner();
+
+        let doc_ref: DocumentRef = name.parse()?;
+        let database = self
+            .project
+            .database(&doc_ref.collection_ref.root_ref)
+            .await;
+        database.delete_doc(&doc_ref, current_document).await?;
+        Ok(Response::new(Empty {}))
     }
 
     /// Starts a new transaction.

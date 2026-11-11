@@ -10,6 +10,7 @@ use googleapis::google::{
     firestore::v1::{
         document_transform::field_transform::{ServerValue, TransformType},
         structured_aggregation_query::{Aggregation, aggregation},
+        structured_query::CollectionSelector,
         *,
     },
     protobuf::Timestamp,
@@ -27,16 +28,18 @@ use self::{
     document::{
         DocumentMeta, DocumentVersion, OwnedDocumentContentsWriteGuard, StoredDocumentVersion,
     },
-    event::DatabaseEvent,
+    event::{DatabaseEvent, ProjectEvent},
     field_path::FieldPath,
-    query::Query,
+    projection::{Project, Projection},
+    query::{Direction, Query, QueryBuilder},
     read_consistency::ReadConsistency,
     reference::{CollectionRef, DocumentRef, Ref, RootRef},
     transaction::{RunningTransactions, TransactionId},
 };
 use crate::{
     FirestoreProject, GenericDatabaseError, database::field_path::FieldReference, error::Result,
-    unimplemented, unimplemented_collection, unimplemented_option, utils::RwLockHashMapExt,
+    unimplemented, unimplemented_bool, unimplemented_collection, unimplemented_option,
+    utils::RwLockHashMapExt,
 };
 
 mod collection;
@@ -309,10 +312,20 @@ impl FirestoreDatabase {
     }
 
     pub async fn write(self: &Arc<Self>, write: Write) -> Result<WriteResult> {
+        let (result, _) = self.write_with_version(write).await?;
+        Ok(result)
+    }
+
+    async fn write_with_version(
+        self: &Arc<Self>,
+        write: Write,
+    ) -> Result<(WriteResult, Option<Arc<StoredDocumentVersion>>)> {
         let name = get_doc_name_from_write(&write)?;
         let mut guard = self.get_doc_meta(&name).await?.write_owned().await?;
         let update_time = guard.acquire_time;
         let (result, new_version) = self.perform_write(write, &mut guard, update_time).await?;
+        let current_stored = guard.current_version().cloned();
+        drop(guard);
         if let Some(new_version) = new_version {
             self.send_event(DatabaseEvent {
                 database: Arc::downgrade(self),
@@ -320,7 +333,208 @@ impl FirestoreDatabase {
                 updates: [(name.clone(), new_version)].into(),
             });
         }
-        Ok(result)
+        Ok((result, current_stored))
+    }
+
+    #[instrument(level = Level::DEBUG, skip_all, err)]
+    pub async fn create_doc(
+        self: &Arc<Self>,
+        parent: &CollectionRef,
+        document_id: &str,
+        fields: HashMap<String, Value>,
+        mask: Option<DocumentMask>,
+    ) -> Result<Document> {
+        if document_id.is_empty() {
+            return Err(GenericDatabaseError::invalid_argument(
+                "document_id is required",
+            ));
+        }
+        let doc_ref: DocumentRef = format!("{parent}/{document_id}").parse()?;
+        let projection = mask.map(Projection::try_from).transpose()?;
+        let (_, stored) = self
+            .write_with_version(Write {
+                update_mask: None,
+                update_transforms: vec![],
+                current_document: Some(Precondition {
+                    condition_type: Some(precondition::ConditionType::Exists(false)),
+                }),
+                operation: Some(write::Operation::Update(Document {
+                    name: doc_ref.to_string(),
+                    fields,
+                    create_time: None,
+                    update_time: None,
+                })),
+            })
+            .await?;
+        let stored = stored.ok_or_else(|| {
+            GenericDatabaseError::internal(format!(
+                "created document missing immediately after write: {doc_ref}"
+            ))
+        })?;
+        Ok(projection.project(&stored))
+    }
+
+    #[instrument(level = Level::DEBUG, skip_all, err)]
+    pub async fn update_doc(
+        self: &Arc<Self>,
+        doc_ref: &DocumentRef,
+        fields: HashMap<String, Value>,
+        update_mask: Option<DocumentMask>,
+        current_document: Option<Precondition>,
+        mask: Option<DocumentMask>,
+    ) -> Result<Document> {
+        let projection = mask.map(Projection::try_from).transpose()?;
+        let (_, stored) = self
+            .write_with_version(Write {
+                update_mask,
+                update_transforms: vec![],
+                current_document,
+                operation: Some(write::Operation::Update(Document {
+                    name: doc_ref.to_string(),
+                    fields,
+                    create_time: None,
+                    update_time: None,
+                })),
+            })
+            .await?;
+        Ok(match stored {
+            Some(stored) => projection.project(&stored),
+            None => Document {
+                name: doc_ref.to_string(),
+                ..Default::default()
+            },
+        })
+    }
+
+    #[instrument(level = Level::DEBUG, skip_all, err)]
+    pub async fn delete_doc(
+        self: &Arc<Self>,
+        doc_ref: &DocumentRef,
+        current_document: Option<Precondition>,
+    ) -> Result<()> {
+        self.write(Write {
+            update_mask: None,
+            update_transforms: vec![],
+            current_document,
+            operation: Some(write::Operation::Delete(doc_ref.to_string())),
+        })
+        .await?;
+        Ok(())
+    }
+
+    #[instrument(level = Level::DEBUG, skip_all, err)]
+    pub async fn delete_prefix(self: &Arc<Self>, prefix: &Ref) -> Result<usize> {
+        let mut to_delete = BTreeSet::new();
+        if let Ref::Document(doc_ref) = prefix {
+            let meta = self.get_doc_meta(doc_ref).await?;
+            if meta.read().await?.exists() {
+                to_delete.insert(doc_ref.clone());
+            }
+        }
+        for col in self.get_all_collections().await {
+            let col_as_ref = Ref::Collection(col.name.clone());
+            if &col_as_ref == prefix || prefix.is_parent_of(&col_as_ref) {
+                for meta in col.docs().await {
+                    if meta.read().await?.exists() {
+                        to_delete.insert(meta.name.clone());
+                    }
+                }
+            }
+        }
+        let count = to_delete.len();
+        for doc_ref in to_delete {
+            self.delete_doc(&doc_ref, None).await?;
+        }
+        Ok(count)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    #[instrument(level = Level::DEBUG, skip_all, err)]
+    pub async fn list_docs(
+        &self,
+        parent: Ref,
+        collection_id: String,
+        page_size: i32,
+        page_token: String,
+        order_by: String,
+        mask: Option<DocumentMask>,
+        show_missing: bool,
+        consistency: ReadConsistency,
+    ) -> Result<(Vec<Document>, String)> {
+        if page_size < 0 {
+            return Err(GenericDatabaseError::invalid_argument(
+                "page_size must be non-negative",
+            ));
+        }
+        if show_missing && !order_by.is_empty() {
+            return Err(GenericDatabaseError::invalid_argument(
+                "show_missing cannot be combined with order_by",
+            ));
+        }
+        unimplemented_bool!(show_missing && collection_id.is_empty());
+
+        let parsed_orders = parse_list_order_by(&order_by)?;
+        let mut builder = QueryBuilder::from(
+            parent,
+            vec![CollectionSelector {
+                all_descendants: collection_id.is_empty(),
+                collection_id:   collection_id.clone(),
+            }],
+        )
+        .enterprise_edition(self.enterprise_edition())
+        .select(mask.map(Projection::try_from).transpose()?)
+        .consistency(consistency);
+
+        if parsed_orders.is_empty() {
+            builder = builder.order_by(FieldReference::DocumentName, Direction::Ascending);
+        } else {
+            let last_dir = parsed_orders
+                .last()
+                .map(|(_, d)| *d)
+                .unwrap_or(Direction::Ascending);
+            let has_doc_name = parsed_orders.iter().any(|(f, _)| f.is_document_name());
+            for (field, dir) in parsed_orders {
+                builder = builder.order_by(field, dir);
+            }
+            if !has_doc_name {
+                builder = builder.order_by(FieldReference::DocumentName, last_dir);
+            }
+        }
+
+        let mut query = builder.build()?;
+        let (_, found_docs) = query.once(self).await?;
+        let mut documents: Vec<Document> = found_docs.iter().map(|v| query.project(v)).collect();
+
+        if show_missing && !collection_id.is_empty() {
+            let existing_names: std::collections::HashSet<String> =
+                documents.iter().map(|d| d.name.clone()).collect();
+            for missing_name in query.missing_docs(self).await? {
+                if !existing_names.contains(&missing_name) {
+                    documents.push(Document {
+                        name: missing_name,
+                        ..Default::default()
+                    });
+                }
+            }
+            documents.sort_by(|a, b| a.name.split('/').cmp(b.name.split('/')));
+        }
+
+        if !page_token.is_empty() {
+            if let Some(pos) = documents.iter().position(|d| d.name == page_token) {
+                documents.drain(..=pos);
+            } else if order_by.is_empty() {
+                documents.retain(|d| d.name.split('/').gt(page_token.split('/')));
+            }
+        }
+
+        let next_page_token = if page_size > 0 && documents.len() > page_size as usize {
+            documents.truncate(page_size as usize);
+            documents.last().map(|d| d.name.clone()).unwrap_or_default()
+        } else {
+            String::new()
+        };
+
+        Ok((documents, next_page_token))
     }
 
     #[instrument(level = Level::DEBUG, skip_all, err)]
@@ -412,6 +626,7 @@ impl FirestoreDatabase {
         let (update_time, document_version) = match operation {
             Update(doc) => {
                 debug!(name = %document.name, "Update");
+                validate_writable_fields(&doc.fields)?;
 
                 let mut fields = if let Some(mask) = update_mask {
                     apply_updates(document, mask, &doc.fields)?
@@ -430,6 +645,7 @@ impl FirestoreDatabase {
                         commit_time,
                     )?);
                 }
+                validate_writable_fields(&fields)?;
                 document.maybe_update(fields, commit_time).await?
             }
             Delete(_) => {
@@ -495,6 +711,16 @@ impl FirestoreDatabase {
     }
 
     pub fn send_event(&self, event: DatabaseEvent) {
+        if !event.updates.is_empty() {
+            let mut paths: Vec<String> = event.updates.keys().map(ToString::to_string).collect();
+            paths.sort();
+            self.project
+                .send_project_event(ProjectEvent::DocumentsChanged {
+                    database: self.name.clone(),
+                    paths,
+                    update_time: event.update_time,
+                });
+        }
         // A send operation can only fail if there are no active receivers,
         // which is ok by me.
         let _unused = self.events.send(event.into());
@@ -509,8 +735,16 @@ impl FirestoreDatabase {
     }
 
     pub fn set_enterprise_edition(&self, enterprise_edition: bool) {
-        self.enterprise_edition
-            .store(enterprise_edition, atomic::Ordering::Relaxed);
+        if self
+            .enterprise_edition
+            .swap(enterprise_edition, atomic::Ordering::Relaxed)
+            != enterprise_edition
+        {
+            self.project
+                .send_project_event(ProjectEvent::DatabaseConfigChanged {
+                    database: self.name.clone(),
+                });
+        }
     }
 
     pub fn optimistic_concurrency(&self) -> bool {
@@ -518,9 +752,96 @@ impl FirestoreDatabase {
     }
 
     pub fn set_optimistic_concurrency(&self, optimistic_concurrency: bool) {
-        self.optimistic_concurrency
-            .store(optimistic_concurrency, atomic::Ordering::Relaxed);
+        if self
+            .optimistic_concurrency
+            .swap(optimistic_concurrency, atomic::Ordering::Relaxed)
+            != optimistic_concurrency
+        {
+            self.project
+                .send_project_event(ProjectEvent::DatabaseConfigChanged {
+                    database: self.name.clone(),
+                });
+        }
     }
+}
+
+fn validate_writable_fields(fields: &HashMap<String, Value>) -> Result<()> {
+    for value in fields.values() {
+        validate_writable_value(value, false)?;
+    }
+    Ok(())
+}
+
+fn validate_writable_value(value: &Value, in_array: bool) -> Result<()> {
+    use value::ValueType;
+    match &value.value_type {
+        None => Err(GenericDatabaseError::invalid_argument(
+            "document field value is missing a value_type",
+        )),
+        Some(ValueType::FieldReferenceValue(_)) => Err(GenericDatabaseError::invalid_argument(
+            "fieldReferenceValue is not valid in stored documents",
+        )),
+        Some(ValueType::FunctionValue(_)) => Err(GenericDatabaseError::invalid_argument(
+            "functionValue is not valid in stored documents",
+        )),
+        Some(ValueType::PipelineValue(_)) => Err(GenericDatabaseError::invalid_argument(
+            "pipelineValue is not valid in stored documents",
+        )),
+        Some(ValueType::ArrayValue(arr)) => {
+            if in_array {
+                return Err(GenericDatabaseError::invalid_argument(
+                    "nested arrays are not supported",
+                ));
+            }
+            for item in &arr.values {
+                validate_writable_value(item, true)?;
+            }
+            Ok(())
+        }
+        Some(ValueType::MapValue(map)) => validate_writable_fields(&map.fields),
+        Some(
+            ValueType::NullValue(_)
+            | ValueType::BooleanValue(_)
+            | ValueType::IntegerValue(_)
+            | ValueType::DoubleValue(_)
+            | ValueType::TimestampValue(_)
+            | ValueType::StringValue(_)
+            | ValueType::BytesValue(_)
+            | ValueType::ReferenceValue(_)
+            | ValueType::GeoPointValue(_),
+        ) => Ok(()),
+    }
+}
+
+fn parse_list_order_by(order_by: &str) -> Result<Vec<(FieldReference, Direction)>> {
+    let trimmed = order_by.trim();
+    if trimmed.is_empty() {
+        return Ok(vec![]);
+    }
+    let mut orders = Vec::new();
+    for raw_clause in trimmed.split(',') {
+        let clause = raw_clause.trim();
+        if clause.is_empty() {
+            return Err(GenericDatabaseError::invalid_argument(
+                "empty clause in order_by",
+            ));
+        }
+        let (field_str, direction) = match clause.rsplit_once(char::is_whitespace) {
+            Some((f, dir))
+                if dir.eq_ignore_ascii_case("asc") || dir.eq_ignore_ascii_case("ascending") =>
+            {
+                (f.trim(), Direction::Ascending)
+            }
+            Some((f, dir))
+                if dir.eq_ignore_ascii_case("desc") || dir.eq_ignore_ascii_case("descending") =>
+            {
+                (f.trim(), Direction::Descending)
+            }
+            _ => (clause, Direction::Ascending),
+        };
+        orders.push((field_str.parse()?, direction));
+    }
+    Ok(orders)
 }
 
 impl Drop for FirestoreDatabase {

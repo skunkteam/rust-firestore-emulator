@@ -1,19 +1,22 @@
 use std::{collections::HashMap, ops::Deref, sync::Arc};
 
 use googleapis::google::firestore::v1::{ListenRequest, ListenResponse};
-use tokio::sync::RwLock;
+use tokio::sync::{RwLock, broadcast};
 use tokio_stream::Stream;
 use tracing::{Level, debug, instrument};
 
 use crate::{
-    FirestoreDatabase, config::FirestoreConfig, error::Result, listener::Listener,
-    reference::RootRef, timeouts::Timeouts, utils::RwLockHashMapExt,
+    FirestoreDatabase, config::FirestoreConfig, error::Result, event::ProjectEvent,
+    listener::Listener, reference::RootRef, timeouts::Timeouts, utils::RwLockHashMapExt,
 };
+
+const MAX_PROJECT_EVENT_BACKLOG: usize = 1024;
 
 pub struct FirestoreProject {
     pub(crate) timeouts: Timeouts,
     pub(crate) default_enterprise: bool,
     databases: RwLock<HashMap<RootRef, Arc<FirestoreDatabase>>>,
+    events: broadcast::Sender<ProjectEvent>,
 }
 
 // A lot of structs refer back to FirestoreProject, so make sure not to print them out in Debug to
@@ -37,7 +40,16 @@ impl FirestoreProject {
             timeouts,
             default_enterprise: config.default_enterprise,
             databases: Default::default(),
+            events: broadcast::channel(MAX_PROJECT_EVENT_BACKLOG).0,
         }
+    }
+
+    pub fn send_project_event(&self, event: ProjectEvent) {
+        let _unused = self.events.send(event);
+    }
+
+    pub fn subscribe_project_events(&self) -> broadcast::Receiver<ProjectEvent> {
+        self.events.subscribe()
     }
 
     /// Drop the given database.
@@ -56,13 +68,20 @@ impl FirestoreProject {
         let strong = Arc::strong_count(&database) - 1;
         let weak = Arc::weak_count(&database);
         debug!("database cleared, remaining references: strong: {strong}, weak: {weak}");
+        self.send_project_event(ProjectEvent::DatabaseCleared {
+            database: name.clone(),
+        });
     }
 
     pub async fn database(&'static self, name: &RootRef) -> Arc<FirestoreDatabase> {
         Arc::clone(
             self.databases
                 .get_or_insert(name, || {
-                    FirestoreDatabase::new(self, name.clone(), self.default_enterprise)
+                    let db = FirestoreDatabase::new(self, name.clone(), self.default_enterprise);
+                    self.send_project_event(ProjectEvent::DatabaseCreated {
+                        database: name.clone(),
+                    });
+                    db
                 })
                 .await
                 .deref(),

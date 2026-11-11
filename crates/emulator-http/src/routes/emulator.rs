@@ -1,62 +1,120 @@
+use std::{convert::Infallible, time::Duration};
+
 use axum::{
     Json, Router,
     extract::{Path, State},
-    http::StatusCode,
-    response::{IntoResponse, Response},
-    routing::get,
+    http::{Method, Uri},
+    response::{
+        IntoResponse, Response,
+        sse::{Event, KeepAlive, Sse},
+    },
+    routing::{delete, get},
 };
-use emulator_database::{FirestoreProject, read_consistency::ReadConsistency, reference::Ref};
+use emulator_database::{FirestoreProject, event::ProjectEvent, reference::Ref};
 use serde_json::json;
+use tokio_stream::{
+    Stream, StreamExt,
+    wrappers::{BroadcastStream, errors::BroadcastStreamRecvError},
+};
 
 use crate::error::{RestError, Result};
 
 pub(crate) fn router() -> Router<&'static FirestoreProject> {
     Router::new()
         .route("/", get(list_databases))
-        .route("/{*ref}", get(get_by_ref).delete(delete_by_ref))
+        .route("/events", get(sse_events))
+        .route(
+            "/{*ref}",
+            delete(delete_by_ref).fallback(unmatched_emulator_route),
+        )
+        .fallback(unmatched_emulator_route)
 }
 
-async fn list_databases(State(project): State<&FirestoreProject>) -> impl IntoResponse {
+async fn list_databases(State(project): State<&'static FirestoreProject>) -> impl IntoResponse {
     Json(project.database_names().await)
 }
 
-async fn get_by_ref(
+async fn sse_events(
     State(project): State<&'static FirestoreProject>,
-    Path(r): Path<Ref>,
-) -> Result<Response> {
-    let database = project.database(r.root()).await;
-    match r {
-        r @ Ref::Root(_) => {
-            let collections = database.get_collection_ids(&r).await?;
-            Ok((Json(collections)).into_response())
+) -> Sse<impl Stream<Item = std::result::Result<Event, Infallible>>> {
+    let rx = project.subscribe_project_events();
+    let stream = BroadcastStream::new(rx).filter_map(|item| match item {
+        Ok(event) => {
+            let payload = match event {
+                ProjectEvent::DatabaseCreated { database } => json!({
+                    "type": "database_created",
+                    "database": database.to_string(),
+                }),
+                ProjectEvent::DatabaseCleared { database } => json!({
+                    "type": "database_cleared",
+                    "database": database.to_string(),
+                }),
+                ProjectEvent::DatabaseConfigChanged { database } => json!({
+                    "type": "database_config_changed",
+                    "database": database.to_string(),
+                }),
+                ProjectEvent::DocumentsChanged {
+                    database,
+                    paths,
+                    update_time,
+                } => json!({
+                    "type": "documents_changed",
+                    "database": database.to_string(),
+                    "paths": paths,
+                    "updateTime": update_time,
+                }),
+            };
+            Event::default()
+                .event("change")
+                .json_data(payload)
+                .ok()
+                .map(Ok)
         }
-        Ref::Collection(r) => Ok(Json(json!({
-            "type": "collection",
-            "documents": database.get_document_ids(&r).await?,
-        }))
-        .into_response()),
-        Ref::Document(r) => Ok(Json(json!({
-            "type": "document",
-            "document": database.get_doc(&r, ReadConsistency::Default).await?.map(|d| d.to_document()),
-            "collections": database.get_collection_ids(&Ref::Document(r)).await?,
-        }))
-        .into_response()),
-    }
+        Err(BroadcastStreamRecvError::Lagged(skipped)) => {
+            tracing::warn!(skipped, "SSE client lagged behind project event stream");
+            Event::default()
+                .event("resync")
+                .json_data(json!({
+                    "type": "resync",
+                    "skipped": skipped,
+                }))
+                .ok()
+                .map(Ok)
+        }
+    });
+
+    Sse::new(stream).keep_alive(
+        KeepAlive::new()
+            .interval(Duration::from_secs(15))
+            .text("heartbeat"),
+    )
 }
 
-async fn delete_by_ref(State(project): State<&FirestoreProject>, Path(r): Path<Ref>) -> Result<()> {
+async fn delete_by_ref(
+    State(project): State<&'static FirestoreProject>,
+    Path(raw_ref): Path<String>,
+) -> Result<Json<serde_json::Value>> {
+    let r: Ref = raw_ref.parse()?;
     match r {
         Ref::Root(r) => {
             project.clear_database(&r).await;
-            Ok(())
         }
-        Ref::Collection(_) => Err(RestError::new(
-            StatusCode::NOT_IMPLEMENTED,
-            "Deleting a collection not implemented yet!".to_string(),
-        )),
-        Ref::Document(_) => Err(RestError::new(
-            StatusCode::NOT_IMPLEMENTED,
-            "Deleting a document not implemented yet!".to_string(),
-        )),
+        Ref::Collection(c) => {
+            let db = project.database(&c.root_ref).await;
+            let _deleted = db.delete_prefix(&Ref::Collection(c)).await?;
+        }
+        Ref::Document(d) => {
+            let db = project.database(&d.collection_ref.root_ref).await;
+            let _deleted = db.delete_prefix(&Ref::Document(d)).await?;
+        }
     }
+    Ok(Json(json!({})))
+}
+
+async fn unmatched_emulator_route(method: Method, uri: Uri) -> Response {
+    RestError::not_found_msg(format!(
+        "Unknown emulator endpoint: {method} /emulator/v1{}",
+        uri.path()
+    ))
+    .into_response()
 }

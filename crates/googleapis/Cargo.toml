@@ -13,7 +13,7 @@ prost = { workspace = true }
 serde = { workspace = true, features = ["serde_derive"] }
 thiserror = { workspace = true }
 tonic-prost = { workspace = true }
-time = { workspace = true, features = ["formatting", "macros"] }
+time = { workspace = true, features = ["formatting", "macros", "parsing"] }
 tonic = { workspace = true }
 
 [build-dependencies]

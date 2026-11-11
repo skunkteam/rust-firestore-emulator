@@ -6,7 +6,8 @@
 # just                          - Run test and linting once
 # just watch                    - Watch test and lint, re-run on filechange
 # just [watch] test [crate]     - Run tests on workspace or the specified crate, e.g. `just test` or `just watch test emulator-tracing`
-# just [watch] lint [crate]     - Run linting on workspace or the specified crate
+# just [watch] lint [crate]     - Run linting on workspace or the specified crate (includes Web UI check when crate is omitted or 'all')
+# just [watch] ui-check         - Type-check the Web UI JavaScript modules via JSDoc/TypeScript
 # just [watch] doc [crate]      - Create crate docs for the workspace or the specified crate
 # just [watch] fmt [crate]      - Format the code of the entire workspace or the specified crate
 # just [watch] clean            - Clean the repo, removing all compiled and generated artifacts
@@ -63,9 +64,23 @@ cov target="all":
     cargo tarpaulin --out lcov --out html {{ if target == "all" { "--workspace" } else { "--packages " + target } }}
 
 # Lint the given crate or the entire workspace if target is omitted
-lint target="all":
+lint target="all": && (ui-lint target)
     echo Running lint for target '"{{ target }}"'
     cargo clippy {{ if target == "all" { "--workspace" } else { "--package " + target } }}
+
+[private]
+ui-lint target: (
+    exec if target == "all" {
+        "just ui-check"
+    } else {
+        "true"
+    }
+)
+
+# Type-check the zero-build Web UI JavaScript modules using JSDoc and TypeScript
+ui-check:
+    echo Running TypeScript JSDoc check for Web UI
+    ./test-suite/node_modules/.bin/tsc --noEmit --allowJs --checkJs --strict --target es2022 --module es2022 --lib es2022,dom,dom.iterable ui/app.js
 
 # Run the application, simple alias for cargo run
 run *cmd:

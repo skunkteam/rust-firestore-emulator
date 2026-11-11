@@ -10,6 +10,7 @@ Core database storage, addressing, query, and transaction primitives for `Firest
 - `[document.rs:DeletedDocumentVersion]`: `pub struct DeletedDocumentVersion { pub name: DocumentRef, pub delete_time: Timestamp }`
 - `[document.rs:DocumentMeta]`, `[document.rs:DocumentContents]`, `[document.rs:DocumentPrecondition]`, `[document.rs:OwnedDocumentContentsReadGuard]`, `[document.rs:OwnedDocumentContentsWriteGuard]`: Crate-internal MVCC document storage, precondition validation, and FIFO read/write lock guards (`read`, `write`, `upgrade`, `current`, `get_at`, `check_precondition`, `maybe_add_version`, `delete`, `maybe_update`, `create`, `transform`).
 - `[event.rs:DatabaseEvent]`: `pub struct DatabaseEvent { pub database: Weak<FirestoreDatabase>, pub update_time: Timestamp, pub updates: HashMap<DocumentRef, DocumentVersion> }`
+- `[event.rs:ProjectEvent]`: `pub enum ProjectEvent { DatabaseCreated { database: RootRef }, DatabaseCleared { database: RootRef }, DatabaseConfigChanged { database: RootRef }, DocumentsChanged { database: RootRef, paths: Vec<String>, update_time: Timestamp } }`
 - `[field_path.rs:DOC_NAME]`: `pub const DOC_NAME: &str = "__name__"`
 - `[field_path.rs:FieldReference]`: `pub enum FieldReference { DocumentName, FieldPath(FieldPath) }` (`get_value`, `is_document_name`)
 - `[field_path.rs:FieldPath]`: `pub struct FieldPath(Vec<String>)` (`get_value`, `set_value`, `delete_value`, `transform_value`, `try_transform_value`)

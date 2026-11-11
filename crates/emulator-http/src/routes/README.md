@@ -1,24 +1,25 @@
 # routes
 
 ## Overview
-Axum HTTP route modules implementing the Firestore emulator's REST endpoints for database inspection and clearing (`/emulator/v1`), dynamic log capture and polling (`/emulator/v1/logging`), and database edition/concurrency configuration (`/v1/projects`).
+Axum HTTP route modules implementing the Firestore emulator's control plane and SSE live-invalidation stream (`/emulator/v1`), dynamic log capture and polling (`/emulator/v1/logging`), and official Google Cloud Firestore v1 ProtoJSON REST CRUD, query, and database metadata endpoints (`/v1/projects`).
 
 ## Interface
-- `pub(crate) fn emulator::router() -> Router<&'static FirestoreProject>` (`[emulator.rs:router]`): Mounts `GET /` (`[emulator.rs:list_databases]`) and `GET` / `DELETE /{*ref}` (`[emulator.rs:get_by_ref]`, `[emulator.rs:delete_by_ref]`).
+- `pub(crate) fn emulator::router() -> Router<&'static FirestoreProject>` (`[emulator.rs:router]`): Mounts `GET /` (`[emulator.rs:list_databases]`), `GET /events` (`[emulator.rs:sse_events]`), and `DELETE /{*ref}` (`[emulator.rs:delete_by_ref]`).
 - `pub(crate) fn logging::router(tracing: &'static impl Tracing) -> Router` (`[logging.rs:router]`): Mounts `POST /{name}` (`[logging.rs:start_capture_or_poll_logs]`, `[logging.rs:poll_logs]`) and `DELETE /{name}` (`[logging.rs:stop_capture]`) backed by `TracingState` (`[logging.rs:TracingState]`).
-- `pub(crate) fn projects::router() -> Router<&'static FirestoreProject>` (`[projects.rs:router]`): Mounts `GET` and `PATCH /{project_id}/databases/{database_id}` (`[projects.rs:get_database]`, `[projects.rs:patch_database]`) using JSON models `DatabaseMetadata` (`[projects.rs:DatabaseMetadata]`), `PatchDatabase` (`[projects.rs:PatchDatabase]`), `DatabaseEdition` (`[projects.rs:DatabaseEdition]`), and `ConcurrencyMode` (`[projects.rs:ConcurrencyMode]`).
+- `pub(crate) fn projects::router() -> Router<&'static FirestoreProject>` (`[projects.rs:router]`): Mounts `GET` and `PATCH /{project_id}/databases/{database_id}` (`[projects.rs:get_database]`, `[projects.rs:patch_database]`) and the unified Firestore v1 document/query dispatcher on `/{project_id}/databases/{database_id}/documents`, `:listCollectionIds`, `:runQuery`, and `/{*tail}` (`[projects.rs:dispatch_documents]`).
 
 ## Invariants
-- `DELETE /{*ref}` only supports deleting root database references (`Ref::Root`); attempting to delete a collection (`Ref::Collection`) or document (`Ref::Document`) returns `StatusCode::NOT_IMPLEMENTED` (`501 Not Implemented`) (`[emulator.rs:delete_by_ref]`).
-- `GET /{*ref}` reads documents using `ReadConsistency::Default` (`[emulator.rs:get_by_ref]`).
-- `POST /{name}` on the logging router treats a `:poll` suffix (`name.strip_suffix(":poll")`) as a poll operation (`poll_logs`) rather than subscriber creation; polling or deleting an unknown handle returns `404 Not Found` via `RestError::not_found` (`[logging.rs:start_capture_or_poll_logs]`, `[logging.rs:poll_logs]`, `[logging.rs:stop_capture]`).
-- Starting log capture on an already-registered handle `name` replaces the existing `DynamicSubscriber` and returns any buffered logs drained from the replaced subscriber (`[logging.rs:start_capture_or_poll_logs]`).
-- `DatabaseMetadata::new` always sets `uid` to `"emulator-uid"` and `type` to `"FIRESTORE_NATIVE"` (`[projects.rs:DatabaseMetadata]`).
-- In `PATCH /{project_id}/databases/{database_id}`, updating `database_edition` automatically sets `optimistic_concurrency` to match `is_enterprise` (`true` for `Enterprise`, `false` for `Standard`), unless `concurrency_mode` is also explicitly supplied in `PatchDatabase` (`[projects.rs:patch_database]`).
+- `GET /emulator/v1` returns `Json(Vec<RootRef>)` (`["projects/{p}/databases/{d}/documents"]`) without creating databases (`[emulator.rs:list_databases]`).
+- `DELETE /emulator/v1/{*ref}` clears an entire database when `{*ref}` is `Ref::Root` (`project.clear_database`) and recursively deletes matching documents and subcollections via `FirestoreDatabase::delete_prefix` when `{*ref}` is `Ref::Collection` or `Ref::Document` (`[emulator.rs:delete_by_ref]`).
+- `GET /emulator/v1/events` streams `ProjectEvent` notifications as SSE `change` events (and emits `event: resync` if the subscriber lags behind the 1024-event broadcast buffer) with a 15-second keep-alive heartbeat (`[emulator.rs:sse_events]`).
+- `POST` and `PATCH` endpoints in `projects.rs` require `Content-Type: application/json` via `parse_json_body` / `ApiJson<T>` (`[projects.rs:dispatch_documents]`, `[projects.rs:patch_database]`).
+- `POST /v1/projects/{p}/databases/{d}/documents/{col}` (`CreateDocument`) requires a non-empty `documentId` query parameter and an empty `document.name` field (`[projects.rs:handle_create_document]`).
+- `POST .../documents:runQuery` returns a JSON array of `RunQueryResponse` objects, padded with a single `{ "readTime": ... }` element when zero documents match (`[projects.rs:handle_run_query]`).
 
 ## Side Effects
-- Accesses and mutates in-memory `FirestoreProject` state, including instantiating/retrieving databases (`project.database`), clearing database contents (`project.clear_database`), and updating database edition and concurrency mode settings (`db.set_enterprise_edition`, `db.set_optimistic_concurrency`) (`[emulator.rs:get_by_ref]`, `[emulator.rs:delete_by_ref]`, `[projects.rs:get_database]`, `[projects.rs:patch_database]`).
-- Acquires a synchronous mutex (`Arc<Mutex<HashMap<String, Box<dyn DynamicSubscriber>>>>`), registers and removes dynamic log subscribers via `Tracing::subscribe`, and drains captured log buffers (`subscriber.drain()`) (`[logging.rs:TracingState]`, `[logging.rs:start_capture_or_poll_logs]`, `[logging.rs:poll_logs]`, `[logging.rs:stop_capture]`).
+- Accesses and mutates in-memory `FirestoreProject` and `FirestoreDatabase` state across database configuration, document CRUD, recursive deletion, and query execution (`[emulator.rs:delete_by_ref]`, `[projects.rs:dispatch_documents]`).
+- Subscribes to `FirestoreProject::subscribe_project_events` for long-lived SSE connections (`[emulator.rs:sse_events]`).
+- Acquires a synchronous mutex (`Arc<Mutex<HashMap<String, Box<dyn DynamicSubscriber>>>>`) to register, poll, and remove dynamic log subscribers (`[logging.rs:TracingState]`).
 
 ## Verification
-- Run: `cargo test -p emulator-http`
+- Run: `cargo nextest run -p emulator-http`

@@ -1,34 +1,35 @@
 # UI (`ui`)
 
 ## Overview
-Browser-based web interface for inspecting and managing Firestore Emulator state. It consists of a single-page HTML application (`index.html`) that routes based on the browser URL path to browse emulated databases, collections, and documents via the `/emulator/v1` HTTP REST API, paired with a bundled copy of `lit-html@3.1.2` (`lit-html.js`) for declarative DOM rendering.
+Zero-build, multi-file ES-module web application for inspecting, creating, editing, deleting, and querying Cloud Firestore Emulator state. Served by `crates/emulator-http` under the default `ui` feature (live from disk in debug builds and embedded into the binary via `crates/emulator-http/build.rs` in release builds), it communicates with the core Firestore v1 ProtoJSON REST API (`/v1/projects/{project_id}/databases/{database_id}/...`) and the emulator control plane (`/emulator/v1/...`, including SSE live invalidations on `/emulator/v1/events`) and renders declaratively using vendored `lit-html@3.1.2`.
+
+## Subdirectories
+- `components`: [./components/README.md](./components/README.md) - Declarative UI view components for Miller-column collection/document navigation (`explorer.js`), the hybrid structured field-tree and Raw ProtoJSON document editor (`editor.js`), and the structured query runner (`query.js`).
 
 ## Interface
-- `[index.html:page]`: IIFE route resolver that matches `location.pathname` against `/` (`dashboard`) or `/projects/<project>/databases/<database>/documents(/<ref>)?` (`database_root` or `ref_root`).
-- `[index.html:refresh]`: Executes the active route handler (`page()`) and renders the returned `lit-html` template into `#canvas` (or delegates errors to `showError`).
-- `[index.html:showError]`: Renders error messages and stack traces into `#canvas`.
-- `[index.html:dashboard]`: Fetches `GET /emulator/v1` and renders the list of active emulator databases.
-- `[index.html:database_root]`: Fetches `GET /emulator/v1/projects/<project>/databases/<database>/documents` to list root collections and binds the `clear` handler (`[index.html:clear]`) to delete database contents via `DELETE /emulator/v1/projects/<project>/databases/<database>/documents`.
-- `[index.html:ref_root]`: Fetches `GET /emulator/v1/projects/<project>/databases/<database>/documents/<ref>` and renders either a collection's document list (`type === "collection"`) or a document's JSON payload and subcollections (`type === "document"`).
-- `[index.html:api]`: Asynchronous `fetch` helper that issues HTTP requests, throws response text on non-2xx statuses, and parses JSON or text responses.
-- `[lit-html.js:html]`: Tagged template literal producer for HTML templates (`lit-html@3.1.2`).
-- `[lit-html.js:svg]`: Tagged template literal producer for SVG templates (`lit-html@3.1.2`).
-- `[lit-html.js:render]`: Renders a `lit-html` `TemplateResult` into a DOM container (`lit-html@3.1.2`).
-- `[lit-html.js:noChange]`: Sentinel symbol (`Symbol.for("lit-noChange")`) indicating no DOM update is needed.
-- `[lit-html.js:nothing]`: Sentinel symbol (`Symbol.for("lit-nothing")`) that clears a rendered part.
-- `[lit-html.js:_$LH]`: Internal `lit-html` primitives export object.
+- `[index.html]`: Minimal HTML shell mounting `<header id="topbar">`, `<main id="workspace">`, `<div id="modal-root">`, `<div id="toast-root">`, `/ui/styles.css`, and `<script type="module" src="/ui/app.js">`.
+- `[styles.css]`: CSS custom properties (automatic light/dark theme tokens), responsive topbar, horizontal Miller-column layout, type badges, hybrid field-tree / Raw ProtoJSON editor styles, query builder layout, modal dialogs, and toast notifications.
+- `[app.js]`: Top-level SPA controller managing URL `pushState`/`popstate` routing (`/projects/{project}/databases/{database}/documents/...`), database discovery and bootstrap (`+ Open / Create Database`), inline `STANDARD`/`ENTERPRISE` and `PESSIMISTIC`/`OPTIMISTIC` toggles, debounced SSE live invalidation (`Pause Live Updates` + dirty-editor protection), modals, and `lit-html` root rendering.
+- `[api.js:ApiError]`: Structured HTTP client error capturing Google Cloud `google.rpc.Status` fields (`httpStatus`, `rpcStatus`, `message`).
+- `[api.js:listDatabases]` / `[api.js:getDatabase]` / `[api.js:patchDatabase]` / `[api.js:clearDatabase]`: Emulator database discovery, metadata inspection, edition/concurrency patching, and database clearing helpers.
+- `[api.js:listCollectionIds]` / `[api.js:listDocuments]` / `[api.js:getDocument]` / `[api.js:createDocument]` / `[api.js:updateDocument]` / `[api.js:deleteDocument]` / `[api.js:deleteCollection]` / `[api.js:runQuery]`: Firestore v1 ProtoJSON REST CRUD, recursive prefix deletion, and structured query helpers.
+- `[api.js:connectEventStream]`: Connects an `EventSource` to `/emulator/v1/events`, coalescing `change` and `resync` events over a `150ms` trailing debounce window.
+- `[values.js:VALUE_TYPES]` / `[values.js:getValueType]` / `[values.js:createDefaultValue]` / `[values.js:formatValuePreview]`: Type descriptors, discriminators, default constructors, and compact preview formatters for all 11 storable Firestore ProtoJSON `Value` types.
+- `[values.js:validateInteger64]` / `[values.js:validateDouble]` / `[values.js:validateTimestamp]` / `[values.js:validateGeoPoint]` / `[values.js:encodeBytes]` / `[values.js:decodeBytes]` / `[values.js:normalizeReference]` / `[values.js:escapeFieldPathSegment]` / `[values.js:validateRawProtoJsonFields]`: Lossless client-side validators and encoders (`BigInt`-checked signed 64-bit integers, IEEE-754 doubles including `NaN`/`Infinity`/`-Infinity`/`-0.0`, RFC 3339 timestamps, Base64/UTF-8/hex bytes, resource references, field-mask escaping, and recursive raw ProtoJSON validation).
+- `[values.js:generateAutoId]`: Generates a uniform, bias-free 20-character alphanumeric Firestore document ID via `crypto.getRandomValues` rejection sampling.
+- `[lit-html.js]` / `[lit-html.d.ts]`: Vendored `lit-html@3.1.2` ES module (`html`, `svg`, `render`, `noChange`, `nothing`) and local ambient TypeScript declarations for `tsc --checkJs --strict`.
 
 ## Invariants
-- `[index.html:page]`: Non-root URL paths must match `/^\/projects\/(?<project>[^/]+)\/databases\/(?<database>[^/]+)\/documents(\/(?<ref>.*))?$/`; any non-matching path resets `location.pathname = ""` to redirect to the root dashboard.
-- `[index.html:ref_root]`: Expects the `/emulator/v1` document/collection endpoint payload to provide a `type` discriminator of either `"collection"` (with `documents: string[]`) or `"document"` (with `document: unknown` and `collections: string[]`).
-- `[lit-html.js:C]`: Template literal calls must pass a valid template strings array possessing a `raw` property, or an `"invalid template strings array"` `Error` is thrown.
+- **Zero-Build ES Modules**: Every `.js` module uses browser-native relative ES module imports (`./...` or `../...`) with `// @ts-check` JSDoc annotations and requires zero bundling or transpilation steps.
+- **Lossless `i64` vs. `f64` Fidelity (`[values.js:validateInteger64]`, `[values.js:validateDouble]`)**: `integerValue` strings are validated strictly via `BigInt` against `[-9223372036854775808n, 9223372036854775807n]` without `Number` coercion, while `doubleValue` preserves `NaN`, `Infinity`, `-Infinity`, and `-0.0`.
+- **Client-Supplied Document IDs (`[app.js:submitModal]`, `[values.js:generateAutoId]`)**: Creating a document always supplies a non-empty `documentId` query parameter (auto-filling with `generateAutoId()` if left blank in the modal).
+- **Dirty-Editor SSE Protection (`[app.js:handleSseBatch]`, `[components/editor.js:syncSessionWithDocument]`)**: Incoming SSE updates never overwrite an `EditorSession` with `isDirty === true`; instead `externalDoc` is recorded and surfaced as a non-destructive reload/keep banner.
 
 ## Side Effects
-- `[index.html:page]`: Mutates `window.location.pathname` to `""` when the current URL path does not match a valid database or document route.
-- `[index.html:refresh]` / `[index.html:showError]`: Mutates the DOM inside `<div id="canvas">` via `render()`.
-- `[index.html:api]`: Performs network HTTP `GET` and `DELETE` requests against `/emulator/v1` endpoints via `fetch()`.
-- `[index.html:clear]`: Issues an HTTP `DELETE` request to `/emulator/v1/projects/<project>/databases/<database>/documents` to wipe the selected database and refreshes the UI.
-- `[lit-html.js:s]`: Registers a browser `trustedTypes` policy named `"lit-html"` when `globalThis.trustedTypes` is available, and appends `"3.1.2"` to `globalThis.litHtmlVersions`.
+- `[app.js]`: Mutates DOM subtrees in `#topbar`, `#workspace`, `#modal-root`, and `#toast-root`, updates browser history via `history.pushState` / `history.replaceState`, and maintains a long-lived `EventSource` connection to `/emulator/v1/events`.
+- `[api.js]`: Issues `fetch` HTTP `GET`, `POST`, `PATCH`, and `DELETE` requests to `/v1/projects/...` and `/emulator/v1/...`.
+- `[lit-html.js]`: Registers a `"lit-html"` `trustedTypes` policy when supported by the browser and appends `"3.1.2"` to `globalThis.litHtmlVersions`.
 
 ## Verification
-- Run: `cargo test`
+- Run: `just ui-check`
+- Run: `cargo nextest run -p emulator-http --all-features`
