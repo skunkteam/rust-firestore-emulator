@@ -1,47 +1,61 @@
 use std::{env, fs, path::PathBuf};
 
 fn main() {
+    let serde_camel_default = "#[derive(serde::Serialize, \
+                               serde::Deserialize)]\n#[serde(rename_all = \"camelCase\", default)]";
+
     tonic_prost_build::configure()
         .build_client(false)
         .include_file("googleapis.rs")
         .compile_well_known_types(true)
         .bytes("bytes_value")
-        .type_attribute(".google.type.LatLng", "#[derive(serde::Serialize)]")
-        .type_attribute(
-            ".google.protobuf.Timestamp",
-            "#[derive(PartialOrd, Ord, serde::Serialize)]",
-        )
-        .type_attribute(
-            ".google.firestore.v1.Document",
-            "#[derive(serde::Serialize)]",
-        )
-        .type_attribute(
-            ".google.firestore.v1.ArrayValue",
-            "#[derive(serde::Serialize)]",
-        )
-        .type_attribute(
-            ".google.firestore.v1.MapValue",
-            "#[derive(serde::Serialize)]",
-        )
-        .type_attribute(
-            ".google.firestore.v1.Function",
-            "#[derive(serde::Serialize)]",
-        )
-        .type_attribute(
-            ".google.firestore.v1.Pipeline",
-            "#[derive(serde::Serialize)]",
-        )
-        .type_attribute(".google.firestore.v1.Value", "#[derive(serde::Serialize)]")
-        .message_attribute(".google.firestore.v1.Value", "#[serde(transparent)]")
-        .enum_attribute(".google.firestore.v1.Value", "#[serde(untagged)]")
+        .type_attribute(".google.protobuf.Timestamp", "#[derive(PartialOrd, Ord)]")
+        .type_attribute(".google.type.LatLng", serde_camel_default)
+        .type_attribute(".google.firestore.v1.ArrayValue", serde_camel_default)
+        .type_attribute(".google.firestore.v1.MapValue", serde_camel_default)
+        .type_attribute(".google.firestore.v1.Document", serde_camel_default)
         .field_attribute(
-            "bytes_value",
-            r#"#[serde(serialize_with="crate::ser::as_base64")]"#,
+            ".google.firestore.v1.Document.fields",
+            "#[serde(skip_serializing_if = \"std::collections::HashMap::is_empty\")]",
         )
         .field_attribute(
-            "value_type.null_value",
-            r#"#[serde(serialize_with="crate::ser::as_null")]"#,
+            ".google.firestore.v1.Document.create_time",
+            "#[serde(skip_serializing_if = \"Option::is_none\")]",
         )
+        .field_attribute(
+            ".google.firestore.v1.Document.update_time",
+            "#[serde(skip_serializing_if = \"Option::is_none\")]",
+        )
+        .type_attribute(".google.firestore.v1.DocumentMask", serde_camel_default)
+        .type_attribute(
+            ".google.firestore.v1.ListDocumentsResponse",
+            serde_camel_default,
+        )
+        .field_attribute(
+            ".google.firestore.v1.ListDocumentsResponse.next_page_token",
+            "#[serde(skip_serializing_if = \"String::is_empty\")]",
+        )
+        .type_attribute(
+            ".google.firestore.v1.ListCollectionIdsResponse",
+            serde_camel_default,
+        )
+        .field_attribute(
+            ".google.firestore.v1.ListCollectionIdsResponse.next_page_token",
+            "#[serde(skip_serializing_if = \"String::is_empty\")]",
+        )
+        .type_attribute(
+            ".google.firestore.v1.StructuredQuery.CollectionSelector",
+            serde_camel_default,
+        )
+        .type_attribute(
+            ".google.firestore.v1.StructuredQuery.FieldReference",
+            serde_camel_default,
+        )
+        .type_attribute(
+            ".google.firestore.v1.StructuredQuery.Projection",
+            serde_camel_default,
+        )
+        .type_attribute(".google.firestore.v1.Cursor", serde_camel_default)
         .compile_protos(
             &["include/google/firestore/v1/firestore.proto"],
             &["include"],
@@ -54,14 +68,13 @@ fn main() {
         fs::read_to_string(&firestore_rs).expect("failed to read google.firestore.v1.rs");
 
     const VALUE_STRUCT_TARGET: &str =
-        "#[serde(transparent)]\n#[derive(Clone, PartialEq, ::prost::Message)]\npub struct Value";
-    const VALUE_STRUCT_REPLACEMENT: &str =
-        "#[serde(transparent)]\n#[derive(Clone, ::prost::Message)]\npub struct Value";
+        "#[derive(Clone, PartialEq, ::prost::Message)]\npub struct Value";
+    const VALUE_STRUCT_REPLACEMENT: &str = "#[derive(Clone, ::prost::Message)]\npub struct Value";
 
-    const VALUE_TYPE_ENUM_TARGET: &str = "    #[serde(untagged)]\n    #[derive(Clone, PartialEq, \
-                                          ::prost::Oneof)]\n    pub enum ValueType";
+    const VALUE_TYPE_ENUM_TARGET: &str =
+        "    #[derive(Clone, PartialEq, ::prost::Oneof)]\n    pub enum ValueType";
     const VALUE_TYPE_ENUM_REPLACEMENT: &str =
-        "    #[serde(untagged)]\n    #[derive(Clone, ::prost::Oneof)]\n    pub enum ValueType";
+        "    #[derive(Clone, ::prost::Oneof)]\n    pub enum ValueType";
 
     assert_eq!(
         contents.matches(VALUE_STRUCT_TARGET).count(),

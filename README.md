@@ -21,7 +21,7 @@ Because the implementation is driven by consumed features, some advanced or edge
 - Nearest neighbors search
 - Some field filters (such as `ArrayContainsAny` and `NotIn`)
 - Explain options
-- Additional unimplemented gRPC endpoints (`create_document`, `update_document`, `delete_document`, `partition_query`, `write`) or request options guarded by `unimplemented!` macros across the codebase.
+- Additional unimplemented gRPC endpoints (`partition_query`, `write`) or request options guarded by `unimplemented!` macros across the codebase.
 
 ### Usage & Development Workflow
 
@@ -84,7 +84,7 @@ FIRESTORE_EMULATOR_HOST=127.0.0.1:8080 firestore-emulator
 ## Subdirectories & System Boundaries
 - `crates`: [./crates/README.md](./crates/README.md) - Workspace library crates providing the database engine (`emulator-database`), gRPC server (`emulator-grpc`), HTTP/REST server (`emulator-http`), dynamic tracing (`emulator-tracing`), FIFO reader-writer lock (`fifo-rwlock`), and compiled Firestore v1 protobufs (`googleapis`).
 - `src`: [./src/README.md](./src/README.md) - Root binary (`main.rs`) and server entrypoint (`lib.rs`, `multiplex.rs`) that initialize CLI options, Jemalloc, `DefaultTracing`, and `'static FirestoreProject` state, and multiplex gRPC and HTTP traffic over a single TCP listener.
-- `ui`: [./ui/README.md](./ui/README.md) - Browser-based single-page web UI (`index.html` and `lit-html.js`) embedded by `emulator-http` (under the default `ui` feature) for inspecting and clearing emulated databases via `/emulator/v1`.
+- `ui`: [./ui/README.md](./ui/README.md) - Zero-build multi-file ES-module web UI (`index.html`, `styles.css`, `lit-html.js`, `app.js`, `api.js`, `values.js`, and `components/`) served by `emulator-http` (under the default `ui` feature) for browsing, creating, editing, deleting, and querying emulated databases via `/v1/projects/...` and `/emulator/v1`.
 
 ## Global Invariants
 - **Static Server State (`[src/lib.rs:run]`, `[src/main.rs:main]`)**: Both `FirestoreProject` and `DefaultTracing` are leaked into `'static` memory (`Box::leak`) once at startup and shared across `emulator-grpc` and `emulator-http` services.

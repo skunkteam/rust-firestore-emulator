@@ -506,25 +506,26 @@ impl Query {
         let parent: CollectionRef =
             format!("{}/{}", self.parent, self.from[0].collection_id).parse()?;
 
-        let all_docs: HashSet<_> = db
-            .get_all_collections()
-            .await
-            .into_iter()
-            .filter_map(|col| {
-                let document_id = col
-                    .name
-                    .strip_collection_prefix(&parent)?
-                    .split_once('/')?
-                    .0;
-                Some(DocumentRef::new(parent.clone(), document_id))
-            })
-            .collect();
+        let mut all_docs = HashSet::new();
+        for col in db.get_all_collections().await {
+            let Some(rest) = col.name.strip_collection_prefix(&parent) else {
+                continue;
+            };
+            let Some((document_id, _)) = rest.split_once('/') else {
+                continue;
+            };
+            if !col.has_doc().await? {
+                continue;
+            }
+            all_docs.insert(DocumentRef::new(parent.clone(), document_id));
+        }
         let mut result = vec![];
         for name in all_docs {
-            if db.get_doc(&name, self.consistency).await.is_ok() {
+            if db.get_doc(&name, self.consistency).await?.is_none() {
                 result.push(name.to_string());
             }
         }
+        result.sort();
         Ok(result)
     }
 
