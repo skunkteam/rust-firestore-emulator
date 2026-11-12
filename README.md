@@ -74,7 +74,7 @@ Run locally in release-mode:
 FIRESTORE_EMULATOR_HOST=127.0.0.1:8080 cargo run --release
 ```
 
-Install directly via Cargo:
+Install directly via Cargo (includes the default `ui` feature for local use; prebuilt GitHub Release tarballs omit `ui` via `--no-default-features` for headless CI environments):
 
 ```shell
 cargo install --path .
@@ -93,6 +93,7 @@ FIRESTORE_EMULATOR_HOST=127.0.0.1:8080 firestore-emulator
 - **FIFO Lock Ordering & Contention (`[crates/fifo-rwlock/src/queue.rs:FifoRwLockQueue]`, `[crates/emulator-database/src/database/document.rs:OwnedDocumentContentsReadGuard::upgrade]`)**: Per-document read, write, and read-to-write upgrade requests are scheduled in strict FIFO order; upgrading a read guard aborts with `GenericDatabaseError::Aborted("contention")` if another writer updated the document while the upgrade waited.
 - **Edition & Concurrency Coupling (`[crates/emulator-database/src/database/pipeline/mod.rs:execute]`, `[crates/emulator-http/src/routes/projects.rs:patch_database]`)**: Pipeline execution (`execute_pipeline`) requires Enterprise Edition (`enterprise_edition() == true`), and patching `database_edition` via `/v1/projects/{project_id}/databases/{database_id}` defaults `optimistic_concurrency` to match Enterprise (`true`) vs. Standard (`false`) unless `concurrency_mode` is explicitly specified.
 - **Safety Lints (`[Cargo.toml:workspace.lints.rust]`)**: Workspace-wide Rust lints forbid `unsafe_code` (except where explicitly overridden inside `crates/fifo-rwlock` for `UnsafeCell` guards) and `explicit_outlives_requirements`.
+- **CI vs. Local Build Features (`[Cargo.toml:features]`, `[.github/workflows/rust.yml:deploy]`)**: Local builds and installations (`cargo install`, `cargo run`, `flake.nix`) enable `default = ["ui"]` to serve the Web UI, whereas `.github/workflows/rust.yml` intentionally builds release tarballs with `--no-default-features` for headless CI runners.
 
 ## Global Side Effects
 - **Process-Wide Runtime Initialization (`[src/main.rs:GLOBAL_ALLOC]`, `[src/main.rs:main]`, `[crates/emulator-tracing/src/lib.rs:DefaultTracing::start]`)**: Installs `tikv_jemallocator::Jemalloc` as the global allocator, installs `color_eyre` hooks, registers the global `tracing_subscriber` registry (and optional `console_subscriber`), and leaks `DefaultTracing` and `FirestoreProject` allocations for the lifetime of the process.
