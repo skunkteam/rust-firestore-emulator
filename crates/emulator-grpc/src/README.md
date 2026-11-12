@@ -31,3 +31,4 @@ Implements the Tonic gRPC server (`FirestoreServer`) for the Google Cloud Firest
 
 ## Verification
 - Run: `cargo test -p emulator-grpc`
+- Run (Cloud Firestore conformance suite against built binary): `just sdk-test`

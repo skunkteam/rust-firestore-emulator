@@ -25,3 +25,4 @@ Core source package for `emulator-http`. Exposes `RouterBuilder` to construct th
 
 ## Verification
 - Run: `cargo nextest run -p emulator-http`
+- Run (Cloud Firestore conformance suite against built binary): `just sdk-test`
