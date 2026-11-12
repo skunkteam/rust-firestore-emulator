@@ -61,17 +61,19 @@ async fn preconditions_enforce_exists_and_update_time_guards() {
         .expect("Exists(true) on existing doc succeeds");
     let t2 = updated.update_time.expect("updated timestamp");
 
-    // Exists(true) on missing document rejects the write and leaves the document absent.
-    let missing_update = db
-        .update(
+    // Exists(true) on missing document rejects with NotFound and leaves the document absent
+    // (verified in `test-suite/tests/10-rust-oracle-edge-cases.test.ts`).
+    assert_status_code(
+        db.update(
             "guards/never_created",
             fields!({ "v": 1i64 }),
             None,
             Some(pre_exists(true)),
             None,
         )
-        .await;
-    expect_that!(missing_update, err(anything()));
+        .await,
+        Code::NotFound,
+    );
     assert_status_code(db.get("guards/never_created").await, Code::NotFound);
 
     // UpdateTime mismatch -> FailedPrecondition; matching UpdateTime -> Ok.
@@ -129,9 +131,11 @@ async fn preconditions_enforce_exists_and_update_time_guards() {
 
 #[gtest]
 #[tokio::test]
-#[ignore = "needs-cloud-oracle: verify exact gRPC status code (NOT_FOUND vs FAILED_PRECONDITION) \
-            for UpdateDocument/DeleteDocument with Precondition::Exists(true) on missing document"]
-async fn precondition_exists_true_on_missing_document_exact_cloud_status() {
+async fn precondition_exists_true_on_missing_document_returns_not_found() {
+    // Ground-truth Cloud Firestore behavior verified in
+    // `test-suite/tests/10-rust-oracle-edge-cases.test.ts`:
+    // `Exists(true)` on a missing document rejects with `5 NOT_FOUND` across UpdateDocument,
+    // DeleteDocument, and Commit (both Update and Delete operations).
     let mut db = TestEnv::new().build_db();
     assert_status_code(
         db.update(
@@ -142,6 +146,26 @@ async fn precondition_exists_true_on_missing_document_exact_cloud_status() {
             None,
         )
         .await,
+        Code::NotFound,
+    );
+    assert_status_code(
+        db.delete("guards/missing", Some(pre_exists(true))).await,
+        Code::NotFound,
+    );
+    assert_status_code(
+        db.commit_writes(WriteBatchSpec::new().update_with(
+            "guards/missing",
+            fields!({ "v": 1i64 }),
+            Some(vec!["v"]),
+            vec![],
+            Some(pre_exists(true)),
+        ))
+        .await,
+        Code::NotFound,
+    );
+    assert_status_code(
+        db.commit_writes(WriteBatchSpec::new().delete("guards/missing", Some(pre_exists(true))))
+            .await,
         Code::NotFound,
     );
 }

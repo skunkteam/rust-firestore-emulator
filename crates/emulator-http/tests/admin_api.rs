@@ -396,16 +396,30 @@ async fn test_rest_error_envelopes_and_404_isolation() -> Result<()> {
     let empty_err: serde_json::Value = empty_val.json().await?;
     expect_eq!(empty_err["error"]["status"], "INVALID_ARGUMENT");
 
-    // 4. Failed precondition on PATCH -> 400 FAILED_PRECONDITION
-    let precond = client
+    // 4. Preconditions on PATCH: Exists(true) on missing -> 404 NOT_FOUND; UpdateTime mismatch ->
+    //    400 FAILED_PRECONDITION
+    let missing_exists = client
         .patch(format!(
             "{docs_root}/users/missing-doc?currentDocument.exists=true"
         ))
         .json(&json!({ "fields": {} }))
         .send()
         .await?;
+    expect_eq!(missing_exists.status(), StatusCode::NOT_FOUND);
+    let missing_exists_err: serde_json::Value = missing_exists.json().await?;
+    expect_eq!(missing_exists_err["error"]["code"], 404);
+    expect_eq!(missing_exists_err["error"]["status"], "NOT_FOUND");
+
+    let precond = client
+        .patch(format!(
+            "{docs_root}/users/missing-doc?currentDocument.updateTime=1970-01-01T00:00:01Z"
+        ))
+        .json(&json!({ "fields": {} }))
+        .send()
+        .await?;
     expect_eq!(precond.status(), StatusCode::BAD_REQUEST);
     let precond_err: serde_json::Value = precond.json().await?;
+    expect_eq!(precond_err["error"]["code"], 400);
     expect_eq!(precond_err["error"]["status"], "FAILED_PRECONDITION");
 
     // 5. Unmatched /v1/... and /emulator/v1/... routes return 404 JSON, never 200 HTML

@@ -80,6 +80,7 @@ impl From<GenericDatabaseError> for RestError {
             GenericDatabaseError::FailedPrecondition(_) => {
                 (StatusCode::BAD_REQUEST, "FAILED_PRECONDITION")
             }
+            GenericDatabaseError::NotFound(_) => (StatusCode::NOT_FOUND, "NOT_FOUND"),
             GenericDatabaseError::NotImplemented(_) => {
                 (StatusCode::NOT_IMPLEMENTED, "UNIMPLEMENTED")
             }

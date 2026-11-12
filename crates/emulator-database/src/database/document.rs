@@ -153,12 +153,9 @@ impl DocumentContents {
 
     pub(crate) fn check_precondition(&self, condition: DocumentPrecondition) -> Result<()> {
         match condition {
-            DocumentPrecondition::Exists if !self.exists() => {
-                Err(GenericDatabaseError::failed_precondition(format!(
-                    "document not found: {}",
-                    self.name
-                )))
-            }
+            DocumentPrecondition::Exists if !self.exists() => Err(GenericDatabaseError::not_found(
+                format!("document not found: {}", self.name),
+            )),
             DocumentPrecondition::NotExists if self.exists() => {
                 Err(GenericDatabaseError::already_exists(format!(
                     "document already exists: {}",
