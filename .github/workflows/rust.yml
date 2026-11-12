@@ -95,6 +95,7 @@ jobs:
       - name: Install Protoc
         uses: arduino/setup-protoc@v3
       - name: Build
+        # Intentionally headless (--no-default-features) for CI runners; local installs use `cargo install` (default = ["ui"]).
         run: cargo build --release --no-default-features
       - name: Package
         shell: bash
