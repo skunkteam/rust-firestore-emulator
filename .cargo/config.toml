@@ -1,2 +1,6 @@
 [build]
 rustflags = ["--cfg", "tokio_unstable"]
+
+[env]
+PROPTEST_CASES = { value = "64", force = false }
+TOKIO_CONSOLE_BIND = { value = "127.0.0.1:0", force = false }

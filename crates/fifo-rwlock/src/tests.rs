@@ -351,8 +351,172 @@ fn dropping_read_request_will_remove_request_from_queue() {
     assert_eq!(get_queue(&lock), "[W1]");
 }
 
+#[test]
+fn dropping_in_flight_upgrade_wakes_queued_writers_and_readers_fairly() {
+    // Public-guard verification of upgrade cancellation without inspecting internal queue strings.
+    let lock = Arc::new(FifoRwLock::new(10));
+
+    // Case 1: R1 and R2 hold read locks; W3 and R4 queue behind them; R1 starts upgrading then
+    // cancels before R2 drops. Once R2 drops, W3 must acquire before R4.
+    let r1 = assert_ready!(spawn(lock.read_owned()).poll());
+    let r2 = assert_ready!(spawn(lock.read()).poll());
+
+    let mut w3_fut = spawn(lock.write_owned());
+    assert_pending!(w3_fut.poll());
+    let mut r4_fut = spawn(lock.read());
+    assert_pending!(r4_fut.poll());
+
+    let mut r1_upgrade_fut = spawn(r1.upgrade());
+    assert_pending!(r1_upgrade_fut.poll());
+
+    // Cancel R1's in-flight upgrade while R2 is still reading.
+    drop(r1_upgrade_fut);
+    assert_pending!(w3_fut.poll(), "W3 must still wait for active reader R2");
+    assert_pending!(r4_fut.poll(), "R4 must still wait behind queued writer W3");
+
+    drop(r2);
+    let mut w3 = assert_ready!(w3_fut.poll(), "W3 acquires once R2 releases");
+    assert_pending!(r4_fut.poll(), "R4 still waits for W3");
+    *w3 = 25;
+    drop(w3);
+
+    let r4 = assert_ready!(r4_fut.poll(), "R4 acquires after W3 releases");
+    assert_eq!(*r4, 25);
+    drop(r4);
+
+    // Case 2: R5 and R6 both attempt upgrade; dropping R5's upgrade immediately unblocks R6's
+    // upgrade.
+    let r5 = assert_ready!(spawn(lock.read_owned()).poll());
+    let r6 = assert_ready!(spawn(lock.read_owned()).poll());
+
+    let mut r5_upgrade = spawn(r5.upgrade());
+    assert_pending!(r5_upgrade.poll());
+    let mut r6_upgrade = spawn(r6.upgrade());
+    assert_pending!(r6_upgrade.poll());
+
+    drop(r5_upgrade);
+    let mut w6 = assert_ready!(
+        r6_upgrade.poll(),
+        "R6 upgrade acquires immediately when higher-priority R5 upgrade is dropped"
+    );
+    assert_eq!(*w6, 25);
+    *w6 = 50;
+    drop(w6);
+
+    let final_read = assert_ready!(spawn(lock.read()).poll());
+    assert_eq!(*final_read, 50);
+}
+
+#[test]
+fn downgrade_visibility_and_fifo_barrier_via_public_guards() {
+    let lock = Arc::new(FifoRwLock::new(1));
+
+    let mut w1 = assert_ready!(spawn(lock.write_owned()).poll());
+    let mut r2_fut = spawn(lock.read());
+    assert_pending!(r2_fut.poll());
+    let mut r3_fut = spawn(lock.read_owned());
+    assert_pending!(r3_fut.poll());
+    let mut w4_fut = spawn(lock.write_owned());
+    assert_pending!(w4_fut.poll());
+    let mut r5_fut = spawn(lock.read());
+    assert_pending!(r5_fut.poll());
+
+    *w1 = 42;
+    let r1 = w1.downgrade();
+
+    // Immediate readers ahead of W4 wake atomically and observe W1's write, while W4 and R5 stay
+    // blocked.
+    let r2 = assert_ready!(r2_fut.poll());
+    let r3 = assert_ready!(r3_fut.poll());
+    assert_eq!(*r1, 42);
+    assert_eq!(*r2, 42);
+    assert_eq!(*r3, 42);
+    assert_pending!(w4_fut.poll());
+    assert_pending!(r5_fut.poll());
+
+    drop((r1, r2));
+    assert_pending!(w4_fut.poll(), "W4 still waits for R3");
+    drop(r3);
+
+    let mut w4 = assert_ready!(w4_fut.poll());
+    assert_eq!(*w4, 42);
+    *w4 = 99;
+    assert_pending!(r5_fut.poll());
+    drop(w4);
+
+    let r5 = assert_ready!(r5_fut.poll());
+    assert_eq!(*r5, 99);
+}
+
+#[test]
+fn miri_scoped_threads_read_write_upgrade_downgrade() {
+    use std::sync::Barrier;
+
+    use futures::executor::block_on;
+
+    let iterations = 16_u32;
+    let rwlock = Arc::new(FifoRwLock::new(0_u32));
+    let barrier = Barrier::new(4);
+
+    std::thread::scope(|s| {
+        // Thread 1: exclusive write increments by 2
+        s.spawn(|| {
+            barrier.wait();
+            for _ in 0..iterations {
+                block_on(async {
+                    let mut g = rwlock.write_owned().await;
+                    *g += 2;
+                });
+            }
+        });
+
+        // Thread 2: read_owned -> upgrade increments by 3
+        s.spawn(|| {
+            barrier.wait();
+            for _ in 0..iterations {
+                block_on(async {
+                    let rg = rwlock.read_owned().await;
+                    let snapshot = *rg;
+                    let mut wg = rg.upgrade().await;
+                    assert!(*wg >= snapshot);
+                    *wg += 3;
+                });
+            }
+        });
+
+        // Thread 3: write_owned -> mutate -> downgrade -> read verification
+        s.spawn(|| {
+            barrier.wait();
+            for _ in 0..iterations {
+                block_on(async {
+                    let mut wg = rwlock.write_owned().await;
+                    *wg += 5;
+                    let expected = *wg;
+                    let rg = wg.downgrade();
+                    assert_eq!(*rg, expected);
+                });
+            }
+        });
+
+        // Thread 4: shared read observer
+        s.spawn(|| {
+            barrier.wait();
+            for _ in 0..iterations {
+                block_on(async {
+                    let rg = rwlock.read().await;
+                    black_box(*rg);
+                });
+            }
+        });
+    });
+
+    let final_val = block_on(async { *rwlock.read().await });
+    assert_eq!(final_val, (2 + 3 + 5) * iterations);
+}
+
 // --- Multithreaded Stress Test ---
 
+#[cfg_attr(miri, ignore)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn multithreaded() {
     use futures::stream::{self, StreamExt};

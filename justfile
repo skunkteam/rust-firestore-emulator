@@ -5,7 +5,10 @@
 # Available commands:
 # just                          - Run test and linting once
 # just watch                    - Watch test and lint, re-run on filechange
-# just [watch] test [crate]     - Run tests on workspace or the specified crate, e.g. `just test` or `just watch test emulator-tracing`
+# just [watch] test [crate]     - Run tests on workspace or the specified crate (run `just test` without a crate to include cross-crate black-box suites in `emulator-tests`)
+# just [watch] cov [crate]      - Generate line/region coverage summary via cargo-llvm-cov + nextest
+# just mutants <crate> <file>   - Run file-scoped mutation testing in ./tmp/mutants using the `mutants` nextest profile
+# just miri                     - Run Miri unsafe aliasing checks on `fifo-rwlock`
 # just [watch] lint [crate]     - Run linting on workspace or the specified crate (includes Web UI check when crate is omitted or 'all')
 # just [watch] ui-check         - Type-check the Web UI JavaScript modules via JSDoc/TypeScript
 # just [watch] doc [crate]      - Create crate docs for the workspace or the specified crate
@@ -61,7 +64,18 @@ fmt target="all":
 
 # Test the given crate with coverage info or the entire workspace if target is omitted
 cov target="all":
-    cargo tarpaulin --out lcov --out html {{ if target == "all" { "--workspace" } else { "--packages " + target } }}
+    mkdir -p ./tmp/cov
+    TMPDIR="{{ justfile_directory() }}/tmp/cov" cargo llvm-cov nextest {{ if target == "all" { "--workspace" } else { "--package " + target } }} --ignore-filename-regex '(OUT_DIR|google\.firestore\.v1\.rs|ui_assets\.rs|crates[\\/]emulator-tests[\\/])'
+
+# Run file-scoped mutation testing with scratch artifacts isolated in ./tmp/mutants
+mutants crate file *args:
+    mkdir -p ./tmp/mutants
+    TMPDIR="{{ justfile_directory() }}/tmp/mutants" NEXTEST_PROFILE=mutants cargo mutants --package {{ crate }} --file {{ file }} --output ./tmp/mutants {{ args }}
+
+# Check unsafe aliasing invariants in fifo-rwlock under Miri
+miri:
+    mkdir -p ./tmp/miri
+    TMPDIR="{{ justfile_directory() }}/tmp/miri" cargo +nightly miri test --package fifo-rwlock
 
 # Lint the given crate or the entire workspace if target is omitted
 lint target="all": && (ui-lint target)
@@ -93,8 +107,9 @@ build *cmd:
 # Test the application using the test suite that uses the JavaScript SDK.
 [working-directory: "test-suite"]
 sdk-test: (build "--no-default-features")
-    npm run test:rust-emulator
+    mkdir -p ../tmp/jest
+    TMPDIR="{{ justfile_directory() }}/tmp/jest" npm run test:rust-emulator
 
 # Watch code and execute just command on change, e.g. `just watch test googleapis`
 watch *cmd:
-    cargo watch --ignore test-suite --clear --shell 'just {{ cmd }}'
+    cargo watch --ignore test-suite --ignore tmp --ignore lcov.info --clear --shell 'just {{ cmd }}'

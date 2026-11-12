@@ -3,7 +3,7 @@ name = "firestore-emulator"
 description = "Google Cloud Firestore emulator with focus on stability"
 version = { workspace = true }
 edition = "2024"
-rust-version = "1.87"
+rust-version = { workspace = true }
 
 [features]
 default = ["ui"]
@@ -19,6 +19,7 @@ members = ["crates/*"]
 
 [workspace.package]
 version = "0.3.0-beta.2"
+rust-version = "1.90"
 
 [workspace.dependencies]
 axum = "0.8"
@@ -30,7 +31,7 @@ console-subscriber = "0.5.0"
 ctreg = "1.0.3"
 emulator-database = { path = "crates/emulator-database" }
 emulator-grpc = { path = "crates/emulator-grpc" }
-emulator-http = { path = "crates/emulator-http" }
+emulator-http = { path = "crates/emulator-http", default-features = false }
 emulator-tracing = { path = "crates/emulator-tracing" }
 fifo-rwlock = { path = "crates/fifo-rwlock" }
 futures = "0.3.34"
@@ -39,6 +40,7 @@ googletest = "0.14.4"
 http = "1.5"
 itertools = "0.15.0"
 prost = "0.14"
+proptest = { version = "1.6.0", default-features = false, features = ["std", "bit-set"] }
 reqwest = "0.13.5"
 rstest = "0.28.0"
 serde = "1.0.229"

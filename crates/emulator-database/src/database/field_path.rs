@@ -302,4 +302,100 @@ mod tests {
             err(eq(&GenericDatabaseError::invalid_argument(msg)))
         );
     }
+
+    mod proptests {
+        use std::collections::HashMap;
+
+        use googleapis::google::firestore::v1::Value;
+        use proptest::prelude::*;
+
+        use super::{DOC_NAME, FieldPath, FieldReference};
+
+        fn encode_field_path_for_test(segments: &[String]) -> String {
+            segments
+                .iter()
+                .map(|seg| {
+                    if seg.is_empty() || seg.contains(['.', '`', '\\']) {
+                        let mut quoted = String::with_capacity(seg.len() + 2);
+                        quoted.push('`');
+                        for ch in seg.chars() {
+                            if matches!(ch, '`' | '\\') {
+                                quoted.push('\\');
+                            }
+                            quoted.push(ch);
+                        }
+                        quoted.push('`');
+                        quoted
+                    } else {
+                        seg.clone()
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(".")
+        }
+
+        fn arb_segment() -> impl Strategy<Value = String> {
+            prop_oneof![
+                Just(String::new()),
+                Just(DOC_NAME.to_string()),
+                "[a-zA-Z0-9_`\\\\.& -]{1,8}",
+            ]
+        }
+
+        proptest! {
+            #[test]
+            fn proptest_field_path_escaped_segments_roundtrip(
+                segments in prop::collection::vec(arb_segment(), 1..=5),
+                leaf_val in any::<i64>(),
+            ) {
+                let encoded = encode_field_path_for_test(&segments);
+                let parsed: FieldPath = encoded.parse().unwrap();
+                prop_assert_eq!(&parsed.0, &segments);
+
+                // Exercise public get_value / set_value / delete_value at the parsed path.
+                let mut root = HashMap::new();
+                parsed.set_value(&mut root, Value::integer(leaf_val));
+                prop_assert_eq!(parsed.get_value(&root), Some(&Value::integer(leaf_val)));
+                let deleted = parsed.delete_value(&mut root);
+                prop_assert_eq!(deleted, Some(Value::integer(leaf_val)));
+                prop_assert_eq!(parsed.get_value(&root), None);
+            }
+
+            #[test]
+            fn proptest_field_path_malformed_inputs_rejected(
+                body in "[a-zA-Z0-9_.& -]{0,8}",
+                trailing in "[a-zA-Z0-9]",
+            ) {
+                prop_assert!("".parse::<FieldPath>().is_err());
+
+                let unclosed = format!("`{body}");
+                prop_assert!(unclosed.parse::<FieldPath>().is_err());
+
+                let trailing_backslash = format!("`{body}\\");
+                prop_assert!(trailing_backslash.parse::<FieldPath>().is_err());
+
+                let junk_after_close = format!("`{body}`{trailing}");
+                prop_assert!(junk_after_close.parse::<FieldPath>().is_err());
+            }
+
+            #[test]
+            fn proptest_field_reference_doc_name_vs_field_path(
+                seg in "[a-zA-Z0-9_]{1,8}",
+            ) {
+                let doc_ref: FieldReference = DOC_NAME.parse().unwrap();
+                prop_assert!(doc_ref.is_document_name());
+                prop_assert_eq!(doc_ref.to_string(), DOC_NAME);
+
+                // Quoted `__name__` is a literal field path, not the document-name pseudo-field.
+                let quoted_doc_name: FieldReference = "`__name__`".parse().unwrap();
+                prop_assert!(!quoted_doc_name.is_document_name());
+
+                if seg != DOC_NAME {
+                    let parsed: FieldReference = seg.parse().unwrap();
+                    prop_assert!(!parsed.is_document_name());
+                    prop_assert_eq!(parsed.to_string(), seg);
+                }
+            }
+        }
+    }
 }

@@ -1,0 +1,9 @@
+test_tool = "nextest"
+test_workspace = true
+gitignore = true
+exclude_globs = ["crates/emulator-tests/**"]
+exclude_re = [
+    'tracing::(trace|debug|info|warn|error)!',
+    '#\[tracing::instrument',
+    'unimplemented(_collection_group|_documents)?!',
+]

@@ -18,6 +18,7 @@ tracing = { workspace = true }
 
 [dev-dependencies]
 googletest = { workspace = true }
+proptest = { workspace = true }
 rstest = { workspace = true }
 tokio-test = { workspace = true }
 

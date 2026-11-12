@@ -23,7 +23,7 @@ async fn spawn_server(
     tokio::spawn(async move {
         axum::serve(listener, router).await.unwrap();
     });
-    Ok((project, Client::new(), base_url))
+    Ok((project, Client::builder().no_proxy().build()?, base_url))
 }
 
 #[gtest]
@@ -498,6 +498,21 @@ async fn test_rest_error_envelopes_and_404_isolation() -> Result<()> {
         );
     }
 
+    #[cfg(not(feature = "ui"))]
+    {
+        let root_ok = client.get(format!("{base_url}/")).send().await?;
+        expect_eq!(root_ok.status(), StatusCode::OK);
+        expect_eq!(root_ok.text().await?, "OK");
+
+        let meta_res = client.get(format!("{base_url}/emulator/v1")).send().await?;
+        expect_eq!(meta_res.status(), StatusCode::OK);
+        let dbs: Vec<String> = meta_res.json().await?;
+        expect_that!(
+            dbs,
+            contains(eq("projects/p/databases/(default)/documents"))
+        );
+    }
+
     Ok(())
 }
 
@@ -555,6 +570,49 @@ async fn test_sse_events_stream() -> Result<()> {
     let cleared_pos = collected.find("\"database_cleared\"").unwrap();
     expect_pred!(created_pos < changed_pos);
     expect_pred!(changed_pos < cleared_pos);
+
+    Ok(())
+}
+
+#[gtest]
+#[tokio::test(start_paused = true)]
+async fn test_sse_heartbeat_and_malformed_json_rejection() -> Result<()> {
+    let (_project, client, base_url) = spawn_server(false).await?;
+
+    // 1. Malformed JSON payloads are rejected with 4xx client errors on both Admin and REST
+    //    endpoints.
+    let bad_admin = client
+        .patch(format!("{base_url}/v1/projects/p/databases/(default)"))
+        .header("content-type", "application/json")
+        .body("{malformed-json")
+        .send()
+        .await?;
+    expect_pred!(bad_admin.status().is_client_error());
+
+    let bad_rest = client
+        .post(format!(
+            "{base_url}/v1/projects/p/databases/(default)/documents/items?documentId=i1"
+        ))
+        .header("content-type", "application/json")
+        .body("{\"fields\": ")
+        .send()
+        .await?;
+    expect_pred!(bad_rest.status().is_client_error());
+
+    // 2. Under `start_paused = true`, advancing across the 15-second SSE KeepAlive interval emits a
+    //    `: heartbeat` comment frame without waiting 15 seconds of wall-clock time.
+    let mut sse_res = client
+        .get(format!("{base_url}/emulator/v1/events"))
+        .send()
+        .await?;
+    expect_eq!(sse_res.status(), StatusCode::OK);
+
+    let chunk = tokio::time::timeout(Duration::from_secs(16), sse_res.chunk())
+        .await
+        .expect("SSE keep-alive heartbeat should fire at 15s virtual time")?
+        .expect("SSE stream should remain open and yield heartbeat bytes");
+    let text = String::from_utf8_lossy(&chunk);
+    expect_that!(text.as_ref(), contains_substring("heartbeat"));
 
     Ok(())
 }
