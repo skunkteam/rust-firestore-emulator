@@ -24,3 +24,4 @@ Root binary and library entry point for the `firestore-emulator` crate. Initiali
 
 ## Verification
 - Run: `cargo test`
+- Run (Cloud Firestore conformance suite against built binary): `just sdk-test`

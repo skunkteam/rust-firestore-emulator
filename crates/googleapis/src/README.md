@@ -37,3 +37,4 @@ Core library implementation for the `googleapis` crate. It includes the `tonic`/
 
 ## Verification
 - Run: `cargo test -p googleapis`
+- Run (Cloud Firestore conformance suite against built binary): `just sdk-test`

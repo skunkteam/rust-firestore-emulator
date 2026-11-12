@@ -27,3 +27,4 @@ Root library module for `emulator-database`, implementing `FirestoreProject` mul
 
 ## Verification
 - Run: `cargo test -p emulator-database`
+- Run (Cloud Firestore conformance suite against built binary): `just sdk-test`
