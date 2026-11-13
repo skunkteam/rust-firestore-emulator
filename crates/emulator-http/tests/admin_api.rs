@@ -2,12 +2,18 @@
 
 use std::time::Duration;
 
-use axum::http::StatusCode;
+use axum::{
+    body::Body,
+    http::{Method, Request, StatusCode},
+    serve::ListenerExt,
+};
 use emulator_database::{FirestoreProject, config::FirestoreConfig};
 use emulator_http::RouterBuilder;
 use googletest::prelude::*;
 use reqwest::Client;
 use serde_json::json;
+use tokio_stream::StreamExt;
+use tower::ServiceExt;
 
 async fn spawn_server(
     default_enterprise: bool,
@@ -20,6 +26,9 @@ async fn spawn_server(
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
     let port = listener.local_addr()?.port();
     let base_url = format!("http://127.0.0.1:{port}");
+    let listener = listener.tap_io(|tcp_stream| {
+        tcp_stream.set_nodelay(true).unwrap();
+    });
     tokio::spawn(async move {
         axum::serve(listener, router).await.unwrap();
     });
@@ -591,42 +600,60 @@ async fn test_sse_events_stream() -> Result<()> {
 #[gtest]
 #[tokio::test(start_paused = true)]
 async fn test_sse_heartbeat_and_malformed_json_rejection() -> Result<()> {
-    let (_project, client, base_url) = spawn_server(false).await?;
+    // Drive the Axum router directly in-memory (`oneshot` + `BodyDataStream`) rather than over an
+    // OS loopback TCP socket so `start_paused = true` virtual-time auto-advance never races Linux
+    // kernel Nagle / Delayed-ACK timers.
+    let project = Box::leak(Box::new(FirestoreProject::new(FirestoreConfig::default())));
+    let router = RouterBuilder::new(project).build();
 
     // 1. Malformed JSON payloads are rejected with 4xx client errors on both Admin and REST
     //    endpoints.
-    let bad_admin = client
-        .patch(format!("{base_url}/v1/projects/p/databases/(default)"))
-        .header("content-type", "application/json")
-        .body("{malformed-json")
-        .send()
+    let bad_admin = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::PATCH)
+                .uri("/v1/projects/p/databases/(default)")
+                .header("content-type", "application/json")
+                .body(Body::from("{malformed-json"))?,
+        )
         .await?;
     expect_pred!(bad_admin.status().is_client_error());
 
-    let bad_rest = client
-        .post(format!(
-            "{base_url}/v1/projects/p/databases/(default)/documents/items?documentId=i1"
-        ))
-        .header("content-type", "application/json")
-        .body("{\"fields\": ")
-        .send()
+    let bad_rest = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/v1/projects/p/databases/(default)/documents/items?documentId=i1")
+                .header("content-type", "application/json")
+                .body(Body::from("{\"fields\": "))?,
+        )
         .await?;
     expect_pred!(bad_rest.status().is_client_error());
 
     // 2. Under `start_paused = true`, advancing across the 15-second SSE KeepAlive interval emits a
     //    `: heartbeat` comment frame without waiting 15 seconds of wall-clock time.
-    let mut sse_res = client
-        .get(format!("{base_url}/emulator/v1/events"))
-        .send()
+    let sse_res = router
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/emulator/v1/events")
+                .body(Body::empty())?,
+        )
         .await?;
     expect_eq!(sse_res.status(), StatusCode::OK);
 
-    let chunk = tokio::time::timeout(Duration::from_secs(16), sse_res.chunk())
+    let mut sse_stream = sse_res.into_body().into_data_stream();
+    let before_interval = tokio::time::timeout(Duration::from_secs(14), sse_stream.next()).await;
+    expect_pred!(before_interval.is_err());
+
+    let chunk = tokio::time::timeout(Duration::from_secs(2), sse_stream.next())
         .await
-        .expect("SSE keep-alive heartbeat should fire at 15s virtual time")?
-        .expect("SSE stream should remain open and yield heartbeat bytes");
+        .expect("SSE keep-alive heartbeat should fire at 15s virtual time")
+        .expect("SSE stream should remain open and yield heartbeat bytes")?;
     let text = String::from_utf8_lossy(&chunk);
-    expect_that!(text.as_ref(), contains_substring("heartbeat"));
+    expect_that!(text.as_ref(), contains_substring(": heartbeat"));
 
     Ok(())
 }

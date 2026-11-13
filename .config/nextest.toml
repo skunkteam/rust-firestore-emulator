@@ -4,6 +4,7 @@ slow-timeout = { period = "15s", terminate-after = 2 }
 
 [profile.ci]
 failure-output = "immediate-final"
+fail-fast = false
 slow-timeout = { period = "15s", terminate-after = 2 }
 
 [profile.ci.junit]

@@ -97,6 +97,9 @@ mod tests {
 
         let tcp_listener = TcpListener::bind("127.0.0.1:0").await?;
         let host = tcp_listener.local_addr()?;
+        let tcp_listener = axum::serve::ListenerExt::tap_io(tcp_listener, |tcp_stream| {
+            tcp_stream.set_nodelay(true).unwrap();
+        });
         tokio::spawn(async {
             axum::serve(tcp_listener, router).await.unwrap();
         });
