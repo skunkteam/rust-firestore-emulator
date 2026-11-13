@@ -74,8 +74,10 @@ mutants crate file *args:
 
 # Check unsafe aliasing invariants in fifo-rwlock under Miri
 miri:
-    mkdir -p ./tmp/miri
-    TMPDIR="{{ justfile_directory() }}/tmp/miri" cargo +nightly miri test --package fifo-rwlock
+    mkdir -p ./tmp/miri/sysroot-build/.cargo
+    printf '[source.crates-io]\nreplace-with = "vendored-sources"\n[source.vendored-sources]\ndirectory = "%s/lib/rustlib/src/rust/library/vendor"\n' "$(rustc +nightly --print sysroot)" > ./tmp/miri/sysroot-build/.cargo/config.toml
+    cd ./tmp/miri/sysroot-build && TMPDIR="{{ justfile_directory() }}/tmp/miri/sysroot-build" MIRI_SYSROOT="${MIRI_SYSROOT:-{{ justfile_directory() }}/tmp/miri/sysroot}" cargo +nightly miri setup
+    TMPDIR="{{ justfile_directory() }}/tmp/miri" MIRI_SYSROOT="${MIRI_SYSROOT:-{{ justfile_directory() }}/tmp/miri/sysroot}" cargo +nightly miri test --package fifo-rwlock
 
 # Lint the given crate or the entire workspace if target is omitted
 lint target="all": && (ui-lint target)
