@@ -21,8 +21,6 @@ regex! {
 pub enum ParseError {
     #[error("invalid directive: {0:?}")]
     InvalidDirective(String),
-    #[error("invalid span filter: {0:?}")]
-    InvalidSpanFilter(String),
 }
 
 /// Filter that uses the same syntax as the [`EnvFilter`](tracing_subscriber::EnvFilter), but works
@@ -109,5 +107,105 @@ impl Directive {
         }
 
         true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use googletest::prelude::*;
+    use rstest::rstest;
+    use tracing::{
+        Callsite, Level, Metadata, callsite::Identifier, field::FieldSet, metadata::Kind,
+        subscriber::Interest,
+    };
+
+    use super::{Filter, ParseError};
+
+    struct StaticCallsite(&'static Metadata<'static>);
+
+    impl Callsite for StaticCallsite {
+        fn set_interest(&self, _interest: Interest) {}
+
+        fn metadata(&self) -> &Metadata<'_> {
+            self.0
+        }
+    }
+
+    macro_rules! static_meta {
+        ($target:literal, $level:expr) => {{
+            static CALLSITE: StaticCallsite = StaticCallsite(&META);
+            static META: Metadata<'static> = Metadata::new(
+                "evt",
+                $target,
+                $level,
+                None,
+                None,
+                None,
+                FieldSet::new(&[], Identifier(&CALLSITE)),
+                Kind::EVENT,
+            );
+            &META
+        }};
+    }
+
+    #[gtest]
+    #[rstest]
+    #[case("off", false, false, false)]
+    #[case("0", false, false, false)]
+    #[case("error", true, false, false)]
+    #[case("WARN", true, false, false)]
+    #[case("info", true, true, false)]
+    #[case("debug", true, true, true)]
+    #[case("trace", true, true, true)]
+    #[case("5", true, true, true)]
+    fn global_level_directives(
+        #[case] directive: &str,
+        #[case] allows_error: bool,
+        #[case] allows_info: bool,
+        #[case] allows_debug: bool,
+    ) {
+        let filter: Filter = directive.parse().unwrap();
+        expect_eq!(
+            filter.allows(static_meta!("any::mod", Level::ERROR)),
+            allows_error
+        );
+        expect_eq!(
+            filter.allows(static_meta!("any::mod", Level::INFO)),
+            allows_info
+        );
+        expect_eq!(
+            filter.allows(static_meta!("any::mod", Level::DEBUG)),
+            allows_debug
+        );
+    }
+
+    #[gtest]
+    fn target_prefix_and_comma_separated_directives() {
+        let filter: Filter = " warn , tower_http::trace=debug , bare_target , "
+            .parse()
+            .unwrap();
+
+        // Global `warn` allows WARN/ERROR everywhere, blocks INFO on unrelated targets.
+        expect_true!(filter.allows(static_meta!("other_crate", Level::WARN)));
+        expect_false!(filter.allows(static_meta!("other_crate", Level::INFO)));
+
+        // Target prefix `tower_http::trace=debug` allows DEBUG on sub-targets, blocks TRACE.
+        expect_true!(filter.allows(static_meta!("tower_http::trace::on_request", Level::DEBUG)));
+        expect_false!(filter.allows(static_meta!("tower_http::trace::on_request", Level::TRACE)));
+
+        // Bare target without `=level` defaults to TRACE.
+        expect_true!(filter.allows(static_meta!("bare_target::child", Level::TRACE)));
+    }
+
+    #[gtest]
+    #[rstest]
+    #[case("tower_http=invalid_level")]
+    #[case("my_target[span_name]=debug")]
+    #[case("has spaces=info")]
+    #[case("=debug")]
+    fn invalid_directives_return_parse_error(#[case] bad: &str) {
+        let err = bad.parse::<Filter>().unwrap_err();
+        expect_that!(err, pat!(ParseError::InvalidDirective(_)));
+        expect_that!(err.to_string(), contains_substring("invalid directive"));
     }
 }

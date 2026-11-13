@@ -31,6 +31,9 @@ pub enum GenericDatabaseError {
     /// applied to a non-directory, etc.
     #[error("Failed precondition: {0}")]
     FailedPrecondition(String),
+    /// Some requested entity (e.g., file or directory) was not found.
+    #[error("Not found: {0}")]
+    NotFound(String),
     /// Operation is not implemented or not supported/enabled in this service.
     #[error("Not implemented: {0}")]
     NotImplemented(String),
@@ -57,6 +60,10 @@ impl GenericDatabaseError {
         Self::InvalidArgument(message.into())
     }
 
+    pub(crate) fn not_found(message: impl Into<String>) -> Self {
+        Self::NotFound(message.into())
+    }
+
     pub(crate) fn not_implemented(message: impl Into<String>) -> Self {
         Self::NotImplemented(message.into())
     }
@@ -73,6 +80,7 @@ impl GenericDatabaseError {
             Self::Internal(_) => tonic::Code::Internal,
             Self::InvalidArgument(_) | Self::InvalidReference(_, _) => tonic::Code::InvalidArgument,
             Self::FailedPrecondition(_) => tonic::Code::FailedPrecondition,
+            Self::NotFound(_) => tonic::Code::NotFound,
             Self::NotImplemented(_) => tonic::Code::Unimplemented,
         }
     }
@@ -87,6 +95,7 @@ impl From<GenericDatabaseError> for tonic::Status {
             | GenericDatabaseError::Internal(msg)
             | GenericDatabaseError::InvalidArgument(msg)
             | GenericDatabaseError::FailedPrecondition(msg)
+            | GenericDatabaseError::NotFound(msg)
             | GenericDatabaseError::NotImplemented(msg) => Self::new(value.grpc_code(), msg),
             GenericDatabaseError::InvalidReference(_, _) => {
                 Self::new(value.grpc_code(), value.to_string())

@@ -6,7 +6,7 @@
     "scripts": {
         "test": "NODE_OPTIONS='--experimental-vm-modules' jest",
         "test:java-emulator": "f() { firebase emulators:exec --only firestore \"NODE_OPTIONS='--experimental-vm-modules' jest --maxConcurrency 1$(printf ' %q' \"$@\")\"; }; f",
-        "test:rust-emulator": "f() { export FIRESTORE_EMULATOR_HOST=127.0.0.1:8080; RUST_LOG=\"${RUST_LOG:=OFF}\" ../target/debug/firestore-emulator & PID=$!; RUST_EMULATOR=true NODE_OPTIONS='--experimental-vm-modules' jest \"$@\"; RET=$?; kill -INT $PID; return $RET; }; f",
+        "test:rust-emulator": "f() { export FIRESTORE_EMULATOR_HOST=127.0.0.1:8080; RUST_LOG=\"${RUST_LOG:=OFF}\" ../target/debug/firestore-emulator & PID=$!; cleanup() { kill -INT \"$PID\" 2>/dev/null || true; wait \"$PID\" 2>/dev/null || true; }; trap cleanup EXIT INT TERM; RUST_EMULATOR=true NODE_OPTIONS='--experimental-vm-modules' jest \"$@\"; }; f",
         "build:rust": "cd .. && cargo build",
         "lint": "eslint tests && prettier -c tests"
     },

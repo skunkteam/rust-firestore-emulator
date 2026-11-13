@@ -2,12 +2,18 @@
 name = "googleapis"
 version = { workspace = true }
 edition = "2024"
+rust-version = { workspace = true }
 
 [lib]
 doctest = false
 
+[features]
+default = []
+client = ["tonic/gzip"]
+
 [dependencies]
 base64 = { workspace = true }
+bytes = { workspace = true }
 itertools = { workspace = true }
 prost = { workspace = true }
 serde = { workspace = true, features = ["serde_derive"] }
@@ -21,6 +27,7 @@ tonic-prost-build = { workspace = true }
 
 [dev-dependencies]
 googletest = { workspace = true }
+proptest = { workspace = true }
 rstest = { workspace = true }
 serde_json = { workspace = true }
 

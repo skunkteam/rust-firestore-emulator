@@ -3,6 +3,7 @@
 
 tonic::include_proto!("googleapis");
 
+mod macros;
 mod ser;
 mod timestamp_ext;
 mod transaction_options_ext;

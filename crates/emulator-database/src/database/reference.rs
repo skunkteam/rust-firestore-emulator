@@ -513,4 +513,90 @@ mod tests {
         };
         assert_that!(input.parse::<Ref>(), ok(eq(&expected)));
     }
+
+    mod proptests {
+        use proptest::{prelude::*, sample::select};
+
+        use super::{CollectionRef, DocumentRef, Ref, RootRef};
+
+        const PROJECT_VOCAB: &[&str] = &["proj-a", "proj-b", "demo-project", "p"];
+        const DB_VOCAB: &[&str] = &["(default)", "db-1", "analytics", "staging"];
+        const ID_VOCAB: &[&str] = &[
+            "users", "orders", "items", "events", "rooms", "msgs", "alpha", "beta", "doc-1",
+            "doc_2", "d3", "d4", "a", "b", "__half", "x__y",
+        ];
+
+        proptest! {
+            #[test]
+            fn proptest_ref_display_from_str_roundtrip_and_hierarchy(
+                project in select(PROJECT_VOCAB),
+                database in select(DB_VOCAB),
+                segments in prop::collection::vec(select(ID_VOCAB), 0..=6),
+            ) {
+                let root_bare = format!("projects/{project}/databases/{database}");
+                let root_docs = format!("{root_bare}/documents");
+
+                let parsed_bare: Ref = root_bare.parse().unwrap();
+                let parsed_docs: Ref = root_docs.parse().unwrap();
+                prop_assert_eq!(&parsed_bare, &parsed_docs);
+                prop_assert_eq!(&parsed_docs.to_string(), &root_docs);
+
+                if segments.is_empty() {
+                    let root_only: RootRef = root_docs.parse().unwrap();
+                    prop_assert_eq!(&root_only.to_string(), &root_docs);
+                    prop_assert!(root_docs.parse::<CollectionRef>().is_err());
+                    prop_assert!(root_docs.parse::<DocumentRef>().is_err());
+                } else {
+                    let full = format!("{root_docs}/{}", segments.join("/"));
+                    let parsed: Ref = full.parse().unwrap();
+                    prop_assert_eq!(&parsed.to_string(), &full);
+                    prop_assert_eq!(&parsed.to_string().parse::<Ref>().unwrap(), &parsed);
+                    prop_assert!(parsed_docs.is_parent_of(&parsed));
+                    prop_assert!(!parsed.is_parent_of(&parsed));
+                    prop_assert!(!parsed.is_parent_of(&parsed_docs));
+
+                    if segments.len() % 2 == 1 {
+                        let col: CollectionRef = full.parse().unwrap();
+                        prop_assert_eq!(&col.to_string(), &full);
+                        prop_assert!(full.parse::<RootRef>().is_err());
+                        prop_assert!(full.parse::<DocumentRef>().is_err());
+
+                        let parent = col.parent();
+                        prop_assert!(parent.is_parent_of(&Ref::Collection(col.clone())));
+                        prop_assert!(col.strip_prefix(&parent).is_some());
+                    } else {
+                        let doc: DocumentRef = full.parse().unwrap();
+                        prop_assert_eq!(&doc.to_string(), &full);
+                        prop_assert!(full.parse::<RootRef>().is_err());
+                        prop_assert!(full.parse::<CollectionRef>().is_err());
+                    }
+                }
+            }
+
+            #[test]
+            fn proptest_ref_rejects_reserved_and_malformed_ids(
+                project in select(PROJECT_VOCAB),
+                database in select(DB_VOCAB),
+                prefix in prop::collection::vec(select(ID_VOCAB), 0..=3),
+                suffix in prop::collection::vec(select(ID_VOCAB), 0..=3),
+                bad_id in prop_oneof![
+                    Just(".".to_string()),
+                    Just("..".to_string()),
+                    Just(String::new()),
+                    Just("_____".to_string()),
+                    Just("__name__".to_string()),
+                    select(ID_VOCAB).prop_map(|s| format!("__{s}__")),
+                ],
+            ) {
+                let mut all = prefix;
+                all.push(&bad_id);
+                all.extend(suffix);
+                let path = format!(
+                    "projects/{project}/databases/{database}/documents/{}",
+                    all.join("/")
+                );
+                prop_assert!(path.parse::<Ref>().is_err());
+            }
+        }
+    }
 }

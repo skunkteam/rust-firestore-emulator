@@ -4,7 +4,7 @@ use googleapis::google::firestore::v1::{Document, StructuredPipeline};
 
 use crate::{
     FirestoreDatabase, GenericDatabaseError, error::Result, read_consistency::ReadConsistency,
-    reference::RootRef, required_option, unimplemented_collection,
+    reference::RootRef, required_option, unimplemented, unimplemented_collection,
 };
 
 mod add_fields;
@@ -50,7 +50,7 @@ pub async fn execute(
 
     let mut current_docs = match first.name.as_str() {
         "collection" => collection::execute(database, root_ref, first, read_consistency).await?,
-        _ => unimplemented!("pipeline stage {} is not supported yet", first.name),
+        _ => unimplemented!(format!("pipeline stage {}", first.name)),
     };
 
     for stage in stages {
@@ -64,7 +64,7 @@ pub async fn execute(
             "add_fields" => add_fields::execute(stage, current_docs)?,
             "select" => select::execute(stage, current_docs)?,
             "remove_fields" => remove_fields::execute(stage, current_docs)?,
-            _ => unimplemented!("pipeline stage {} is not supported yet", stage.name),
+            _ => unimplemented!(format!("pipeline stage {}", stage.name)),
         };
     }
 

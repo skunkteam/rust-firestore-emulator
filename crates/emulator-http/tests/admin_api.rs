@@ -2,12 +2,18 @@
 
 use std::time::Duration;
 
-use axum::http::StatusCode;
+use axum::{
+    body::Body,
+    http::{Method, Request, StatusCode},
+    serve::ListenerExt,
+};
 use emulator_database::{FirestoreProject, config::FirestoreConfig};
 use emulator_http::RouterBuilder;
 use googletest::prelude::*;
 use reqwest::Client;
 use serde_json::json;
+use tokio_stream::StreamExt;
+use tower::ServiceExt;
 
 async fn spawn_server(
     default_enterprise: bool,
@@ -20,10 +26,13 @@ async fn spawn_server(
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
     let port = listener.local_addr()?.port();
     let base_url = format!("http://127.0.0.1:{port}");
+    let listener = listener.tap_io(|tcp_stream| {
+        tcp_stream.set_nodelay(true).unwrap();
+    });
     tokio::spawn(async move {
         axum::serve(listener, router).await.unwrap();
     });
-    Ok((project, Client::new(), base_url))
+    Ok((project, Client::builder().no_proxy().build()?, base_url))
 }
 
 #[gtest]
@@ -396,16 +405,30 @@ async fn test_rest_error_envelopes_and_404_isolation() -> Result<()> {
     let empty_err: serde_json::Value = empty_val.json().await?;
     expect_eq!(empty_err["error"]["status"], "INVALID_ARGUMENT");
 
-    // 4. Failed precondition on PATCH -> 400 FAILED_PRECONDITION
-    let precond = client
+    // 4. Preconditions on PATCH: Exists(true) on missing -> 404 NOT_FOUND; UpdateTime mismatch ->
+    //    400 FAILED_PRECONDITION
+    let missing_exists = client
         .patch(format!(
             "{docs_root}/users/missing-doc?currentDocument.exists=true"
         ))
         .json(&json!({ "fields": {} }))
         .send()
         .await?;
+    expect_eq!(missing_exists.status(), StatusCode::NOT_FOUND);
+    let missing_exists_err: serde_json::Value = missing_exists.json().await?;
+    expect_eq!(missing_exists_err["error"]["code"], 404);
+    expect_eq!(missing_exists_err["error"]["status"], "NOT_FOUND");
+
+    let precond = client
+        .patch(format!(
+            "{docs_root}/users/missing-doc?currentDocument.updateTime=1970-01-01T00:00:01Z"
+        ))
+        .json(&json!({ "fields": {} }))
+        .send()
+        .await?;
     expect_eq!(precond.status(), StatusCode::BAD_REQUEST);
     let precond_err: serde_json::Value = precond.json().await?;
+    expect_eq!(precond_err["error"]["code"], 400);
     expect_eq!(precond_err["error"]["status"], "FAILED_PRECONDITION");
 
     // 5. Unmatched /v1/... and /emulator/v1/... routes return 404 JSON, never 200 HTML
@@ -498,6 +521,21 @@ async fn test_rest_error_envelopes_and_404_isolation() -> Result<()> {
         );
     }
 
+    #[cfg(not(feature = "ui"))]
+    {
+        let root_ok = client.get(format!("{base_url}/")).send().await?;
+        expect_eq!(root_ok.status(), StatusCode::OK);
+        expect_eq!(root_ok.text().await?, "OK");
+
+        let meta_res = client.get(format!("{base_url}/emulator/v1")).send().await?;
+        expect_eq!(meta_res.status(), StatusCode::OK);
+        let dbs: Vec<String> = meta_res.json().await?;
+        expect_that!(
+            dbs,
+            contains(eq("projects/p/databases/(default)/documents"))
+        );
+    }
+
     Ok(())
 }
 
@@ -555,6 +593,67 @@ async fn test_sse_events_stream() -> Result<()> {
     let cleared_pos = collected.find("\"database_cleared\"").unwrap();
     expect_pred!(created_pos < changed_pos);
     expect_pred!(changed_pos < cleared_pos);
+
+    Ok(())
+}
+
+#[gtest]
+#[tokio::test(start_paused = true)]
+async fn test_sse_heartbeat_and_malformed_json_rejection() -> Result<()> {
+    // Drive the Axum router directly in-memory (`oneshot` + `BodyDataStream`) rather than over an
+    // OS loopback TCP socket so `start_paused = true` virtual-time auto-advance never races Linux
+    // kernel Nagle / Delayed-ACK timers.
+    let project = Box::leak(Box::new(FirestoreProject::new(FirestoreConfig::default())));
+    let router = RouterBuilder::new(project).build();
+
+    // 1. Malformed JSON payloads are rejected with 4xx client errors on both Admin and REST
+    //    endpoints.
+    let bad_admin = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::PATCH)
+                .uri("/v1/projects/p/databases/(default)")
+                .header("content-type", "application/json")
+                .body(Body::from("{malformed-json"))?,
+        )
+        .await?;
+    expect_pred!(bad_admin.status().is_client_error());
+
+    let bad_rest = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/v1/projects/p/databases/(default)/documents/items?documentId=i1")
+                .header("content-type", "application/json")
+                .body(Body::from("{\"fields\": "))?,
+        )
+        .await?;
+    expect_pred!(bad_rest.status().is_client_error());
+
+    // 2. Under `start_paused = true`, advancing across the 15-second SSE KeepAlive interval emits a
+    //    `: heartbeat` comment frame without waiting 15 seconds of wall-clock time.
+    let sse_res = router
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/emulator/v1/events")
+                .body(Body::empty())?,
+        )
+        .await?;
+    expect_eq!(sse_res.status(), StatusCode::OK);
+
+    let mut sse_stream = sse_res.into_body().into_data_stream();
+    let before_interval = tokio::time::timeout(Duration::from_secs(14), sse_stream.next()).await;
+    expect_pred!(before_interval.is_err());
+
+    let chunk = tokio::time::timeout(Duration::from_secs(2), sse_stream.next())
+        .await
+        .expect("SSE keep-alive heartbeat should fire at 15s virtual time")
+        .expect("SSE stream should remain open and yield heartbeat bytes")?;
+    let text = String::from_utf8_lossy(&chunk);
+    expect_that!(text.as_ref(), contains_substring(": heartbeat"));
 
     Ok(())
 }

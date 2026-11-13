@@ -18,7 +18,7 @@ Every new emulator feature or bugfix affecting Firestore semantics must add, upd
 - `[jest.config.js]`: `ts-jest` Node test runner configuration matching `<rootDir>/tests/**/*.test.ts`, loading `jest-extended/all`, and setting `testTimeout: 10_000` ms.
 - `[tsconfig.json]`, `[.eslintrc.js]`, `[.prettierrc]`, `[.npmrc]`: Strict TypeScript (`es2024`/`esnext`, `strict: true`), ESLint, Prettier (`printWidth: 140`, `tabWidth: 4`), and npm shell (`script-shell = /bin/bash`) configurations; `node_modules/.bin/tsc` is also invoked from the repository root by `just ui-check` (`../justfile`).
 - Subdirectories:
-  - `tests`: [./tests/README.md](./tests/README.md) - Numbered conformance test suites (`1-get-set.test.ts` through `9-pipeline-operators.test.ts`) and shared backend/concurrency test utilities (`./tests/utils/README.md`).
+  - `tests`: [./tests/README.md](./tests/README.md) - Numbered conformance test suites (`1-get-set.test.ts` through `10-rust-oracle-edge-cases.test.ts`) and shared backend/concurrency test utilities (`./tests/utils/README.md`).
 
 ## Invariants
 - **No-Build Binary Execution in `test:rust-emulator` (`[package.json:scripts.test:rust-emulator]`, `[../justfile:sdk-test]`)**: `npm run test:rust-emulator` executes `../target/debug/firestore-emulator` directly without invoking `cargo build`. Running it without rebuilding after Rust changes silently tests a stale binary (or fails if `target/debug/firestore-emulator` is absent); always run `just sdk-test` from the workspace root or run `cargo build` / `npm run build:rust` prior to `npm run test:rust-emulator`.

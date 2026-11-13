@@ -1,7 +1,7 @@
 use std::{cmp, collections::HashMap, iter::Sum, ops::Add};
 
+use bytes::Bytes;
 use itertools::Itertools;
-use tonic_prost::prost::bytes::Bytes;
 
 use crate::google::{
     firestore::v1::{
@@ -542,6 +542,107 @@ impl PartialOrd for LatLng {
     }
 }
 
+impl From<bool> for Value {
+    fn from(value: bool) -> Self {
+        Self::boolean(value)
+    }
+}
+
+impl From<i32> for Value {
+    fn from(value: i32) -> Self {
+        Self::integer(i64::from(value))
+    }
+}
+
+impl From<i64> for Value {
+    fn from(value: i64) -> Self {
+        Self::integer(value)
+    }
+}
+
+impl From<f64> for Value {
+    fn from(value: f64) -> Self {
+        Self::double(value)
+    }
+}
+
+impl From<&str> for Value {
+    fn from(value: &str) -> Self {
+        Self::string(value)
+    }
+}
+
+impl From<String> for Value {
+    fn from(value: String) -> Self {
+        Self::string(value)
+    }
+}
+
+impl From<Bytes> for Value {
+    fn from(value: Bytes) -> Self {
+        Self::bytes(value)
+    }
+}
+
+impl From<Vec<u8>> for Value {
+    fn from(value: Vec<u8>) -> Self {
+        Self::bytes(value)
+    }
+}
+
+impl From<&[u8]> for Value {
+    fn from(value: &[u8]) -> Self {
+        Self::bytes(Bytes::copy_from_slice(value))
+    }
+}
+
+impl<const N: usize> From<&[u8; N]> for Value {
+    fn from(value: &[u8; N]) -> Self {
+        Self::bytes(Bytes::copy_from_slice(value))
+    }
+}
+
+impl<const N: usize> From<[u8; N]> for Value {
+    fn from(value: [u8; N]) -> Self {
+        Self::bytes(Bytes::copy_from_slice(&value))
+    }
+}
+
+impl From<Timestamp> for Value {
+    fn from(value: Timestamp) -> Self {
+        Self::timestamp(value)
+    }
+}
+
+impl From<LatLng> for Value {
+    fn from(value: LatLng) -> Self {
+        Self {
+            value_type: Some(ValueType::GeoPointValue(value)),
+        }
+    }
+}
+
+impl From<Vec<Value>> for Value {
+    fn from(values: Vec<Value>) -> Self {
+        Self::array(values)
+    }
+}
+
+impl From<HashMap<String, Value>> for Value {
+    fn from(fields: HashMap<String, Value>) -> Self {
+        Self::map(fields)
+    }
+}
+
+impl<T: Into<Value>> From<Option<T>> for Value {
+    fn from(value: Option<T>) -> Self {
+        match value {
+            Some(v) => v.into(),
+            None => Self::null(),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::{cmp::Ordering, collections::HashMap};
@@ -743,5 +844,197 @@ mod tests {
         let ref_empty = Value::reference("projects/p/databases/d/documents/c/".into());
         expect_that!(ref_sentinel == ref_empty, eq(true));
         expect_that!(ref_sentinel.storage_eq(&ref_empty), eq(false));
+    }
+
+    #[gtest]
+    fn from_conversions_preserve_exact_firestore_wire_types() {
+        use bytes::Bytes;
+
+        use crate::google::protobuf::Timestamp;
+
+        expect_true!(Value::from(true).storage_eq(&Value::boolean(true)));
+        expect_true!(Value::from(42_i32).storage_eq(&Value::integer(42)));
+        expect_true!(Value::from(42_i64).storage_eq(&Value::integer(42)));
+        expect_true!(Value::from(42.0_f64).storage_eq(&Value::double(42.0)));
+        expect_false!(Value::from(42_i32).storage_eq(&Value::from(42.0_f64)));
+        expect_true!(Value::from("abc").storage_eq(&Value::string("abc")));
+        expect_true!(Value::from("abc".to_string()).storage_eq(&Value::string("abc")));
+        expect_true!(
+            Value::from(Bytes::from_static(b"xyz")).storage_eq(&Value::bytes(&b"xyz"[..]))
+        );
+        expect_true!(Value::from(vec![1_u8, 2, 3]).storage_eq(&Value::bytes(&[1_u8, 2, 3][..])));
+        let slice: &[u8] = &[4, 5];
+        expect_true!(Value::from(slice).storage_eq(&Value::bytes(&[4_u8, 5][..])));
+        expect_true!(Value::from(b"hi").storage_eq(&Value::bytes(&b"hi"[..])));
+        expect_true!(Value::from([9_u8, 8]).storage_eq(&Value::bytes(&[9_u8, 8][..])));
+        let ts = Timestamp {
+            seconds: 123,
+            nanos:   456,
+        };
+        expect_true!(Value::from(ts).storage_eq(&Value::timestamp(ts)));
+        let geo = LatLng {
+            latitude:  52.0,
+            longitude: 4.0,
+        };
+        expect_true!(Value::from(geo).storage_eq(&Value {
+            value_type: Some(ValueType::GeoPointValue(geo)),
+        }));
+        expect_true!(
+            Value::from(vec![Value::from(1_i32)])
+                .storage_eq(&Value::array(vec![Value::integer(1)]))
+        );
+        let map = HashMap::from([("k".to_string(), Value::from("v"))]);
+        expect_true!(Value::from(map.clone()).storage_eq(&Value::map(map)));
+        expect_true!(Value::from(None::<i64>).storage_eq(&Value::null()));
+        expect_true!(Value::from(Some(7_i32)).storage_eq(&Value::integer(7)));
+    }
+
+    mod proptests {
+        use std::{cmp::Ordering, collections::HashMap};
+
+        use bytes::Bytes;
+        use proptest::prelude::*;
+
+        use crate::google::{
+            firestore::v1::{Value, value::ValueType},
+            protobuf::Timestamp,
+            r#type::LatLng,
+        };
+
+        fn arb_f64() -> impl Strategy<Value = f64> {
+            prop_oneof![
+                Just(0.0),
+                Just(-0.0),
+                Just(1.0),
+                Just(-1.0),
+                Just(f64::NAN),
+                Just(f64::from_bits(0x7ff8_0000_0000_0001)),
+                Just(f64::from_bits(0xfff8_0000_0000_0002)),
+                Just(f64::INFINITY),
+                Just(f64::NEG_INFINITY),
+                Just(i64::MIN as f64),
+                Just(i64::MAX as f64),
+                Just(9_007_199_254_740_992.0),
+                any::<f64>(),
+            ]
+        }
+
+        fn arb_i64() -> impl Strategy<Value = i64> {
+            prop_oneof![
+                Just(0),
+                Just(1),
+                Just(-1),
+                Just(i64::MIN),
+                Just(i64::MIN + 1),
+                Just(i64::MAX - 1),
+                Just(i64::MAX),
+                -1000_i64..=1000_i64,
+                any::<i64>(),
+            ]
+        }
+
+        fn arb_value() -> impl Strategy<Value = Value> {
+            let leaf = prop_oneof![
+                Just(Value::default()),
+                Just(Value::null()),
+                any::<bool>().prop_map(Value::boolean),
+                arb_i64().prop_map(Value::integer),
+                arb_f64().prop_map(Value::double),
+                (
+                    -62_135_596_800_i64..=253_402_300_799_i64,
+                    0_i32..1_000_000_000_i32
+                )
+                    .prop_map(|(seconds, nanos)| Value::timestamp(Timestamp { seconds, nanos })),
+                "[a-z0-9_/]{0,12}".prop_map(Value::string),
+                prop::collection::vec(any::<u8>(), 0..8).prop_map(|v| Value::bytes(Bytes::from(v))),
+                prop_oneof![
+                    Just(Value::reference(
+                        "projects/p/databases/(default)/documents/c/__id-9223372036854775808__"
+                            .to_string(),
+                    )),
+                    Just(Value::reference(
+                        "projects/p/databases/(default)/documents/c/".to_string()
+                    )),
+                    "[a-z]{1,4}/[a-z0-9]{1,4}".prop_map(|tail| {
+                        Value::reference(format!("projects/p/databases/(default)/documents/{tail}"))
+                    }),
+                ],
+                (arb_f64(), arb_f64()).prop_map(|(latitude, longitude)| Value {
+                    value_type: Some(ValueType::GeoPointValue(LatLng {
+                        latitude,
+                        longitude,
+                    })),
+                }),
+            ];
+            leaf.prop_recursive(2, 16, 4, |inner| {
+                prop_oneof![
+                    prop::collection::vec(inner.clone(), 0..4).prop_map(Value::array),
+                    prop::collection::hash_map("[a-d]{1,2}", inner, 0..4).prop_map(Value::map),
+                ]
+            })
+        }
+
+        proptest! {
+            #[test]
+            fn proptest_value_total_order_and_eq_laws(
+                a in arb_value(),
+                b in arb_value(),
+                c in arb_value(),
+            ) {
+                // Reflexivity
+                prop_assert_eq!(a.cmp(&a), Ordering::Equal);
+                prop_assert_eq!(&a, &a);
+                prop_assert!(a.storage_eq(&a));
+
+                // Antisymmetry & PartialEq coherence
+                let ab = a.cmp(&b);
+                let ba = b.cmp(&a);
+                prop_assert_eq!(ab, ba.reverse());
+                prop_assert_eq!(a == b, ab == Ordering::Equal);
+                prop_assert_eq!(a.storage_eq(&b), b.storage_eq(&a));
+                if a.storage_eq(&b) {
+                    prop_assert_eq!(&a, &b);
+                }
+
+                // Transitivity across arbitrary triples (sort the triple to force x <= y <= z)
+                let mut triple = [a, b, c];
+                triple.sort();
+                prop_assert!(triple[0] <= triple[1]);
+                prop_assert!(triple[1] <= triple[2]);
+                prop_assert!(triple[0] <= triple[2]);
+            }
+
+            #[test]
+            fn proptest_numeric_add_saturates_and_sum_promotes_overflow(
+                a in arb_i64(),
+                b in arb_i64(),
+            ) {
+                let va = Value::integer(a);
+                let vb = Value::integer(b);
+
+                // Increment (`Add`) saturates integer overflow to i64::MIN / i64::MAX.
+                let inc = va.clone() + vb.clone();
+                prop_assert!(inc.storage_eq(&Value::integer(a.saturating_add(b))));
+
+                // Non-numeric receiver on `Add` is overwritten by rhs.
+                let overwritten = Value::string("not-a-number") + vb.clone();
+                prop_assert!(overwritten.storage_eq(&vb));
+
+                // Aggregation (`Sum`) promotes integer overflow to f64 while skipping non-numbers.
+                let summed: Value = [
+                    Value::null(),
+                    va,
+                    Value::string("skip"),
+                    vb,
+                    Value::map(HashMap::new()),
+                ]
+                .into_iter()
+                .sum();
+                match a.checked_add(b) {
+                    Some(exact) => prop_assert!(summed.storage_eq(&Value::integer(exact))),
+                    None => prop_assert!(summed.storage_eq(&Value::double(a as f64 + b as f64))),
+                }
+            }
+        }
     }
 }

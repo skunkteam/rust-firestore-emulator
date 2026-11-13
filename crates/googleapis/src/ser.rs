@@ -1317,4 +1317,316 @@ mod tests {
             err(anything())
         );
     }
+
+    #[gtest]
+    fn structured_query_run_query_and_precondition_validation_edges() {
+        use crate::google::firestore::v1::structured_query::FindNearest;
+
+        // Negative offset and limit are rejected
+        expect_that!(
+            serde_json::from_value::<StructuredQuery>(json!({ "offset": -1 })),
+            err(anything())
+        );
+        expect_that!(
+            serde_json::from_value::<StructuredQuery>(json!({ "limit": -5 })),
+            err(anything())
+        );
+        expect_that!(
+            serde_json::from_value::<StructuredQuery>(json!({ "limit": 3_000_000_000_i64 })),
+            err(anything())
+        );
+        expect_that!(
+            serde_json::from_value::<StructuredQuery>(json!({ "limit": "not-an-i32" })),
+            err(anything())
+        );
+
+        // findNearest is rejected on both deserialize and serialize
+        expect_that!(
+            serde_json::from_value::<StructuredQuery>(json!({
+                "findNearest": { "queryVector": { "mapValue": {} } }
+            })),
+            err(anything())
+        );
+        let sq_with_nearest = StructuredQuery {
+            find_nearest: Some(FindNearest::default()),
+            ..Default::default()
+        };
+        expect_that!(serde_json::to_string(&sq_with_nearest), err(anything()));
+
+        // Conflicting readTime + transaction in RunQueryRequest is rejected
+        expect_that!(
+            serde_json::from_value::<RunQueryRequest>(json!({
+                "parent": "projects/p/databases/(default)/documents",
+                "readTime": "2026-11-10T12:00:00Z",
+                "transaction": "AAEC"
+            })),
+            err(anything())
+        );
+
+        // Precondition empty, exists, updateTime, and conflicting fields
+        let empty_pre: Precondition = serde_json::from_str("{}").unwrap();
+        expect_eq!(empty_pre.condition_type, None);
+        expect_eq!(serde_json::to_value(empty_pre).unwrap(), json!({}));
+
+        let exists_pre: Precondition = serde_json::from_str(r#"{"exists": false}"#).unwrap();
+        expect_eq!(
+            exists_pre.condition_type,
+            Some(precondition::ConditionType::Exists(false))
+        );
+        expect_eq!(
+            serde_json::to_value(exists_pre).unwrap(),
+            json!({ "exists": false })
+        );
+
+        let ts: Timestamp = datetime!(2026-11-10 12:00:00.500 UTC).into();
+        let ut_pre = Precondition {
+            condition_type: Some(precondition::ConditionType::UpdateTime(ts)),
+        };
+        let ut_round: Precondition =
+            serde_json::from_str(&serde_json::to_string(&ut_pre).unwrap()).unwrap();
+        expect_eq!(ut_round, ut_pre);
+
+        expect_that!(
+            serde_json::from_value::<Precondition>(json!({
+                "exists": true,
+                "updateTime": "2026-11-10T12:00:00Z"
+            })),
+            err(anything())
+        );
+
+        // Filter edge cases: multiple filter types, missing filter_type, missing UnaryFilter/Order
+        // field
+        expect_that!(
+            serde_json::from_value::<Filter>(json!({
+                "fieldFilter": {
+                    "field": { "fieldPath": "a" },
+                    "op": "EQUAL",
+                    "value": { "integerValue": "1" }
+                },
+                "unaryFilter": {
+                    "op": "IS_NULL",
+                    "field": { "fieldPath": "a" }
+                }
+            })),
+            err(anything())
+        );
+        expect_that!(
+            serde_json::to_string(&Filter { filter_type: None }),
+            err(anything())
+        );
+        expect_that!(
+            serde_json::from_value::<UnaryFilter>(json!({ "op": "IS_NULL" })),
+            err(anything())
+        );
+        expect_that!(
+            serde_json::from_value::<Order>(json!({ "direction": "ASCENDING" })),
+            err(anything())
+        );
+    }
+
+    mod proptests {
+        use proptest::prelude::*;
+
+        use super::*;
+
+        fn arb_valid_timestamp() -> impl Strategy<Value = Timestamp> {
+            (
+                MIN_TIMESTAMP_SECONDS..=MAX_TIMESTAMP_SECONDS,
+                0_i32..1_000_000_000_i32,
+            )
+                .prop_map(|(seconds, nanos)| Timestamp { seconds, nanos })
+        }
+
+        fn arb_protojson_f64() -> impl Strategy<Value = f64> {
+            prop_oneof![
+                Just(0.0),
+                Just(-0.0),
+                Just(f64::NAN),
+                Just(f64::INFINITY),
+                Just(f64::NEG_INFINITY),
+                (-1_000_000_i64..=1_000_000_i64).prop_map(|n| (n as f64) * 0.0625),
+            ]
+        }
+
+        fn arb_storable_value() -> impl Strategy<Value = Value> {
+            let leaf = prop_oneof![
+                Just(Value::null()),
+                any::<bool>().prop_map(Value::boolean),
+                any::<i64>().prop_map(Value::integer),
+                arb_protojson_f64().prop_map(Value::double),
+                arb_valid_timestamp().prop_map(Value::timestamp),
+                "[a-zA-Z0-9_/-]{0,16}".prop_map(Value::string),
+                prop::collection::vec(any::<u8>(), 0..12)
+                    .prop_map(|b| Value::bytes(Bytes::from(b))),
+                "[a-z]{1,4}/[a-z0-9]{1,4}".prop_map(|tail| {
+                    Value::reference(format!("projects/p/databases/(default)/documents/{tail}"))
+                }),
+                (-700_i32..=700_i32, -1400_i32..=1400_i32).prop_map(|(lat, lon)| {
+                    Value {
+                        value_type: Some(ValueType::GeoPointValue(LatLng {
+                            latitude:  f64::from(lat) * 0.125,
+                            longitude: f64::from(lon) * 0.125,
+                        })),
+                    }
+                }),
+            ];
+            leaf.prop_recursive(2, 12, 3, |inner| {
+                prop_oneof![
+                    prop::collection::vec(inner.clone(), 0..3).prop_map(Value::array),
+                    prop::collection::hash_map("[a-d]{1,3}", inner, 0..3).prop_map(Value::map),
+                ]
+            })
+        }
+
+        fn arb_filter() -> impl Strategy<Value = Filter> {
+            let leaf = prop_oneof![
+                (
+                    "[a-d]{1,4}",
+                    prop_oneof![
+                        Just(field_filter::Operator::LessThan as i32),
+                        Just(field_filter::Operator::LessThanOrEqual as i32),
+                        Just(field_filter::Operator::GreaterThan as i32),
+                        Just(field_filter::Operator::GreaterThanOrEqual as i32),
+                        Just(field_filter::Operator::Equal as i32),
+                        Just(field_filter::Operator::NotEqual as i32),
+                        Just(field_filter::Operator::ArrayContains as i32),
+                        Just(field_filter::Operator::In as i32),
+                    ],
+                    arb_storable_value(),
+                )
+                    .prop_map(|(field_path, op, val)| Filter {
+                        filter_type: Some(filter::FilterType::FieldFilter(FieldFilter {
+                            field: Some(FieldReference { field_path }),
+                            op,
+                            value: Some(val),
+                        })),
+                    }),
+                (
+                    "[a-d]{1,4}",
+                    prop_oneof![
+                        Just(unary_filter::Operator::IsNan as i32),
+                        Just(unary_filter::Operator::IsNull as i32),
+                        Just(unary_filter::Operator::IsNotNan as i32),
+                        Just(unary_filter::Operator::IsNotNull as i32),
+                    ],
+                )
+                    .prop_map(|(field_path, op)| Filter {
+                        filter_type: Some(filter::FilterType::UnaryFilter(UnaryFilter {
+                            op,
+                            operand_type: Some(unary_filter::OperandType::Field(FieldReference {
+                                field_path,
+                            })),
+                        })),
+                    }),
+            ];
+            leaf.prop_recursive(2, 6, 3, |inner| {
+                (
+                    prop_oneof![
+                        Just(composite_filter::Operator::And as i32),
+                        Just(composite_filter::Operator::Or as i32),
+                    ],
+                    prop::collection::vec(inner, 1..=3),
+                )
+                    .prop_map(|(op, filters)| Filter {
+                        filter_type: Some(filter::FilterType::CompositeFilter(CompositeFilter {
+                            op,
+                            filters,
+                        })),
+                    })
+            })
+        }
+
+        fn arb_structured_query() -> impl Strategy<Value = StructuredQuery> {
+            (
+                prop::option::of(
+                    prop::collection::vec("[a-d]{1,4}", 1..=3).prop_map(|paths| Projection {
+                        fields: paths
+                            .into_iter()
+                            .map(|field_path| FieldReference { field_path })
+                            .collect(),
+                    }),
+                ),
+                prop::collection::vec(
+                    ("[a-d]{1,4}", any::<bool>()).prop_map(|(collection_id, all_descendants)| {
+                        CollectionSelector {
+                            collection_id,
+                            all_descendants,
+                        }
+                    }),
+                    0..=2,
+                ),
+                prop::option::of(arb_filter()),
+                prop::collection::vec(
+                    (
+                        "[a-d]{1,4}",
+                        prop_oneof![
+                            Just(Direction::Ascending as i32),
+                            Just(Direction::Descending as i32),
+                        ],
+                    )
+                        .prop_map(|(field_path, direction)| Order {
+                            field: Some(FieldReference { field_path }),
+                            direction,
+                        }),
+                    0..=2,
+                ),
+                prop::option::of(
+                    (
+                        prop::collection::vec(arb_storable_value(), 1..=2),
+                        any::<bool>(),
+                    )
+                        .prop_map(|(values, before)| Cursor { values, before }),
+                ),
+                0_i32..=100_i32,
+                prop::option::of(0_i32..=100_i32),
+            )
+                .prop_map(
+                    |(select, from, r#where, order_by, start_at, offset, limit)| StructuredQuery {
+                        select,
+                        from,
+                        r#where,
+                        order_by,
+                        start_at,
+                        end_at: None,
+                        offset,
+                        limit: limit.map(|value| Int32Value { value }),
+                        find_nearest: None,
+                    },
+                )
+        }
+
+        proptest! {
+            #[test]
+            fn proptest_document_protojson_roundtrip(
+                col in "[a-d]{1,4}",
+                doc_id in "[a-z0-9]{1,6}",
+                fields in prop::collection::hash_map("[a-f]{1,4}", arb_storable_value(), 0..6),
+                create_time in prop::option::of(arb_valid_timestamp()),
+                update_time in prop::option::of(arb_valid_timestamp()),
+            ) {
+                let doc = Document {
+                    name: format!("projects/p/databases/(default)/documents/{col}/{doc_id}"),
+                    fields,
+                    create_time,
+                    update_time,
+                };
+                let json_str = serde_json::to_string(&doc).unwrap();
+                let roundtripped: Document = serde_json::from_str(&json_str).unwrap();
+                prop_assert_eq!(&roundtripped.name, &doc.name);
+                prop_assert_eq!(roundtripped.create_time, doc.create_time);
+                prop_assert_eq!(roundtripped.update_time, doc.update_time);
+                prop_assert!(Value::fields_storage_eq(&roundtripped.fields, &doc.fields));
+            }
+
+            #[test]
+            fn proptest_structured_query_protojson_roundtrip(sq in arb_structured_query()) {
+                let json_str = serde_json::to_string(&sq).unwrap();
+                let roundtripped: StructuredQuery = serde_json::from_str(&json_str).unwrap();
+                let roundtripped_twice: StructuredQuery =
+                    serde_json::from_str(&serde_json::to_string(&roundtripped).unwrap()).unwrap();
+                prop_assert_eq!(&roundtripped, &sq);
+                prop_assert_eq!(&roundtripped_twice, &roundtripped);
+            }
+        }
+    }
 }

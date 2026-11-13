@@ -59,7 +59,8 @@
             nixfmt-rfc-style
             # Additional project dependencies.
             just
-            cargo-tarpaulin
+            cargo-llvm-cov
+            cargo-mutants
             cargo-nextest
             rustup
             # Misc.

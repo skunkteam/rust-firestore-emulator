@@ -5,7 +5,7 @@ fn main() {
                                serde::Deserialize)]\n#[serde(rename_all = \"camelCase\", default)]";
 
     tonic_prost_build::configure()
-        .build_client(false)
+        .build_client(cfg!(feature = "client"))
         .include_file("googleapis.rs")
         .compile_well_known_types(true)
         .bytes("bytes_value")
