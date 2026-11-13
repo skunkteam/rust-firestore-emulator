@@ -16,6 +16,7 @@ ui = ["emulator-http/ui"]
 
 [workspace]
 members = ["crates/*"]
+exclude = ["tmp"]
 
 [workspace.package]
 version = "0.3.0-beta.2"
