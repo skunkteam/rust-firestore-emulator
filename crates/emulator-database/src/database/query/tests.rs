@@ -12,11 +12,11 @@ use itertools::Itertools;
 use tokio_test::{assert_ready, assert_ready_ok, task::spawn};
 
 use crate::{
-    FirestoreConfig, FirestoreDatabase, FirestoreProject,
+    FirestoreConfig, FirestoreDatabase, FirestoreProject, GenericDatabaseError,
     database::transaction::TransactionId,
     document::DocumentMeta,
     query::{
-        Direction, Query, QueryBuilder,
+        Direction, DistanceMeasure, FindNearest, Query, QueryBuilder,
         filter::{FieldFilter, FieldOperator, Filter},
     },
     read_consistency::ReadConsistency,
@@ -102,7 +102,7 @@ fn eval_query(
     query: &mut Query,
 ) -> Result<(Docs, Docs)> {
     let (_, result) = assert_ready_ok!(spawn(query.once(database)).poll_until_idle());
-    let matched_docnames = result.iter().map(|meta| meta.name.clone()).collect_vec();
+    let matched_docnames = result.iter().map(|m| m.version.name.clone()).collect_vec();
 
     let collection_ref = CollectionRef::new(database.name.clone(), collection_id);
     let collection =
@@ -202,6 +202,150 @@ async fn correct_locking_in_txn_with_offset_and_limit() -> Result<()> {
     expect_that!(unmatched_docs, len(eq(7)));
     expect_that!(matched_docs, each(predicate(is_locked)));
     expect_that!(unmatched_docs, each(not(predicate(is_locked))));
+
+    Ok(())
+}
+
+#[gtest]
+#[tokio::test]
+async fn query_builder_find_nearest_validates_and_executes() -> Result<()> {
+    let database = fresh_database()?;
+    let collection_id = "vec-collection";
+    insert_docs(&database, collection_id, 0..3, |i| {
+        [("emb", Value::vector([i as f64, 0.0]))]
+    })?;
+
+    let col_ref = CollectionRef::new(database.name.clone(), collection_id);
+    let mut query = QueryBuilder::from_collection(col_ref.clone())
+        .find_nearest(
+            FindNearest::new(
+                "emb".parse()?,
+                vec![0.2, 0.0],
+                DistanceMeasure::Euclidean,
+                2,
+            )
+            .distance_result_field("dist".parse()?)
+            .distance_threshold(1.0),
+        )
+        .build()?;
+    assert!(query.has_find_nearest());
+
+    let (_, matches) = assert_ready_ok!(spawn(query.once(&database)).poll_until_idle());
+    let projected: Vec<_> = matches.iter().map(|m| query.project(m)).collect();
+    expect_eq!(projected.len(), 2);
+    expect_eq!(
+        projected[0].name,
+        format!("{}/{collection_id}/document-0", database.name)
+    );
+    expect_eq!(projected[0].fields["dist"].as_double(), Some(0.2));
+    expect_eq!(
+        projected[1].name,
+        format!("{}/{collection_id}/document-1", database.name)
+    );
+    expect_eq!(projected[1].fields["dist"].as_double(), Some(0.8));
+
+    // Invalid FindNearest constraints caught by Query::validate
+    for bad_limit in [0, 1001] {
+        assert_that!(
+            QueryBuilder::from_collection(col_ref.clone())
+                .find_nearest(FindNearest::new(
+                    "emb".parse()?,
+                    vec![1.0, 0.0],
+                    DistanceMeasure::Euclidean,
+                    bad_limit,
+                ))
+                .build(),
+            err(eq(&GenericDatabaseError::invalid_argument(
+                "find_nearest limit must be between 1 and 1000"
+            )))
+        );
+    }
+
+    assert_that!(
+        QueryBuilder::from_collection(col_ref.clone())
+            .find_nearest(FindNearest::new(
+                "emb".parse()?,
+                vec![],
+                DistanceMeasure::Euclidean,
+                2,
+            ))
+            .build(),
+        err(eq(&GenericDatabaseError::invalid_argument(
+            "Cannot have a zero length vector."
+        )))
+    );
+
+    assert_that!(
+        QueryBuilder::from_collection(col_ref.clone())
+            .enterprise_edition(false)
+            .find_nearest(FindNearest::new(
+                "emb".parse()?,
+                vec![0.0, 0.0],
+                DistanceMeasure::Cosine,
+                2,
+            ))
+            .build(),
+        err(eq(&GenericDatabaseError::failed_precondition(
+            "Cannot compute cosine distance against a vector with a magnitude of zero."
+        )))
+    );
+
+    assert_that!(
+        QueryBuilder::from_collection(col_ref.clone())
+            .enterprise_edition(true)
+            .find_nearest(FindNearest::new(
+                "emb".parse()?,
+                vec![0.0, 0.0],
+                DistanceMeasure::Cosine,
+                2,
+            ))
+            .build(),
+        err(eq(&GenericDatabaseError::invalid_argument(
+            "cosine_distance(...) result is NaN."
+        )))
+    );
+
+    assert_that!(
+        QueryBuilder::from_collection(col_ref.clone())
+            .find_nearest(FindNearest::new(
+                "emb".parse()?,
+                vec![1.0, 0.0],
+                DistanceMeasure::Euclidean,
+                2,
+            ))
+            .limit(1)
+            .build(),
+        err(eq(&GenericDatabaseError::invalid_argument(
+            "A query limit cannot be used with FindNearest"
+        )))
+    );
+
+    // Filter and cursor malformed vector operand checks
+    assert_that!(
+        QueryBuilder::from_collection(col_ref.clone())
+            .filter(Filter::Field(FieldFilter {
+                field: "emb".parse()?,
+                op:    FieldOperator::Equal,
+                value: Value::vector([]),
+            }))
+            .build(),
+        err(eq(&GenericDatabaseError::invalid_argument(
+            "Cannot have a zero length vector."
+        )))
+    );
+
+    assert_that!(
+        QueryBuilder::from_collection(col_ref)
+            .order_by("emb".parse()?, Direction::Ascending)
+            .start_at(Cursor {
+                before: true,
+                values: vec![Value::vector([])],
+            })
+            .build(),
+        err(eq(&GenericDatabaseError::invalid_argument(
+            "Cannot have a zero length vector."
+        )))
+    );
 
     Ok(())
 }

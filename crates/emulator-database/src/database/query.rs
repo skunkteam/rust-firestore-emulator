@@ -1,4 +1,5 @@
 use std::{
+    borrow::Cow,
     cmp,
     collections::{HashMap, HashSet},
     ops::Deref,
@@ -7,7 +8,7 @@ use std::{
 
 use googleapis::google::{
     firestore::v1::{
-        Cursor, Document, StructuredQuery,
+        Cursor, Document, StructuredQuery, Value,
         structured_query::{self, CollectionSelector},
     },
     protobuf::Timestamp,
@@ -16,14 +17,17 @@ use itertools::Itertools;
 use string_cache::DefaultAtom;
 
 use self::filter::Filter;
+pub use self::find_nearest::FindNearest;
+pub use super::vector::DistanceMeasure;
 use super::{
     FirestoreDatabase,
     collection::Collection,
     document::StoredDocumentVersion,
-    field_path::FieldReference,
-    projection::{Project, Projection},
+    field_path::{FieldPath, FieldReference},
+    projection::{Project, Projection, project_with_distance},
     read_consistency::ReadConsistency,
     reference::{CollectionRef, Ref},
+    vector,
 };
 use crate::{
     GenericDatabaseError,
@@ -33,12 +37,18 @@ use crate::{
     document::{DocumentMeta, OwnedDocumentContentsReadGuard},
     error::Result,
     reference::DocumentRef,
-    unimplemented_option,
 };
 
 mod filter;
+mod find_nearest;
 #[cfg(test)]
 mod tests;
+
+#[derive(Clone, Debug)]
+pub struct QueryMatch {
+    pub version: Arc<StoredDocumentVersion>,
+    pub computed_distance: Option<f64>,
+}
 
 #[derive(Debug)]
 pub struct QueryBuilder {
@@ -52,6 +62,7 @@ pub struct QueryBuilder {
     end_at: Option<Cursor>,
     offset: usize,
     limit: Option<usize>,
+    find_nearest: Option<FindNearest>,
     consistency: ReadConsistency,
 }
 
@@ -68,6 +79,7 @@ impl QueryBuilder {
             end_at: None,
             offset: 0,
             limit: None,
+            find_nearest: None,
             consistency: ReadConsistency::Default,
         }
     }
@@ -209,6 +221,14 @@ impl QueryBuilder {
         self
     }
 
+    /// Optional nearest-neighbors vector search configuration.
+    ///
+    /// Subsequent calls will replace previously set values.
+    pub fn find_nearest(mut self, find_nearest: FindNearest) -> Self {
+        self.find_nearest = Some(find_nearest);
+        self
+    }
+
     pub fn consistency(mut self, consistency: ReadConsistency) -> Self {
         self.consistency = consistency;
         self
@@ -227,6 +247,7 @@ impl QueryBuilder {
             end_at: self.end_at,
             offset: self.offset,
             limit: self.limit,
+            find_nearest: self.find_nearest,
             consistency: self.consistency,
             collection_cache: Default::default(),
         };
@@ -332,6 +353,8 @@ pub struct Query {
     /// Applies after all other constraints.
     limit: Option<usize>,
 
+    find_nearest: Option<FindNearest>,
+
     consistency: ReadConsistency,
 
     collection_cache: HashMap<DefaultAtom, bool>,
@@ -356,7 +379,20 @@ impl Query {
             find_nearest,
         } = query;
 
-        unimplemented_option!(find_nearest);
+        if offset < 0 {
+            return Err(GenericDatabaseError::invalid_argument(
+                "offset cannot be negative",
+            ));
+        }
+        if limit.as_ref().is_some_and(|l| l.value < 0) {
+            return Err(GenericDatabaseError::invalid_argument(
+                "limit cannot be negative",
+            ));
+        }
+
+        let find_nearest = find_nearest
+            .map(|fn_proto| FindNearest::try_from_proto(fn_proto, enterprise_edition))
+            .transpose()?;
 
         let mut query = Box::new(Self {
             parent,
@@ -369,6 +405,7 @@ impl Query {
             end_at,
             offset: offset as usize,
             limit: limit.map(|v| v.value as usize),
+            find_nearest,
             consistency,
             collection_cache: Default::default(),
         });
@@ -388,53 +425,111 @@ impl Query {
                 "Query FROM is mandatory",
             ));
         }
-        if !enterprise_edition && let Some(filter) = &self.filter {
-            // Ensure order_by is consistent
-            if self.order_by.is_empty() {
-                self.order_by
-                    .extend(filter.get_inequality_fields().map(|field| Order {
-                        field:     field.clone(),
-                        direction: Direction::Ascending,
-                    }));
-            }
 
-            filter
-                .field_filters()
-                .filter(|f| f.op.is_array_contains())
-                .at_most_one()
-                .map_err(|_| {
-                    GenericDatabaseError::invalid_argument(
-                        "A maximum of 1 'ARRAY_CONTAINS' filter is allowed per disjunction.",
-                    )
-                })?;
+        if let Some(filter) = &self.filter {
+            for ff in filter.field_filters() {
+                vector::validate_query_operand_value(&ff.value, enterprise_edition)?;
+            }
+        }
+        for cursor in [&self.start_at, &self.end_at].into_iter().flatten() {
+            for v in &cursor.values {
+                vector::validate_query_operand_value(v, enterprise_edition)?;
+            }
         }
 
-        let has_all_descendants = self.from.iter().any(|selector| selector.all_descendants);
-        if (!enterprise_edition || has_all_descendants)
-            && !self.order_by.iter().any(|o| o.field.is_document_name())
-        {
-            self.order_by.push(Order {
-                field:     FieldReference::DocumentName,
-                direction: Direction::Ascending,
-            })
+        if let Some(spec) = &self.find_nearest {
+            spec.validate(enterprise_edition)?;
+            if self.limit.is_some() {
+                return Err(GenericDatabaseError::invalid_argument(
+                    "A query limit cannot be used with FindNearest",
+                ));
+            }
+            if self.offset > 0 {
+                return Err(GenericDatabaseError::invalid_argument(
+                    "A query offset cannot be used with FindNearest",
+                ));
+            }
+            if self.start_at.is_some() || self.end_at.is_some() {
+                return Err(GenericDatabaseError::invalid_argument(
+                    "A cursor cannot be used with FindNearest",
+                ));
+            }
+            if !enterprise_edition && let Some(filter) = &self.filter {
+                filter
+                    .field_filters()
+                    .filter(|f| f.op.is_array_contains())
+                    .at_most_one()
+                    .map_err(|_| {
+                        GenericDatabaseError::invalid_argument(
+                            "A maximum of 1 'ARRAY_CONTAINS' filter is allowed per disjunction.",
+                        )
+                    })?;
+            }
+        } else {
+            if !enterprise_edition && let Some(filter) = &self.filter {
+                // Ensure order_by is consistent
+                if self.order_by.is_empty() {
+                    self.order_by
+                        .extend(filter.get_inequality_fields().map(|field| Order {
+                            field:     field.clone(),
+                            direction: Direction::Ascending,
+                        }));
+                }
+
+                filter
+                    .field_filters()
+                    .filter(|f| f.op.is_array_contains())
+                    .at_most_one()
+                    .map_err(|_| {
+                        GenericDatabaseError::invalid_argument(
+                            "A maximum of 1 'ARRAY_CONTAINS' filter is allowed per disjunction.",
+                        )
+                    })?;
+            }
+
+            let has_all_descendants = self.from.iter().any(|selector| selector.all_descendants);
+            if (!enterprise_edition || has_all_descendants)
+                && !self.order_by.iter().any(|o| o.field.is_document_name())
+            {
+                self.order_by.push(Order {
+                    field:     FieldReference::DocumentName,
+                    direction: Direction::Ascending,
+                })
+            }
+
+            if self
+                .start_at
+                .as_ref()
+                .is_some_and(|c| c.values.len() > self.order_by.len())
+                || self
+                    .end_at
+                    .as_ref()
+                    .is_some_and(|c| c.values.len() > self.order_by.len())
+            {
+                return Err(GenericDatabaseError::invalid_argument(
+                    "Cursor has too many values.",
+                ));
+            }
         }
         Ok(())
     }
 
+    pub fn has_find_nearest(&self) -> bool {
+        self.find_nearest.is_some()
+    }
+
     pub fn reset_on_update(&self) -> bool {
-        self.order_by.iter().any(|o| !o.field.is_document_name())
+        self.find_nearest.is_none() && self.order_by.iter().any(|o| !o.field.is_document_name())
     }
 
     pub fn reset_consistency_to_default(&mut self) {
         self.consistency = ReadConsistency::Default;
     }
 
-    pub async fn once(
-        &mut self,
-        db: &FirestoreDatabase,
-    ) -> Result<(Timestamp, Vec<Arc<StoredDocumentVersion>>)> {
+    pub async fn once(&mut self, db: &FirestoreDatabase) -> Result<(Timestamp, Vec<QueryMatch>)> {
         // First collect all Arc<Collection>s in a Vec to release the collection lock asap.
-        let collections = self.applicable_collections(db).await;
+        let mut collections = self.applicable_collections(db).await;
+        collections.sort_by(|a, b| a.name.cmp(&b.name));
 
         let txn; // If we find a transaction, we borrow from it.
         let mut lock_strategy = match self.consistency {
@@ -446,31 +541,85 @@ impl Query {
             }
         };
 
-        let mut buffer = vec![];
-        for col in collections {
-            for meta in col.docs().await {
-                if let Some(doc) = lock_strategy.read(&meta).await?
-                    && self.includes_document(&doc.version)?
-                {
-                    buffer.push(doc);
+        let result = if let Some(spec) = self.find_nearest.clone() {
+            let mut scanned_guards = vec![];
+            let mut candidates = vec![];
+            for col in collections {
+                let mut docs = col.docs().await;
+                docs.sort_by(|a, b| a.name.cmp_firestore_order(&b.name));
+                for meta in docs {
+                    if let Some(mut doc) = lock_strategy.read(&meta).await? {
+                        if self.enterprise_edition
+                            && let Some(guard) = doc.guard.as_ref()
+                        {
+                            scanned_guards.push(Arc::clone(guard));
+                        }
+                        if !self.matches_prefilters(&doc.version)? {
+                            continue;
+                        }
+                        let Some(dist) =
+                            self.evaluate_find_nearest_candidate(&spec, &doc.version.fields)?
+                        else {
+                            continue;
+                        };
+                        doc.computed_distance = Some(dist);
+                        candidates.push(doc);
+                    }
                 }
             }
-        }
 
-        buffer.sort_unstable_by(|a, b| self.order_by_cmp(&a.version, &b.version));
+            vector::select_and_sort_nearest(&mut candidates, Some(spec.limit), |a, b| {
+                let da = a.computed_distance.unwrap_or(f64::NAN);
+                let db = b.computed_distance.unwrap_or(f64::NAN);
+                spec.distance_measure
+                    .cmp_distance(da, db)
+                    .then_with(|| self.find_nearest_tie_cmp(&a.version, &b.version))
+            });
 
-        if self.offset > 0 {
-            buffer.drain(0..self.offset.min(buffer.len()));
-        }
+            if self.enterprise_edition {
+                lock_strategy.retain_pessimistic_guards(scanned_guards.into_iter());
+            }
 
-        if let Some(limit) = self.limit {
-            buffer.truncate(limit)
-        }
+            lock_strategy
+                .confirm_all(candidates.into_iter(), self)
+                .await
+        } else {
+            let mut buffer = vec![];
+            for (col_idx, col) in collections.into_iter().enumerate() {
+                let mut ordered = col.docs().await.into_iter().enumerate().collect_vec();
+                ordered.sort_by(|(_, a), (_, b)| a.name.cmp_firestore_order(&b.name));
+                for (orig_idx, meta) in ordered {
+                    if let Some(doc) = lock_strategy.read(&meta).await?
+                        && self.includes_document(&doc.version)?
+                    {
+                        buffer.push((col_idx, orig_idx, doc));
+                    }
+                }
+            }
 
-        // Now make sure that the transaction (if any and if needed) acquires a lock to all
-        // resulting documents or remember which results were served in case of optimistic
-        // concurrency.
-        let result = lock_strategy.confirm_all(buffer.into_iter(), self).await;
+            if self.order_by.is_empty() {
+                buffer.sort_unstable_by_key(|&(col_idx, orig_idx, _)| (col_idx, orig_idx));
+            } else {
+                buffer.sort_unstable_by(|(_, _, a), (_, _, b)| {
+                    self.order_by_cmp(&a.version, &b.version)
+                });
+            }
+
+            if self.offset > 0 {
+                buffer.drain(0..self.offset.min(buffer.len()));
+            }
+
+            if let Some(limit) = self.limit {
+                buffer.truncate(limit)
+            }
+
+            // Now make sure that the transaction (if any and if needed) acquires a lock to all
+            // resulting documents or remember which results were served in case of optimistic
+            // concurrency.
+            lock_strategy
+                .confirm_all(buffer.into_iter().map(|(_, _, doc)| doc), self)
+                .await
+        };
 
         Ok((lock_strategy.read_time(), result))
     }
@@ -491,6 +640,7 @@ impl Query {
             self.end_at.is_some().then_some("end_at"),
             (self.offset > 0).then_some("offset"),
             self.limit.is_some().then_some("limit"),
+            self.find_nearest.is_some().then_some("find_nearest"),
         ]
         .into_iter()
         .flatten()
@@ -574,7 +724,7 @@ impl Query {
         included
     }
 
-    pub fn includes_document(&mut self, doc: &StoredDocumentVersion) -> Result<bool> {
+    pub(crate) fn matches_prefilters(&mut self, doc: &StoredDocumentVersion) -> Result<bool> {
         if !self.includes_collection(&doc.name.collection_ref) {
             return Ok(false);
         }
@@ -588,6 +738,13 @@ impl Query {
                 return Ok(false);
             }
         }
+        Ok(true)
+    }
+
+    pub fn includes_document(&mut self, doc: &StoredDocumentVersion) -> Result<bool> {
+        if !self.matches_prefilters(doc)? {
+            return Ok(false);
+        }
         if let Some(cursor) = &self.start_at
             && self.doc_on_left_of_cursor(doc, cursor)
         {
@@ -598,11 +755,113 @@ impl Query {
         {
             return Ok(false);
         }
+        if let Some(spec) = &self.find_nearest {
+            return Ok(self
+                .evaluate_find_nearest_candidate(spec, &doc.fields)?
+                .is_some());
+        }
         Ok(true)
     }
 
-    pub fn project(&self, version: &StoredDocumentVersion) -> Document {
+    fn evaluate_find_nearest_candidate(
+        &self,
+        spec: &FindNearest,
+        fields: &HashMap<String, Value>,
+    ) -> Result<Option<f64>> {
+        let Some(coords) = spec
+            .vector_field
+            .get_value(fields)
+            .and_then(|v| v.iter_vector_f64())
+        else {
+            return Ok(None);
+        };
+        if coords.len() != spec.query_vector.len() {
+            return Ok(None);
+        }
+        if !self.enterprise_edition && coords.clone().any(|x| !x.is_finite()) {
+            return Ok(None);
+        }
+        let dist = vector::compute_query_distance(
+            spec.distance_measure,
+            self.enterprise_edition,
+            spec.query_vector.iter().copied(),
+            coords,
+        )?;
+        if let Some(threshold) = spec.distance_threshold {
+            if !spec.distance_measure.passes_threshold(dist, threshold) {
+                return Ok(None);
+            }
+        } else if !self.enterprise_edition {
+            let within_default_bound = match spec.distance_measure {
+                DistanceMeasure::Euclidean | DistanceMeasure::Cosine => dist < f64::INFINITY,
+                DistanceMeasure::DotProduct => dist > f64::NEG_INFINITY,
+            };
+            if !within_default_bound {
+                return Ok(None);
+            }
+        }
+        Ok(Some(dist))
+    }
+
+    fn find_nearest_tie_cmp(
+        &self,
+        a: &Arc<StoredDocumentVersion>,
+        b: &Arc<StoredDocumentVersion>,
+    ) -> cmp::Ordering {
+        if !self.enterprise_edition && !self.order_by.is_empty() {
+            let ord = self.order_by_cmp(a, b);
+            if ord != cmp::Ordering::Equal {
+                return ord;
+            }
+            let name_cmp = a.name.cmp_firestore_order(&b.name);
+            return match self.order_by.last().map(|o| o.direction) {
+                Some(Direction::Descending) => name_cmp.reverse(),
+                _ => name_cmp,
+            };
+        }
+        if let Some(filter) = &self.filter {
+            for field in filter.get_inequality_fields() {
+                let ord = field.get_value(a).cmp(&field.get_value(b));
+                if ord != cmp::Ordering::Equal {
+                    return ord;
+                }
+            }
+        }
+        a.name.cmp_firestore_order(&b.name)
+    }
+
+    pub fn project(&self, item: &QueryMatch) -> Document {
+        let distance = self.distance_result_field().zip(item.computed_distance);
+        project_with_distance(&self.select, &item.version, distance)
+    }
+
+    pub(crate) fn project_base(&self, version: &StoredDocumentVersion) -> Document {
         self.select.project(version)
+    }
+
+    pub(crate) fn distance_result_field(&self) -> Option<&FieldPath> {
+        self.find_nearest
+            .as_ref()
+            .and_then(|spec| spec.distance_result_field.as_ref())
+    }
+
+    pub(crate) fn effective_numeric_field_value<'a>(
+        &self,
+        item: &'a QueryMatch,
+        field_ref: &FieldReference,
+    ) -> Option<Cow<'a, Value>> {
+        if let (Some(dist_path), Some(dist)) =
+            (self.distance_result_field(), item.computed_distance)
+            && let FieldReference::FieldPath(fp) = field_ref
+        {
+            if fp == dist_path {
+                return Some(Cow::Owned(Value::double(dist)));
+            }
+            if fp.starts_with(dist_path) || dist_path.starts_with(fp) {
+                return None;
+            }
+        }
+        field_ref.get_value(&item.version)
     }
 
     fn order_by_cmp(
@@ -713,6 +972,7 @@ impl<'a> LockStrategy<'a> {
                     LockStrategyDocument {
                         version,
                         guard: Some(read_guard),
+                        computed_distance: None,
                     }
                 }));
             }
@@ -726,14 +986,26 @@ impl<'a> LockStrategy<'a> {
             .map(|version| LockStrategyDocument {
                 version,
                 guard: None,
+                computed_distance: None,
             }))
+    }
+
+    fn retain_pessimistic_guards(
+        &mut self,
+        guards: impl Iterator<Item = Arc<OwnedDocumentContentsReadGuard>>,
+    ) {
+        if let LockStrategy::PessimisticTransaction(txn) = self {
+            for guard in guards {
+                txn.manage_read_guard(guard);
+            }
+        }
     }
 
     async fn confirm_all(
         &mut self,
         docs: impl Iterator<Item = LockStrategyDocument>,
         query: &Query,
-    ) -> Vec<Arc<StoredDocumentVersion>> {
+    ) -> Vec<QueryMatch> {
         let result = docs
             .map(|doc| {
                 if let LockStrategy::PessimisticTransaction(txn) = self
@@ -741,7 +1013,10 @@ impl<'a> LockStrategy<'a> {
                 {
                     txn.manage_read_guard(guard);
                 }
-                doc.version
+                QueryMatch {
+                    version: doc.version,
+                    computed_distance: doc.computed_distance,
+                }
             })
             .collect_vec();
 
@@ -750,7 +1025,7 @@ impl<'a> LockStrategy<'a> {
                 .observed_docs
                 .lock()
                 .await
-                .extend(result.iter().map(|d| d.name.clone()));
+                .extend(result.iter().map(|m| m.version.name.clone()));
             let mut verification_query = query.clone();
             verification_query.reset_consistency_to_default();
             state.executed_queries.lock().await.push(verification_query);
@@ -775,5 +1050,6 @@ impl<'a> LockStrategy<'a> {
 
 struct LockStrategyDocument {
     version: Arc<StoredDocumentVersion>,
-    guard:   Option<Arc<OwnedDocumentContentsReadGuard>>,
+    guard: Option<Arc<OwnedDocumentContentsReadGuard>>,
+    computed_distance: Option<f64>,
 }

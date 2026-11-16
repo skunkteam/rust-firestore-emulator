@@ -1,10 +1,10 @@
 //! This crate provides the service that implements the GRPC API to the emulator database. See
 //! [`service`] for usage info.
 
-use std::mem;
+use std::{future::Future, mem};
 
 use emulator_database::{
-    FirestoreProject, pipeline,
+    FirestoreDatabase, FirestoreProject, GenericDatabaseError, pipeline,
     projection::{Project, Projection},
     query::Query,
     read_consistency::ReadConsistency,
@@ -19,6 +19,7 @@ use googleapis::google::{
     protobuf::{Empty, Timestamp},
 };
 use itertools::Itertools;
+use prost::{Message, encoding::encoded_len_varint};
 use tokio::sync::mpsc;
 use tokio_stream::{StreamExt, once, wrappers::ReceiverStream};
 use tonic::{Code, Request, Response, Result, Status, async_trait, codec::CompressionEncoding};
@@ -29,6 +30,84 @@ use utils::error_in_stream;
 mod utils;
 
 const MAX_MESSAGE_SIZE: usize = 50 * 1024 * 1024;
+const MAX_PIPELINE_RESPONSE_BYTES: usize = 1024 * 1024;
+
+async fn rollback_new_txn(database: &FirestoreDatabase, new_txn_bytes: &[u8]) {
+    if !new_txn_bytes.is_empty()
+        && let Ok(id) = new_txn_bytes.to_vec().try_into()
+    {
+        drop(database.rollback(id).await);
+    }
+}
+
+async fn with_new_txn_cleanup<T, E, Fut>(
+    database: &FirestoreDatabase,
+    new_txn_bytes: &[u8],
+    fut: Fut,
+) -> std::result::Result<T, E>
+where
+    Fut: Future<Output = std::result::Result<T, E>>,
+{
+    let result = fut.await;
+    if result.is_err() {
+        rollback_new_txn(database, new_txn_bytes).await;
+    }
+    result
+}
+
+fn chunk_pipeline_responses(
+    mut new_transaction: Vec<u8>,
+    results: Vec<Document>,
+    read_time: Timestamp,
+) -> impl Iterator<Item = Result<ExecutePipelineResponse>> {
+    let mut iter = results.into_iter().peekable();
+    let mut emitted_empty = false;
+
+    std::iter::from_fn(move || {
+        if iter.peek().is_none() {
+            if emitted_empty {
+                return None;
+            }
+            emitted_empty = true;
+            return Some(Ok(ExecutePipelineResponse {
+                transaction: mem::take(&mut new_transaction),
+                results: Vec::new(),
+                execution_time: Some(read_time),
+                explain_stats: None,
+            }));
+        }
+
+        emitted_empty = true;
+        let transaction = mem::take(&mut new_transaction);
+        let mut frame_bytes = ExecutePipelineResponse {
+            transaction: transaction.clone(),
+            results: Vec::new(),
+            execution_time: Some(read_time),
+            explain_stats: None,
+        }
+        .encoded_len();
+
+        let mut chunk = Vec::new();
+        while let Some(doc) = iter.peek() {
+            let doc_len = doc.encoded_len();
+            let entry_bytes = 1 + encoded_len_varint(doc_len as u64) + doc_len;
+            if !chunk.is_empty() && frame_bytes + entry_bytes > MAX_PIPELINE_RESPONSE_BYTES {
+                break;
+            }
+            frame_bytes += entry_bytes;
+            if let Some(doc) = iter.next() {
+                chunk.push(doc);
+            }
+        }
+
+        Some(Ok(ExecutePipelineResponse {
+            transaction,
+            results: chunk,
+            execution_time: Some(read_time),
+            explain_stats: None,
+        }))
+    })
+}
 
 /// Instantiate a tonic service that provides the GRPC access to the given emulated Firestore
 /// database.
@@ -147,9 +226,11 @@ impl Firestore for FirestoreEmulator {
                 Span::current().record("txn_id", display(id));
             }
 
+            let new_txn_bytes = new_transaction.clone();
             let (tx, rx) = mpsc::channel(16);
             tokio::spawn(
                 async move {
+                    let mut txn_sent = false;
                     let read_time = database
                         .get_read_time(read_consistency)
                         .await
@@ -165,11 +246,19 @@ impl Firestore for FirestoreEmulator {
                                 read_time:   Some(read_time),
                                 transaction: mem::take(&mut new_transaction),
                             }),
-                            Err(err) => Err(Status::from(err)),
+                            Err(err) => {
+                                rollback_new_txn(&database, &new_txn_bytes).await;
+                                drop(tx.send(Err(Status::from(err))).await);
+                                return;
+                            }
                         };
                         if tx.send(msg).await.is_err() {
                             break;
                         }
+                        txn_sent = true;
+                    }
+                    if !txn_sent {
+                        rollback_new_txn(&database, &new_txn_bytes).await;
                     }
                 }
                 .instrument(debug_span!("worker")),
@@ -193,8 +282,8 @@ impl Firestore for FirestoreEmulator {
 
         let database = self.project.database(&database.parse()?).await;
 
-        let txn_id = if transaction.is_empty() {
-            database
+        let (txn_id, new_txn_bytes) = if transaction.is_empty() {
+            let id = database
                 .new_txn(TransactionOptions {
                     mode: Some(transaction_options::Mode::ReadWrite(
                         transaction_options::ReadWrite {
@@ -202,14 +291,17 @@ impl Firestore for FirestoreEmulator {
                         },
                     )),
                 })
-                .await?
+                .await?;
+            (id, Vec::from(id))
         } else {
-            transaction.try_into()?
+            (transaction.try_into()?, Vec::new())
         };
 
         Span::current().record("txn_id", display(txn_id));
         debug!(?txn_id);
-        let (commit_time, write_results) = database.commit(writes, txn_id).await?;
+        let (commit_time, write_results) =
+            with_new_txn_cleanup(&database, &new_txn_bytes, database.commit(writes, txn_id))
+                .await?;
 
         Ok(Response::new(CommitResponse {
             write_results,
@@ -408,13 +500,16 @@ impl Firestore for FirestoreEmulator {
                 }
                 s => (vec![], s.try_into()?),
             };
-            let mut query = Query::from_structured(
-                parent,
-                query,
-                read_consistency,
-                database.enterprise_edition(),
-            )?;
-            let (read_time, docs) = database.run_query(&mut query).await?;
+            let (read_time, docs) = with_new_txn_cleanup(&database, &new_transaction, async {
+                let mut query = Query::from_structured(
+                    parent,
+                    query,
+                    read_consistency,
+                    database.enterprise_edition(),
+                )?;
+                database.run_query(&mut query).await
+            })
+            .await?;
             // The docs of RunQueryResponse::read_time say:
             // If the query returns no results, a response with `read_time` and
             // no `document` will be sent, and this represents the time at which
@@ -465,7 +560,7 @@ impl Firestore for FirestoreEmulator {
 
             // TODO: Deze code komt een paar keer in vergelijkbare vorm terug. Kijken of we dit
             // herbruikbaar kunnen maken.
-            let (mut new_transaction, read_consistency) = match consistency_selector {
+            let (new_transaction, read_consistency) = match consistency_selector {
                 Some(execute_pipeline_request::ConsistencySelector::NewTransaction(txn_opts)) => {
                     let id = database.new_txn(txn_opts).await?;
                     debug!("started new transaction");
@@ -474,19 +569,19 @@ impl Firestore for FirestoreEmulator {
                 s => (vec![], s.try_into()?),
             };
 
-            let results =
-                pipeline::execute(&database, &root_ref, pipeline, read_consistency).await?;
+            let (results, read_time) = with_new_txn_cleanup(&database, &new_transaction, async {
+                let results =
+                    pipeline::execute(&database, &root_ref, pipeline, read_consistency).await?;
+                let read_time = database.get_read_time(read_consistency).await?;
+                Ok::<_, GenericDatabaseError>((results, read_time))
+            })
+            .await?;
 
-            let read_time = database.get_read_time(read_consistency).await?;
-
-            let response = ExecutePipelineResponse {
-                transaction: mem::take(&mut new_transaction),
+            Ok(tokio_stream::iter(chunk_pipeline_responses(
+                new_transaction,
                 results,
-                execution_time: Some(read_time),
-                explain_stats: None,
-            };
-
-            Ok(once(Ok(response)))
+                read_time,
+            )))
         })
         .await
     }
@@ -548,9 +643,17 @@ impl Firestore for FirestoreEmulator {
             };
 
             debug!(?read_consistency);
-            let (read_time, aggregate_fields) = database
-                .run_aggregation_query(parent, query, agg_query.aggregations, read_consistency)
-                .await?;
+            let (read_time, aggregate_fields) = with_new_txn_cleanup(
+                &database,
+                &new_transaction,
+                database.run_aggregation_query(
+                    parent,
+                    query,
+                    agg_query.aggregations,
+                    read_consistency,
+                ),
+            )
+            .await?;
 
             let response = RunAggregationQueryResponse {
                 result: Some(AggregationResult { aggregate_fields }),

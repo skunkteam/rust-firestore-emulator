@@ -392,12 +392,121 @@ export function escapeFieldPathSegment(segment) {
 }
 
 /**
+ * Returns true if `val` is a Cloud Firestore vector sentinel map
+ * (`{ mapValue: { fields: { __type__: { stringValue: "__vector__" }, value: { arrayValue: { values: [...] } } } } }`)
+ * with 1..2048 non-NaN double coordinates.
+ * @param {FirestoreValue | null | undefined} val
+ * @returns {boolean}
+ */
+export function isVectorMapValue(val) {
+  const fields = val?.mapValue?.fields;
+  if (!fields) return false;
+  if (Object.keys(fields).length !== 2) return false;
+  if (fields.__type__?.stringValue !== "__vector__") return false;
+  const values = fields.value?.arrayValue?.values;
+  if (!Array.isArray(values) || values.length < 1 || values.length > 2048) {
+    return false;
+  }
+  return values.every((el) => {
+    const d = el?.doubleValue;
+    return (
+      (typeof d === "number" && !Number.isNaN(d)) ||
+      d === "Infinity" ||
+      d === "-Infinity"
+    );
+  });
+}
+
+/**
+ * Formats a compact one-line summary for a vector sentinel map value.
+ * @param {FirestoreValue | null | undefined} val
+ * @returns {string}
+ */
+export function formatVectorSummary(val) {
+  const values = val?.mapValue?.fields?.value?.arrayValue?.values ?? [];
+  const n = values.length;
+  const head = values
+    .slice(0, 3)
+    .map((el) => formatDoubleInput(el?.doubleValue))
+    .join(", ");
+  return `vector (${n} dims) [${head}${n > 3 ? ", …" : ""}]`;
+}
+
+/**
+ * Checks structural equality between two FirestoreValue ProtoJSON objects.
+ * Uses Object.is for numeric doubleValue comparison (preserving -0 vs +0) and
+ * compares mapValue fields independently of key insertion order.
+ * @param {FirestoreValue | null | undefined} a
+ * @param {FirestoreValue | null | undefined} b
+ * @returns {boolean}
+ */
+export function firestoreValueEquals(a, b) {
+  if (a === b) return true;
+  if (!a || !b) return false;
+  const ta = getValueType(a);
+  const tb = getValueType(b);
+  if (ta !== tb) return false;
+  switch (ta) {
+    case "nullValue":
+      return true;
+    case "booleanValue":
+      return Boolean(a.booleanValue) === Boolean(b.booleanValue);
+    case "integerValue":
+      return (a.integerValue ?? "0") === (b.integerValue ?? "0");
+    case "doubleValue":
+      return typeof a.doubleValue === "number" && typeof b.doubleValue === "number"
+        ? Object.is(a.doubleValue, b.doubleValue)
+        : a.doubleValue === b.doubleValue;
+    case "stringValue":
+      return (a.stringValue ?? "") === (b.stringValue ?? "");
+    case "timestampValue":
+      return (a.timestampValue ?? "") === (b.timestampValue ?? "");
+    case "referenceValue":
+      return (a.referenceValue ?? "") === (b.referenceValue ?? "");
+    case "bytesValue":
+      return (a.bytesValue ?? "") === (b.bytesValue ?? "");
+    case "geoPointValue": {
+      const ga = a.geoPointValue;
+      const gb = b.geoPointValue;
+      return (
+        Object.is(ga?.latitude ?? 0, gb?.latitude ?? 0) &&
+        Object.is(ga?.longitude ?? 0, gb?.longitude ?? 0)
+      );
+    }
+    case "arrayValue": {
+      const va = a.arrayValue?.values ?? [];
+      const vb = b.arrayValue?.values ?? [];
+      if (va.length !== vb.length) return false;
+      for (let i = 0; i < va.length; i++) {
+        if (!firestoreValueEquals(va[i], vb[i])) return false;
+      }
+      return true;
+    }
+    case "mapValue": {
+      const fa = a.mapValue?.fields ?? {};
+      const fb = b.mapValue?.fields ?? {};
+      const ka = Object.keys(fa);
+      const kb = Object.keys(fb);
+      if (ka.length !== kb.length) return false;
+      for (const k of ka) {
+        if (!Object.prototype.hasOwnProperty.call(fb, k)) return false;
+        if (!firestoreValueEquals(fa[k], fb[k])) return false;
+      }
+      return true;
+    }
+  }
+}
+
+/**
  * Formats a compact, single-line human-readable summary of a FirestoreValue.
  * @param {FirestoreValue | undefined} val
  * @returns {string}
  */
 export function formatValuePreview(val) {
   if (!val) return "null";
+  if (isVectorMapValue(val)) {
+    return formatVectorSummary(val);
+  }
   const t = getValueType(val);
   switch (t) {
     case "nullValue":

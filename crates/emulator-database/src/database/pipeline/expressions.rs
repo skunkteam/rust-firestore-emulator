@@ -1,7 +1,7 @@
 use googleapis::google::firestore::v1::{Document, Value, value::ValueType};
 
 use super::get_document_value;
-use crate::{error::Result, pipeline::function};
+use crate::{GenericDatabaseError, error::Result, pipeline::function};
 
 /// Recursively evaluates a `Value` Expression against a standard `Document`.
 pub(super) fn evaluate<'a>(value: &'a Value, doc: &'a Document) -> Result<Value> {
@@ -9,7 +9,12 @@ pub(super) fn evaluate<'a>(value: &'a Value, doc: &'a Document) -> Result<Value>
 }
 
 pub(super) fn maybe_evaluate<'a>(value: &'a Value, doc: &'a Document) -> Result<Option<Value>> {
-    match value.value_type() {
+    let Some(vt) = value.value_type.as_ref() else {
+        return Err(GenericDatabaseError::invalid_argument(
+            "missing value_type in value",
+        ));
+    };
+    match vt {
         ValueType::FieldReferenceValue(f) => {
             let field_ref = f.parse()?;
             Ok(get_document_value(&field_ref, doc))

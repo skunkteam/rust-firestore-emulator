@@ -53,6 +53,8 @@ pub mod read_consistency;
 pub mod reference;
 pub(crate) mod timeouts;
 mod transaction;
+mod validation;
+pub(crate) mod vector;
 
 const MAX_EVENT_BACKLOG: usize = 1024;
 
@@ -201,10 +203,7 @@ impl FirestoreDatabase {
         debug!(result_count = result.len());
         Ok((
             read_time,
-            result
-                .into_iter()
-                .map(|version| query.project(&version))
-                .collect(),
+            result.into_iter().map(|m| query.project(&m)).collect(),
         ))
     }
 
@@ -267,9 +266,22 @@ impl FirestoreDatabase {
                                 )
                             })?
                             .try_into()?;
-                        docs.iter()
-                            .filter_map(|doc| Some(field_ref.get_value(doc)?.into_owned()))
-                            .sum()
+                        let mut values = docs
+                            .iter()
+                            .filter_map(|m| {
+                                Some(
+                                    query
+                                        .effective_numeric_field_value(m, &field_ref)?
+                                        .into_owned(),
+                                )
+                            })
+                            .filter(Value::is_number)
+                            .peekable();
+                        if self.enterprise_edition() && values.peek().is_none() {
+                            Value::null()
+                        } else {
+                            values.sum()
+                        }
                     }
                     // Average of the values of the requested field.
                     //
@@ -293,7 +305,13 @@ impl FirestoreDatabase {
                             .try_into()?;
                         let values = docs
                             .iter()
-                            .filter_map(|doc| Some(field_ref.get_value(doc)?.into_owned()))
+                            .filter_map(|m| {
+                                Some(
+                                    query
+                                        .effective_numeric_field_value(m, &field_ref)?
+                                        .into_owned(),
+                                )
+                            })
                             .filter(Value::is_number)
                             .collect_vec();
                         if values.is_empty() {
@@ -560,12 +578,13 @@ impl FirestoreDatabase {
         // update them.
         for write in &writes {
             let name = get_doc_name_from_write(write)?;
+            let txn = rw_txn.as_ref().ok_or_else(|| {
+                GenericDatabaseError::invalid_argument(
+                    "Cannot modify entities in a read-only transaction",
+                )
+            })?;
+            validation::validate_write(write)?;
             if let Entry::Vacant(entry) = write_guard_cache.entry(name.clone()) {
-                let txn = rw_txn.as_ref().ok_or_else(|| {
-                    GenericDatabaseError::invalid_argument(
-                        "Cannot modify entities in a read-only transaction",
-                    )
-                })?;
                 entry.insert(txn.get_write_guard(&name).await?);
             }
         }
@@ -626,7 +645,11 @@ impl FirestoreDatabase {
         let (update_time, document_version) = match operation {
             Update(doc) => {
                 debug!(name = %document.name, "Update");
-                validate_writable_fields(&doc.fields)?;
+                validation::validate_writable_fields(&doc.fields)?;
+                if let Some(mask) = &update_mask {
+                    validation::validate_update_mask(mask)?;
+                }
+                validation::validate_field_transforms(&update_transforms)?;
 
                 let mut fields = if let Some(mask) = update_mask {
                     apply_updates(document, mask, &doc.fields)?
@@ -766,51 +789,7 @@ impl FirestoreDatabase {
 }
 
 fn validate_writable_fields(fields: &HashMap<String, Value>) -> Result<()> {
-    for value in fields.values() {
-        validate_writable_value(value, false)?;
-    }
-    Ok(())
-}
-
-fn validate_writable_value(value: &Value, in_array: bool) -> Result<()> {
-    use value::ValueType;
-    match &value.value_type {
-        None => Err(GenericDatabaseError::invalid_argument(
-            "document field value is missing a value_type",
-        )),
-        Some(ValueType::FieldReferenceValue(_)) => Err(GenericDatabaseError::invalid_argument(
-            "fieldReferenceValue is not valid in stored documents",
-        )),
-        Some(ValueType::FunctionValue(_)) => Err(GenericDatabaseError::invalid_argument(
-            "functionValue is not valid in stored documents",
-        )),
-        Some(ValueType::PipelineValue(_)) => Err(GenericDatabaseError::invalid_argument(
-            "pipelineValue is not valid in stored documents",
-        )),
-        Some(ValueType::ArrayValue(arr)) => {
-            if in_array {
-                return Err(GenericDatabaseError::invalid_argument(
-                    "nested arrays are not supported",
-                ));
-            }
-            for item in &arr.values {
-                validate_writable_value(item, true)?;
-            }
-            Ok(())
-        }
-        Some(ValueType::MapValue(map)) => validate_writable_fields(&map.fields),
-        Some(
-            ValueType::NullValue(_)
-            | ValueType::BooleanValue(_)
-            | ValueType::IntegerValue(_)
-            | ValueType::DoubleValue(_)
-            | ValueType::TimestampValue(_)
-            | ValueType::StringValue(_)
-            | ValueType::BytesValue(_)
-            | ValueType::ReferenceValue(_)
-            | ValueType::GeoPointValue(_),
-        ) => Ok(()),
-    }
+    validation::validate_writable_fields(fields)
 }
 
 fn parse_list_order_by(order_by: &str) -> Result<Vec<(FieldReference, Direction)>> {

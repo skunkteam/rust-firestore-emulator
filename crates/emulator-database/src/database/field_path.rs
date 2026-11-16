@@ -33,6 +33,19 @@ impl FieldReference {
     pub fn is_document_name(&self) -> bool {
         matches!(self, Self::DocumentName)
     }
+
+    pub(crate) fn into_non_reserved_field_path(
+        self,
+        context_err: &'static str,
+    ) -> Result<FieldPath> {
+        match self {
+            Self::DocumentName => Err(GenericDatabaseError::invalid_argument(context_err)),
+            Self::FieldPath(p) => {
+                p.validate_non_reserved()?;
+                Ok(p)
+            }
+        }
+    }
 }
 
 impl TryFrom<&structured_query::FieldReference> for FieldReference {
@@ -78,6 +91,26 @@ impl Display for FieldReference {
 pub struct FieldPath(Vec<String>);
 
 impl FieldPath {
+    pub(crate) fn starts_with(&self, prefix: &Self) -> bool {
+        self.0.starts_with(&prefix.0)
+    }
+
+    pub(crate) fn validate_non_reserved(&self) -> Result<()> {
+        for seg in &self.0 {
+            if seg.is_empty() {
+                return Err(GenericDatabaseError::invalid_argument(
+                    "field path cannot contain empty segments",
+                ));
+            }
+            if super::reference::is_reserved_name(seg) {
+                return Err(GenericDatabaseError::invalid_argument(format!(
+                    "the name {seg} is reserved"
+                )));
+            }
+        }
+        Ok(())
+    }
+
     /// Walk the path as represented by this [`FieldPath`] into the given object fields and return
     /// the value found at the end of the path, if any. Also returns [`None`] if any intermediate
     /// value was absent or not an object.
@@ -300,6 +333,86 @@ mod tests {
         assert_that!(
             parse_field_path(input),
             err(eq(&GenericDatabaseError::invalid_argument(msg)))
+        );
+    }
+
+    #[gtest]
+    fn into_non_reserved_field_path_rejects_reserved_and_empty_segments() {
+        let doc_name: FieldReference = DOC_NAME.parse().unwrap();
+        assert_that!(
+            doc_name.into_non_reserved_field_path("cannot be __name__"),
+            err(eq(&GenericDatabaseError::invalid_argument(
+                "cannot be __name__"
+            )))
+        );
+
+        let quoted_doc_name: FieldReference = "`__name__`".parse().unwrap();
+        assert_that!(
+            quoted_doc_name.into_non_reserved_field_path("cannot be __name__"),
+            err(eq(&GenericDatabaseError::invalid_argument(
+                "the name __name__ is reserved"
+            )))
+        );
+
+        let nested_reserved: FieldReference = "a.__custom__.b".parse().unwrap();
+        assert_that!(
+            nested_reserved.into_non_reserved_field_path("cannot be __name__"),
+            err(eq(&GenericDatabaseError::invalid_argument(
+                "the name __custom__ is reserved"
+            )))
+        );
+
+        let empty_seg: FieldReference = "a..b".parse().unwrap();
+        assert_that!(
+            empty_seg.into_non_reserved_field_path("cannot be __name__"),
+            err(eq(&GenericDatabaseError::invalid_argument(
+                "field path cannot contain empty segments"
+            )))
+        );
+
+        let four_underscores: FieldReference = "____".parse().unwrap();
+        let parsed = four_underscores
+            .into_non_reserved_field_path("cannot be __name__")
+            .unwrap();
+        assert_eq!(&parsed.0, &["____"]);
+        assert!(
+            "a.b"
+                .parse::<FieldPath>()
+                .unwrap()
+                .starts_with(&"a".parse::<FieldPath>().unwrap())
+        );
+    }
+
+    #[gtest]
+    fn vector_is_not_traversed_or_mutated_as_map() {
+        let mut fields = HashMap::from([("embedding".to_string(), Value::vector([1.0, 2.0]))]);
+
+        let emb_path: FieldPath = "embedding".parse().unwrap();
+        let value_subpath: FieldPath = "embedding.value".parse().unwrap();
+        let type_subpath: FieldPath = "embedding.__type__".parse().unwrap();
+        let nested_subpath: FieldPath = "embedding.nested".parse().unwrap();
+
+        assert_that!(
+            emb_path.get_value(&fields),
+            some(eq(&Value::vector([1.0, 2.0])))
+        );
+        assert_that!(value_subpath.get_value(&fields), none());
+        assert_that!(type_subpath.get_value(&fields), none());
+
+        assert_that!(value_subpath.delete_value(&mut fields), none());
+        assert_that!(type_subpath.delete_value(&mut fields), none());
+        assert_that!(
+            emb_path.get_value(&fields),
+            some(eq(&Value::vector([1.0, 2.0])))
+        );
+
+        nested_subpath.set_value(&mut fields, Value::string("replaced"));
+        assert_that!(
+            emb_path.get_value(&fields),
+            some(eq(&Value::map(HashMap::from([(
+                "nested".to_string(),
+                Value::string("replaced")
+            )]))))
         );
     }
 

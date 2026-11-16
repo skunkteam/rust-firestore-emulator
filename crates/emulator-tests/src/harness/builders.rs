@@ -10,8 +10,8 @@ use googleapis::google::{
         structured_aggregation_query::{Aggregation, aggregation},
         structured_query::{
             CollectionSelector, CompositeFilter, Direction, FieldFilter, FieldReference, Filter,
-            Order, Projection, UnaryFilter, composite_filter, field_filter, filter::FilterType,
-            unary_filter,
+            FindNearest, Order, Projection, UnaryFilter, composite_filter, field_filter,
+            filter::FilterType, unary_filter,
         },
         value::ValueType,
         write,
@@ -150,7 +150,8 @@ pub(crate) fn or_filters(filters: Vec<Filter>) -> Filter {
 #[derive(Clone, Debug)]
 pub(crate) struct QuerySpec {
     parent: String,
-    query:  StructuredQuery,
+    query: StructuredQuery,
+    find_nearest: Option<FindNearest>,
 }
 
 impl QuerySpec {
@@ -165,19 +166,21 @@ impl QuerySpec {
                 }],
                 ..Default::default()
             },
+            find_nearest: None,
         }
     }
 
     pub(crate) fn collection_group(collection_id: &str) -> Self {
         Self {
             parent: DOCUMENTS_ROOT.to_string(),
-            query:  StructuredQuery {
+            query: StructuredQuery {
                 from: vec![CollectionSelector {
                     collection_id:   collection_id.to_string(),
                     all_descendants: true,
                 }],
                 ..Default::default()
             },
+            find_nearest: None,
         }
     }
 
@@ -242,7 +245,13 @@ impl QuerySpec {
         self
     }
 
-    pub(crate) fn into_parts(self) -> (String, StructuredQuery) {
+    pub(crate) fn find_nearest(mut self, find_nearest: FindNearest) -> Self {
+        self.find_nearest = Some(find_nearest);
+        self
+    }
+
+    pub(crate) fn into_parts(mut self) -> (String, StructuredQuery) {
+        self.query.find_nearest = self.find_nearest;
         (self.parent, self.query)
     }
 }
@@ -307,6 +316,10 @@ impl AggregationSpec {
     }
 }
 
+pub(crate) fn vec_val(coords: impl IntoIterator<Item = f64>) -> Value {
+    Value::vector(coords)
+}
+
 pub(crate) fn field_ref_val(field: &str) -> Value {
     Value {
         value_type: Some(ValueType::FieldReferenceValue(field.to_string())),
@@ -352,6 +365,46 @@ impl PipelineSpec {
             options: HashMap::new(),
         });
         self
+    }
+
+    pub(crate) fn raw_stage_with_options(
+        mut self,
+        name: &str,
+        args: Vec<Value>,
+        options: HashMap<String, Value>,
+    ) -> Self {
+        self.stages.push(Stage {
+            name: name.to_string(),
+            args,
+            options,
+        });
+        self
+    }
+
+    pub(crate) fn find_nearest(
+        self,
+        field: &str,
+        query_vector: Value,
+        distance_measure: &str,
+        limit: Option<i64>,
+        distance_field: Option<&str>,
+    ) -> Self {
+        let mut options = HashMap::new();
+        if let Some(limit) = limit {
+            options.insert("limit".to_string(), Value::integer(limit));
+        }
+        if let Some(distance_field) = distance_field {
+            options.insert("distance_field".to_string(), field_ref_val(distance_field));
+        }
+        self.raw_stage_with_options(
+            "find_nearest",
+            vec![
+                field_ref_val(field),
+                query_vector,
+                Value::string(distance_measure),
+            ],
+            options,
+        )
     }
 
     pub(crate) fn where_expr(self, expr: Value) -> Self {

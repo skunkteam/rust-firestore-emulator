@@ -3,12 +3,15 @@ use std::{cmp, collections::HashMap, iter::Sum, ops::Add};
 use bytes::Bytes;
 use itertools::Itertools;
 
-use crate::google::{
-    firestore::v1::{
-        ArrayValue, Function, MapValue, Pipeline, Value, pipeline::Stage, value::ValueType,
+use crate::{
+    google::{
+        firestore::v1::{
+            ArrayValue, Function, MapValue, Pipeline, Value, pipeline::Stage, value::ValueType,
+        },
+        protobuf::Timestamp,
+        r#type::LatLng,
     },
-    protobuf::Timestamp,
-    r#type::LatLng,
+    vector_ext::{VectorClassification, classify_vector_map},
 };
 
 impl Value {
@@ -73,112 +76,102 @@ impl Value {
     }
 
     pub fn as_field_reference(&self) -> Option<&str> {
-        match self.value_type() {
-            ValueType::FieldReferenceValue(reference) => Some(reference),
+        match self.value_type.as_ref() {
+            Some(ValueType::FieldReferenceValue(reference)) => Some(reference),
             _ => None,
         }
     }
 
     pub fn as_function_value(&self) -> Option<&Function> {
-        match self.value_type() {
-            ValueType::FunctionValue(f) => Some(f),
+        match self.value_type.as_ref() {
+            Some(ValueType::FunctionValue(f)) => Some(f),
             _ => None,
         }
     }
 
     pub fn as_reference(&self) -> Option<&str> {
-        match self.value_type() {
-            ValueType::ReferenceValue(reference) => Some(reference),
+        match self.value_type.as_ref() {
+            Some(ValueType::ReferenceValue(reference)) => Some(reference),
             _ => None,
         }
     }
 
     pub fn as_map(&self) -> Option<&HashMap<String, Self>> {
-        match self.value_type() {
-            ValueType::MapValue(MapValue { fields }) => Some(fields),
+        if self.is_vector() {
+            return None;
+        }
+        match self.value_type.as_ref() {
+            Some(ValueType::MapValue(MapValue { fields })) => Some(fields),
             _ => None,
         }
     }
 
     pub fn as_map_mut(&mut self) -> Option<&mut HashMap<String, Self>> {
-        match self.value_type_mut() {
-            ValueType::MapValue(MapValue { fields }) => Some(fields),
+        if self.is_vector() {
+            return None;
+        }
+        match self.value_type.as_mut() {
+            Some(ValueType::MapValue(MapValue { fields })) => Some(fields),
             _ => None,
         }
     }
 
     pub fn as_string(&self) -> Option<&str> {
-        match self.value_type() {
-            ValueType::StringValue(s) => Some(s),
+        match self.value_type.as_ref() {
+            Some(ValueType::StringValue(s)) => Some(s),
             _ => None,
         }
     }
 
     pub fn into_array(self) -> Option<Vec<Self>> {
-        match self.into_value_type() {
-            ValueType::ArrayValue(ArrayValue { values }) => Some(values),
+        match self.value_type {
+            Some(ValueType::ArrayValue(ArrayValue { values })) => Some(values),
             _ => None,
         }
     }
 
     pub fn as_array(&self) -> Option<&[Self]> {
-        match self.value_type() {
-            ValueType::ArrayValue(ArrayValue { values }) => Some(values),
+        match self.value_type.as_ref() {
+            Some(ValueType::ArrayValue(ArrayValue { values })) => Some(values),
             _ => None,
         }
     }
 
     pub fn as_boolean(&self) -> Option<bool> {
-        match self.value_type() {
-            ValueType::BooleanValue(b) => Some(*b),
+        match self.value_type.as_ref() {
+            Some(ValueType::BooleanValue(b)) => Some(*b),
             _ => None,
         }
     }
 
     pub fn as_double(&self) -> Option<f64> {
-        match self.value_type() {
-            ValueType::DoubleValue(d) => Some(*d),
-            ValueType::IntegerValue(i) => Some(*i as f64),
+        match self.value_type.as_ref() {
+            Some(ValueType::DoubleValue(d)) => Some(*d),
+            Some(ValueType::IntegerValue(i)) => Some(*i as f64),
             _ => None,
         }
     }
 
     pub fn as_integer(&self) -> Option<i64> {
-        match self.value_type() {
-            ValueType::IntegerValue(i) => Some(*i),
+        match self.value_type.as_ref() {
+            Some(ValueType::IntegerValue(i)) => Some(*i),
             _ => None,
         }
     }
 
     pub fn is_nan(&self) -> bool {
-        matches!(self.value_type(), ValueType::DoubleValue(v) if v.is_nan())
+        matches!(self.value_type, Some(ValueType::DoubleValue(v)) if v.is_nan())
     }
 
     pub fn is_number(&self) -> bool {
         matches!(
-            self.value_type(),
-            ValueType::IntegerValue(_) | ValueType::DoubleValue(_)
+            self.value_type,
+            Some(ValueType::IntegerValue(_) | ValueType::DoubleValue(_))
         )
     }
 
     pub fn is_null(&self) -> bool {
-        matches!(self.value_type(), ValueType::NullValue(_))
-    }
-
-    pub fn into_value_type(self) -> ValueType {
-        self.value_type.expect("missing value_type in value")
-    }
-
-    pub fn value_type(&self) -> &ValueType {
-        self.value_type
-            .as_ref()
-            .expect("missing value_type in value")
-    }
-
-    pub fn value_type_mut(&mut self) -> &mut ValueType {
-        self.value_type
-            .as_mut()
-            .expect("missing value_type in value")
+        matches!(self.value_type, Some(ValueType::NullValue(_)))
     }
 
     pub fn is_compatible_with(&self, other: &Self) -> bool {
@@ -237,32 +230,73 @@ impl Value {
                 .all(|(k, v)| b.get(k).is_some_and(|ov| v.storage_eq(ov)))
     }
 
-    fn value_type_order(&self) -> usize {
+    fn value_type_order(&self) -> u8 {
         value_type_rank(self.value_type.as_ref())
     }
 }
 
-fn value_type_rank(vt: Option<&ValueType>) -> usize {
+fn classify_value_type_rank(vt: Option<&ValueType>) -> (u8, Option<&[Value]>) {
     // See: https://firebase.google.com/docs/firestore/manage-data/data-types#value_type_ordering
     match vt {
-        None => 0,
-        Some(ValueType::NullValue(_)) => 1,
-        Some(ValueType::BooleanValue(_)) => 2,
-        Some(ValueType::DoubleValue(value)) if value.is_nan() => 3,
-        Some(ValueType::IntegerValue(_)) => 4,
-        Some(ValueType::DoubleValue(_)) => 4,
-        Some(ValueType::TimestampValue(_)) => 5,
-        Some(ValueType::StringValue(_)) => 6,
-        Some(ValueType::BytesValue(_)) => 7,
-        Some(ValueType::ReferenceValue(_)) => 8,
-        Some(ValueType::GeoPointValue(_)) => 9,
-        Some(ValueType::ArrayValue(_)) => 10,
-        Some(ValueType::MapValue(_)) => 11,
+        None => (0, None),
+        Some(ValueType::NullValue(_)) => (1, None),
+        Some(ValueType::BooleanValue(_)) => (2, None),
+        Some(ValueType::DoubleValue(value)) if value.is_nan() => (3, None),
+        Some(ValueType::IntegerValue(_)) => (4, None),
+        Some(ValueType::DoubleValue(_)) => (4, None),
+        Some(ValueType::TimestampValue(_)) => (5, None),
+        Some(ValueType::StringValue(_)) => (6, None),
+        Some(ValueType::BytesValue(_)) => (7, None),
+        Some(ValueType::ReferenceValue(_)) => (8, None),
+        Some(ValueType::GeoPointValue(_)) => (9, None),
+        Some(ValueType::ArrayValue(_)) => (10, None),
+        Some(ValueType::MapValue(map)) => match classify_vector_map(&map.fields) {
+            VectorClassification::Valid(values) => (11, Some(values)),
+            VectorClassification::NotVectorMap | VectorClassification::Invalid(_) => (12, None),
+        },
         // The following are not allowed to be used when writing documents.
-        Some(ValueType::FieldReferenceValue(_)) => usize::MAX - 2,
-        Some(ValueType::FunctionValue(_)) => usize::MAX - 1,
-        Some(ValueType::PipelineValue(_)) => usize::MAX,
+        Some(ValueType::FieldReferenceValue(_)) => (u8::MAX - 2, None),
+        Some(ValueType::FunctionValue(_)) => (u8::MAX - 1, None),
+        Some(ValueType::PipelineValue(_)) => (u8::MAX, None),
     }
+}
+
+fn value_type_rank(vt: Option<&ValueType>) -> u8 {
+    classify_value_type_rank(vt).0
+}
+
+/// Datastore allowed numeric IDs where Firestore only allows strings.
+/// Numeric IDs are exposed to Firestore as
+/// `__idNUM__`, so this is the lowest possible
+/// negative numeric value expressed in that format. It should be lower than
+/// everything else.
+///
+/// This constant is used to specify startAt/endAt values when querying for
+/// all descendants in a single collection.
+const REFERENCE_NAME_MIN_ID: &str = "__id-9223372036854775808__";
+
+fn process_numeric_ids(s: &str) -> &str {
+    // TODO: Maybe support all numeric IDs? We need this one at least,
+    // because it is used by the JavaScript SDK,
+    // but we could try to support all numeric IDs here
+    // for fun and profit.
+    match s {
+        REFERENCE_NAME_MIN_ID => "",
+        _ => s,
+    }
+}
+
+pub fn cmp_reference_segments<'a>(
+    a: impl IntoIterator<Item = &'a str>,
+    b: impl IntoIterator<Item = &'a str>,
+) -> cmp::Ordering {
+    a.into_iter()
+        .map(process_numeric_ids)
+        .cmp(b.into_iter().map(process_numeric_ids))
+}
+
+pub fn cmp_reference_paths(a: &str, b: &str) -> cmp::Ordering {
+    cmp_reference_segments(a.split('/'), b.split('/'))
 }
 
 fn cmp_f64(a: f64, b: f64) -> cmp::Ordering {
@@ -305,66 +339,59 @@ fn cmp_i64_f64(i: i64, d: f64) -> cmp::Ordering {
 }
 
 fn cmp_value_type(a: &ValueType, b: &ValueType) -> cmp::Ordering {
-    value_type_rank(Some(a))
-        .cmp(&value_type_rank(Some(b)))
-        .then_with(|| {
-            // See: https://cloud.google.com/firestore/docs/concepts/data-types#data_types
-            match (a, b) {
-                (ValueType::NullValue(_), ValueType::NullValue(_)) => cmp::Ordering::Equal,
-                (ValueType::BooleanValue(a), ValueType::BooleanValue(b)) => a.cmp(b),
-                (ValueType::DoubleValue(a), ValueType::DoubleValue(b)) => cmp_f64(*a, *b),
-                (ValueType::DoubleValue(a), ValueType::IntegerValue(b)) => {
-                    cmp_i64_f64(*b, *a).reverse()
-                }
-                (ValueType::IntegerValue(a), ValueType::DoubleValue(b)) => cmp_i64_f64(*a, *b),
-                (ValueType::IntegerValue(a), ValueType::IntegerValue(b)) => a.cmp(b),
-                (ValueType::TimestampValue(a), ValueType::TimestampValue(b)) => a.cmp(b),
-                (ValueType::StringValue(a), ValueType::StringValue(b)) => a.cmp(b),
-                (ValueType::BytesValue(a), ValueType::BytesValue(b)) => a.cmp(b),
-                (ValueType::ReferenceValue(a), ValueType::ReferenceValue(b)) => {
-                    /// Datastore allowed numeric IDs where Firestore only allows strings.
-                    /// Numeric IDs are exposed to Firestore as
-                    /// `__idNUM__`, so this is the lowest possible
-                    /// negative numeric value expressed in that format. It should be lower than
-                    /// everything else.
-                    ///
-                    /// This constant is used to specify startAt/endAt values when querying for
-                    /// all descendants in a single collection.
-                    const REFERENCE_NAME_MIN_ID: &str = "__id-9223372036854775808__";
-
-                    fn process_numeric_ids(s: &str) -> &str {
-                        // TODO: Maybe support all numeric IDs? We need this one at least,
-                        // because it is used by the JavaScript SDK,
-                        // but we could try to support all numeric IDs here
-                        // for fun and profit.
-                        match s {
-                            REFERENCE_NAME_MIN_ID => "",
-                            _ => s,
-                        }
-                    }
-                    let a = a.split('/').map(process_numeric_ids);
-                    let b = b.split('/').map(process_numeric_ids);
-                    a.cmp(b)
-                }
-                (ValueType::GeoPointValue(a), ValueType::GeoPointValue(b)) => a.cmp(b),
-                (ValueType::ArrayValue(a), ValueType::ArrayValue(b)) => a.values.cmp(&b.values),
-                (ValueType::MapValue(a), ValueType::MapValue(b)) => {
-                    a.fields.iter().sorted().cmp(b.fields.iter().sorted())
-                }
-                (ValueType::FieldReferenceValue(a), ValueType::FieldReferenceValue(b)) => a.cmp(b),
-                (ValueType::FunctionValue(a), ValueType::FunctionValue(b)) => a.cmp(b),
-                (ValueType::PipelineValue(a), ValueType::PipelineValue(b)) => a.cmp(b),
-                // Only the above types should need to be compared here, because of the type
-                // ordering above.
-                _ => unreachable!("logic error in Ord implementation of Value"),
+    let (rank_a, vec_a) = classify_value_type_rank(Some(a));
+    let (rank_b, vec_b) = classify_value_type_rank(Some(b));
+    rank_a.cmp(&rank_b).then_with(|| {
+        // See: https://cloud.google.com/firestore/docs/concepts/data-types#data_types
+        match (a, b) {
+            (ValueType::NullValue(_), ValueType::NullValue(_)) => cmp::Ordering::Equal,
+            (ValueType::BooleanValue(a), ValueType::BooleanValue(b)) => a.cmp(b),
+            (ValueType::DoubleValue(a), ValueType::DoubleValue(b)) => cmp_f64(*a, *b),
+            (ValueType::DoubleValue(a), ValueType::IntegerValue(b)) => {
+                cmp_i64_f64(*b, *a).reverse()
             }
-        })
+            (ValueType::IntegerValue(a), ValueType::DoubleValue(b)) => cmp_i64_f64(*a, *b),
+            (ValueType::IntegerValue(a), ValueType::IntegerValue(b)) => a.cmp(b),
+            (ValueType::TimestampValue(a), ValueType::TimestampValue(b)) => a.cmp(b),
+            (ValueType::StringValue(a), ValueType::StringValue(b)) => a.cmp(b),
+            (ValueType::BytesValue(a), ValueType::BytesValue(b)) => a.cmp(b),
+            (ValueType::ReferenceValue(a), ValueType::ReferenceValue(b)) => {
+                cmp_reference_paths(a, b)
+            }
+            (ValueType::GeoPointValue(a), ValueType::GeoPointValue(b)) => a.cmp(b),
+            (ValueType::ArrayValue(a), ValueType::ArrayValue(b)) => a.values.cmp(&b.values),
+            (ValueType::MapValue(a), ValueType::MapValue(b)) => match (vec_a, vec_b) {
+                (Some(va), Some(vb)) => va.len().cmp(&vb.len()).then_with(|| va.cmp(vb)),
+                (None, None) => a.fields.iter().sorted().cmp(b.fields.iter().sorted()),
+                _ => unreachable!("logic error in Ord implementation of Value"),
+            },
+            (ValueType::FieldReferenceValue(a), ValueType::FieldReferenceValue(b)) => a.cmp(b),
+            (ValueType::FunctionValue(a), ValueType::FunctionValue(b)) => a.cmp(b),
+            (ValueType::PipelineValue(a), ValueType::PipelineValue(b)) => a.cmp(b),
+            // Only the above types should need to be compared here, because of the type
+            // ordering above.
+            _ => unreachable!("logic error in Ord implementation of Value"),
+        }
+    })
 }
 
 impl PartialEq for ValueType {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
-            (ValueType::MapValue(a), ValueType::MapValue(b)) => a.fields == b.fields,
+            (ValueType::MapValue(a), ValueType::MapValue(b)) => {
+                match (
+                    classify_vector_map(&a.fields),
+                    classify_vector_map(&b.fields),
+                ) {
+                    (VectorClassification::Valid(va), VectorClassification::Valid(vb)) => {
+                        va.len() == vb.len() && va == vb
+                    }
+                    (VectorClassification::Valid(_), _) | (_, VectorClassification::Valid(_)) => {
+                        false
+                    }
+                    _ => a.fields.len() == b.fields.len() && a.fields == b.fields,
+                }
+            }
             (ValueType::ArrayValue(a), ValueType::ArrayValue(b)) => a.values == b.values,
             (ValueType::StringValue(a), ValueType::StringValue(b)) => a == b,
             (ValueType::BytesValue(a), ValueType::BytesValue(b)) => a == b,
@@ -417,11 +444,11 @@ impl Add for Value {
 
     fn add(self, rhs: Self) -> Self::Output {
         use ValueType::*;
-        match (self.value_type(), rhs.value_type()) {
-            (IntegerValue(a), IntegerValue(b)) => Self::integer(a.saturating_add(*b)),
-            (IntegerValue(a), DoubleValue(b)) => Self::double(*a as f64 + b),
-            (DoubleValue(a), IntegerValue(b)) => Self::double(a + *b as f64),
-            (DoubleValue(a), DoubleValue(b)) => Self::double(a + b),
+        match (self.value_type.as_ref(), rhs.value_type.as_ref()) {
+            (Some(IntegerValue(a)), Some(IntegerValue(b))) => Self::integer(a.saturating_add(*b)),
+            (Some(IntegerValue(a)), Some(DoubleValue(b))) => Self::double(*a as f64 + b),
+            (Some(DoubleValue(a)), Some(IntegerValue(b))) => Self::double(a + *b as f64),
+            (Some(DoubleValue(a)), Some(DoubleValue(b))) => Self::double(a + b),
             _ => rhs,
         }
     }
@@ -450,7 +477,7 @@ impl Sum for Value {
     fn sum<I: Iterator<Item = Self>>(iter: I) -> Self {
         use ValueType::*;
         let value_type = iter
-            .map(|v| v.value_type().clone())
+            .filter_map(|v| v.value_type)
             .fold(IntegerValue(0), |a, b| match (a, b) {
                 (IntegerValue(a), IntegerValue(b)) => a
                     .checked_add(b)
@@ -650,9 +677,13 @@ mod tests {
     use googletest::prelude::*;
     use itertools::Itertools;
 
-    use crate::google::{
-        firestore::v1::{Function, Pipeline, Value, pipeline::Stage, value::ValueType},
-        r#type::LatLng,
+    use super::{cmp_reference_paths, cmp_reference_segments};
+    use crate::{
+        google::{
+            firestore::v1::{Function, Pipeline, Value, pipeline::Stage, value::ValueType},
+            r#type::LatLng,
+        },
+        vector_ext::{VECTOR_MAP_TYPE_KEY, VECTOR_MAP_TYPE_SENTINEL, VECTOR_MAP_VALUE_KEY},
     };
 
     #[gtest]
@@ -732,6 +763,23 @@ mod tests {
                 Value::array(vec![Value::integer(1), Value::double(f64::NAN)]),
                 Value::array(vec![Value::double(1.0), Value::double(neg_nan)]),
             ],
+            vec![Value::vector([f64::NEG_INFINITY])],
+            vec![Value::vector([-0.0]), Value::vector([0.0])],
+            vec![Value::vector([1.0])],
+            vec![Value::vector([f64::INFINITY])],
+            vec![Value::vector([0.0, 0.0]), Value::vector([-0.0, 0.0])],
+            vec![Value::vector([1.0, 2.0])],
+            vec![Value::vector([0.0, 0.0, 0.0])],
+            vec![Value::map(HashMap::from([
+                (
+                    VECTOR_MAP_TYPE_KEY.to_string(),
+                    Value::string(VECTOR_MAP_TYPE_SENTINEL),
+                ),
+                (
+                    VECTOR_MAP_VALUE_KEY.to_string(),
+                    Value::array(vec![Value::integer(1)]),
+                ),
+            ]))],
             vec![
                 Value::map(HashMap::from([("k".to_string(), Value::integer(7))])),
                 Value::map(HashMap::from([("k".to_string(), Value::double(7.0))])),
@@ -889,16 +937,133 @@ mod tests {
         expect_true!(Value::from(Some(7_i32)).storage_eq(&Value::integer(7)));
     }
 
+    #[gtest]
+    fn none_value_type_accessors_and_arithmetic_are_total() {
+        let mut empty = Value::default();
+        expect_that!(empty.as_field_reference(), none());
+        expect_that!(empty.as_function_value(), none());
+        expect_that!(empty.as_reference(), none());
+        expect_that!(empty.as_map(), none());
+        expect_that!(empty.as_map_mut(), none());
+        expect_that!(empty.as_string(), none());
+        expect_that!(empty.as_array(), none());
+        expect_that!(empty.as_boolean(), none());
+        expect_that!(empty.as_double(), none());
+        expect_that!(empty.as_integer(), none());
+        expect_false!(empty.is_nan());
+        expect_false!(empty.is_number());
+        expect_false!(empty.is_null());
+        expect_false!(empty.is_vector());
+        expect_true!(empty.is_compatible_with(&Value::default()));
+        expect_false!(empty.is_compatible_with(&Value::null()));
+        expect_that!(empty.clone().into_array(), none());
+
+        let rhs = Value::integer(5);
+        expect_true!((Value::default() + rhs.clone()).storage_eq(&rhs));
+        expect_true!((rhs + Value::default()).storage_eq(&Value::default()));
+
+        let summed: Value = [Value::default(), Value::integer(3), Value::default()]
+            .into_iter()
+            .sum();
+        expect_true!(summed.storage_eq(&Value::integer(3)));
+
+        let summed_empty: Value = [Value::default()].into_iter().sum();
+        expect_true!(summed_empty.storage_eq(&Value::integer(0)));
+    }
+
+    #[gtest]
+    fn as_map_treats_valid_vectors_atomically() {
+        let mut vec_val = Value::vector([1.0, 2.0]);
+        expect_true!(vec_val.is_vector());
+        expect_that!(vec_val.as_map(), none());
+        expect_that!(vec_val.as_map_mut(), none());
+
+        let mut regular_map = Value::map(HashMap::from([("a".to_string(), Value::integer(1))]));
+        expect_false!(regular_map.is_vector());
+        expect_that!(regular_map.as_map(), some(anything()));
+        expect_that!(regular_map.as_map_mut(), some(anything()));
+
+        let mut malformed_vec = Value::map(HashMap::from([
+            (
+                VECTOR_MAP_TYPE_KEY.to_string(),
+                Value::string(VECTOR_MAP_TYPE_SENTINEL),
+            ),
+            (
+                VECTOR_MAP_VALUE_KEY.to_string(),
+                Value::array(vec![Value::integer(1)]),
+            ),
+        ]));
+        expect_false!(malformed_vec.is_vector());
+        expect_that!(malformed_vec.as_map(), some(anything()));
+        expect_that!(malformed_vec.as_map_mut(), some(anything()));
+    }
+
+    #[gtest]
+    fn vector_extraction_and_ordering() {
+        let v1 = Value::vector([1.0, 2.0, 3.0]);
+        expect_true!(v1.is_vector());
+        expect_eq!(v1.as_vector_values().map(<[Value]>::len), Some(3));
+        expect_eq!(
+            v1.iter_vector_f64().map(Iterator::collect::<Vec<_>>),
+            Some(vec![1.0, 2.0, 3.0])
+        );
+
+        let neg_zero = Value::vector([-0.0, 2.0]);
+        let pos_zero = Value::vector([0.0, 2.0]);
+        expect_eq!(neg_zero, pos_zero);
+        expect_eq!(neg_zero.cmp(&pos_zero), Ordering::Equal);
+
+        // Array < Vector < Map, and vectors sort by dimension length before elements.
+        let arr = Value::array(vec![Value::double(999.0)]);
+        let short_larger = Value::vector([10.0]);
+        let long_smaller = Value::vector([1.0, 2.0]);
+        let long_larger = Value::vector([1.0, 3.0]);
+        let map = Value::map(HashMap::from([("a".to_string(), Value::integer(1))]));
+
+        expect_lt!(arr, &short_larger);
+        expect_lt!(short_larger, &long_smaller);
+        expect_lt!(long_smaller, &long_larger);
+        expect_lt!(long_larger, &map);
+    }
+
+    #[gtest]
+    fn reference_segment_and_path_comparison() {
+        expect_eq!(
+            cmp_reference_paths(
+                "projects/p/databases/d/documents/c/__id-9223372036854775808__",
+                "projects/p/databases/d/documents/c/",
+            ),
+            Ordering::Equal
+        );
+        expect_eq!(
+            cmp_reference_segments(
+                ["parents", "doc", "collection", "__id-9223372036854775808__"],
+                ["parents", "doc", "collection", "\0"],
+            ),
+            Ordering::Less
+        );
+        expect_eq!(
+            cmp_reference_segments(
+                ["parents", "doc", "collection", "x"],
+                ["parents", "doc-1", "collection", "x"],
+            ),
+            Ordering::Less
+        );
+    }
+
     mod proptests {
         use std::{cmp::Ordering, collections::HashMap};
 
         use bytes::Bytes;
         use proptest::prelude::*;
 
-        use crate::google::{
-            firestore::v1::{Value, value::ValueType},
-            protobuf::Timestamp,
-            r#type::LatLng,
+        use crate::{
+            google::{
+                firestore::v1::{Value, value::ValueType},
+                protobuf::Timestamp,
+                r#type::LatLng,
+            },
+            vector_ext::{VECTOR_MAP_TYPE_KEY, VECTOR_MAP_TYPE_SENTINEL, VECTOR_MAP_VALUE_KEY},
         };
 
         fn arb_f64() -> impl Strategy<Value = f64> {
@@ -916,6 +1081,20 @@ mod tests {
                 Just(i64::MAX as f64),
                 Just(9_007_199_254_740_992.0),
                 any::<f64>(),
+            ]
+        }
+
+        fn arb_non_nan_f64() -> impl Strategy<Value = f64> {
+            prop_oneof![
+                Just(0.0),
+                Just(-0.0),
+                Just(1.0),
+                Just(-1.0),
+                Just(f64::INFINITY),
+                Just(f64::NEG_INFINITY),
+                Just(i64::MIN as f64),
+                Just(i64::MAX as f64),
+                (-10_000_i64..=10_000_i64).prop_map(|n| (n as f64) * 0.25),
             ]
         }
 
@@ -965,6 +1144,17 @@ mod tests {
                         longitude,
                     })),
                 }),
+                prop::collection::vec(arb_non_nan_f64(), 1..=4).prop_map(Value::vector),
+                Just(Value::map(HashMap::from([
+                    (
+                        VECTOR_MAP_TYPE_KEY.to_string(),
+                        Value::string(VECTOR_MAP_TYPE_SENTINEL),
+                    ),
+                    (
+                        VECTOR_MAP_VALUE_KEY.to_string(),
+                        Value::array(vec![Value::integer(1)]),
+                    ),
+                ]))),
             ];
             leaf.prop_recursive(2, 16, 4, |inner| {
                 prop_oneof![

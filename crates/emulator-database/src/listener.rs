@@ -9,8 +9,8 @@ use std::{
 
 use googleapis::google::{
     firestore::v1::{
-        DocumentChange, DocumentDelete, ListenRequest, ListenResponse, Target, TargetChange,
-        listen_request,
+        DocumentChange, DocumentDelete, DocumentRemove, ListenRequest, ListenResponse, Target,
+        TargetChange, listen_request,
         listen_response::ResponseType,
         target::{self, query_target},
         target_change::TargetChangeType,
@@ -23,7 +23,7 @@ use tokio_stream::{
     StreamExt, StreamMap, StreamNotifyClose,
     wrappers::{BroadcastStream, ReceiverStream, errors::BroadcastStreamRecvError},
 };
-use tracing::{Level, debug, error, instrument};
+use tracing::{Level, debug, instrument, warn};
 
 use crate::{
     FirestoreDatabase, FirestoreProject, GenericDatabaseError,
@@ -91,7 +91,8 @@ impl Listener {
                         Some(msg) => {
                             if let Err(err) = self.process_request(msg).await {
                                 self.send_err(err).await?;
-                            };
+                                return Ok(());
+                            }
                         }
                         // We're done, drop the listener.
                         None => {
@@ -110,18 +111,31 @@ impl Listener {
                                 db_name,
                                 StreamNotifyClose::new(BroadcastStream::new(database.subscribe())),
                             );
-                            self.reset(database).await?;
-                        },
+                            if let Err(err) = self.reset(database).await {
+                                self.send_err(err).await?;
+                                return Ok(());
+                            }
+                        }
                         // Received an event from the database.
-                        (_, Some(Ok(event))) => self.process_event(&event).await?,
+                        (_, Some(Ok(event))) => {
+                            if let Err(err) = self.process_event(&event).await {
+                                self.send_err(err).await?;
+                                return Ok(());
+                            }
+                        }
                         // Buffer overflow, we weren't able to keep up with the amount of events of one of the databases.
-                        (_, Some(Err(BroadcastStreamRecvError::Lagged(count)))) => {
-                            error!(
+                        (db_name, Some(Err(BroadcastStreamRecvError::Lagged(count)))) => {
+                            warn!(
                                 id = self.id,
                                 count = count,
                                 "listener missed {} events, because of buffer overflow",
                                 count
                             );
+                            let database = &*self.project.database(&db_name).await;
+                            if let Err(err) = self.reset(database).await {
+                                self.send_err(err).await?;
+                                return Ok(());
+                            }
                         }
                     }
                 }
@@ -492,6 +506,62 @@ impl QueryTarget {
         event: &DatabaseEvent,
     ) -> Result<Vec<ResponseType>> {
         let mut updates_to_apply = vec![];
+        if self.query.has_find_nearest() {
+            let mut updates: Vec<_> = event.updates.values().collect();
+            updates.sort_by(|a, b| a.name().cmp_firestore_order(b.name()));
+            for update in updates {
+                let name = update.name();
+                let update_time = update.update_time();
+                match update.stored_document() {
+                    Some(doc) => {
+                        if self.query.matches_prefilters(doc)? {
+                            if let Some(target) = self.doctargets_by_name.get_mut(name) {
+                                if target.last_read_time >= update_time {
+                                    continue;
+                                }
+                                target.last_read_time = update_time;
+                            } else {
+                                self.doctargets_by_name.insert(
+                                    name.clone(),
+                                    DocumentTarget {
+                                        name: name.clone(),
+                                        last_read_time: update_time,
+                                    },
+                                );
+                            }
+                            updates_to_apply.push(ResponseType::DocumentChange(DocumentChange {
+                                document: Some(self.query.project_base(doc)),
+                                target_ids: vec![TARGET_ID],
+                                removed_target_ids: vec![],
+                            }));
+                        } else if let Some(target) = self.doctargets_by_name.get(name)
+                            && target.last_read_time < update_time
+                        {
+                            self.doctargets_by_name.remove(name);
+                            updates_to_apply.push(ResponseType::DocumentRemove(DocumentRemove {
+                                document: name.to_string(),
+                                removed_target_ids: vec![TARGET_ID],
+                                read_time: Some(update_time),
+                            }));
+                        }
+                    }
+                    None => {
+                        if let Some(target) = self.doctargets_by_name.get(name)
+                            && target.last_read_time < update_time
+                        {
+                            self.doctargets_by_name.remove(name);
+                            updates_to_apply.push(ResponseType::DocumentDelete(DocumentDelete {
+                                document: name.to_string(),
+                                removed_target_ids: vec![TARGET_ID],
+                                read_time: Some(update_time),
+                            }));
+                        }
+                    }
+                }
+            }
+            return Ok(updates_to_apply);
+        }
+
         let needs_reset = 'reset: {
             for update in event.updates.values() {
                 let name = update.name();
@@ -534,17 +604,17 @@ impl QueryTarget {
         })];
 
         self.doctargets_by_name.clear();
-        let (_, versions) = self.query.once(database).await?;
-        for version in versions {
+        let (_, matches) = self.query.once(database).await?;
+        for m in matches {
             self.doctargets_by_name.insert(
-                version.name.clone(),
+                m.version.name.clone(),
                 DocumentTarget {
-                    name: version.name.clone(),
+                    name: m.version.name.clone(),
                     last_read_time: time,
                 },
             );
             msgs.push(ResponseType::DocumentChange(DocumentChange {
-                document: Some(self.query.project(&version)),
+                document: Some(self.query.project(&m)),
                 target_ids: vec![TARGET_ID],
                 removed_target_ids: vec![],
             }))

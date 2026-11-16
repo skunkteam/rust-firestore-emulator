@@ -13,10 +13,15 @@ fn main() {
         .type_attribute(".google.type.LatLng", serde_camel_default)
         .type_attribute(".google.firestore.v1.ArrayValue", serde_camel_default)
         .type_attribute(".google.firestore.v1.MapValue", serde_camel_default)
+        .field_attribute(
+            ".google.firestore.v1.MapValue.fields",
+            "#[serde(serialize_with = \"crate::ser::serialize_sorted_map\")]",
+        )
         .type_attribute(".google.firestore.v1.Document", serde_camel_default)
         .field_attribute(
             ".google.firestore.v1.Document.fields",
-            "#[serde(skip_serializing_if = \"std::collections::HashMap::is_empty\")]",
+            "#[serde(skip_serializing_if = \"std::collections::HashMap::is_empty\", \
+             serialize_with = \"crate::ser::serialize_sorted_map\")]",
         )
         .field_attribute(
             ".google.firestore.v1.Document.create_time",

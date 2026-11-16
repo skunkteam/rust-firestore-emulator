@@ -1,12 +1,32 @@
-use googleapis::google::firestore::v1::{Document, Function, Value};
+use googleapis::google::firestore::v1::{Document, Function, Value, value::ValueType};
 use itertools::Itertools;
 
 use crate::{
     GenericDatabaseError,
+    database::vector::{self, DistanceMeasure},
     error::Result,
     pipeline::{expressions, get_exact_expr_args},
-    unimplemented_collection,
+    unimplemented, unimplemented_collection,
 };
+
+fn pipeline_type_name(v: &Value) -> &'static str {
+    match v.value_type.as_ref() {
+        None | Some(ValueType::NullValue(_)) => "NULL",
+        Some(ValueType::BooleanValue(_)) => "BOOLEAN",
+        Some(ValueType::IntegerValue(_)) => "INT64",
+        Some(ValueType::DoubleValue(_)) => "FLOAT64",
+        Some(ValueType::TimestampValue(_)) => "TIMESTAMP",
+        Some(ValueType::StringValue(_)) => "STRING",
+        Some(ValueType::BytesValue(_)) => "BYTES",
+        Some(ValueType::ReferenceValue(_)) => "PATH",
+        Some(ValueType::GeoPointValue(_)) => "GEOPOINT",
+        Some(ValueType::ArrayValue(_)) => "ARRAY",
+        Some(ValueType::MapValue(_)) => "MAP",
+        Some(ValueType::FieldReferenceValue(_)) => "FIELD_REFERENCE",
+        Some(ValueType::FunctionValue(_)) => "FUNCTION",
+        Some(ValueType::PipelineValue(_)) => "PIPELINE",
+    }
+}
 
 pub(super) fn evaluate(
     Function {
@@ -20,13 +40,97 @@ pub(super) fn evaluate(
 
     if name == "is_error" {
         let [arg] = get_exact_expr_args(args, name)?;
-        let is_err = expressions::evaluate(arg, doc).is_err();
-        return Ok(Some(Value::boolean(is_err)));
+        return match expressions::evaluate(arg, doc) {
+            Ok(_) => Ok(Some(Value::boolean(false))),
+            Err(GenericDatabaseError::InvalidArgument(_)) => Ok(Some(Value::boolean(true))),
+            Err(err) => Err(err),
+        };
     }
     if name == "is_absent" {
         let [arg] = get_exact_expr_args(args, name)?;
         let is_absent = expressions::maybe_evaluate(arg, doc)?.is_none();
         return Ok(Some(Value::boolean(is_absent)));
+    }
+
+    match name.as_str() {
+        "cosine_distance" | "euclidean_distance" | "dot_product" => {
+            let [a_expr, b_expr] = get_exact_expr_args(args, name)?;
+            let a = expressions::maybe_evaluate(a_expr, doc)?;
+            let b = expressions::maybe_evaluate(b_expr, doc)?;
+            let (Some(a), Some(b)) = (a, b) else {
+                return Ok(Some(Value::null()));
+            };
+            if a.is_null() || b.is_null() {
+                return Ok(Some(Value::null()));
+            }
+            let a_vals = a.iter_vector_f64().ok_or_else(|| {
+                GenericDatabaseError::invalid_argument(format!(
+                    "The function {name}(...) requires `Vector` but got `{}`.",
+                    pipeline_type_name(&a)
+                ))
+            })?;
+            let b_vals = b.iter_vector_f64().ok_or_else(|| {
+                GenericDatabaseError::invalid_argument(format!(
+                    "The function {name}(...) requires `Vector` but got `{}`.",
+                    pipeline_type_name(&b)
+                ))
+            })?;
+            if a_vals.len() != b_vals.len() {
+                return Err(GenericDatabaseError::invalid_argument(format!(
+                    "{name}(...) arguments must be the same length."
+                )));
+            }
+            let measure = match name.as_str() {
+                "cosine_distance" => DistanceMeasure::Cosine,
+                "euclidean_distance" => DistanceMeasure::Euclidean,
+                "dot_product" => DistanceMeasure::DotProduct,
+                _ => unreachable!(),
+            };
+            let dist = vector::compute_distance(measure, a_vals, b_vals)?;
+            return Ok(Some(Value::double(dist)));
+        }
+        "vector_length" => {
+            let [arg] = get_exact_expr_args(args, name)?;
+            let Some(v) = expressions::maybe_evaluate(arg, doc)? else {
+                return Ok(Some(Value::null()));
+            };
+            if v.is_null() {
+                return Ok(Some(Value::null()));
+            }
+            let vals = v.as_vector_values().ok_or_else(|| {
+                GenericDatabaseError::invalid_argument(format!(
+                    "The function {name}(...) requires `Vector` but got `{}`.",
+                    pipeline_type_name(&v)
+                ))
+            })?;
+            return Ok(Some(Value::integer(vals.len() as i64)));
+        }
+        "string_concat" | "array" | "array_concat" => {}
+        "to_upper" | "to_lower" | "char_length" | "abs" | "ceil" | "floor" | "round" | "sqrt"
+        | "log10" | "ln" | "not" | "array_length" => {
+            let [_] = get_exact_expr_args(args, name)?;
+        }
+        "split"
+        | "add"
+        | "subtract"
+        | "multiply"
+        | "divide"
+        | "mod"
+        | "pow"
+        | "and"
+        | "or"
+        | "equal"
+        | "not_equal"
+        | "greater_than"
+        | "greater_than_or_equal"
+        | "less_than"
+        | "less_than_or_equal" => {
+            let [_, _] = get_exact_expr_args(args, name)?;
+        }
+        _ => unimplemented!(format!(
+            "function {name}({})",
+            args.iter().map(|v| format!("{v:?}")).join(", ")
+        )),
     }
 
     let args: Vec<_> = args
@@ -248,10 +352,7 @@ pub(super) fn evaluate(
             Ok(Some(Value::array(result)))
         }
 
-        _ => Err(GenericDatabaseError::not_implemented(format!(
-            "function '{}' not supported inside expressions yet. Args: {:?}",
-            name, args
-        ))),
+        _ => unreachable!(),
     }
 }
 

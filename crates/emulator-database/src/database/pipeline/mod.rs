@@ -13,6 +13,7 @@ mod collection;
 mod distinct;
 mod expressions;
 mod filter;
+mod find_nearest;
 mod function;
 mod limit;
 mod offset;
@@ -64,6 +65,7 @@ pub async fn execute(
             "add_fields" => add_fields::execute(stage, current_docs)?,
             "select" => select::execute(stage, current_docs)?,
             "remove_fields" => remove_fields::execute(stage, current_docs)?,
+            "find_nearest" => find_nearest::execute(stage, current_docs)?,
             _ => unimplemented!(format!("pipeline stage {}", stage.name)),
         };
     }
