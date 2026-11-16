@@ -720,6 +720,7 @@ textarea {
 .type-badge.geoPointValue { background: #ccfbf1; color: #115e59; }
 .type-badge.arrayValue,
 .type-badge.mapValue { background: #e2e8f0; color: #334155; }
+.type-badge.vector { background: #cffafe; color: #155e75; }
 
 /* Raw JSON Editor */
 .raw-json-wrap {

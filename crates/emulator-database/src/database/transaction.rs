@@ -284,9 +284,13 @@ impl OptimisticState {
         {
             let mut executed_queries = self.executed_queries.lock().await;
             for query in executed_queries.iter_mut() {
-                let (_, result_docs) = query.once(&db).await?;
-                for doc in result_docs {
-                    if doc.update_time > rt {
+                let (_, result_docs) = query.once(&db).await.map_err(|_| {
+                    GenericDatabaseError::aborted(
+                        "contention: concurrent modification invalidated query",
+                    )
+                })?;
+                for m in result_docs {
+                    if m.version.update_time > rt {
                         return Err(GenericDatabaseError::aborted(
                             "contention: query result changed",
                         ));

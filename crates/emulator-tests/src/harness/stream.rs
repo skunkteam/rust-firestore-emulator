@@ -203,6 +203,7 @@ pub(crate) struct ListenBatch {
     pub(crate) saw_current:   bool,
     pub(crate) changed_docs:  Vec<Document>,
     pub(crate) deleted_docs:  Vec<String>,
+    pub(crate) removed_docs:  Vec<String>,
     pub(crate) read_time:     Option<Timestamp>,
     pub(crate) resume_token:  Vec<u8>,
 }
@@ -299,7 +300,10 @@ impl ListenHandle {
                 Some(ResponseType::DocumentDelete(dd)) => {
                     batch.deleted_docs.push(dd.document);
                 }
-                Some(ResponseType::DocumentRemove(_) | ResponseType::Filter(_)) | None => {}
+                Some(ResponseType::DocumentRemove(dr)) => {
+                    batch.removed_docs.push(dr.document);
+                }
+                Some(ResponseType::Filter(_)) | None => {}
             }
         }
         Err(Status::cancelled(

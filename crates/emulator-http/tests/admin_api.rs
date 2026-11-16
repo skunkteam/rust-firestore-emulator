@@ -657,3 +657,192 @@ async fn test_sse_heartbeat_and_malformed_json_rejection() -> Result<()> {
 
     Ok(())
 }
+
+#[gtest]
+#[tokio::test]
+async fn test_rest_vector_passthrough_body_limit_and_run_query_find_nearest() -> Result<()> {
+    let project = Box::leak(Box::new(FirestoreProject::new(FirestoreConfig::default())));
+    let router = RouterBuilder::new(project).build();
+    let docs_root = "/v1/projects/p/databases/(default)/documents";
+
+    // 1. POST :runQuery with object `findNearest` returns 501 UNIMPLEMENTED; non-object returns
+    //    400.
+    let unimpl_res = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri(format!("{docs_root}:runQuery"))
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_vec(&json!({
+                    "structuredQuery": {
+                        "from": [{ "collectionId": "items" }],
+                        "findNearest": {
+                            "vectorField": { "fieldPath": "embedding" },
+                            "distanceMeasure": "EUCLIDEAN",
+                            "queryVector": {
+                                "mapValue": {
+                                    "fields": {
+                                        "__type__": { "stringValue": "__vector__" },
+                                        "value": {
+                                            "arrayValue": {
+                                                "values": [{ "doubleValue": 1.0 }]
+                                            }
+                                        }
+                                    }
+                                }
+                            },
+                            "limit": 1
+                        }
+                    }
+                }))?))?,
+        )
+        .await?;
+    expect_eq!(unimpl_res.status(), StatusCode::NOT_IMPLEMENTED);
+    let unimpl_bytes = axum::body::to_bytes(unimpl_res.into_body(), usize::MAX).await?;
+    let unimpl_body: serde_json::Value = serde_json::from_slice(&unimpl_bytes)?;
+    expect_eq!(unimpl_body["error"]["status"], "UNIMPLEMENTED");
+
+    let bad_fn_res = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri(format!("{docs_root}:runQuery"))
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_vec(&json!({
+                    "structuredQuery": {
+                        "from": [{ "collectionId": "items" }],
+                        "findNearest": 123
+                    }
+                }))?))?,
+        )
+        .await?;
+    expect_eq!(bad_fn_res.status(), StatusCode::BAD_REQUEST);
+    let bad_fn_bytes = axum::body::to_bytes(bad_fn_res.into_body(), usize::MAX).await?;
+    let bad_fn_body: serde_json::Value = serde_json::from_slice(&bad_fn_bytes)?;
+    expect_eq!(bad_fn_body["error"]["status"], "INVALID_ARGUMENT");
+
+    // 2. PATCH and GET with a valid __vector__ map (including -0.0) serialize "__type__" before
+    //    "value" deterministically and preserve -0.0; invalid __vector__ writes return 400.
+    let vec_payload = json!({
+        "fields": {
+            "embedding": {
+                "mapValue": {
+                    "fields": {
+                        "value": {
+                            "arrayValue": {
+                                "values": [
+                                    { "doubleValue": -0.0 },
+                                    { "doubleValue": 2.5 }
+                                ]
+                            }
+                        },
+                        "__type__": { "stringValue": "__vector__" }
+                    }
+                }
+            }
+        }
+    });
+    let patch_res = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::PATCH)
+                .uri(format!("{docs_root}/items/v1"))
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_vec(&vec_payload)?))?,
+        )
+        .await?;
+    expect_eq!(patch_res.status(), StatusCode::OK);
+    let patch_bytes = axum::body::to_bytes(patch_res.into_body(), usize::MAX).await?;
+    let patch_text = String::from_utf8(patch_bytes.to_vec())?;
+    let type_pos = patch_text
+        .find("\"__type__\"")
+        .expect("PATCH response should contain __type__");
+    let value_pos = patch_text
+        .find("\"value\"")
+        .expect("PATCH response should contain value");
+    expect_pred!(type_pos < value_pos);
+    expect_that!(patch_text.as_str(), contains_substring("-0.0"));
+
+    let get_res = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri(format!("{docs_root}/items/v1"))
+                .body(Body::empty())?,
+        )
+        .await?;
+    expect_eq!(get_res.status(), StatusCode::OK);
+    let get_bytes = axum::body::to_bytes(get_res.into_body(), usize::MAX).await?;
+    let get_text = String::from_utf8(get_bytes.to_vec())?;
+    let get_type_pos = get_text
+        .find("\"__type__\"")
+        .expect("GET response should contain __type__");
+    let get_value_pos = get_text
+        .find("\"value\"")
+        .expect("GET response should contain value");
+    expect_pred!(get_type_pos < get_value_pos);
+    expect_that!(get_text.as_str(), contains_substring("-0.0"));
+
+    let invalid_vec_res = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::PATCH)
+                .uri(format!("{docs_root}/items/bad"))
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_vec(&json!({
+                    "fields": {
+                        "embedding": {
+                            "mapValue": {
+                                "fields": {
+                                    "__type__": { "stringValue": "__vector__" },
+                                    "value": { "arrayValue": { "values": [] } }
+                                }
+                            }
+                        }
+                    }
+                }))?))?,
+        )
+        .await?;
+    expect_eq!(invalid_vec_res.status(), StatusCode::BAD_REQUEST);
+    let invalid_vec_bytes = axum::body::to_bytes(invalid_vec_res.into_body(), usize::MAX).await?;
+    let invalid_vec_body: serde_json::Value = serde_json::from_slice(&invalid_vec_bytes)?;
+    expect_eq!(invalid_vec_body["error"]["status"], "INVALID_ARGUMENT");
+
+    // 3. PATCH with a valid > 2 MiB multi-vector payload succeeds (200 OK) under the 50 MiB limit.
+    let vector_2048 = json!({
+        "mapValue": {
+            "fields": {
+                "__type__": { "stringValue": "__vector__" },
+                "value": {
+                    "arrayValue": {
+                        "values": vec![json!({ "doubleValue": 0.25 }); 2048]
+                    }
+                }
+            }
+        }
+    });
+    let mut big_fields = serde_json::Map::new();
+    for i in 0..75 {
+        big_fields.insert(format!("v{i}"), vector_2048.clone());
+    }
+    let big_body = serde_json::to_vec(&json!({ "fields": big_fields }))?;
+    expect_pred!(big_body.len() > 2 * 1024 * 1024);
+
+    let big_patch_res = router
+        .oneshot(
+            Request::builder()
+                .method(Method::PATCH)
+                .uri(format!("{docs_root}/items/big"))
+                .header("content-type", "application/json")
+                .body(Body::from(big_body))?,
+        )
+        .await?;
+    expect_eq!(big_patch_res.status(), StatusCode::OK);
+
+    Ok(())
+}

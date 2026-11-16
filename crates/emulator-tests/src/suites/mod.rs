@@ -9,3 +9,4 @@ mod properties;
 mod structured_query;
 mod transactions_mvcc;
 mod transforms_preconditions;
+mod vector_search;

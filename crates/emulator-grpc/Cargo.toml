@@ -10,6 +10,7 @@ emulator-database = { workspace = true }
 futures = { workspace = true }
 googleapis = { workspace = true }
 itertools = { workspace = true }
+prost = { workspace = true }
 tokio = { workspace = true }
 tokio-stream = { workspace = true }
 tonic = { workspace = true, features = ["gzip"] }

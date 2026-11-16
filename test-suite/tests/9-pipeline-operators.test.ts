@@ -1,6 +1,6 @@
 import { CollectionReference, DocumentData, FieldValue, GeoPoint, Timestamp } from '@google-cloud/firestore';
 import * as p from '@google-cloud/firestore/pipelines';
-import { editions, notImplementedInRust, writeData } from './utils';
+import { callRawStreamRpc, editions, expectCloudLimitationCanary, notImplementedInRust, writeData } from './utils';
 
 const enterpriseDatabases = editions.filter(e => e.enterprise);
 const suite = enterpriseDatabases.length ? describe.each(enterpriseDatabases) : describe.skip.each(editions);
@@ -819,22 +819,22 @@ suite('$description', fs => {
                     { name: 'like (true)', expr: p.constant('abc').like('ab%'), expected: true },
                     { name: 'like (false)', expr: p.constant('abc').like('x%'), expected: false },
                 ],
-                cosineDistance: notImplementedInRust || {
+                cosineDistance: {
                     name: 'cosineDistance',
                     expr: p.constant(FieldValue.vector([1, 2])).cosineDistance(p.constant(FieldValue.vector([1, 2]))),
                     expected: 0,
                 },
-                euclideanDistance: notImplementedInRust || {
+                euclideanDistance: {
                     name: 'euclideanDistance',
                     expr: p.constant(FieldValue.vector([1, 2])).euclideanDistance(p.constant(FieldValue.vector([1, 2]))),
                     expected: 0,
                 },
-                dotProduct: notImplementedInRust || {
+                dotProduct: {
                     name: 'dotProduct',
                     expr: p.constant(FieldValue.vector([1, 2])).dotProduct(p.constant(FieldValue.vector([1, 2]))),
                     expected: 5,
                 },
-                vectorLength: notImplementedInRust || {
+                vectorLength: {
                     name: 'vectorLength',
                     expr: p.constant(FieldValue.vector([1, 2])).vectorLength(),
                     expected: 2,
@@ -1271,22 +1271,22 @@ suite('$description', fs => {
                     { name: 'like (true)', expr: p.like(p.constant('abc'), 'ab%'), expected: true },
                     { name: 'like (false)', expr: p.like(p.constant('abc'), 'x%'), expected: false },
                 ],
-                cosineDistance: notImplementedInRust || {
+                cosineDistance: {
                     name: 'cosineDistance',
                     expr: p.cosineDistance(p.constant(FieldValue.vector([1, 2])), p.constant(FieldValue.vector([1, 2]))),
                     expected: 0,
                 },
-                euclideanDistance: notImplementedInRust || {
+                euclideanDistance: {
                     name: 'euclideanDistance',
                     expr: p.euclideanDistance(p.constant(FieldValue.vector([1, 2])), p.constant(FieldValue.vector([1, 2]))),
                     expected: 0,
                 },
-                dotProduct: notImplementedInRust || {
+                dotProduct: {
                     name: 'dotProduct',
                     expr: p.dotProduct(p.constant(FieldValue.vector([1, 2])), p.constant(FieldValue.vector([1, 2]))),
                     expected: 5,
                 },
-                vectorLength: notImplementedInRust || {
+                vectorLength: {
                     name: 'vectorLength',
                     expr: p.vectorLength(p.constant(FieldValue.vector([1, 2]))),
                     expected: 2,
@@ -1627,6 +1627,394 @@ suite('$description', fs => {
                     } satisfies Record<AggregateOperators, unknown>,
                 ]);
             });
+        });
+
+        describe('vectorFunctions', () => {
+            let vecRef: CollectionReference;
+
+            beforeAll(async () => {
+                vecRef = fs.collection.doc().collection('vectorFunctions');
+                await vecRef.doc('sample').set(
+                    writeData({
+                        vec: FieldValue.vector([3, 4]),
+                        zeroVec: FieldValue.vector([0, 0]),
+                        nullVec: null,
+                        strVal: 'not-a-vector',
+                    }),
+                );
+            });
+
+            test.concurrent('evaluates distances, length, and null propagation on missing/null fields', async () => {
+                const pipe = fs.firestore
+                    .pipeline()
+                    .collection(vecRef)
+                    .limit(1)
+                    .select(
+                        p.field('vec').vectorLength().as('len'),
+                        p
+                            .field('vec')
+                            .euclideanDistance(FieldValue.vector([0, 0]))
+                            .as('euc'),
+                        p
+                            .field('vec')
+                            .cosineDistance(FieldValue.vector([3, 4]))
+                            .as('cosSame'),
+                        p
+                            .field('vec')
+                            .dotProduct(FieldValue.vector([1, 2]))
+                            .as('dot'),
+                        p.field('missing').vectorLength().as('lenMissing'),
+                        p.field('nullVec').vectorLength().as('lenNull'),
+                        p
+                            .field('nullVec')
+                            .euclideanDistance(FieldValue.vector([1, 0]))
+                            .as('eucNull'),
+                        p.cosineDistance(p.field('vec'), p.field('missing')).as('cosMissing'),
+                        p.dotProduct(p.field('missing'), p.field('vec')).as('dotMissing'),
+                    );
+                const snap = await pipe.execute();
+                expect(snap.results).toHaveLength(1);
+                expect(snap.results[0].data()).toEqual({
+                    len: 2,
+                    euc: 5,
+                    cosSame: expect.closeTo(0, 9),
+                    dot: 11,
+                    lenMissing: null,
+                    lenNull: null,
+                    eucNull: null,
+                    cosMissing: null,
+                    dotMissing: null,
+                });
+            });
+
+            test.concurrent(
+                'propagates isError() and rejects INVALID_ARGUMENT for mismatched dimensions, non-vectors, and stored [0, 0] cosineDistance',
+                async () => {
+                    const mismatchVec = FieldValue.vector([1, 2, 3]);
+                    const errorExprs: Record<string, p.Expression> = {
+                        eucMismatch: p.field('vec').euclideanDistance(mismatchVec),
+                        cosMismatch: p.field('vec').cosineDistance(mismatchVec),
+                        dotMismatch: p.field('vec').dotProduct(mismatchVec),
+                        lenNonVector: p.field('strVal').vectorLength(),
+                        eucNonVector: p.field('strVal').euclideanDistance(FieldValue.vector([1, 0])),
+                        cosStoredZeroLeft: p.field('zeroVec').cosineDistance(FieldValue.vector([1, 0])),
+                        cosStoredZeroRight: p.field('vec').cosineDistance(p.field('zeroVec')),
+                    };
+
+                    const isErrorPipe = fs.firestore
+                        .pipeline()
+                        .collection(vecRef)
+                        .limit(1)
+                        .select({
+                            selections: Object.entries(errorExprs).map(([key, expr]) => p.isError(expr).as(key)),
+                        });
+                    const isErrorSnap = await isErrorPipe.execute();
+                    expect(isErrorSnap.results).toHaveLength(1);
+                    expect(isErrorSnap.results[0].data()).toEqual({
+                        eucMismatch: true,
+                        cosMismatch: true,
+                        dotMismatch: true,
+                        lenNonVector: true,
+                        eucNonVector: true,
+                        cosStoredZeroLeft: true,
+                        cosStoredZeroRight: true,
+                    });
+
+                    for (const expr of Object.values(errorExprs)) {
+                        const directPipe = fs.firestore.pipeline().collection(vecRef).limit(1).select(expr.as('res'));
+                        await expect(directPipe.execute()).rejects.toThrow(/3 INVALID_ARGUMENT/);
+                    }
+                },
+            );
+
+            test.concurrent('matches Cloud IEEE 754 behavior for extreme magnitudes, cosine overshoot, and infinity inputs', async () => {
+                const cosUnderflowExpr = p
+                    .constant(FieldValue.vector([1e-200, 0]))
+                    .cosineDistance(p.constant(FieldValue.vector([1e-200, 0])));
+                const snap = await fs.firestore
+                    .pipeline()
+                    .collection(vecRef)
+                    .limit(1)
+                    .select(
+                        p
+                            .constant(FieldValue.vector([1e100, 0]))
+                            .cosineDistance(p.constant(FieldValue.vector([1e100, 0])))
+                            .as('cos1e100'),
+                        p
+                            .constant(FieldValue.vector([1e-100, 1e-100]))
+                            .cosineDistance(p.constant(FieldValue.vector([1e-100, 0])))
+                            .as('cos1eNeg100'),
+                        p
+                            .constant(FieldValue.vector([1e-100, 0]))
+                            .cosineDistance(p.constant(FieldValue.vector([-1e-100, 0])))
+                            .as('cos1eNeg100Opp'),
+                        p
+                            .constant(FieldValue.vector([1.0000008, 2.0000024, 3.0000056]))
+                            .cosineDistance(p.constant(FieldValue.vector([1.3333344080000062, 2.6666698826666857, 4.000007490666712])))
+                            .as('cosOvershoot'),
+                        p.isError(cosUnderflowExpr).as('cosUnderflowIsErr'),
+                        p
+                            .constant(FieldValue.vector([Number.POSITIVE_INFINITY, 0]))
+                            .euclideanDistance(p.constant(FieldValue.vector([1, 0])))
+                            .as('eucInf'),
+                        p
+                            .constant(FieldValue.vector([Number.POSITIVE_INFINITY, 0]))
+                            .dotProduct(p.constant(FieldValue.vector([1, 2])))
+                            .as('dotInf'),
+                    )
+                    .execute();
+
+                expect(snap.results).toHaveLength(1);
+                expect(snap.results[0].data()).toEqual({
+                    cos1e100: 1,
+                    cos1eNeg100: Number.NEGATIVE_INFINITY,
+                    cos1eNeg100Opp: Number.POSITIVE_INFINITY,
+                    cosOvershoot: -2.220446049250313e-16,
+                    cosUnderflowIsErr: true,
+                    eucInf: Number.POSITIVE_INFINITY,
+                    dotInf: Number.POSITIVE_INFINITY,
+                });
+
+                await expect(
+                    fs.firestore.pipeline().collection(vecRef).limit(1).select(cosUnderflowExpr.as('res')).execute(),
+                ).rejects.toThrow(/3 INVALID_ARGUMENT/);
+            });
+        });
+
+        describe('findNearest stage', () => {
+            let nearestRef: CollectionReference;
+
+            beforeAll(async () => {
+                nearestRef = fs.collection.doc().collection('pipelineFindNearest');
+                const docs: DocumentData[] = [
+                    { name: 'a', vec: FieldValue.vector([1, 0]) },
+                    { name: 'b', vec: FieldValue.vector([0.5, 2]) },
+                    { name: 'c', vec: FieldValue.vector([3, 1]) },
+                    { name: 'd', vec: FieldValue.vector([-1, 3]) },
+                    { name: 'skipMissing' },
+                    { name: 'skipStr', vec: 'not-a-vector' },
+                    { name: 'skip3d', vec: FieldValue.vector([1, 0, 0]) },
+                ];
+                await Promise.all(docs.map(d => nearestRef.doc(d.name as string).set(writeData(d))));
+            });
+
+            test.concurrent('supports euclidean distanceMeasure with FieldValue.vector, limit, and distanceField', async () => {
+                const snap = await fs.firestore
+                    .pipeline()
+                    .collection(nearestRef)
+                    .findNearest({
+                        field: 'vec',
+                        vectorValue: FieldValue.vector([1, 0]),
+                        distanceMeasure: 'euclidean',
+                        limit: 2,
+                        distanceField: 'dist',
+                    })
+                    .execute();
+
+                const rows = snap.results.map(r => r.data());
+                expect(rows.map(r => r.name)).toEqual(['a', 'b']);
+                expect(rows[0].dist).toBeCloseTo(0, 9);
+                expect(rows[1].dist).toBeCloseTo(Math.sqrt(4.25), 9);
+            });
+
+            test.concurrent('supports cosine distanceMeasure with number[] query vector', async () => {
+                const snap = await fs.firestore
+                    .pipeline()
+                    .collection(nearestRef)
+                    .findNearest({
+                        field: 'vec',
+                        vectorValue: [1, 0],
+                        distanceMeasure: 'cosine',
+                        limit: 3,
+                        distanceField: 'dist',
+                    })
+                    .execute();
+
+                const rows = snap.results.map(r => r.data());
+                expect(rows.map(r => r.name)).toEqual(['a', 'c', 'b']);
+                expect(rows[0].dist).toBeCloseTo(0, 9);
+                expect(rows[1].dist).toBeCloseTo(1 - 3 / Math.sqrt(10), 9);
+                expect(rows[2].dist).toBeCloseTo(1 - 0.5 / Math.sqrt(4.25), 9);
+            });
+
+            test.concurrent('supports dot_product distanceMeasure without limit or distanceField', async () => {
+                const snapWithDist = await fs.firestore
+                    .pipeline()
+                    .collection(nearestRef)
+                    .findNearest({
+                        field: 'vec',
+                        vectorValue: FieldValue.vector([1, 0]),
+                        distanceMeasure: 'dot_product',
+                        distanceField: 'dist',
+                    })
+                    .execute();
+
+                const rowsWithDist = snapWithDist.results.map(r => r.data());
+                expect(rowsWithDist.map(r => r.name)).toEqual(['c', 'a', 'b', 'd']);
+                expect(rowsWithDist[0].dist).toBeCloseTo(3, 9);
+                expect(rowsWithDist[1].dist).toBeCloseTo(1, 9);
+                expect(rowsWithDist[2].dist).toBeCloseTo(0.5, 9);
+                expect(rowsWithDist[3].dist).toBeCloseTo(-1, 9);
+
+                const snapNoDist = await fs.firestore
+                    .pipeline()
+                    .collection(nearestRef)
+                    .findNearest({
+                        field: 'vec',
+                        vectorValue: [1, 0],
+                        distanceMeasure: 'dot_product',
+                        limit: 1,
+                    })
+                    .execute();
+                expect(snapNoDist.results).toHaveLength(1);
+                const noDistData = snapNoDist.results[0].data();
+                expect(noDistData.name).toBe('c');
+                expect('dist' in noDistData).toBe(false);
+            });
+
+            test.concurrent('rejects threshold rawOptions via cloud limitation canaries', async () => {
+                await expectCloudLimitationCanary('pipeline findNearest rawOptions.threshold', () =>
+                    fs.firestore
+                        .pipeline()
+                        .collection(nearestRef)
+                        .findNearest({
+                            field: 'vec',
+                            vectorValue: [1, 0],
+                            distanceMeasure: 'euclidean',
+                            rawOptions: { threshold: 0.5 },
+                        })
+                        .execute(),
+                );
+
+                await expectCloudLimitationCanary('pipeline findNearest rawOptions.distance_threshold', () =>
+                    fs.firestore
+                        .pipeline()
+                        .collection(nearestRef)
+                        .findNearest({
+                            field: 'vec',
+                            vectorValue: [1, 0],
+                            distanceMeasure: 'euclidean',
+                            rawOptions: { distance_threshold: 0.5 },
+                        })
+                        .execute(),
+                );
+            });
+
+            test.concurrent('rejects raw ArrayValue vector and StringValue field/distance_field over executePipeline', async () => {
+                const database = (fs.firestore as unknown as { formattedName: string }).formattedName;
+                const colStage = { name: 'collection', args: [{ referenceValue: `/${nearestRef.path}` }] };
+                const vecMap = (coords: number[]) => ({
+                    mapValue: {
+                        fields: {
+                            __type__: { stringValue: '__vector__' },
+                            value: { arrayValue: { values: coords.map(doubleValue => ({ doubleValue })) } },
+                        },
+                    },
+                });
+
+                const badStages = [
+                    {
+                        label: 'double ArrayValue vector',
+                        stage: {
+                            name: 'find_nearest',
+                            args: [
+                                { fieldReferenceValue: 'vec' },
+                                { arrayValue: { values: [{ doubleValue: 1 }, { doubleValue: 0 }] } },
+                                { stringValue: 'euclidean' },
+                            ],
+                            options: {},
+                        },
+                    },
+                    {
+                        label: 'integer ArrayValue vector',
+                        stage: {
+                            name: 'find_nearest',
+                            args: [
+                                { fieldReferenceValue: 'vec' },
+                                { arrayValue: { values: [{ integerValue: '1' }, { doubleValue: 0 }] } },
+                                { stringValue: 'euclidean' },
+                            ],
+                            options: {},
+                        },
+                    },
+                    {
+                        label: 'StringValue field',
+                        stage: {
+                            name: 'find_nearest',
+                            args: [{ stringValue: 'vec' }, vecMap([1, 0]), { stringValue: 'euclidean' }],
+                            options: {},
+                        },
+                    },
+                    {
+                        label: 'StringValue distance_field',
+                        stage: {
+                            name: 'find_nearest',
+                            args: [{ fieldReferenceValue: 'vec' }, vecMap([1, 0]), { stringValue: 'euclidean' }],
+                            options: { distance_field: { stringValue: 'dist' } },
+                        },
+                    },
+                ];
+
+                for (const item of badStages) {
+                    let code: number | undefined;
+                    try {
+                        await callRawStreamRpc(fs.firestore, 'executePipeline', {
+                            database,
+                            structuredPipeline: {
+                                pipeline: {
+                                    stages: [colStage, item.stage],
+                                },
+                            },
+                        });
+                    } catch (err: unknown) {
+                        code = typeof err === 'object' && err !== null ? Number((err as { code?: unknown }).code) : undefined;
+                    }
+                    expect({ label: item.label, code }).toEqual({ label: item.label, code: 3 });
+                }
+            });
+
+            test.concurrent(
+                'streams >200 unprojected 2048D vector documents exceeding 4 MiB total response size',
+                async () => {
+                    const bigCol = fs.collection.doc().collection('pipelineFindNearestLarge');
+                    const docCount = 210;
+                    const makeVec = (seed: number): number[] => {
+                        const arr = new Array<number>(2048).fill(0);
+                        arr[0] = seed;
+                        arr[2047] = 1;
+                        return arr;
+                    };
+
+                    const batchSize = 50;
+                    for (let start = 0; start < docCount; start += batchSize) {
+                        const batch = fs.firestore.batch();
+                        const end = Math.min(start + batchSize, docCount);
+                        for (let i = start; i < end; i++) {
+                            const id = `doc-${String(i).padStart(3, '0')}`;
+                            batch.set(bigCol.doc(id), writeData({ idx: i, vec: FieldValue.vector(makeVec(i)) }));
+                        }
+                        await batch.commit();
+                    }
+
+                    const snap = await fs.firestore
+                        .pipeline()
+                        .collection(bigCol)
+                        .findNearest({
+                            field: 'vec',
+                            vectorValue: makeVec(0),
+                            distanceMeasure: 'euclidean',
+                            limit: docCount,
+                            distanceField: 'dist',
+                        })
+                        .execute();
+
+                    expect(snap.results).toHaveLength(docCount);
+                    expect(snap.results[0].data().idx).toBe(0);
+                    expect(snap.results[0].data().dist).toBeCloseTo(0, 9);
+                    expect(snap.results[docCount - 1].data().idx).toBe(docCount - 1);
+                },
+                30_000,
+            );
         });
     });
 });

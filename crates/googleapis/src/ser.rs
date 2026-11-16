@@ -1,10 +1,11 @@
-use std::fmt;
+use std::{collections::HashMap, fmt};
 
 use base64::{
     Engine as _,
     display::Base64Display,
     prelude::{BASE64_STANDARD, BASE64_STANDARD_NO_PAD, BASE64_URL_SAFE, BASE64_URL_SAFE_NO_PAD},
 };
+use itertools::Itertools;
 use prost::bytes::Bytes;
 use serde::{
     Deserialize, Deserializer, Serialize, Serializer,
@@ -27,6 +28,17 @@ use crate::google::{
     protobuf::{Int32Value, Timestamp},
     r#type::LatLng,
 };
+
+pub(crate) fn serialize_sorted_map<S: Serializer>(
+    fields: &HashMap<String, Value>,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    let mut map = serializer.serialize_map(Some(fields.len()))?;
+    for (k, v) in fields.iter().sorted_by_key(|(k, _)| *k) {
+        map.serialize_entry(k, v)?;
+    }
+    map.end()
+}
 
 /// Minimum valid Proto3 `Timestamp` seconds (`0001-01-01T00:00:00Z`).
 const MIN_TIMESTAMP_SECONDS: i64 = -62_135_596_800;
@@ -1422,6 +1434,44 @@ mod tests {
             serde_json::from_value::<Order>(json!({ "direction": "ASCENDING" })),
             err(anything())
         );
+    }
+
+    #[gtest]
+    fn vector_map_and_document_serialize_keys_deterministically_and_preserve_neg_zero() {
+        let vec_val = Value::vector([-0.0, 1.5, f64::INFINITY]);
+        let vec_json = serde_json::to_string(&vec_val).unwrap();
+        let type_idx = vec_json.find(r#""__type__""#).unwrap();
+        let value_idx = vec_json.find(r#""value""#).unwrap();
+        expect_lt!(type_idx, value_idx);
+        expect_that!(vec_json, contains_substring("-0.0"));
+
+        let parsed_vec: Value = serde_json::from_str(&vec_json).unwrap();
+        expect_true!(vec_val.storage_eq(&parsed_vec));
+
+        let doc = Document {
+            name: "projects/p/databases/(default)/documents/items/v1".to_string(),
+            fields: HashMap::from([
+                ("zeta".to_string(), Value::integer(1)),
+                ("embedding".to_string(), vec_val.clone()),
+                ("alpha".to_string(), Value::string("first")),
+            ]),
+            create_time: None,
+            update_time: None,
+        };
+        let doc_json = serde_json::to_string(&doc).unwrap();
+        let alpha_idx = doc_json.find(r#""alpha""#).unwrap();
+        let emb_idx = doc_json.find(r#""embedding""#).unwrap();
+        let zeta_idx = doc_json.find(r#""zeta""#).unwrap();
+        expect_lt!(alpha_idx, emb_idx);
+        expect_lt!(emb_idx, zeta_idx);
+
+        let emb_slice = &doc_json[emb_idx..zeta_idx];
+        let emb_type_idx = emb_slice.find(r#""__type__""#).unwrap();
+        let emb_value_idx = emb_slice.find(r#""value""#).unwrap();
+        expect_lt!(emb_type_idx, emb_value_idx);
+
+        let parsed_doc: Document = serde_json::from_str(&doc_json).unwrap();
+        expect_true!(Value::fields_storage_eq(&doc.fields, &parsed_doc.fields));
     }
 
     mod proptests {

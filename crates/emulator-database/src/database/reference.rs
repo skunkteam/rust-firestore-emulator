@@ -1,9 +1,13 @@
-use std::{fmt::Display, str::FromStr};
+use std::{cmp, fmt::Display, iter, str::FromStr};
 
 use serde_with::{DeserializeFromStr, SerializeDisplay};
 use string_cache::DefaultAtom;
 
 use crate::GenericDatabaseError;
+
+pub(crate) fn is_reserved_name(s: &str) -> bool {
+    s.starts_with("__") && s.ends_with("__") && s.len() >= 5
+}
 
 /// A reference to either the database root (including project name and database name), a single
 /// collection or a single document.
@@ -164,11 +168,7 @@ impl FromStr for Ref {
             let s = s.strip_prefix('/')?;
 
             let is_invalid_id = |id: &str| {
-                id.is_empty()
-                    || id == "."
-                    || id == ".."
-                    || (id.starts_with("__") && id.ends_with("__") && id.len() >= 5)
-                    || id.len() > 1500
+                id.is_empty() || id == "." || id == ".." || is_reserved_name(id) || id.len() > 1500
             };
             if s.split('/').any(is_invalid_id) {
                 return None;
@@ -447,6 +447,25 @@ impl DocumentRef {
             collection_ref,
             document_id: document_id.into(),
         }
+    }
+
+    pub(crate) fn cmp_firestore_order(&self, other: &Self) -> cmp::Ordering {
+        self.collection_ref
+            .root_ref
+            .cmp(&other.collection_ref.root_ref)
+            .then_with(|| {
+                googleapis::cmp_reference_segments(
+                    self.collection_ref
+                        .collection_id
+                        .split('/')
+                        .chain(iter::once(self.document_id.as_str())),
+                    other
+                        .collection_ref
+                        .collection_id
+                        .split('/')
+                        .chain(iter::once(other.document_id.as_str())),
+                )
+            })
     }
 }
 

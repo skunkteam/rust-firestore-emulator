@@ -344,7 +344,7 @@ async fn structured_query_rejects_invalid_from_parent_operator_and_duplicate_arr
         Code::InvalidArgument,
     );
 
-    // 5. `find_nearest` vector search -> Unimplemented
+    // 5. `find_nearest` with default/invalid fields -> InvalidArgument
     let nearest = collect_run_query(
         db.raw_grpc()
             .run_query(RunQueryRequest {
@@ -367,5 +367,5 @@ async fn structured_query_rejects_invalid_from_parent_operator_and_duplicate_arr
             .into_inner(),
     )
     .await;
-    assert_status_code(nearest, Code::Unimplemented);
+    assert_status_code(nearest, Code::InvalidArgument);
 }

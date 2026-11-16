@@ -9,7 +9,7 @@ This repository provides a Rust alternative to the official Java-based Firebase 
 ### Key Characteristics
 
 - **Strict Concurrency Simulation**: Utilizes a custom `fifo-rwlock` (`crates/fifo-rwlock`) underneath the hood because standard async read-write locks do not provide the strict FIFO queuing and priority-preserving read-to-write lock upgrades required to emulate Cloud Firestore's pessimistic locking and contention behavior.
-- **Driven by Need**: Exceptionally complete for core Firestore workflows (collections, documents, structured queries, aggregations, Enterprise Edition pipelines, real-time listeners, and pessimistic/optimistic transactions).
+- **Driven by Need**: Exceptionally complete for core Firestore workflows (collections, documents, structured queries, aggregations, `VectorValue` embeddings and `findNearest` vector search, Enterprise Edition pipelines, real-time listeners, and pessimistic/optimistic transactions).
 - **Cloud-Compliant Behavior**: Aligns with actual Google Cloud Firestore behavior rather than Java emulator edge cases, continuously verified by the `@google-cloud/firestore` conformance suite in [`test-suite/`](./test-suite/README.md).
 
 ### Missing Features
@@ -18,7 +18,6 @@ Because the implementation is driven by consumed features, some advanced or edge
 
 - Some updates with Transforms (such as `Maximum` and `Minimum`)
 - Multiplexing listeners in a single stream (used by frontend Firestore SDKs; `Listener` enforces a single active target with `target_id == 1`)
-- Nearest neighbors search
 - Some field filters (such as `ArrayContainsAny` and `NotIn`)
 - Explain options
 - Additional unimplemented gRPC endpoints (`partition_query`, `write`) or request options guarded by `unimplemented!` macros across the codebase.

@@ -3,7 +3,7 @@ use std::sync::Arc;
 use axum::{
     Json, Router,
     body::Bytes,
-    extract::{Path, State},
+    extract::{DefaultBodyLimit, Path, State},
     http::{HeaderMap, Method, Uri},
     response::{IntoResponse, Response},
     routing::{any, get, post},
@@ -62,6 +62,7 @@ pub(crate) fn router() -> Router<&'static FirestoreProject> {
             "/{project_id}/databases/{database_id}/documents/{*tail}",
             any(dispatch_documents_tail),
         )
+        .layer(DefaultBodyLimit::max(50 * 1024 * 1024))
         .fallback(unmatched_projects_route)
 }
 
@@ -441,7 +442,24 @@ async fn handle_run_query(
     headers: &HeaderMap,
     body: &[u8],
 ) -> Result<Response> {
-    let req: RunQueryRequest = parse_json_body(headers, body)?;
+    let raw: serde_json::Value = parse_json_body(headers, body)?;
+    if let Some(sq) = raw
+        .get("structuredQuery")
+        .or_else(|| raw.get("structured_query"))
+        && let Some(fn_val) = sq.get("findNearest").or_else(|| sq.get("find_nearest"))
+        && !fn_val.is_null()
+    {
+        if fn_val.is_object() {
+            return Err(RestError::not_implemented(
+                "StructuredQuery.findNearest over REST is not implemented",
+            ));
+        }
+        return Err(RestError::bad_request(
+            "invalid findNearest in StructuredQuery",
+        ));
+    }
+    let req: RunQueryRequest =
+        serde_json::from_value(raw).map_err(|e| RestError::bad_request(e.to_string()))?;
     let Some(run_query_request::QueryType::StructuredQuery(structured_query)) = req.query_type
     else {
         return Err(RestError::bad_request(

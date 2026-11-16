@@ -7,8 +7,11 @@ import {
   decodeBytes,
   encodeBytes,
   escapeFieldPathSegment,
+  firestoreValueEquals,
   formatDoubleInput,
+  formatVectorSummary,
   getValueType,
+  isVectorMapValue,
   normalizeReference,
   validateDouble,
   validateGeoPoint,
@@ -26,12 +29,13 @@ import {
  * @typedef {{
  *   id: number,
  *   key: string,
- *   type: ValueTypeKey,
+ *   type: ValueTypeKey | 'vector',
  *   text: string,
  *   boolVal: boolean,
  *   latText: string,
  *   lngText: string,
  *   bytesMode: 'base64' | 'utf8' | 'hex',
+ *   rawVectorValue?: FirestoreValue,
  *   children: DraftNode[],
  * }} DraftNode
  */
@@ -44,6 +48,7 @@ import {
  *   mode: 'structured' | 'raw',
  *   cleanDoc: FirestoreDocument | null,
  *   cleanJson: string,
+ *   rawBaselineText: string,
  *   nodes: DraftNode[],
  *   rawText: string,
  *   rawError: string | null,
@@ -74,6 +79,20 @@ export function fieldsToDraftNodes(fields) {
  * @returns {DraftNode}
  */
 function valueToDraftNode(key, val) {
+  if (isVectorMapValue(val)) {
+    return {
+      id: nextNodeId++,
+      key,
+      type: "vector",
+      text: "",
+      boolVal: false,
+      latText: "0",
+      lngText: "0",
+      bytesMode: "base64",
+      rawVectorValue: val,
+      children: [],
+    };
+  }
   const type = getValueType(val);
   /** @type {DraftNode} */
   const node = {
@@ -272,6 +291,9 @@ function convertSingleNode(node, projectId, databaseId, inArray, errors) {
       const fields = collectMapNodes(node.children, projectId, databaseId, errors);
       return { mapValue: { fields } };
     }
+
+    case "vector":
+      return node.rawVectorValue ?? null;
   }
 }
 
@@ -284,15 +306,17 @@ function convertSingleNode(node, projectId, databaseId, inArray, errors) {
  * @returns {EditorSession}
  */
 export function createEditorSession(docPath, projectId, databaseId, doc) {
-  const fields = doc?.fields ?? {};
+  const cleanDoc = doc ? structuredClone(doc) : null;
+  const fields = cleanDoc?.fields ?? {};
   const cleanJson = JSON.stringify({ fields }, null, 2);
   return {
     docPath,
     projectId,
     databaseId,
     mode: "structured",
-    cleanDoc: doc ? structuredClone(doc) : null,
+    cleanDoc,
     cleanJson,
+    rawBaselineText: cleanJson,
     nodes: fieldsToDraftNodes(fields),
     rawText: cleanJson,
     rawError: null,
@@ -309,10 +333,12 @@ export function createEditorSession(docPath, projectId, databaseId, doc) {
  * @param {FirestoreDocument} doc
  */
 export function syncSessionWithDocument(session, doc) {
-  const fields = doc.fields ?? {};
+  const cleanDoc = structuredClone(doc);
+  const fields = cleanDoc.fields ?? {};
   const cleanJson = JSON.stringify({ fields }, null, 2);
-  session.cleanDoc = structuredClone(doc);
+  session.cleanDoc = cleanDoc;
   session.cleanJson = cleanJson;
+  session.rawBaselineText = cleanJson;
   session.nodes = fieldsToDraftNodes(fields);
   session.rawText = cleanJson;
   session.rawError = null;
@@ -362,9 +388,12 @@ export function computeChangedFieldMask(cleanFields, nextFields) {
   /** @type {string[]} */
   const mask = [];
   for (const key of allKeys) {
-    const a = JSON.stringify(cleanFields[key]);
-    const b = JSON.stringify(nextFields[key]);
-    if (a !== b) {
+    const inClean = Object.prototype.hasOwnProperty.call(cleanFields, key);
+    const inNext = Object.prototype.hasOwnProperty.call(nextFields, key);
+    if (
+      inClean !== inNext ||
+      !firestoreValueEquals(cleanFields[key], nextFields[key])
+    ) {
       mask.push(escapeFieldPathSegment(key));
     }
   }
@@ -388,8 +417,8 @@ function recomputeDirty(session) {
     session.isDirty = true;
     return;
   }
-  const currentJson = JSON.stringify({ fields: res.fields }, null, 2);
-  session.isDirty = currentJson !== session.cleanJson;
+  const cleanFields = session.cleanDoc?.fields ?? {};
+  session.isDirty = computeChangedFieldMask(cleanFields, res.fields).length > 0;
 }
 
 /**
@@ -427,7 +456,10 @@ export function renderHybridEditor(props) {
         onChange();
         return;
       }
-      session.rawText = JSON.stringify({ fields: check.fields }, null, 2);
+      session.rawText = session.isDirty
+        ? JSON.stringify({ fields: check.fields }, null, 2)
+        : session.cleanJson;
+      session.rawBaselineText = session.rawText;
       session.rawError = null;
       session.mode = "raw";
     } else {
@@ -437,7 +469,11 @@ export function renderHybridEditor(props) {
         onChange();
         return;
       }
-      session.nodes = fieldsToDraftNodes(rawCheck.fields);
+      if (session.rawText.trim() === session.cleanJson.trim()) {
+        session.nodes = fieldsToDraftNodes(session.cleanDoc?.fields ?? {});
+      } else if (session.rawText !== session.rawBaselineText) {
+        session.nodes = fieldsToDraftNodes(rawCheck.fields);
+      }
       session.rawError = null;
       session.mode = "structured";
     }
@@ -469,6 +505,7 @@ export function renderHybridEditor(props) {
     } else {
       session.nodes = [];
       session.rawText = JSON.stringify({ fields: {} }, null, 2);
+      session.rawBaselineText = session.rawText;
       session.rawError = null;
       session.saveError = null;
       session.isDirty = false;
@@ -741,21 +778,27 @@ function renderDraftNode(
               />
             `}
 
-        <select
-          class="select field-type-select"
-          .value=${node.type}
-          @change=${onTypeChange}
-        >
-          ${allowedTypes.map(
-            (t) =>
-              html`<option value=${t.key} ?selected=${node.type === t.key}>
-                ${t.label}
-              </option>`
-          )}
-        </select>
+        ${node.type === "vector"
+          ? nothing
+          : html`
+              <select
+                class="select field-type-select"
+                .value=${node.type}
+                @change=${onTypeChange}
+              >
+                ${allowedTypes.map(
+                  (t) =>
+                    html`<option value=${t.key} ?selected=${node.type === t.key}>
+                      ${t.label}
+                    </option>`
+                )}
+              </select>
+            `}
 
         <span class="type-badge ${node.type}">
-          ${VALUE_TYPES.find((t) => t.key === node.type)?.shortLabel ?? node.type}
+          ${node.type === "vector"
+            ? "vec"
+            : (VALUE_TYPES.find((t) => t.key === node.type)?.shortLabel ?? node.type)}
         </span>
 
         <div class="field-value-wrap">
@@ -997,6 +1040,13 @@ function renderValueEditorControl(session, node, hasError, onChange) {
         <span style="color: var(--text-faint); font-size: 12px;">
           ${node.children.length}
           ${node.children.length === 1 ? "field" : "fields"}
+        </span>
+      `;
+
+    case "vector":
+      return html`
+        <span class="mono" style="color: var(--text-muted); font-size: 12px;">
+          ${formatVectorSummary(node.rawVectorValue)}
         </span>
       `;
   }

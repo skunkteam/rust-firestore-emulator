@@ -10,6 +10,8 @@ Stateless `lit-html` view templates and session state helpers powering the three
 
 ## Invariants
 - `[editor.js:setSessionMode]`: Switching from Raw ProtoJSON mode back to Structured Tree mode is blocked while `rawError !== null` so invalid JSON text cannot corrupt the structured `DraftNode` tree.
+- `[editor.js:valueToDraftNode]` / `[editor.js:renderDraftNode]`: `__vector__` sentinel maps (verified via `[values.js:isVectorMapValue]`) render as collapsed read-only `'vector'` rows (`vec` badge + `[values.js:formatVectorSummary]` + remove `✕` button, without a type dropdown or nested tree) and pass their untouched `rawVectorValue` from `cleanDoc` through verbatim on save (preserving untouched `-0.0` coordinates and dirty state across Structured <-> Raw ProtoJSON mode switches via `cleanJson` / `rawBaselineText`).
+- `[editor.js:computeChangedFieldMask]` / `[editor.js:recomputeDirty]`: Diff `cleanDoc.fields` against draft fields structurally via `[values.js:firestoreValueEquals]` rather than `JSON.stringify`, avoiding false positives from map key ordering or `-0` normalization while keeping untouched vector fields out of `updateMask`.
 - `[editor.js:extractNodeMap]`: Sibling field keys inside any `Document.fields` or `mapValue.fields` object must be non-empty and unique before saving or syncing to ProtoJSON.
 - `[query.js:FILTER_OPERATORS]`: Only operators supported by `crates/emulator-database/src/database/query/filter.rs` are exposed in the visual query builder (`ARRAY_CONTAINS_ANY` and `NOT_IN` are intentionally omitted).
 
