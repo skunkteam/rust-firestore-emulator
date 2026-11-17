@@ -1047,6 +1047,100 @@ suite('$description - concurrent tests', fs => {
                 ]);
             });
         });
+
+        describe('query offset and concurrent write-skew validation', () => {
+            test.concurrent('offset query retries when skipped leading doc is deleted concurrently', async () => {
+                const test = new ConcurrentTest();
+                const subcol = fs.collection.doc().collection('items');
+                const [d1, d2, d3] = [subcol.doc('d1'), subcol.doc('d2'), subcol.doc('d3')];
+                const [outDoc] = refs();
+
+                await Promise.all([
+                    d1.create(writeData({ k: 1 })),
+                    d2.create(writeData({ k: 2 })),
+                    d3.create(writeData({ k: 3 })),
+                    outDoc.create(writeData({ chosen: 'init', attempt: 0 })),
+                ]);
+
+                const offsetQuery = subcol.orderBy('k').offset(1).limit(1);
+
+                await test.run(
+                    async () => {
+                        let attempt = 0;
+                        await fs.firestore.runTransaction(async txn => {
+                            test.event(`txn attempt ${++attempt} started`);
+                            const snap = await txn.get(offsetQuery);
+                            const chosen = snap.docs[0]?.id ?? 'none';
+                            test.event(`txn read ${chosen}`);
+                            if (attempt === 1) await test.when('d1 deleted');
+                            txn.update(outDoc, { chosen, attempt });
+                        });
+                        test.event('txn completed');
+                    },
+                    async () => {
+                        await test.when('txn read d2');
+                        await d1.delete();
+                        test.event('d1 deleted');
+                    },
+                );
+
+                expect(await getData(outDoc.get())).toEqual({ chosen: 'd3', attempt: 2 });
+                expect(test.log).toEqual([
+                    '       | <<2>> | WAITING UNTIL: txn read d2',
+                    ' <<1>> | EVENT: txn attempt 1 started',
+                    ' <<1>> | EVENT: txn read d2',
+                    ' <<1>> | WAITING UNTIL: d1 deleted',
+                    '       | <<2>> | EVENT: d1 deleted',
+                    ' <<1>> | EVENT: txn attempt 2 started',
+                    ' <<1>> | EVENT: txn read d3',
+                    ' <<1>> | EVENT: txn completed',
+                ]);
+            });
+
+            test.concurrent('concurrent overlapping optimistic commits prevent cross-doc write-skew', async () => {
+                const test = new ConcurrentTest();
+                const [docRef1, docRef2] = refs();
+                await Promise.all([docRef1.create(writeData({ v: 1 })), docRef2.create(writeData({ v: 1 }))]);
+
+                await test.run(
+                    async () => {
+                        let attempt = 0;
+                        await fs.firestore.runTransaction(async txn => {
+                            attempt++;
+                            const [s1, s2] = await txn.getAll(docRef1, docRef2);
+                            const v1 = readData<{ v: number }>(s1.data()).v;
+                            const v2 = readData<{ v: number }>(s2.data()).v;
+                            if (attempt === 1) {
+                                test.event('p1 read both');
+                                await test.when('p2 read both');
+                            }
+                            if (v1 + v2 === 2) {
+                                txn.update(docRef1, { v: v1 + 10 });
+                            }
+                        });
+                    },
+                    async () => {
+                        await test.when('p1 read both');
+                        let attempt = 0;
+                        await fs.firestore.runTransaction(async txn => {
+                            attempt++;
+                            const [s1, s2] = await txn.getAll(docRef1, docRef2);
+                            const v1 = readData<{ v: number }>(s1.data()).v;
+                            const v2 = readData<{ v: number }>(s2.data()).v;
+                            if (attempt === 1) {
+                                test.event('p2 read both');
+                            }
+                            if (v1 + v2 === 2) {
+                                txn.update(docRef2, { v: v2 + 10 });
+                            }
+                        });
+                    },
+                );
+
+                const [d1, d2] = await Promise.all([readDataRef<{ v: number }>(docRef1), readDataRef<{ v: number }>(docRef2)]);
+                expect([d1.v, d2.v].sort((a, b) => a - b)).toEqual([1, 11]);
+            });
+        });
     });
 
     function refs() {

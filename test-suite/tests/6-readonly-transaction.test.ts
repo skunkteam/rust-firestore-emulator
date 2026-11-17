@@ -1,6 +1,6 @@
 import { FieldValue, Timestamp } from '@google-cloud/firestore';
 import { range } from 'lodash';
-import { editions, readData, writeData } from './utils';
+import { ConcurrentTest, editions, readData, writeData } from './utils';
 
 describe.each(editions)('$description', fs => {
     describe('readonly transactions', () => {
@@ -120,6 +120,62 @@ describe.each(editions)('$description', fs => {
             });
             const updatedDocs = updatedSnaps.map(s => s.data());
             expect(updatedDocs).toEqual([{ id: 1, updated: true }, { id: 2 }]);
+        });
+
+        test.concurrent('read-only txn without readTime maintains snapshot isolation', async () => {
+            const test = new ConcurrentTest();
+            const docRef1 = fs.collection.doc();
+            const docRef2 = fs.collection.doc();
+            await Promise.all([docRef1.create(writeData({ v: 1 })), docRef2.create(writeData({ v: 1 }))]);
+
+            await test.run(
+                async () => {
+                    await fs.firestore.runTransaction(
+                        async txn => {
+                            const snap1 = await txn.get(docRef1);
+                            test.event('ro read docRef1');
+                            await test.when('docs updated');
+                            const snap2 = await txn.get(docRef2);
+                            const [all1, all2] = await txn.getAll(docRef1, docRef2);
+
+                            expect(readData(snap1.data())).toEqual({ v: 1 });
+                            expect(readData(snap2.data())).toEqual({ v: 1 });
+                            expect([readData(all1.data()), readData(all2.data())]).toEqual([{ v: 1 }, { v: 1 }]);
+                            expect(snap1.readTime.isEqual(snap2.readTime)).toBeTrue();
+                            expect(snap1.readTime.isEqual(all1.readTime)).toBeTrue();
+                        },
+                        { readOnly: true },
+                    );
+                },
+                async () => {
+                    await test.when('ro read docRef1');
+                    await Promise.all([docRef1.update({ v: 2 }), docRef2.update({ v: 2 })]);
+                    test.event('docs updated');
+                },
+            );
+
+            expect(test.log).toEqual([
+                '       | <<2>> | WAITING UNTIL: ro read docRef1',
+                ' <<1>> | EVENT: ro read docRef1',
+                ' <<1>> | WAITING UNTIL: docs updated',
+                '       | <<2>> | EVENT: docs updated',
+            ]);
+            expect(readData((await docRef1.get()).data())).toEqual({ v: 2 });
+            expect(readData((await docRef2.get()).data())).toEqual({ v: 2 });
+        });
+
+        test.concurrent('rejects future and negative readTime in read-only txn', async () => {
+            const docRef = fs.collection.doc();
+            const future = Timestamp.fromMillis(Date.now() + 60_000);
+            const negative = Timestamp.fromMillis(-1000);
+
+            await expect(fs.firestore.runTransaction(txn => txn.get(docRef), { readOnly: true, readTime: future })).rejects.toThrow(
+                /3 INVALID_ARGUMENT/,
+            );
+
+            await expect(fs.firestore.runTransaction(txn => txn.get(docRef), { readOnly: true, readTime: negative })).rejects.toThrow(
+                /3 INVALID_ARGUMENT/,
+            );
         });
     });
 });

@@ -3,8 +3,11 @@ use googleapis::{
     google::firestore::v1::{
         RunQueryRequest, StructuredQuery, Value, run_query_request,
         structured_query::{
-            CollectionSelector, Direction, FindNearest, Order, field_filter::Operator, unary_filter,
+            CollectionSelector, CompositeFilter, Direction, FieldFilter, FieldReference, Filter,
+            FindNearest, Order, UnaryFilter, composite_filter, field_filter::Operator,
+            filter::FilterType, unary_filter,
         },
+        value::ValueType,
     },
     val,
 };
@@ -368,4 +371,209 @@ async fn structured_query_rejects_invalid_from_parent_operator_and_duplicate_arr
     )
     .await;
     assert_status_code(nearest, Code::InvalidArgument);
+}
+
+#[gtest]
+#[tokio::test]
+async fn run_query_rejects_malformed_filter_subfields_with_invalid_argument() {
+    let mut db = TestEnv::new().build_db();
+    let filters = [
+        Filter { filter_type: None },
+        Filter {
+            filter_type: Some(FilterType::FieldFilter(FieldFilter {
+                field: None,
+                op:    Operator::Equal as i32,
+                value: Some(val!(1i64)),
+            })),
+        },
+        Filter {
+            filter_type: Some(FilterType::FieldFilter(FieldFilter {
+                field: Some(FieldReference {
+                    field_path: "x".to_string(),
+                }),
+                op:    Operator::Equal as i32,
+                value: None,
+            })),
+        },
+        Filter {
+            filter_type: Some(FilterType::UnaryFilter(UnaryFilter {
+                op: unary_filter::Operator::IsNull as i32,
+                operand_type: None,
+            })),
+        },
+        Filter {
+            filter_type: Some(FilterType::CompositeFilter(CompositeFilter {
+                op:      composite_filter::Operator::And as i32,
+                filters: vec![Filter { filter_type: None }],
+            })),
+        },
+    ];
+
+    for filter in filters {
+        let res = collect_run_query(
+            db.raw_grpc()
+                .run_query(RunQueryRequest {
+                    parent: DOCUMENTS_ROOT.to_string(),
+                    query_type: Some(run_query_request::QueryType::StructuredQuery(
+                        StructuredQuery {
+                            from: vec![CollectionSelector {
+                                collection_id:   "items".to_string(),
+                                all_descendants: false,
+                            }],
+                            r#where: Some(filter),
+                            ..Default::default()
+                        },
+                    )),
+                    consistency_selector: None,
+                    explain_options: None,
+                })
+                .await
+                .unwrap()
+                .into_inner(),
+        )
+        .await;
+        assert_status_code(res, Code::InvalidArgument);
+    }
+}
+
+#[gtest]
+#[tokio::test]
+async fn structured_query_implicit_order_by_and_cursor_tie_breakers() {
+    let mut db = TestEnv::new().build_db();
+    for (id, tie, a, b) in [
+        ("tie/a", 1i64, 1i64, 10i64),
+        ("tie/b", 1i64, 2i64, 5i64),
+        ("tie/c", 2i64, 10i64, 1i64),
+        ("tie/d", 2i64, 5i64, 2i64),
+    ] {
+        db.put(id, fields!({ "tie": tie, "a": a, "b": b }))
+            .await
+            .unwrap();
+    }
+
+    // 1. Explicit `orderBy('tie', DESC)` appends implicit `__name__ DESC` in Standard Edition,
+    //    allowing both tie-breaking and a 2-value cursor `[tie, __name__]`.
+    let desc_ties = db
+        .query(QuerySpec::collection("tie").order_desc("tie"))
+        .await
+        .unwrap();
+    expect_eq!(short_ids(&desc_ties.documents), vec!["d", "c", "b", "a"]);
+
+    let desc_after = db
+        .query(QuerySpec::collection("tie").order_desc("tie").start_at(
+            vec![
+                val!(2i64),
+                Value {
+                    value_type: Some(ValueType::ReferenceValue(doc_path("tie/d"))),
+                },
+            ],
+            false,
+        ))
+        .await
+        .unwrap();
+    expect_eq!(short_ids(&desc_after.documents), vec!["c", "b", "a"]);
+
+    // 2. Inequality on `__name__` plus `a > 0`: `a` orders before `__name__` (`b, d, c`).
+    let name_and_a = db
+        .query(QuerySpec::collection("tie").where_filter(and_filters(vec![
+            field_filter(
+                "__name__",
+                Operator::GreaterThan,
+                Value {
+                    value_type: Some(ValueType::ReferenceValue(doc_path("tie/a"))),
+                },
+            ),
+            field_filter("a", Operator::GreaterThan, 0i64),
+        ])))
+        .await
+        .unwrap();
+    expect_eq!(short_ids(&name_and_a.documents), vec!["b", "d", "c"]);
+
+    // 3. Multiple inequalities (`b > 0 AND a > 0`) order fields lexicographically (`a` then `b`).
+    let multi_ineq = db
+        .query(QuerySpec::collection("tie").where_filter(and_filters(vec![
+            field_filter("b", Operator::GreaterThan, 0i64),
+            field_filter("a", Operator::GreaterThan, 0i64),
+        ])))
+        .await
+        .unwrap();
+    expect_eq!(short_ids(&multi_ineq.documents), vec!["a", "b", "d", "c"]);
+
+    // 4. Duplicate inequality on the same field deduplicates in implicit `order_by` so a 2-value
+    //    cursor `[a, __name__]` aligns cleanly.
+    let dup_ineq_cursor = db
+        .query(
+            QuerySpec::collection("tie")
+                .where_filter(and_filters(vec![
+                    field_filter("a", Operator::GreaterThan, 0i64),
+                    field_filter("a", Operator::LessThan, 10i64),
+                ]))
+                .start_at(
+                    vec![
+                        val!(1i64),
+                        Value {
+                            value_type: Some(ValueType::ReferenceValue(doc_path("tie/a"))),
+                        },
+                    ],
+                    false,
+                ),
+        )
+        .await
+        .unwrap();
+    expect_eq!(short_ids(&dup_ineq_cursor.documents), vec!["b", "d"]);
+
+    // 5. Explicit `orderBy('a', DESC)` combined with `b > 0` appends `b DESC, __name__ DESC`.
+    db.put("explicit/x1", fields!({ "a": 5i64, "b": 10i64 }))
+        .await
+        .unwrap();
+    db.put("explicit/x2", fields!({ "a": 5i64, "b": 1i64 }))
+        .await
+        .unwrap();
+    db.put("explicit/x3", fields!({ "a": 9i64, "b": 2i64 }))
+        .await
+        .unwrap();
+    let explicit_with_ineq = db
+        .query(
+            QuerySpec::collection("explicit")
+                .where_filter(field_filter("b", Operator::GreaterThan, 0i64))
+                .order_desc("a"),
+        )
+        .await
+        .unwrap();
+    expect_eq!(
+        short_ids(&explicit_with_ineq.documents),
+        vec!["x3", "x1", "x2"]
+    );
+
+    // 6. Enterprise Edition: direct collection with `orderBy('tie', DESC)` does NOT synthesize
+    //    `__name__` (so a 2-value cursor is rejected), whereas `collection_group` DOES append
+    //    `__name__ DESC` (`all_descendants: true`).
+    let mut edb = TestEnv::enterprise().build_db();
+    edb.put("items/p1", fields!({ "tie": 1i64 })).await.unwrap();
+    edb.put("items/p2", fields!({ "tie": 1i64 })).await.unwrap();
+    edb.put("roots/r1/grp/c", fields!({ "tie": 1i64 }))
+        .await
+        .unwrap();
+    edb.put("roots/r2/grp/d", fields!({ "tie": 1i64 }))
+        .await
+        .unwrap();
+
+    let ent_direct_cursor = edb
+        .query(QuerySpec::collection("items").order_desc("tie").start_at(
+            vec![
+                val!(1i64),
+                Value {
+                    value_type: Some(ValueType::ReferenceValue(doc_path("items/p2"))),
+                },
+            ],
+            false,
+        ))
+        .await;
+    assert_status_code(ent_direct_cursor, Code::InvalidArgument);
+
+    let ent_cg = edb
+        .query(QuerySpec::collection_group("grp").order_desc("tie"))
+        .await
+        .unwrap();
+    expect_eq!(short_ids(&ent_cg.documents), vec!["d", "c"]);
 }

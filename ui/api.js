@@ -1,5 +1,7 @@
 // @ts-check
 
+import { stringifyProtoJson } from "./values.js";
+
 /** @typedef {import('./values.js').FirestoreValue} FirestoreValue */
 /** @typedef {import('./values.js').FirestoreDocument} FirestoreDocument */
 
@@ -218,7 +220,7 @@ export async function createDocument(parentPath, collectionId, docId, fields) {
   return requestJson(url, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ fields }),
+    body: stringifyProtoJson({ fields }),
   });
 }
 
@@ -254,7 +256,7 @@ export async function updateDocument(
   return requestJson(url, {
     method: "PATCH",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ fields }),
+    body: stringifyProtoJson({ fields }),
   });
 }
 
@@ -292,7 +294,7 @@ export async function runQuery(parentPath, structuredQuery) {
   return requestJson(`/v1/${encodeResourcePath(parentPath)}:runQuery`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ structuredQuery }),
+    body: stringifyProtoJson({ structuredQuery }),
   });
 }
 

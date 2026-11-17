@@ -14,7 +14,7 @@ use googleapis::google::{
     protobuf::Timestamp,
 };
 use tokio::time::{error::Elapsed, sleep, timeout};
-use tracing::{Level, debug, instrument, trace, warn};
+use tracing::{Level, debug, instrument, warn};
 
 use super::reference::DocumentRef;
 use crate::{FirestoreProject, GenericDatabaseError, error::Result};
@@ -121,6 +121,10 @@ impl DocumentContents {
         }
     }
 
+    pub(crate) fn latest_version(&self) -> Option<&DocumentVersion> {
+        self.versions.last()
+    }
+
     pub(crate) fn current_version(&self) -> Option<&Arc<StoredDocumentVersion>> {
         self.versions
             .last()
@@ -143,35 +147,59 @@ impl DocumentContents {
             .is_some_and(|version| matches!(version, DocumentVersion::Stored(_)))
     }
 
-    pub(crate) fn create_time(&self) -> Option<Timestamp> {
-        self.versions.last().and_then(DocumentVersion::create_time)
-    }
-
     pub(crate) fn last_updated(&self) -> Option<Timestamp> {
         self.versions.last().map(DocumentVersion::update_time)
     }
+}
 
-    pub(crate) fn check_precondition(&self, condition: DocumentPrecondition) -> Result<()> {
-        match condition {
-            DocumentPrecondition::Exists if !self.exists() => Err(GenericDatabaseError::not_found(
-                format!("document not found: {}", self.name),
-            )),
-            DocumentPrecondition::NotExists if self.exists() => {
-                Err(GenericDatabaseError::already_exists(format!(
-                    "document already exists: {}",
-                    self.name
-                )))
-            }
-            DocumentPrecondition::UpdateTime(time)
-                if self.last_updated().as_ref() != Some(&time) =>
-            {
-                Err(GenericDatabaseError::failed_precondition(format!(
-                    "document has different update_time: {}",
-                    self.name
-                )))
-            }
-            _ => Ok(()),
+pub(crate) fn stage_stored_version(
+    name: &DocumentRef,
+    acquire_time: Timestamp,
+    latest: Option<&DocumentVersion>,
+    fields: HashMap<String, Value>,
+    update_time: Timestamp,
+) -> Result<(Timestamp, Option<DocumentVersion>)> {
+    if update_time < acquire_time {
+        return Err(GenericDatabaseError::internal(
+            "lock should always be acquired before claiming write/update time",
+        ));
+    }
+    if let Some(last) = latest.and_then(DocumentVersion::stored_document)
+        && Value::fields_storage_eq(&last.fields, &fields)
+    {
+        return Ok((last.update_time, None));
+    }
+    let create_time = latest
+        .and_then(DocumentVersion::create_time)
+        .unwrap_or(update_time);
+    let version = DocumentVersion::Stored(Arc::new(StoredDocumentVersion {
+        name: name.clone(),
+        create_time,
+        update_time,
+        fields,
+    }));
+    Ok((update_time, Some(version)))
+}
+
+pub(crate) fn check_version_precondition(
+    name: &DocumentRef,
+    latest: Option<&DocumentVersion>,
+    condition: DocumentPrecondition,
+) -> Result<()> {
+    let current = latest.and_then(DocumentVersion::stored_document);
+    match condition {
+        DocumentPrecondition::Exists if current.is_none() => Err(GenericDatabaseError::not_found(
+            format!("document not found: {name}"),
+        )),
+        DocumentPrecondition::NotExists if current.is_some() => Err(
+            GenericDatabaseError::already_exists(format!("document already exists: {name}")),
+        ),
+        DocumentPrecondition::UpdateTime(time) if current.map(|v| v.update_time) != Some(time) => {
+            Err(GenericDatabaseError::failed_precondition(format!(
+                "document has different update_time: {name}"
+            )))
         }
+        _ => Ok(()),
     }
 }
 
@@ -237,51 +265,28 @@ pub(crate) struct OwnedDocumentContentsWriteGuard {
 }
 
 impl OwnedDocumentContentsWriteGuard {
-    /// Add a new version with the given `update_time`, if the given `fields` are identical to the
-    /// last version, it will return [`Err`] with the update time ([`Timestamp`]) of the last
-    /// version.
-    #[instrument(level = Level::DEBUG, skip_all, fields(
-        doc_name = %self.name,
-        time = display(&update_time),
-    ))]
+    /// Add a new version with the given `update_time`; if `fields` equals the last stored version
+    /// in storage representation, returns its existing `update_time` and `None`.
+    #[cfg(test)]
     pub(crate) async fn maybe_update(
         &mut self,
         fields: HashMap<String, Value>,
         update_time: Timestamp,
     ) -> Result<(Timestamp, Option<DocumentVersion>)> {
-        trace!(?fields);
-        // Check if the fields are exactly equal to the last version, in that case, do not generate
-        // a new version.
-        if let Some(last) = self
-            .versions
-            .last()
-            .and_then(DocumentVersion::stored_document)
-            && Value::fields_storage_eq(&last.fields, &fields)
-        {
-            trace!("fields are equal to previous version");
-            return Ok((last.update_time, None));
-        }
-        let create_time = self.create_time().unwrap_or(update_time);
-        let version = DocumentVersion::Stored(Arc::new(StoredDocumentVersion {
-            name: self.name.clone(),
-            create_time,
-            update_time,
+        let (ts, version) = stage_stored_version(
+            &self.name,
+            self.acquire_time,
+            self.versions.last(),
             fields,
-        }));
-        self.maybe_add_version(&version)?;
-        return Ok((update_time, Some(version)));
+            update_time,
+        )?;
+        if let Some(ref version) = version {
+            self.maybe_add_version(version)?;
+        }
+        Ok((ts, version))
     }
 
-    pub(crate) async fn delete(&mut self, delete_time: Timestamp) -> Result<DocumentVersion> {
-        let version = DocumentVersion::Deleted(Arc::new(DeletedDocumentVersion {
-            name: self.name.clone(),
-            delete_time,
-        }));
-        self.maybe_add_version(&version)?;
-        Ok(version)
-    }
-
-    fn maybe_add_version(&mut self, version: &DocumentVersion) -> Result<()> {
+    pub(crate) fn maybe_add_version(&mut self, version: &DocumentVersion) -> Result<()> {
         if version.update_time() < self.acquire_time {
             return Err(GenericDatabaseError::internal(
                 "lock should always be acquired before claiming write/update time",

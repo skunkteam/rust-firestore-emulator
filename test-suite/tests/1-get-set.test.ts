@@ -1,4 +1,4 @@
-import { DocumentReference, FieldValue, Timestamp } from '@google-cloud/firestore';
+import { DocumentReference, FieldPath, FieldValue, Timestamp } from '@google-cloud/firestore';
 import { editions, notImplementedInJava, readData, writeData } from './utils';
 
 describe.each(editions)('$description', fs => {
@@ -189,6 +189,18 @@ describe.each(editions)('$description', fs => {
                     } else {
                         expect(await getDoc()).toEqual({ arr: [0, NaN, { nested: -0 }, 42] });
                     }
+
+                    // Deduplicating inputs on missing and non-array scalar fields
+                    await updateFn({ scalarArr: 'not-an-array' });
+                    await updateFn({
+                        missingArr: FieldValue.arrayUnion(1, 1, 0, -0, NaN, NaN),
+                        scalarArr: FieldValue.arrayUnion('x', 'x', 'y'),
+                    });
+                    const afterMissingUnion = await getDoc();
+                    expect(afterMissingUnion).toMatchObject({
+                        missingArr: [1, 0, NaN],
+                        scalarArr: ['x', 'y'],
+                    });
                 });
 
                 test('arrayRemove', async () => {
@@ -206,6 +218,32 @@ describe.each(editions)('$description', fs => {
                     expect(await getDoc()).toEqual({ arr: setOperation ? [] : [42] });
                 });
             });
+        });
+        test('updating and merging multi-byte UTF-8 nested field paths', async () => {
+            await docRef.set(writeData({ café: { price: 5, keep: true }, aéb: 'before' }));
+            await docRef.update(new FieldPath('café', 'price'), 7);
+            await docRef.update(new FieldPath('aéb'), 'after');
+            expect(await getDoc()).toEqual({ café: { price: 7, keep: true }, aéb: 'after' });
+        });
+
+        test('concurrent opposite-order WriteBatch commits succeed without deadlock', async () => {
+            const refA = fs.collection.doc();
+            const refB = fs.collection.doc();
+            await Promise.all([
+                fs.firestore
+                    .batch()
+                    .set(refA, writeData({ by: 'batch1' }))
+                    .set(refB, writeData({ by: 'batch1' }))
+                    .commit(),
+                fs.firestore
+                    .batch()
+                    .set(refB, writeData({ by: 'batch2' }))
+                    .set(refA, writeData({ by: 'batch2' }))
+                    .commit(),
+            ]);
+            const [snapA, snapB] = await fs.firestore.getAll(refA, refB);
+            expect(snapA.exists).toBeTrue();
+            expect(snapB.exists).toBeTrue();
         });
     });
 

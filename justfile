@@ -82,7 +82,7 @@ miri:
 # Lint the given crate or the entire workspace if target is omitted
 lint target="all": && (ui-lint target)
     echo Running lint for target '"{{ target }}"'
-    cargo clippy {{ if target == "all" { "--workspace" } else { "--package " + target } }}
+    cargo clippy {{ if target == "all" { "--workspace" } else { "--package " + target } }} --all-targets --all-features -- -D warnings
 
 [private]
 ui-lint target: (

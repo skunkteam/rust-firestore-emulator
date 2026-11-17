@@ -26,6 +26,21 @@ impl Filter {
         })
     }
 
+    pub(crate) fn sorted_non_name_inequality_fields(&self) -> Vec<FieldReference> {
+        let mut fields: Vec<FieldReference> = self
+            .get_inequality_fields()
+            .filter(|f| !f.is_document_name())
+            .cloned()
+            .unique()
+            .collect();
+        fields.sort_by(|a, b| {
+            let sa = a.to_string();
+            let sb = b.to_string();
+            sa.split('.').cmp(sb.split('.')).then_with(|| sa.cmp(&sb))
+        });
+        fields
+    }
+
     pub fn field_filters(&self) -> impl Iterator<Item = &FieldFilter> {
         self.depth_first().filter_map(Filter::as_field)
     }
@@ -78,7 +93,10 @@ impl TryFrom<structured_query::Filter> for Filter {
 
     fn try_from(value: structured_query::Filter) -> Result<Self, Self::Error> {
         use structured_query::filter::FilterType::*;
-        match value.filter_type.expect("filter without filter_type") {
+        let filter_type = value.filter_type.ok_or_else(|| {
+            GenericDatabaseError::invalid_argument("missing filter_type in Filter")
+        })?;
+        match filter_type {
             CompositeFilter(f) => Ok(Self::Composite(f.try_into()?)),
             FieldFilter(f) => Ok(Self::Field(f.try_into()?)),
             UnaryFilter(f) => Ok(Self::Unary(f.try_into()?)),
@@ -195,15 +213,20 @@ impl TryFrom<structured_query::FieldFilter> for FieldFilter {
     type Error = GenericDatabaseError;
 
     fn try_from(value: structured_query::FieldFilter) -> Result<Self, Self::Error> {
+        let field = value
+            .field
+            .as_ref()
+            .ok_or_else(|| GenericDatabaseError::invalid_argument("missing field in FieldFilter"))?
+            .field_path
+            .parse()?;
+        let op = value.op().try_into()?;
+        let val = value.value.ok_or_else(|| {
+            GenericDatabaseError::invalid_argument("missing value in FieldFilter")
+        })?;
         Ok(Self {
-            field: value
-                .field
-                .as_ref()
-                .expect("missing field in FieldFilter")
-                .field_path
-                .parse()?,
-            op:    value.op().try_into()?,
-            value: value.value.expect("missing value in FieldFilter"),
+            field,
+            op,
+            value: val,
         })
     }
 }
@@ -361,10 +384,10 @@ impl TryFrom<structured_query::UnaryFilter> for UnaryFilter {
     type Error = GenericDatabaseError;
 
     fn try_from(value: structured_query::UnaryFilter) -> Result<Self, Self::Error> {
-        let structured_query::unary_filter::OperandType::Field(field) = value
-            .operand_type
-            .as_ref()
-            .expect("missing operand_type in UnaryFilter");
+        let structured_query::unary_filter::OperandType::Field(field) =
+            value.operand_type.as_ref().ok_or_else(|| {
+                GenericDatabaseError::invalid_argument("missing operand_type in UnaryFilter")
+            })?;
         Ok(Self {
             field: field.field_path.parse()?,
             op:    value.op().try_into()?,
@@ -495,5 +518,53 @@ mod tests {
         };
         expect_that!(nan_in_filter.eval(&nan_version, false), ok(eq(&false)));
         expect_that!(nan_in_filter.eval(&nan_version, true), ok(eq(&true)));
+    }
+
+    #[gtest]
+    fn try_from_missing_required_proto_fields_returns_invalid_argument() {
+        use googleapis::google::firestore::v1::structured_query;
+
+        use super::{Filter, GenericDatabaseError};
+
+        assert_that!(
+            Filter::try_from(structured_query::Filter { filter_type: None }),
+            err(eq(&GenericDatabaseError::invalid_argument(
+                "missing filter_type in Filter"
+            )))
+        );
+
+        assert_that!(
+            FieldFilter::try_from(structured_query::FieldFilter {
+                field: None,
+                op:    structured_query::field_filter::Operator::Equal as i32,
+                value: Some(Value::integer(1)),
+            }),
+            err(eq(&GenericDatabaseError::invalid_argument(
+                "missing field in FieldFilter"
+            )))
+        );
+
+        assert_that!(
+            FieldFilter::try_from(structured_query::FieldFilter {
+                field: Some(structured_query::FieldReference {
+                    field_path: "a".to_string(),
+                }),
+                op:    structured_query::field_filter::Operator::Equal as i32,
+                value: None,
+            }),
+            err(eq(&GenericDatabaseError::invalid_argument(
+                "missing value in FieldFilter"
+            )))
+        );
+
+        assert_that!(
+            super::UnaryFilter::try_from(structured_query::UnaryFilter {
+                op: structured_query::unary_filter::Operator::IsNull as i32,
+                operand_type: None,
+            }),
+            err(eq(&GenericDatabaseError::invalid_argument(
+                "missing operand_type in UnaryFilter"
+            )))
+        );
     }
 }

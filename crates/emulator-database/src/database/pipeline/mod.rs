@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
 
 use googleapis::google::firestore::v1::{Document, StructuredPipeline};
 
@@ -24,7 +24,7 @@ mod sort;
 use googleapis::google::firestore::v1::Value;
 use itertools::Itertools;
 
-use crate::database::field_path::FieldReference;
+use crate::database::field_path::{FieldPath, FieldReference};
 
 pub async fn execute(
     database: &Arc<FirestoreDatabase>,
@@ -91,4 +91,34 @@ fn get_exact_expr_args<'a, const N: usize>(
     args.iter().collect_array().ok_or_else(|| {
         GenericDatabaseError::invalid_argument(format!("{what} expects {N} arguments"))
     })
+}
+
+/// Parses and validates projection/add-fields target paths deterministically, rejecting
+/// overlapping ancestor/descendant or duplicate-representation paths in the same stage.
+pub(super) fn parse_projection_paths(
+    projection_map: &HashMap<String, Value>,
+) -> Result<Vec<(FieldPath, &Value)>> {
+    let mut entries: Vec<(&String, FieldPath, &Value)> = Vec::with_capacity(projection_map.len());
+    for (alias, expr) in projection_map {
+        let path: FieldPath = alias.parse()?;
+        path.validate_non_reserved()?;
+        entries.push((alias, path, expr));
+    }
+    entries.sort_by(|a, b| a.0.cmp(b.0));
+
+    for i in 0..entries.len() {
+        for j in (i + 1)..entries.len() {
+            if entries[i].1.starts_with(&entries[j].1) || entries[j].1.starts_with(&entries[i].1) {
+                return Err(GenericDatabaseError::invalid_argument(format!(
+                    "Conflicting field paths '{}' and '{}'",
+                    entries[i].0, entries[j].0
+                )));
+            }
+        }
+    }
+
+    Ok(entries
+        .into_iter()
+        .map(|(_, path, expr)| (path, expr))
+        .collect())
 }

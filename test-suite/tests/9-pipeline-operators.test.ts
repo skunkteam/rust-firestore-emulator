@@ -1,4 +1,4 @@
-import { CollectionReference, DocumentData, FieldValue, GeoPoint, Timestamp } from '@google-cloud/firestore';
+import { CollectionReference, DocumentData, FieldPath, FieldValue, GeoPoint, Timestamp } from '@google-cloud/firestore';
 import * as p from '@google-cloud/firestore/pipelines';
 import { callRawStreamRpc, editions, expectCloudLimitationCanary, notImplementedInRust, writeData } from './utils';
 
@@ -446,6 +446,272 @@ suite('$description', fs => {
                 const snap = await pipe.execute();
                 const res = snap.results[0].data();
                 expect(res).toEqual({ minPop: 160000, maxPop: 900000 });
+            });
+
+            test.concurrent('count with field expression, minimum/maximum ignoring null, and expression-argument sum', async () => {
+                const subCol = fs.collection.doc().collection('extendedAggNullAndExpr');
+                await Promise.all([
+                    subCol.doc('a').set({ n: null, qty: 2, price: 5 }),
+                    subCol.doc('b').set({ n: 10, qty: 3, price: 10 }),
+                    subCol.doc('c').set({ qty: 1, price: 20 }),
+                ]);
+
+                const cityCountSnap = await fs.firestore
+                    .pipeline()
+                    .collection(cityRef)
+                    .aggregate(p.count(p.field('zero')).as('countZero'))
+                    .execute();
+                expect(cityCountSnap.results[0].data()).toEqual({ countZero: 1 });
+
+                const aggSnap = await fs.firestore
+                    .pipeline()
+                    .collection(subCol)
+                    .aggregate(
+                        p.count(p.field('n')).as('countN'),
+                        p.minimum('n').as('minN'),
+                        p.maximum('n').as('maxN'),
+                        p.field('qty').multiply(p.field('price')).sum().as('revenue'),
+                    )
+                    .execute();
+                expect(aggSnap.results[0].data()).toEqual({
+                    countN: 1,
+                    minN: 10,
+                    maxN: 10,
+                    revenue: 60,
+                });
+            });
+        });
+
+        describe('bugfix conformance regressions', () => {
+            test.concurrent(
+                'variadic and/or, binary add/multiply arity, and pow with negative exponent, overflow, and domain errors',
+                async () => {
+                    const pipe = fs.firestore
+                        .pipeline()
+                        .collection(cityRef)
+                        .where(p.field('city').equal('Haarlem'))
+                        .limit(1)
+                        .select(
+                            p
+                                .and(p.field('city').equal('Haarlem'), p.field('zero').equal(0), p.field('arr').arrayLength().equal(2))
+                                .as('andAllTrue'),
+                            p
+                                .and(p.field('city').equal('Haarlem'), p.field('zero').equal(0), p.field('arr').arrayLength().equal(99))
+                                .as('andLastFalse'),
+                            p
+                                .or(p.field('city').equal('Other'), p.field('zero').equal(99), p.field('arr').arrayLength().equal(2))
+                                .as('orLastTrue'),
+                            p
+                                .or(p.field('city').equal('Other'), p.field('zero').equal(99), p.field('arr').arrayLength().equal(0))
+                                .as('orAllFalse'),
+                            p.constant(2).pow(-1).as('powNeg'),
+                            p.constant(1e200).pow(2).as('powOverflow'),
+                            p.isError(p.constant(-2).pow(0.5)).as('powNegFracErr'),
+                            p.isError(p.constant(0).pow(-1)).as('powZeroNegErr'),
+                            p.isError(p.constant(1e200).pow(2)).as('powOverflowErr'),
+                        );
+                    const snap = await pipe.execute();
+                    expect(snap.results[0].data()).toEqual({
+                        andAllTrue: true,
+                        andLastFalse: false,
+                        orLastTrue: true,
+                        orAllFalse: false,
+                        powNeg: 0.5,
+                        powOverflow: Infinity,
+                        powNegFracErr: true,
+                        powZeroNegErr: true,
+                        powOverflowErr: false,
+                    });
+
+                    await expect(
+                        fs.firestore.pipeline().collection(cityRef).limit(1).select(p.constant(1).add(2, 3).as('add3')).execute(),
+                    ).rejects.toThrow(/3 INVALID_ARGUMENT/);
+                    await expect(
+                        fs.firestore.pipeline().collection(cityRef).limit(1).select(p.constant(2).multiply(3, 4).as('mul3')).execute(),
+                    ).rejects.toThrow(/3 INVALID_ARGUMENT/);
+                },
+            );
+
+            test.concurrent('where constant(true), boolean field filtering, and arrayLength/arrayConcat null propagation', async () => {
+                const subCol = fs.collection.doc().collection('whereArrayNull');
+                await Promise.all([
+                    subCol.doc('d1').set({ flag: true, n: null, arr: [1] }),
+                    subCol.doc('d2').set({ flag: false }),
+                    subCol.doc('d3').set({ flag: null }),
+                    subCol.doc('d4').set({ other: 1 }),
+                ]);
+
+                const allTrueSnap = await fs.firestore.pipeline().collection(subCol).where(p.constant(true)).execute();
+                expect(allTrueSnap.results).toHaveLength(4);
+
+                const filteredSnap = await fs.firestore
+                    .pipeline()
+                    .collection(subCol)
+                    .where(p.field('flag').asBoolean())
+                    .select(
+                        p.arrayLength(p.constant(null)).as('lenConstNull'),
+                        p.field('n').arrayLength().as('lenFieldNull'),
+                        p.field('missing').arrayLength().as('lenMissing'),
+                        p.field('arr').arrayConcat(p.constant(null)).as('catConstNull'),
+                        p.field('arr').arrayConcat(p.field('missing')).as('catMissing'),
+                    )
+                    .execute();
+                expect(filteredSnap.results).toHaveLength(1);
+                expect(filteredSnap.results[0].data()).toEqual({
+                    lenConstNull: null,
+                    lenFieldNull: null,
+                    lenMissing: null,
+                    catConstNull: null,
+                    catMissing: null,
+                });
+            });
+
+            test.concurrent('sort with expression ordering and null tie-breaking', async () => {
+                const subCol = fs.collection.doc().collection('sortExprNull');
+                await Promise.all([
+                    subCol.doc('d2').set({ id: 2, tag: null, qty: 3, price: 5 }),
+                    subCol.doc('d1').set({ id: 1, tag: null, qty: 2, price: 10 }),
+                    subCol.doc('d3').set({ id: 3, tag: 'a', qty: 1, price: 100 }),
+                ]);
+
+                const tagSorted = await fs.firestore.pipeline().collection(subCol).sort(p.ascending('tag'), p.ascending('id')).execute();
+                expect(tagSorted.results.map(r => r.id)).toEqual(['d1', 'd2', 'd3']);
+
+                const exprSorted = await fs.firestore
+                    .pipeline()
+                    .collection(subCol)
+                    .sort(p.descending(p.field('qty').multiply(p.field('price'))))
+                    .execute();
+                expect(exprSorted.results.map(r => r.id)).toEqual(['d3', 'd1', 'd2']);
+            });
+
+            test.concurrent('nested and escaped field paths in addFields, select, removeFields, and conflict rejection', async () => {
+                const subCol = fs.collection.doc().collection('nestedProjection');
+                await subCol.doc('p1').set({
+                    'user': { name: 'Ada', secret: 'hidden' },
+                    'a.b': 'literal',
+                });
+
+                const mutated = await fs.firestore
+                    .pipeline()
+                    .collection(subCol)
+                    .addFields(p.constant('admin').as('user.role'), p.constant('dark').as('prefs.theme'))
+                    .removeFields('user.secret', p.field(new FieldPath('a.b')))
+                    .execute();
+                expect(mutated.results[0].data()).toEqual({
+                    user: { name: 'Ada', role: 'admin' },
+                    prefs: { theme: 'dark' },
+                });
+
+                const selected = await fs.firestore
+                    .pipeline()
+                    .collection(subCol)
+                    .select('user.name', p.field(new FieldPath('a.b')))
+                    .execute();
+                expect(selected.results[0].data()).toEqual({
+                    'user': { name: 'Ada' },
+                    'a.b': 'literal',
+                });
+
+                const conflicting = fs.firestore.pipeline().collection(subCol).select(p.constant(1).as('a'), p.constant(2).as('a.b'));
+                await expect(conflicting.execute()).rejects.toThrow(/3 INVALID_ARGUMENT/);
+            });
+
+            test.concurrent('comparison operators distinguish absent, null, NaN, and incompatible types', async () => {
+                const subCol = fs.collection.doc().collection('comparisonAbsentNull');
+                await Promise.all([
+                    subCol.doc('d_absent').set({ num: 5, str: 'abc', arrNum: [1, 2], arrStr: [1, 'a'] }),
+                    subCol.doc('d_null').set({ opt: null, opt2: null, num: 5, nanVal: NaN, nanVal2: NaN }),
+                    subCol.doc('d_val').set({ opt: 3, num: 5 }),
+                ]);
+
+                const absentDocSnap = await fs.firestore
+                    .pipeline()
+                    .collection(subCol)
+                    .where(p.field('__name__').equal(subCol.doc('d_absent')))
+                    .select(
+                        p.equal(p.field('m1'), p.field('m2')).as('absAbsEq'),
+                        p.notEqual(p.field('m1'), p.field('m2')).as('absAbsNe'),
+                        p.lessThan(p.field('m1'), p.field('m2')).as('absAbsLt'),
+                        p.lessThanOrEqual(p.field('m1'), p.field('m2')).as('absAbsLte'),
+                        p.greaterThan(p.field('m1'), p.field('m2')).as('absAbsGt'),
+                        p.greaterThanOrEqual(p.field('m1'), p.field('m2')).as('absAbsGte'),
+                        p.equal(p.field('m1'), p.constant(null)).as('absNullEq'),
+                        p.notEqual(p.field('m1'), p.constant(null)).as('absNullNe'),
+                        p.lessThan(p.constant(null), p.field('m1')).as('nullAbsLt'),
+                        p.lessThanOrEqual(p.constant(null), p.field('m1')).as('nullAbsLte'),
+                        p.lessThan(p.field('m1'), p.field('num')).as('absFiveLt'),
+                        p.greaterThan(p.field('num'), p.field('m1')).as('fiveAbsGt'),
+                        p.notEqual(p.field('m1'), p.field('num')).as('absFiveNe'),
+                        p.lessThan(p.field('num'), p.field('str')).as('fiveStrLt'),
+                        p.greaterThan(p.field('num'), p.field('str')).as('fiveStrGt'),
+                        p.notEqual(p.field('num'), p.field('str')).as('fiveStrNe'),
+                        p.lessThan(p.field('arrNum'), p.field('arrStr')).as('arrCrossLt'),
+                    )
+                    .execute();
+                expect(absentDocSnap.results).toHaveLength(1);
+                expect(absentDocSnap.results[0].data()).toEqual({
+                    absAbsEq: true,
+                    absAbsNe: false,
+                    absAbsLt: false,
+                    absAbsLte: true,
+                    absAbsGt: false,
+                    absAbsGte: true,
+                    absNullEq: false,
+                    absNullNe: true,
+                    nullAbsLt: false,
+                    nullAbsLte: false,
+                    absFiveLt: false,
+                    fiveAbsGt: false,
+                    absFiveNe: true,
+                    fiveStrLt: false,
+                    fiveStrGt: false,
+                    fiveStrNe: true,
+                    arrCrossLt: true,
+                });
+
+                const nullNanSnap = await fs.firestore
+                    .pipeline()
+                    .collection(subCol)
+                    .where(p.field('__name__').equal(subCol.doc('d_null')))
+                    .select(
+                        p.equal(p.field('opt'), p.field('opt2')).as('nullNullEq'),
+                        p.lessThanOrEqual(p.field('opt'), p.field('opt2')).as('nullNullLte'),
+                        p.lessThan(p.field('opt'), p.field('num')).as('nullFiveLt'),
+                        p.notEqual(p.field('opt'), p.field('num')).as('nullFiveNe'),
+                        p.equal(p.field('nanVal'), p.field('nanVal2')).as('nanNanEq'),
+                        p.lessThanOrEqual(p.field('nanVal'), p.field('nanVal2')).as('nanNanLte'),
+                        p.lessThan(p.field('nanVal'), p.field('num')).as('nanFiveLt'),
+                        p.greaterThan(p.field('num'), p.field('nanVal')).as('fiveNanGt'),
+                        p.notEqual(p.field('nanVal'), p.field('num')).as('nanFiveNe'),
+                    )
+                    .execute();
+                expect(nullNanSnap.results).toHaveLength(1);
+                expect(nullNanSnap.results[0].data()).toEqual({
+                    nullNullEq: true,
+                    nullNullLte: true,
+                    nullFiveLt: false,
+                    nullFiveNe: true,
+                    nanNanEq: true,
+                    nanNanLte: true,
+                    nanFiveLt: false,
+                    fiveNanGt: false,
+                    nanFiveNe: true,
+                });
+
+                const eqNullSnap = await fs.firestore.pipeline().collection(subCol).where(p.field('opt').equal(null)).execute();
+                expect(eqNullSnap.results.map(r => r.id)).toEqual(['d_null']);
+
+                const neNullSnap = await fs.firestore
+                    .pipeline()
+                    .collection(subCol)
+                    .where(p.field('opt').notEqual(null))
+                    .sort(p.ascending('__name__'))
+                    .execute();
+                expect(neNullSnap.results.map(r => r.id)).toEqual(['d_absent', 'd_val']);
+
+                const ltFiveSnap = await fs.firestore.pipeline().collection(subCol).where(p.field('opt').lessThan(5)).execute();
+                expect(ltFiveSnap.results.map(r => r.id)).toEqual(['d_val']);
             });
         });
 

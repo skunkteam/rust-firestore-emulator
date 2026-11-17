@@ -26,9 +26,9 @@ use tonic::Code;
 
 use crate::harness::{
     builders::{
-        AggregationSpec, PipelineSpec, QuerySpec, WriteBatchSpec, doc_mask, doc_path, field_filter,
-        field_ref_val, fn_val, tf_append_missing, tf_increment, tf_remove_all, tf_server_timestamp,
-        vec_val,
+        AggregationSpec, PipelineSpec, QuerySpec, WriteBatchSpec, and_filters, doc_mask, doc_path,
+        field_filter, field_ref_val, fn_val, tf_append_missing, tf_increment, tf_remove_all,
+        tf_server_timestamp, vec_val,
     },
     contention::ContentionProbe,
     env::{DATABASE_ROOT, DOCUMENTS_ROOT, TestEnv},
@@ -1643,6 +1643,51 @@ async fn listen_find_nearest_updates_threshold_suppression_and_dynamic_nan_termi
     for doc in &reset_docs {
         assert!(doc.fields.contains_key("dist"));
     }
+
+    // Confirm no stale pre-reset `far_*` DocumentChange frames leak after post-lag Reset, and a
+    // follow-up write delivers only `lag/after_reset` without any spurious `far_*` events.
+    db.put("lag/after_reset", fields!({ "emb": vec_val([1.0, 0.0]) }))
+        .await
+        .unwrap();
+    let mut followup_docs = Vec::new();
+    while let Some(frame) = tokio::time::timeout(Duration::from_secs(2), raw_lag_stream.message())
+        .await
+        .expect("timed out waiting for post-lag follow-up listen batch")
+        .unwrap()
+    {
+        match frame.response_type {
+            Some(
+                googleapis::google::firestore::v1::listen_response::ResponseType::TargetChange(tc),
+            ) => {
+                let kind =
+                    googleapis::google::firestore::v1::target_change::TargetChangeType::try_from(
+                        tc.target_change_type,
+                    );
+                if kind == Ok(
+                    googleapis::google::firestore::v1::target_change::TargetChangeType::NoChange,
+                ) && tc.target_ids.is_empty()
+                {
+                    break;
+                }
+            }
+            Some(
+                googleapis::google::firestore::v1::listen_response::ResponseType::DocumentChange(
+                    dc,
+                ),
+            ) => {
+                if let Some(doc) = dc.document {
+                    assert!(
+                        !doc.name.contains("/lag/far_"),
+                        "stale far_* document leaked after lag recovery: {}",
+                        doc.name
+                    );
+                    followup_docs.push(doc);
+                }
+            }
+            _ => {}
+        }
+    }
+    expect_eq!(short_ids(&followup_docs), vec!["after_reset"]);
     drop(lag_tx);
 
     // (b) Opening a Listen query on a collection that already fails COSINE `[0, 0]` delivers the
@@ -2436,4 +2481,51 @@ async fn new_transaction_errors_rollback_cleanly_across_all_five_rpcs() {
         .await
         .expect("execute_pipeline NewTransaction error must not leak d1 lock");
     }
+}
+
+#[gtest]
+#[tokio::test]
+async fn run_query_find_nearest_tie_breaks_by_sorted_non_name_inequality_fields_before_document_name()
+ {
+    let mut db = TestEnv::new().build_db();
+    for (id, a, b) in [
+        ("tie_fn/a", 10i64, 1i64),
+        ("tie_fn/b", 2i64, 20i64),
+        ("tie_fn/c", 2i64, 5i64),
+        ("tie_fn/d", 1i64, 99i64),
+    ] {
+        db.put(id, fields!({ "emb": vec_val([1.0, 0.0]), "a": a, "b": b }))
+            .await
+            .unwrap();
+    }
+
+    // All 4 docs tie at Euclidean distance 0.0; filter mentions `__name__`, then `b`, then `a`.
+    // Tie-breaker order must exclude `__name__` from inequality prefix and sort remaining
+    // inequality fields lexicographically (`a ASC, b ASC, __name__ ASC`) -> `d, c, b, a`.
+    let docs = db
+        .query(
+            QuerySpec::collection("tie_fn")
+                .where_filter(and_filters(vec![
+                    field_filter(
+                        "__name__",
+                        Operator::GreaterThan,
+                        Value {
+                            value_type: Some(ValueType::ReferenceValue(doc_path("tie_fn/0"))),
+                        },
+                    ),
+                    field_filter("b", Operator::LessThan, 100i64),
+                    field_filter("a", Operator::LessThan, 100i64),
+                ]))
+                .find_nearest(make_find_nearest(
+                    "emb",
+                    vec_val([1.0, 0.0]),
+                    find_nearest::DistanceMeasure::Euclidean,
+                    4,
+                    None,
+                    None,
+                )),
+        )
+        .await
+        .unwrap();
+    expect_eq!(short_ids(&docs.documents), vec!["d", "c", "b", "a"]);
 }

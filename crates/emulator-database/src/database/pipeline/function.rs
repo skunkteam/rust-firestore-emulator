@@ -105,26 +105,78 @@ pub(super) fn evaluate(
             })?;
             return Ok(Some(Value::integer(vals.len() as i64)));
         }
+        "not" => {
+            let [arg] = get_exact_expr_args(args, name)?;
+            let val = expressions::evaluate(arg, doc)?;
+            if val.is_null() {
+                return Ok(Some(Value::null()));
+            }
+            let a = val.as_boolean().ok_or_else(|| {
+                GenericDatabaseError::invalid_argument("First logic argument must be a boolean")
+            })?;
+            return Ok(Some(Value::boolean(!a)));
+        }
+        "and" | "or" => {
+            if args.len() < 2 {
+                return Err(GenericDatabaseError::invalid_argument(format!(
+                    "{name} expects at least 2 arguments"
+                )));
+            }
+            let short_circuit_on = name == "or";
+            let mut saw_null = false;
+            for (idx, arg) in args.iter().enumerate() {
+                let val = expressions::evaluate(arg, doc)?;
+                if val.is_null() {
+                    saw_null = true;
+                    continue;
+                }
+                let b = val.as_boolean().ok_or_else(|| {
+                    GenericDatabaseError::invalid_argument(format!(
+                        "Logic argument {} must be a boolean",
+                        idx + 1
+                    ))
+                })?;
+                if b == short_circuit_on {
+                    return Ok(Some(Value::boolean(b)));
+                }
+            }
+            return Ok(Some(if saw_null {
+                Value::null()
+            } else {
+                Value::boolean(!short_circuit_on)
+            }));
+        }
         "string_concat" | "array" | "array_concat" => {}
         "to_upper" | "to_lower" | "char_length" | "abs" | "ceil" | "floor" | "round" | "sqrt"
-        | "log10" | "ln" | "not" | "array_length" => {
+        | "log10" | "ln" | "array_length" => {
             let [_] = get_exact_expr_args(args, name)?;
         }
-        "split"
-        | "add"
-        | "subtract"
-        | "multiply"
-        | "divide"
-        | "mod"
-        | "pow"
-        | "and"
-        | "or"
-        | "equal"
+        "equal"
         | "not_equal"
         | "greater_than"
         | "greater_than_or_equal"
         | "less_than"
         | "less_than_or_equal" => {
+            let [a_expr, b_expr] = get_exact_expr_args(args, name)?;
+            let a = expressions::maybe_evaluate(a_expr, doc)?;
+            let b = expressions::maybe_evaluate(b_expr, doc)?;
+            let res = match (name.as_str(), a, b) {
+                ("equal" | "less_than_or_equal" | "greater_than_or_equal", None, None) => true,
+                ("not_equal" | "less_than" | "greater_than", None, None) => false,
+                ("not_equal", None, Some(_)) | ("not_equal", Some(_), None) => true,
+                (_, None, Some(_)) | (_, Some(_), None) => false,
+                ("equal", Some(a), Some(b)) => a == b,
+                ("not_equal", Some(a), Some(b)) => a != b,
+                (_, Some(a), Some(b)) if !a.is_compatible_with(&b) => false,
+                ("greater_than", Some(a), Some(b)) => a > b,
+                ("greater_than_or_equal", Some(a), Some(b)) => a >= b,
+                ("less_than", Some(a), Some(b)) => a < b,
+                ("less_than_or_equal", Some(a), Some(b)) => a <= b,
+                _ => unreachable!(),
+            };
+            return Ok(Some(Value::boolean(res)));
+        }
+        "split" | "add" | "subtract" | "multiply" | "divide" | "mod" | "pow" => {
             let [_, _] = get_exact_expr_args(args, name)?;
         }
         _ => unimplemented!(format!(
@@ -191,7 +243,15 @@ pub(super) fn evaluate(
             let sep = sep.as_string().ok_or_else(|| {
                 GenericDatabaseError::invalid_argument("Argument must be a string")
             })?;
-            let parts: Vec<Value> = a.split(sep).map(Value::string).collect();
+            let parts: Vec<Value> = if sep.is_empty() {
+                if a.is_empty() {
+                    vec![Value::string("")]
+                } else {
+                    a.chars().map(|c| Value::string(c.to_string())).collect()
+                }
+            } else {
+                a.split(sep).map(Value::string).collect()
+            };
             Ok(Some(Value::array(parts)))
         }
 
@@ -199,26 +259,42 @@ pub(super) fn evaluate(
         "add" | "subtract" | "multiply" | "divide" | "mod" | "pow" => {
             let [a, b] = get_exact_expr_args(&args, name)?;
             if a.is_null() || b.is_null() {
+                if (!a.is_null() && !a.is_number()) || (!b.is_null() && !b.is_number()) {
+                    return Err(GenericDatabaseError::invalid_argument(
+                        "Arguments must be numbers",
+                    ));
+                }
                 return Ok(Some(Value::null()));
             }
-            if let [Some(a), Some(b)] = [a.as_integer(), b.as_integer()] {
+            if name != "pow"
+                && let [Some(a), Some(b)] = [a.as_integer(), b.as_integer()]
+            {
                 let res = match name.as_str() {
-                    "add" => a + b,
-                    "subtract" => a - b,
-                    "multiply" => a * b,
+                    "add" => a.checked_add(b).ok_or_else(|| {
+                        GenericDatabaseError::invalid_argument("Integer overflow in add")
+                    })?,
+                    "subtract" => a.checked_sub(b).ok_or_else(|| {
+                        GenericDatabaseError::invalid_argument("Integer overflow in subtract")
+                    })?,
+                    "multiply" => a.checked_mul(b).ok_or_else(|| {
+                        GenericDatabaseError::invalid_argument("Integer overflow in multiply")
+                    })?,
                     "divide" => {
                         if b == 0 {
                             return Err(GenericDatabaseError::invalid_argument("Division by zero"));
                         }
-                        a / b
+                        a.checked_div(b).ok_or_else(|| {
+                            GenericDatabaseError::invalid_argument("Integer overflow in divide")
+                        })?
                     }
                     "mod" => {
                         if b == 0 {
                             return Err(GenericDatabaseError::invalid_argument("Modulo by zero"));
                         }
-                        a % b
+                        a.checked_rem(b).ok_or_else(|| {
+                            GenericDatabaseError::invalid_argument("Integer overflow in mod")
+                        })?
                     }
-                    "pow" => a.pow(b as u32),
                     _ => unreachable!(),
                 };
                 return Ok(Some(Value::integer(res)));
@@ -247,7 +323,23 @@ pub(super) fn evaluate(
                     }
                     a % b
                 }
-                "pow" => a.powf(b),
+                "pow" => {
+                    if a.is_nan() || b.is_nan() {
+                        f64::NAN
+                    } else if a == 0.0 && b < 0.0 {
+                        return Err(GenericDatabaseError::invalid_argument(
+                            "pow division by zero",
+                        ));
+                    } else {
+                        let res = a.powf(b);
+                        if res.is_nan() {
+                            return Err(GenericDatabaseError::invalid_argument(
+                                "pow invalid domain",
+                            ));
+                        }
+                        res
+                    }
+                }
                 _ => unreachable!(),
             };
             Ok(Some(Value::double(res)))
@@ -257,7 +349,18 @@ pub(super) fn evaluate(
             if a.is_null() {
                 return Ok(Some(Value::null()));
             }
-            // TODO: support integer arithmetic when argument is an integer
+            if matches!(name.as_str(), "abs" | "ceil" | "floor" | "round")
+                && let Some(i) = a.as_integer()
+            {
+                let res = match name.as_str() {
+                    "abs" => i.checked_abs().ok_or_else(|| {
+                        GenericDatabaseError::invalid_argument("Integer overflow in abs")
+                    })?,
+                    "ceil" | "floor" | "round" => i,
+                    _ => unreachable!(),
+                };
+                return Ok(Some(Value::integer(res)));
+            }
             let a = a.as_double().ok_or_else(|| {
                 GenericDatabaseError::invalid_argument("Argument must be a number")
             })?;
@@ -290,49 +393,12 @@ pub(super) fn evaluate(
             Ok(Some(Value::double(res)))
         }
 
-        // Logic functions
-        "not" => {
-            let [a] = get_exact_expr_args(&args, name)?;
-            let a = a.as_boolean().ok_or_else(|| {
-                GenericDatabaseError::invalid_argument("First logic argument must be a boolean")
-            })?;
-            Ok(Some(Value::boolean(!a)))
-        }
-        "and" | "or" => {
-            let [a, b] = get_exact_expr_args(&args, name)?;
-            let a = a.as_boolean().ok_or_else(|| {
-                GenericDatabaseError::invalid_argument("First logic argument must be a boolean")
-            })?;
-            let b = b.as_boolean().ok_or_else(|| {
-                GenericDatabaseError::invalid_argument("Second logic argument must be a boolean")
-            })?;
-            let res = if name == "and" { a && b } else { a || b };
-            Ok(Some(Value::boolean(res)))
-        }
-
-        // Comparison functions
-        "equal"
-        | "not_equal"
-        | "greater_than"
-        | "greater_than_or_equal"
-        | "less_than"
-        | "less_than_or_equal" => {
-            let [a, b] = get_exact_expr_args(&args, name)?;
-            let res = match name.as_str() {
-                "equal" => a == b,
-                "not_equal" => a != b,
-                "greater_than" => a > b,
-                "greater_than_or_equal" => a >= b,
-                "less_than" => a < b,
-                "less_than_or_equal" => a <= b,
-                _ => unreachable!(),
-            };
-            Ok(Some(Value::boolean(res)))
-        }
-
         // Array functions
         "array_length" => {
             let [arg] = get_exact_expr_args(&args, name)?;
+            if arg.is_null() {
+                return Ok(Some(Value::null()));
+            }
             let arr = arg.as_array().ok_or_else(|| {
                 GenericDatabaseError::invalid_argument("array_length requires an array argument")
             })?;
@@ -340,6 +406,16 @@ pub(super) fn evaluate(
         }
         "array" => Ok(Some(Value::array(args))),
         "array_concat" => {
+            if args.iter().any(Value::is_null) {
+                for arg in &args {
+                    if !arg.is_null() && arg.as_array().is_none() {
+                        return Err(GenericDatabaseError::invalid_argument(
+                            "array_concat requires an array argument",
+                        ));
+                    }
+                }
+                return Ok(Some(Value::null()));
+            }
             let mut result = vec![];
             for arg in args {
                 let arr = arg.into_array().ok_or_else(|| {

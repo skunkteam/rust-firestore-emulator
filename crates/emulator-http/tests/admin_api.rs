@@ -846,3 +846,561 @@ async fn test_rest_vector_passthrough_body_limit_and_run_query_find_nearest() ->
 
     Ok(())
 }
+
+async fn send_oneshot(
+    router: &axum::Router,
+    method: Method,
+    uri: &str,
+    json_body: Option<serde_json::Value>,
+) -> Result<(StatusCode, serde_json::Value)> {
+    let mut builder = Request::builder().method(method).uri(uri);
+    let body = if let Some(val) = json_body {
+        builder = builder.header("content-type", "application/json");
+        Body::from(serde_json::to_vec(&val)?)
+    } else {
+        Body::empty()
+    };
+    let resp = router.clone().oneshot(builder.body(body)?).await?;
+    let status = resp.status();
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await?;
+    let parsed = if bytes.is_empty() {
+        serde_json::Value::Null
+    } else {
+        serde_json::from_slice(&bytes)?
+    };
+    Ok((status, parsed))
+}
+
+#[gtest]
+#[tokio::test]
+async fn test_rest_custom_verbs_percent_encoded_colons_and_empty_prefixes() -> Result<()> {
+    let project = Box::leak(Box::new(FirestoreProject::new(FirestoreConfig::default())));
+    let router = RouterBuilder::new(project).build();
+    let docs_root = "/v1/projects/p/databases/(default)/documents";
+
+    // 1. Percent-encoded %3A in collection IDs must not be treated as a custom :verb.
+    let (status, created_commit_col) = send_oneshot(
+        &router,
+        Method::POST,
+        &format!("{docs_root}/events%3Acommit?documentId=d1"),
+        Some(json!({ "fields": { "k": { "stringValue": "v1" } } })),
+    )
+    .await?;
+    expect_eq!(status, StatusCode::OK);
+    expect_eq!(
+        created_commit_col["name"],
+        "projects/p/databases/(default)/documents/events:commit/d1"
+    );
+
+    let (status, created_query_col) = send_oneshot(
+        &router,
+        Method::POST,
+        &format!("{docs_root}/jobs%3ArunQuery?documentId=d1"),
+        Some(json!({ "fields": { "k": { "stringValue": "v2" } } })),
+    )
+    .await?;
+    expect_eq!(status, StatusCode::OK);
+    expect_eq!(
+        created_query_col["name"],
+        "projects/p/databases/(default)/documents/jobs:runQuery/d1"
+    );
+
+    let (status, created_leading_colon) = send_oneshot(
+        &router,
+        Method::POST,
+        &format!("{docs_root}/%3ArunQuery?documentId=d1"),
+        Some(json!({ "fields": {} })),
+    )
+    .await?;
+    expect_eq!(status, StatusCode::OK);
+    expect_eq!(
+        created_leading_colon["name"],
+        "projects/p/databases/(default)/documents/:runQuery/d1"
+    );
+
+    // 2. Empty prefix before :verb (`/:runQuery` or `/col/:runQuery`) must not route to root or
+    //    produce trailing-slash Ref errors.
+    let (status, empty_prefix_err) = send_oneshot(
+        &router,
+        Method::POST,
+        &format!("{docs_root}/:runQuery"),
+        Some(json!({
+            "structuredQuery": { "from": [{ "collectionId": "events:commit" }] }
+        })),
+    )
+    .await?;
+    expect_eq!(status, StatusCode::BAD_REQUEST);
+    expect_eq!(empty_prefix_err["error"]["status"], "INVALID_ARGUMENT");
+
+    let (status, slash_prefix_err) = send_oneshot(
+        &router,
+        Method::POST,
+        &format!("{docs_root}/col/:runQuery"),
+        Some(json!({ "structuredQuery": {} })),
+    )
+    .await?;
+    expect_eq!(status, StatusCode::NOT_FOUND);
+    expect_eq!(slash_prefix_err["error"]["status"], "NOT_FOUND");
+
+    // 3. Unencoded :runQuery on a document path with %3A inside the doc ID works as parent query.
+    let (status, _) = send_oneshot(
+        &router,
+        Method::POST,
+        &format!("{docs_root}/col/doc%3A1/sub?documentId=s1"),
+        Some(json!({ "fields": { "ok": { "booleanValue": true } } })),
+    )
+    .await?;
+    expect_eq!(status, StatusCode::OK);
+
+    let (status, sub_rows) = send_oneshot(
+        &router,
+        Method::POST,
+        &format!("{docs_root}/col/doc%3A1:runQuery"),
+        Some(json!({
+            "structuredQuery": { "from": [{ "collectionId": "sub" }] }
+        })),
+    )
+    .await?;
+    expect_eq!(status, StatusCode::OK);
+    expect_eq!(sub_rows.as_array().unwrap().len(), 1);
+    expect_eq!(
+        sub_rows[0]["document"]["name"],
+        "projects/p/databases/(default)/documents/col/doc:1/sub/s1"
+    );
+
+    // 4. Root-only Phase-2 verbs (:commit) return 501 only on valid database/documents:commit, and
+    //    404 on subpaths or bogus paths; document-capable Phase-2 verbs return 501 on doc paths.
+    let (status, root_commit) = send_oneshot(
+        &router,
+        Method::POST,
+        &format!("{docs_root}:commit"),
+        Some(json!({})),
+    )
+    .await?;
+    expect_eq!(status, StatusCode::NOT_IMPLEMENTED);
+    expect_eq!(root_commit["error"]["status"], "UNIMPLEMENTED");
+
+    let (status, doc_commit) = send_oneshot(
+        &router,
+        Method::POST,
+        &format!("{docs_root}/col/doc:commit"),
+        Some(json!({})),
+    )
+    .await?;
+    expect_eq!(status, StatusCode::NOT_FOUND);
+    expect_eq!(doc_commit["error"]["status"], "NOT_FOUND");
+
+    let (status, bogus_commit) =
+        send_oneshot(&router, Method::POST, "/v1/projects/bogus:commit", None).await?;
+    expect_eq!(status, StatusCode::NOT_FOUND);
+    expect_eq!(bogus_commit["error"]["status"], "NOT_FOUND");
+
+    let (status, doc_agg) = send_oneshot(
+        &router,
+        Method::POST,
+        &format!("{docs_root}/col/doc:runAggregationQuery"),
+        Some(json!({})),
+    )
+    .await?;
+    expect_eq!(status, StatusCode::NOT_IMPLEMENTED);
+    expect_eq!(doc_agg["error"]["status"], "UNIMPLEMENTED");
+
+    Ok(())
+}
+
+#[gtest]
+#[tokio::test]
+async fn test_rest_rejects_percent_encoded_slashes_and_preserves_plus() -> Result<()> {
+    let project = Box::leak(Box::new(FirestoreProject::new(FirestoreConfig::default())));
+    let router = RouterBuilder::new(project).build();
+
+    // Seed a real document so we verify %2F delete/read cannot target it.
+    let (status, _) = send_oneshot(
+        &router,
+        Method::POST,
+        "/v1/projects/p/databases/(default)/documents/col/doc/sub?documentId=d1",
+        Some(json!({ "fields": { "x": { "integerValue": "1" } } })),
+    )
+    .await?;
+    expect_eq!(status, StatusCode::OK);
+
+    for (method, bad_uri) in [
+        (
+            Method::GET,
+            "/v1/projects/p/databases/(default)%2Fdocuments",
+        ),
+        (Method::GET, "/v1/projects/p%2Fx/databases/(default)"),
+        (
+            Method::GET,
+            "/v1/projects/p/databases/(default)%2Fdocuments%2Fcol%2Fdoc/documents/sub",
+        ),
+        (
+            Method::GET,
+            "/v1/projects/p/databases/(default)/documents/col/doc%2Fsub",
+        ),
+        (
+            Method::PATCH,
+            "/v1/projects/p/databases/(default)/documents/col/doc%2Fsub%2Fd1",
+        ),
+        (
+            Method::DELETE,
+            "/emulator/v1/projects/p/databases/(default)/documents/col/doc%2Fsub",
+        ),
+        (
+            Method::DELETE,
+            "/emulator/v1/projects/p/databases/(default)%2Fdocuments",
+        ),
+    ] {
+        let body = (method == Method::PATCH).then(|| json!({ "fields": {} }));
+        let (status, err) = send_oneshot(&router, method, bad_uri, body).await?;
+        expect_eq!(status, StatusCode::BAD_REQUEST, "uri: {bad_uri}");
+        expect_eq!(err["error"]["status"], "INVALID_ARGUMENT", "uri: {bad_uri}");
+    }
+
+    // Seeded doc must remain untouched after rejected %2F DELETE attempts.
+    let (status, _) = send_oneshot(
+        &router,
+        Method::GET,
+        "/v1/projects/p/databases/(default)/documents/col/doc/sub/d1",
+        None,
+    )
+    .await?;
+    expect_eq!(status, StatusCode::OK);
+
+    // Literal '+' in URL path segments must not be decoded as a space.
+    let (status, created_plus) = send_oneshot(
+        &router,
+        Method::POST,
+        "/v1/projects/p/databases/(default)/documents/col?documentId=doc%2B1",
+        Some(json!({ "fields": { "plus": { "booleanValue": true } } })),
+    )
+    .await?;
+    expect_eq!(status, StatusCode::OK);
+    expect_eq!(
+        created_plus["name"],
+        "projects/p/databases/(default)/documents/col/doc+1"
+    );
+
+    let (status, got_plus) = send_oneshot(
+        &router,
+        Method::GET,
+        "/v1/projects/p/databases/(default)/documents/col/doc+1",
+        None,
+    )
+    .await?;
+    expect_eq!(status, StatusCode::OK);
+    expect_eq!(got_plus["fields"]["plus"]["booleanValue"], true);
+
+    Ok(())
+}
+
+#[gtest]
+#[tokio::test]
+async fn test_patch_database_coupling_sse_events_and_update_mask() -> Result<()> {
+    let project = Box::leak(Box::new(FirestoreProject::new(FirestoreConfig::default())));
+    let router = RouterBuilder::new(project).build();
+    let admin_url = "/v1/projects/p/databases/(default)";
+
+    // Subscribe to in-memory SSE events before patching.
+    let sse_resp = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/emulator/v1/events")
+                .body(Body::empty())?,
+        )
+        .await?;
+    expect_eq!(sse_resp.status(), StatusCode::OK);
+    let mut sse_stream = sse_resp.into_body().into_data_stream();
+
+    // 1. Switching from STANDARD+PESSIMISTIC -> ENTERPRISE+PESSIMISTIC must not transiently flip
+    //    optimistic_concurrency or emit duplicate database_config_changed events.
+    let (status, patched) = send_oneshot(
+        &router,
+        Method::PATCH,
+        admin_url,
+        Some(json!({
+            "databaseEdition": "ENTERPRISE",
+            "concurrencyMode": "PESSIMISTIC"
+        })),
+    )
+    .await?;
+    expect_eq!(status, StatusCode::OK);
+    expect_eq!(patched["databaseEdition"], "ENTERPRISE");
+    expect_eq!(patched["concurrencyMode"], "PESSIMISTIC");
+
+    // Trigger one sentinel event afterward so we can deterministically read all preceding events.
+    let (status, _) = send_oneshot(
+        &router,
+        Method::POST,
+        "/v1/projects/p/databases/(default)/documents/items?documentId=sentinel",
+        Some(json!({ "fields": {} })),
+    )
+    .await?;
+    expect_eq!(status, StatusCode::OK);
+
+    let mut sse_text = String::new();
+    while !sse_text.contains("\"documents_changed\"") {
+        let chunk = tokio::time::timeout(Duration::from_secs(2), sse_stream.next())
+            .await
+            .expect("SSE chunk arrived")
+            .expect("SSE stream open")?;
+        sse_text.push_str(&String::from_utf8_lossy(&chunk));
+    }
+    expect_eq!(sse_text.matches("\"database_config_changed\"").count(), 1);
+
+    // 2. updateMask restricts which fields in the PATCH body are applied.
+    let (status, mask_concurrency) = send_oneshot(
+        &router,
+        Method::PATCH,
+        &format!("{admin_url}?updateMask=concurrencyMode"),
+        Some(json!({
+            "databaseEdition": "STANDARD",
+            "concurrencyMode": "OPTIMISTIC"
+        })),
+    )
+    .await?;
+    expect_eq!(status, StatusCode::OK);
+    expect_eq!(mask_concurrency["databaseEdition"], "ENTERPRISE");
+    expect_eq!(mask_concurrency["concurrencyMode"], "OPTIMISTIC");
+
+    let (status, mask_edition) = send_oneshot(
+        &router,
+        Method::PATCH,
+        &format!("{admin_url}?updateMask=databaseEdition"),
+        Some(json!({
+            "databaseEdition": "STANDARD",
+            "concurrencyMode": "OPTIMISTIC"
+        })),
+    )
+    .await?;
+    expect_eq!(status, StatusCode::OK);
+    expect_eq!(mask_edition["databaseEdition"], "STANDARD");
+    expect_eq!(mask_edition["concurrencyMode"], "PESSIMISTIC");
+
+    let (status, mask_snake) = send_oneshot(
+        &router,
+        Method::PATCH,
+        &format!("{admin_url}?updateMask=database_edition,concurrency_mode"),
+        Some(json!({
+            "databaseEdition": "ENTERPRISE",
+            "concurrencyMode": "PESSIMISTIC"
+        })),
+    )
+    .await?;
+    expect_eq!(status, StatusCode::OK);
+    expect_eq!(mask_snake["databaseEdition"], "ENTERPRISE");
+    expect_eq!(mask_snake["concurrencyMode"], "PESSIMISTIC");
+
+    for bad_mask in ["", "unknownField", "databaseEdition,"] {
+        let (status, err) = send_oneshot(
+            &router,
+            Method::PATCH,
+            &format!("{admin_url}?updateMask={bad_mask}"),
+            Some(json!({ "concurrencyMode": "OPTIMISTIC" })),
+        )
+        .await?;
+        expect_eq!(status, StatusCode::BAD_REQUEST, "mask: {bad_mask}");
+        expect_eq!(err["error"]["status"], "INVALID_ARGUMENT");
+    }
+
+    Ok(())
+}
+
+#[gtest]
+#[tokio::test]
+async fn test_rest_masks_read_time_consistency_and_create_document_slash_id() -> Result<()> {
+    let project = Box::leak(Box::new(FirestoreProject::new(FirestoreConfig::default())));
+    let router = RouterBuilder::new(project).build();
+    let docs_root = "/v1/projects/p/databases/(default)/documents";
+
+    // 1. Empty mask.fieldPaths= on CREATE returns metadata only (no fields).
+    let (status, created_empty_mask) = send_oneshot(
+        &router,
+        Method::POST,
+        &format!("{docs_root}/items?documentId=i1&mask.fieldPaths="),
+        Some(json!({ "fields": { "v": { "integerValue": "1" } } })),
+    )
+    .await?;
+    expect_eq!(status, StatusCode::OK);
+    expect_that!(created_empty_mask.get("fields"), none());
+    let t1 = created_empty_mask["updateTime"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // 2. Empty mask.fieldPaths= on GET and LIST returns metadata only.
+    let (status, got_empty_mask) = send_oneshot(
+        &router,
+        Method::GET,
+        &format!("{docs_root}/items/i1?mask.fieldPaths="),
+        None,
+    )
+    .await?;
+    expect_eq!(status, StatusCode::OK);
+    expect_that!(got_empty_mask.get("fields"), none());
+
+    let (status, listed_empty_mask) = send_oneshot(
+        &router,
+        Method::GET,
+        &format!("{docs_root}/items?mask.fieldPaths="),
+        None,
+    )
+    .await?;
+    expect_eq!(status, StatusCode::OK);
+    expect_that!(listed_empty_mask["documents"][0].get("fields"), none());
+
+    // 3. Mixed empty + non-empty mask/updateMask entries must fail with 400 INVALID_ARGUMENT, while
+    //    sole empty updateMask.fieldPaths= preserves existing fields.
+    let (status, mixed_mask_err) = send_oneshot(
+        &router,
+        Method::GET,
+        &format!("{docs_root}/items/i1?mask.fieldPaths=v&mask.fieldPaths="),
+        None,
+    )
+    .await?;
+    expect_eq!(status, StatusCode::BAD_REQUEST);
+    expect_eq!(mixed_mask_err["error"]["status"], "INVALID_ARGUMENT");
+
+    let (status, mixed_update_mask_err) = send_oneshot(
+        &router,
+        Method::PATCH,
+        &format!("{docs_root}/items/i1?updateMask.fieldPaths=v&updateMask.fieldPaths="),
+        Some(json!({ "fields": { "v": { "integerValue": "2" } } })),
+    )
+    .await?;
+    expect_eq!(status, StatusCode::BAD_REQUEST);
+    expect_eq!(mixed_update_mask_err["error"]["status"], "INVALID_ARGUMENT");
+
+    let (status, noop_patch) = send_oneshot(
+        &router,
+        Method::PATCH,
+        &format!("{docs_root}/items/i1?updateMask.fieldPaths="),
+        Some(json!({ "fields": { "other": { "stringValue": "ignored" } } })),
+    )
+    .await?;
+    expect_eq!(status, StatusCode::OK);
+    expect_eq!(noop_patch["fields"]["v"]["integerValue"], "1");
+    expect_that!(noop_patch["fields"].get("other"), none());
+
+    // 4. Update i1 to v=2 and create i2; readTime=t1 must still observe the historical snapshot.
+    let (status, _) = send_oneshot(
+        &router,
+        Method::PATCH,
+        &format!("{docs_root}/items/i1"),
+        Some(json!({ "fields": { "v": { "integerValue": "2" } } })),
+    )
+    .await?;
+    expect_eq!(status, StatusCode::OK);
+
+    let (status, _) = send_oneshot(
+        &router,
+        Method::POST,
+        &format!("{docs_root}/items?documentId=i2"),
+        Some(json!({ "fields": { "v": { "integerValue": "10" } } })),
+    )
+    .await?;
+    expect_eq!(status, StatusCode::OK);
+
+    let encoded_t1 = t1.replace(':', "%3A");
+    let (status, get_at_t1) = send_oneshot(
+        &router,
+        Method::GET,
+        &format!("{docs_root}/items/i1?readTime={encoded_t1}"),
+        None,
+    )
+    .await?;
+    expect_eq!(status, StatusCode::OK);
+    expect_eq!(get_at_t1["fields"]["v"]["integerValue"], "1");
+
+    let (status, missing_at_t1) = send_oneshot(
+        &router,
+        Method::GET,
+        &format!("{docs_root}/items/i2?readTime={encoded_t1}"),
+        None,
+    )
+    .await?;
+    expect_eq!(status, StatusCode::NOT_FOUND);
+    expect_eq!(missing_at_t1["error"]["status"], "NOT_FOUND");
+
+    let (status, list_at_t1) = send_oneshot(
+        &router,
+        Method::GET,
+        &format!("{docs_root}/items?readTime={encoded_t1}"),
+        None,
+    )
+    .await?;
+    expect_eq!(status, StatusCode::OK);
+    expect_eq!(list_at_t1["documents"].as_array().unwrap().len(), 1);
+    expect_eq!(
+        list_at_t1["documents"][0]["fields"]["v"]["integerValue"],
+        "1"
+    );
+
+    // 5. Invalid/unsupported consistency selectors on GET and :listCollectionIds.
+    let (status, bad_rt) = send_oneshot(
+        &router,
+        Method::GET,
+        &format!("{docs_root}/items/i1?readTime=not-a-timestamp"),
+        None,
+    )
+    .await?;
+    expect_eq!(status, StatusCode::BAD_REQUEST);
+    expect_eq!(bad_rt["error"]["status"], "INVALID_ARGUMENT");
+
+    let (status, txn_get) = send_oneshot(
+        &router,
+        Method::GET,
+        &format!("{docs_root}/items/i1?transaction=AAEC"),
+        None,
+    )
+    .await?;
+    expect_eq!(status, StatusCode::NOT_IMPLEMENTED);
+    expect_eq!(txn_get["error"]["status"], "UNIMPLEMENTED");
+
+    let (status, txn_list) = send_oneshot(
+        &router,
+        Method::GET,
+        &format!("{docs_root}/items?transaction=AAEC"),
+        None,
+    )
+    .await?;
+    expect_eq!(status, StatusCode::NOT_IMPLEMENTED);
+    expect_eq!(txn_list["error"]["status"], "UNIMPLEMENTED");
+
+    let (status, conflict_sel) = send_oneshot(
+        &router,
+        Method::GET,
+        &format!("{docs_root}/items/i1?readTime={encoded_t1}&transaction=AAEC"),
+        None,
+    )
+    .await?;
+    expect_eq!(status, StatusCode::BAD_REQUEST);
+    expect_eq!(conflict_sel["error"]["status"], "INVALID_ARGUMENT");
+
+    let (status, list_cols_rt) = send_oneshot(
+        &router,
+        Method::POST,
+        &format!("{docs_root}:listCollectionIds"),
+        Some(json!({ "readTime": t1 })),
+    )
+    .await?;
+    expect_eq!(status, StatusCode::NOT_IMPLEMENTED);
+    expect_eq!(list_cols_rt["error"]["status"], "UNIMPLEMENTED");
+
+    // 6. CreateDocument must reject documentId containing '/'.
+    for bad_doc_id in ["alice/posts/p1", "alice/posts"] {
+        let (status, err) = send_oneshot(
+            &router,
+            Method::POST,
+            &format!("{docs_root}/users?documentId={bad_doc_id}"),
+            Some(json!({ "fields": {} })),
+        )
+        .await?;
+        expect_eq!(status, StatusCode::BAD_REQUEST, "doc_id: {bad_doc_id}");
+        expect_eq!(err["error"]["status"], "INVALID_ARGUMENT");
+    }
+
+    Ok(())
+}

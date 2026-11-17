@@ -92,9 +92,12 @@ async fn sse_events(
 
 async fn delete_by_ref(
     State(project): State<&'static FirestoreProject>,
-    Path(raw_ref): Path<String>,
+    Path(_raw_ref): Path<String>,
+    uri: Uri,
 ) -> Result<Json<serde_json::Value>> {
-    let r: Ref = raw_ref.parse()?;
+    let raw_path = uri.path().strip_prefix('/').unwrap_or(uri.path());
+    let decoded_ref = super::projects::decode_raw_path_segments(raw_path)?;
+    let r: Ref = decoded_ref.parse()?;
     match r {
         Ref::Root(r) => {
             project.clear_database(&r).await;

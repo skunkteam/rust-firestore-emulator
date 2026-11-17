@@ -1,7 +1,7 @@
 use std::{
     borrow::Cow,
     cmp,
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     ops::Deref,
     sync::Arc,
 };
@@ -25,16 +25,17 @@ use super::{
     document::StoredDocumentVersion,
     field_path::{FieldPath, FieldReference},
     projection::{Project, Projection, project_with_distance},
-    read_consistency::ReadConsistency,
+    read_consistency::{ReadConsistency, validate_read_time},
     reference::{CollectionRef, Ref},
     vector,
 };
 use crate::{
     GenericDatabaseError,
     database::transaction::{
-        ConcurrencyMode, OptimisticState, PessimisticTransactionQuerySupport, Transaction,
+        ConcurrencyMode, ExecutedQuery, OptimisticState, PessimisticTransactionQuerySupport,
+        Transaction,
     },
-    document::{DocumentMeta, OwnedDocumentContentsReadGuard},
+    document::{DocumentMeta, OwnedDocumentContentsReadGuard, OwnedDocumentContentsWriteGuard},
     error::Result,
     reference::DocumentRef,
 };
@@ -466,14 +467,19 @@ impl Query {
                     })?;
             }
         } else {
+            let last_dir = self
+                .order_by
+                .last()
+                .map_or(Direction::Ascending, |o| o.direction);
+
             if !enterprise_edition && let Some(filter) = &self.filter {
-                // Ensure order_by is consistent
-                if self.order_by.is_empty() {
-                    self.order_by
-                        .extend(filter.get_inequality_fields().map(|field| Order {
-                            field:     field.clone(),
-                            direction: Direction::Ascending,
-                        }));
+                for field in filter.sorted_non_name_inequality_fields() {
+                    if !self.order_by.iter().any(|o| o.field == field) {
+                        self.order_by.push(Order {
+                            field,
+                            direction: last_dir,
+                        });
+                    }
                 }
 
                 filter
@@ -493,7 +499,7 @@ impl Query {
             {
                 self.order_by.push(Order {
                     field:     FieldReference::DocumentName,
-                    direction: Direction::Ascending,
+                    direction: last_dir,
                 })
             }
 
@@ -522,24 +528,46 @@ impl Query {
         self.find_nearest.is_none() && self.order_by.iter().any(|o| !o.field.is_document_name())
     }
 
+    pub(crate) fn affects_offset_window(&mut self, collection: &CollectionRef) -> bool {
+        self.offset > 0 && self.includes_collection(collection)
+    }
+
     pub fn reset_consistency_to_default(&mut self) {
         self.consistency = ReadConsistency::Default;
     }
 
     pub async fn once(&mut self, db: &FirestoreDatabase) -> Result<(Timestamp, Vec<QueryMatch>)> {
-        // First collect all Arc<Collection>s in a Vec to release the collection lock asap.
-        let mut collections = self.applicable_collections(db).await;
-        collections.sort_by(|a, b| a.name.cmp(&b.name));
-
         let txn; // If we find a transaction, we borrow from it.
-        let mut lock_strategy = match self.consistency {
+        let lock_strategy = match self.consistency {
             ReadConsistency::Default => LockStrategy::ReadTime(Timestamp::now()),
-            ReadConsistency::ReadTime(timestamp) => LockStrategy::ReadTime(timestamp),
+            ReadConsistency::ReadTime(timestamp) => {
+                LockStrategy::ReadTime(validate_read_time(timestamp)?)
+            }
             ReadConsistency::Transaction(transaction_id) => {
                 txn = db.transactions.get(transaction_id).await?;
                 LockStrategy::from_transaction(&txn).await
             }
         };
+        self.once_with_strategy(db, lock_strategy).await
+    }
+
+    pub(crate) async fn once_for_validation(
+        &mut self,
+        db: &FirestoreDatabase,
+        held_write_guards: &BTreeMap<DocumentRef, OwnedDocumentContentsWriteGuard>,
+    ) -> Result<(Timestamp, Vec<QueryMatch>)> {
+        self.once_with_strategy(db, LockStrategy::ValidationReadOnly(held_write_guards))
+            .await
+    }
+
+    async fn once_with_strategy(
+        &mut self,
+        db: &FirestoreDatabase,
+        mut lock_strategy: LockStrategy<'_>,
+    ) -> Result<(Timestamp, Vec<QueryMatch>)> {
+        // First collect all Arc<Collection>s in a Vec to release the collection lock asap.
+        let mut collections = self.applicable_collections(db).await;
+        collections.sort_by(|a, b| a.name.cmp(&b.name));
 
         let result = if let Some(spec) = self.find_nearest.clone() {
             let mut scanned_guards = vec![];
@@ -820,7 +848,7 @@ impl Query {
             };
         }
         if let Some(filter) = &self.filter {
-            for field in filter.get_inequality_fields() {
+            for field in filter.sorted_non_name_inequality_fields() {
                 let ord = field.get_value(a).cmp(&field.get_value(b));
                 if ord != cmp::Ordering::Equal {
                     return ord;
@@ -947,6 +975,7 @@ impl From<structured_query::Direction> for Direction {
 enum LockStrategy<'a> {
     PessimisticTransaction(PessimisticTransactionQuerySupport<'a>),
     OptimisticTransaction(&'a OptimisticState),
+    ValidationReadOnly(&'a BTreeMap<DocumentRef, OwnedDocumentContentsWriteGuard>),
     ReadTime(Timestamp),
 }
 
@@ -974,6 +1003,18 @@ impl<'a> LockStrategy<'a> {
                         guard: Some(read_guard),
                         computed_distance: None,
                     }
+                }));
+            }
+            LockStrategy::ValidationReadOnly(held_write_guards) => {
+                let version = if let Some(wg) = held_write_guards.get(&meta.name) {
+                    wg.current_version().cloned()
+                } else {
+                    meta.read().await?.current_version().cloned()
+                };
+                return Ok(version.map(|version| LockStrategyDocument {
+                    version,
+                    guard: None,
+                    computed_distance: None,
                 }));
             }
             LockStrategy::OptimisticTransaction(state) => *state.read_time,
@@ -1026,9 +1067,16 @@ impl<'a> LockStrategy<'a> {
                 .lock()
                 .await
                 .extend(result.iter().map(|m| m.version.name.clone()));
+            let snapshot = result
+                .iter()
+                .map(|m| (m.version.name.clone(), m.version.update_time))
+                .collect();
             let mut verification_query = query.clone();
             verification_query.reset_consistency_to_default();
-            state.executed_queries.lock().await.push(verification_query);
+            state.executed_queries.lock().await.push(ExecutedQuery {
+                query: verification_query,
+                snapshot,
+            });
         }
 
         result
@@ -1041,7 +1089,9 @@ impl<'a> LockStrategy<'a> {
             // because the documents are locked and cannot change while being locked. So
             // we are sure that the documents are unchanged and are still the same at
             // this particular point in time.
-            LockStrategy::PessimisticTransaction(_) => Timestamp::now(),
+            LockStrategy::PessimisticTransaction(_) | LockStrategy::ValidationReadOnly(_) => {
+                Timestamp::now()
+            }
             LockStrategy::OptimisticTransaction(state) => *state.read_time,
             LockStrategy::ReadTime(timestamp) => timestamp,
         }

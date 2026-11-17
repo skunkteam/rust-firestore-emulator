@@ -200,6 +200,23 @@ export function validateDouble(str) {
   return { valid: true, value: n };
 }
 
+const MIN_TIMESTAMP_SECONDS = -62135596800; // 0001-01-01T00:00:00Z
+const MAX_TIMESTAMP_SECONDS = 253402300799; // 9999-12-31T23:59:59Z
+const DAYS_IN_MONTH = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+
+/**
+ * @param {number} year
+ * @param {number} month
+ * @returns {number}
+ */
+function daysInGregorianMonth(year, month) {
+  if (month === 2) {
+    const isLeap = (year % 4 === 0 && year % 100 !== 0) || year % 400 === 0;
+    return isLeap ? 29 : 28;
+  }
+  return DAYS_IN_MONTH[month - 1];
+}
+
 /**
  * Validates an RFC 3339 timestamp string with up to 9 fractional nanosecond digits.
  * @param {string} str
@@ -207,18 +224,59 @@ export function validateDouble(str) {
  */
 export function validateTimestamp(str) {
   const trimmed = str.trim();
-  const rfc3339 =
-    /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,9})?(?:Z|[+-]\d{2}:\d{2})$/;
-  if (!rfc3339.test(trimmed)) {
+  const match =
+    /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.\d{1,9})?(Z|([+-])(\d{2}):(\d{2}))$/.exec(
+      trimmed
+    );
+  if (!match) {
     return {
       valid: false,
       error: "Expected RFC 3339 timestamp (e.g. 2026-11-10T15:30:00Z)",
     };
   }
-  const coarseIso = trimmed.replace(/(\.\d{3})\d+/, "$1");
-  const ms = Date.parse(coarseIso);
-  if (Number.isNaN(ms)) {
+  const year = Number(match[1]);
+  const month = Number(match[2]);
+  const day = Number(match[3]);
+  const hour = Number(match[4]);
+  const minute = Number(match[5]);
+  const second = Number(match[6]);
+
+  if (year < 1 || year > 9999 || month < 1 || month > 12) {
     return { valid: false, error: "Invalid calendar date/time in timestamp" };
+  }
+  if (day < 1 || day > daysInGregorianMonth(year, month)) {
+    return { valid: false, error: "Invalid calendar date/time in timestamp" };
+  }
+  if (hour > 23 || minute > 59 || second > 59) {
+    return { valid: false, error: "Invalid calendar date/time in timestamp" };
+  }
+
+  let offsetSeconds = 0;
+  if (match[7] !== "Z") {
+    const sign = match[8] === "-" ? -1 : 1;
+    const offHour = Number(match[9]);
+    const offMinute = Number(match[10]);
+    if (offHour > 23 || offMinute > 59) {
+      return { valid: false, error: "Invalid timezone offset in timestamp" };
+    }
+    offsetSeconds = sign * (offHour * 3600 + offMinute * 60);
+  }
+
+  // Use setUTCFullYear so years 0001..0099 are not shifted to 1901..1999 by Date.UTC.
+  const utcDate = new Date(0);
+  utcDate.setUTCFullYear(year, month - 1, day);
+  utcDate.setUTCHours(hour, minute, second, 0);
+  const utcSeconds = Math.floor(utcDate.getTime() / 1000) - offsetSeconds;
+  if (
+    Number.isNaN(utcSeconds) ||
+    utcSeconds < MIN_TIMESTAMP_SECONDS ||
+    utcSeconds > MAX_TIMESTAMP_SECONDS
+  ) {
+    return {
+      valid: false,
+      error:
+        "Timestamp must be between 0001-01-01T00:00:00Z and 9999-12-31T23:59:59.999999999Z",
+    };
   }
   return { valid: true };
 }
@@ -230,8 +288,14 @@ export function validateTimestamp(str) {
  * @returns {{ valid: boolean, latitude?: number, longitude?: number, error?: string }}
  */
 export function validateGeoPoint(latInput, lngInput) {
-  const latStr = String(latInput).trim();
-  const lngStr = String(lngInput).trim();
+  const latStr =
+    typeof latInput === "number" && Object.is(latInput, -0)
+      ? "-0.0"
+      : String(latInput).trim();
+  const lngStr =
+    typeof lngInput === "number" && Object.is(lngInput, -0)
+      ? "-0.0"
+      : String(lngInput).trim();
   if (!latStr || !lngStr) {
     return { valid: false, error: "Latitude and longitude are required" };
   }
@@ -669,7 +733,7 @@ function normalizeFieldsMap(mapObj, pathLabel) {
     if (!res.valid || !res.value) {
       return { valid: false, error: res.error };
     }
-    normalized[key] = res.value;
+    setFieldProperty(normalized, key, res.value);
   }
   return { valid: true, fields: normalized };
 }
@@ -873,4 +937,83 @@ function normalizeProtoValue(rawVal, pathLabel, inArray) {
       return { valid: true, value: { mapValue: { fields: mapRes.fields } } };
     }
   }
+}
+
+/**
+ * Defines an own enumerable field property safely, including `"__proto__"`.
+ * @template T
+ * @param {Record<string, T>} target
+ * @param {string} key
+ * @param {T} value
+ */
+export function setFieldProperty(target, key, value) {
+  Object.defineProperty(target, key, {
+    value,
+    enumerable: true,
+    writable: true,
+    configurable: true,
+  });
+}
+
+/**
+ * Serializes a value to JSON while preserving `-0` as `-0.0` (which `JSON.stringify`
+ * would otherwise normalize to `0`).
+ * @param {unknown} value
+ * @param {number} [indent]
+ * @returns {string}
+ */
+export function stringifyProtoJson(value, indent = 0) {
+  return formatProtoJsonValue(value, indent, 0) ?? "null";
+}
+
+/**
+ * @param {unknown} value
+ * @param {number} indent
+ * @param {number} depth
+ * @returns {string | undefined}
+ */
+function formatProtoJsonValue(value, indent, depth) {
+  if (
+    value !== null &&
+    typeof value === "object" &&
+    "toJSON" in value &&
+    typeof /** @type {{ toJSON?: unknown }} */ (value).toJSON === "function"
+  ) {
+    value = /** @type {{ toJSON: () => unknown }} */ (value).toJSON();
+  }
+  if (value === null) return "null";
+  if (typeof value === "boolean") return value ? "true" : "false";
+  if (typeof value === "number") {
+    if (Object.is(value, -0)) return "-0.0";
+    return Number.isFinite(value) ? JSON.stringify(value) : "null";
+  }
+  if (typeof value === "string") return JSON.stringify(value);
+  if (typeof value !== "object") return undefined;
+
+  const step = indent > 0 ? " ".repeat(indent) : "";
+  const nl = indent > 0 ? "\n" : "";
+  const childPad = indent > 0 ? step.repeat(depth + 1) : "";
+  const closePad = indent > 0 ? step.repeat(depth) : "";
+  const sep = indent > 0 ? ": " : ":";
+
+  if (Array.isArray(value)) {
+    if (value.length === 0) return "[]";
+    const items = value.map(
+      (item) =>
+        `${childPad}${formatProtoJsonValue(item, indent, depth + 1) ?? "null"}`
+    );
+    return `[${nl}${items.join(`,${nl}`)}${nl}${closePad}]`;
+  }
+
+  const obj = /** @type {Record<string, unknown>} */ (value);
+  /** @type {string[]} */
+  const entries = [];
+  for (const key of Object.keys(obj)) {
+    const rendered = formatProtoJsonValue(obj[key], indent, depth + 1);
+    if (rendered !== undefined) {
+      entries.push(`${childPad}${JSON.stringify(key)}${sep}${rendered}`);
+    }
+  }
+  if (entries.length === 0) return "{}";
+  return `{${nl}${entries.join(`,${nl}`)}${nl}${closePad}}`;
 }

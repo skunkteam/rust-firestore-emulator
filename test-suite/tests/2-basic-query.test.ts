@@ -712,6 +712,39 @@ describe.each(editions)('$description', fs => {
             expect(orderedIds.slice(0, 2)).toIncludeSameMembers(['double-2p53', 'int-2p53']);
             expect(orderedIds.slice(2)).toEqual(['int-2p53-plus-1', 'int-max', 'double-2p63']);
         });
+
+        test('implicit __name__ direction and deduplicated inequality cursor ordering', async () => {
+            const subCol = fs.collection.doc().collection('implicitOrderEdgeCases');
+            await Promise.all([
+                subCol.doc('doc-a').set(writeData({ val: 10 })),
+                subCol.doc('doc-b').set(writeData({ val: 10 })),
+                subCol.doc('doc-c').set(writeData({ val: 20 })),
+            ]);
+
+            const ids = async (q: Query) => (await q.get()).docs.map(d => d.id);
+
+            // Standard Edition inherits `DESC` for implicit `__name__` ties; Enterprise leaves ties unspecified.
+            const descIds = await ids(subCol.orderBy('val', 'desc'));
+            expect(descIds[0]).toBe('doc-c');
+            if (fs.enterprise) {
+                expect(descIds.slice(1)).toIncludeSameMembers(['doc-a', 'doc-b']);
+            } else {
+                expect(descIds.slice(1)).toEqual(['doc-b', 'doc-a']);
+            }
+
+            // Duplicate inequalities on a single field (`val > 0 AND val < 100`) must order cleanly in
+            // Standard Edition and paginate cleanly with snapshot `startAfter` (`[val ASC, __name__ ASC]`).
+            const ineqIds = await ids(subCol.where('val', '>', 0).where('val', '<', 100));
+            if (fs.enterprise) {
+                expect(ineqIds).toIncludeSameMembers(['doc-a', 'doc-b', 'doc-c']);
+            } else {
+                expect(ineqIds).toEqual(['doc-a', 'doc-b', 'doc-c']);
+            }
+
+            const docASnap = await subCol.doc('doc-a').get();
+            const afterAIds = await ids(subCol.where('val', '>', 0).where('val', '<', 100).startAfter(docASnap));
+            expect(afterAIds).toEqual(['doc-b', 'doc-c']);
+        });
     });
 
     async function getData(query: Query) {

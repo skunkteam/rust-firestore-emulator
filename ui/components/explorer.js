@@ -469,7 +469,8 @@ function renderDocumentInspector(p) {
             `}
       </div>
 
-      ${!p.docState.exists || !p.docState.editorSession
+      ${!p.docState.editorSession ||
+      (!p.docState.exists && !p.docState.editorSession.isDirty)
         ? html`
             <div class="phantom-card">
               <h3>Non-existent ancestor document (<i>${p.docId}</i>)</h3>

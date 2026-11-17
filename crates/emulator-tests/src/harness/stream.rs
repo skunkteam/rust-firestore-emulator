@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use googleapis::google::{
     firestore::v1::{
         BatchGetDocumentsResponse, Document, ExecutePipelineResponse, ListenRequest,
-        ListenResponse, RunAggregationQueryResponse, RunQueryResponse, Value,
+        ListenResponse, RunAggregationQueryResponse, RunQueryResponse, TargetChange, Value,
         batch_get_documents_response, listen_response::ResponseType,
         target_change::TargetChangeType,
     },
@@ -100,19 +100,29 @@ pub(crate) async fn collect_run_query(
     })
 }
 
+struct AbortOnDrop(Option<JoinHandle<()>>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        if let Some(handle) = self.0.take() {
+            handle.abort();
+        }
+    }
+}
+
 /// Drains `BatchGetDocuments` on a background collector task so large batches never stall
 /// server-side bounded channels, unpacking `error_in_stream` errors automatically.
 pub(crate) async fn collect_batch_get(
     mut stream: Streaming<BatchGetDocumentsResponse>,
 ) -> Result<BatchGetOutput, Status> {
     let (tx, mut rx) = mpsc::unbounded_channel();
-    let collector = tokio::spawn(async move {
+    let mut collector_guard = AbortOnDrop(Some(tokio::spawn(async move {
         while let Some(item) = stream.message().await.transpose() {
             if tx.send(item).is_err() {
                 break;
             }
         }
-    });
+    })));
 
     let mut items = Vec::new();
     let mut transaction = Vec::new();
@@ -137,7 +147,9 @@ pub(crate) async fn collect_batch_get(
         }
     }
 
-    let _unused = collector.await;
+    if let Some(collector) = collector_guard.0.take() {
+        let _unused = collector.await;
+    }
     Ok(BatchGetOutput {
         items,
         transaction,
@@ -255,41 +267,8 @@ impl ListenHandle {
             let frame = frame_res?;
             match frame.response_type {
                 Some(ResponseType::TargetChange(tc)) => {
-                    let change_type = TargetChangeType::try_from(tc.target_change_type)
-                        .unwrap_or(TargetChangeType::NoChange);
-                    match change_type {
-                        TargetChangeType::Add => {
-                            batch.added_targets.extend(tc.target_ids);
-                        }
-                        TargetChangeType::Reset => {
-                            batch.was_reset = true;
-                        }
-                        TargetChangeType::Current => {
-                            batch.saw_current = true;
-                            if tc.read_time.is_some() {
-                                batch.read_time = tc.read_time;
-                            }
-                            if !tc.resume_token.is_empty() {
-                                batch.resume_token = tc.resume_token;
-                            }
-                        }
-                        TargetChangeType::NoChange if tc.target_ids.is_empty() => {
-                            if tc.read_time.is_some() {
-                                batch.read_time = tc.read_time;
-                            }
-                            if !tc.resume_token.is_empty() {
-                                batch.resume_token = tc.resume_token;
-                            }
-                            return Ok(batch);
-                        }
-                        TargetChangeType::NoChange | TargetChangeType::Remove => {
-                            if let Some(cause) = tc.cause {
-                                return Err(Status::new(
-                                    tonic::Code::from_i32(cause.code),
-                                    cause.message,
-                                ));
-                            }
-                        }
+                    if apply_target_change(&mut batch, tc)? {
+                        return Ok(batch);
                     }
                 }
                 Some(ResponseType::DocumentChange(dc)) => {
@@ -325,5 +304,145 @@ impl Drop for ListenHandle {
         if let Some(task) = self.collector_task.take() {
             task.abort();
         }
+    }
+}
+
+fn apply_target_change(batch: &mut ListenBatch, tc: TargetChange) -> Result<bool, Status> {
+    if let Some(cause) = tc.cause {
+        return Err(Status::new(
+            tonic::Code::from_i32(cause.code),
+            cause.message,
+        ));
+    }
+    let change_type = TargetChangeType::try_from(tc.target_change_type).map_err(|_| {
+        Status::internal(format!(
+            "unknown TargetChangeType value: {}",
+            tc.target_change_type
+        ))
+    })?;
+    match change_type {
+        TargetChangeType::Add => {
+            batch.added_targets.extend(tc.target_ids);
+        }
+        TargetChangeType::Reset => {
+            batch.was_reset = true;
+        }
+        TargetChangeType::Current => {
+            batch.saw_current = true;
+            if tc.read_time.is_some() {
+                batch.read_time = tc.read_time;
+            }
+            if !tc.resume_token.is_empty() {
+                batch.resume_token = tc.resume_token;
+            }
+        }
+        TargetChangeType::NoChange if tc.target_ids.is_empty() => {
+            if tc.read_time.is_some() {
+                batch.read_time = tc.read_time;
+            }
+            if !tc.resume_token.is_empty() {
+                batch.resume_token = tc.resume_token;
+            }
+            return Ok(true);
+        }
+        TargetChangeType::NoChange | TargetChangeType::Remove => {}
+    }
+    Ok(false)
+}
+
+#[cfg(test)]
+mod tests {
+    use googleapis::google::rpc::Status as RpcStatus;
+    use tonic::Code;
+
+    use super::*;
+
+    #[test]
+    fn apply_target_change_surfaces_cause_on_no_change_with_empty_targets() {
+        let mut batch = ListenBatch::default();
+        let err = apply_target_change(
+            &mut batch,
+            TargetChange {
+                target_change_type: TargetChangeType::NoChange as i32,
+                target_ids: vec![],
+                cause: Some(RpcStatus {
+                    code:    Code::PermissionDenied as i32,
+                    message: "denied".to_string(),
+                    details: vec![],
+                }),
+                resume_token: vec![],
+                read_time: None,
+            },
+        )
+        .expect_err("TargetChange with cause must return Err even when target_ids is empty");
+        assert_eq!(err.code(), Code::PermissionDenied);
+        assert_eq!(err.message(), "denied");
+    }
+
+    #[test]
+    fn apply_target_change_rejects_unknown_change_type() {
+        let mut batch = ListenBatch::default();
+        let err = apply_target_change(
+            &mut batch,
+            TargetChange {
+                target_change_type: 999,
+                target_ids: vec![],
+                cause: None,
+                resume_token: vec![],
+                read_time: None,
+            },
+        )
+        .expect_err("unknown TargetChangeType must not silently complete batch");
+        assert_eq!(err.code(), Code::Internal);
+    }
+
+    #[test]
+    fn apply_target_change_completes_batch_on_valid_current_and_no_change() {
+        let mut batch = ListenBatch::default();
+        let ts = Timestamp {
+            seconds: 42,
+            nanos:   7,
+        };
+        assert!(
+            !apply_target_change(
+                &mut batch,
+                TargetChange {
+                    target_change_type: TargetChangeType::Current as i32,
+                    target_ids: vec![1],
+                    cause: None,
+                    resume_token: vec![1, 2],
+                    read_time: Some(ts),
+                },
+            )
+            .unwrap()
+        );
+        assert!(batch.saw_current);
+        assert!(
+            apply_target_change(
+                &mut batch,
+                TargetChange {
+                    target_change_type: TargetChangeType::NoChange as i32,
+                    target_ids: vec![],
+                    cause: None,
+                    resume_token: vec![1, 2],
+                    read_time: Some(ts),
+                },
+            )
+            .unwrap()
+        );
+        assert_eq!(batch.read_time, Some(ts));
+        assert_eq!(batch.resume_token, vec![1, 2]);
+    }
+
+    #[tokio::test]
+    async fn abort_on_drop_cancels_collector_task() {
+        let (tx, mut rx) = mpsc::channel::<()>(1);
+        let handle = tokio::spawn(async move {
+            futures::future::pending::<()>().await;
+            drop(tx);
+        });
+        let guard = AbortOnDrop(Some(handle));
+        drop(guard);
+        assert!(rx.recv().await.is_none());
     }
 }

@@ -85,8 +85,16 @@ jobs:
           node-version: 22
           cache: npm
           cache-dependency-path: test-suite/package-lock.json
+      - name: Install test-suite dependencies
+        run: npm ci
+        working-directory: test-suite
+      - name: Check test-suite lint and types
+        run: npm run lint && npx tsc -p tsconfig.json --noEmit
+        working-directory: test-suite
+      - name: Check Web UI JSDoc types
+        run: ./test-suite/node_modules/.bin/tsc --noEmit --allowJs --checkJs --strict --target es2022 --module es2022 --lib es2022,dom,dom.iterable ui/app.js
       - name: Run compatibility test suite
-        run: npm ci && npm run test:rust-emulator -- --maxConcurrency=3
+        run: npm run test:rust-emulator -- --maxConcurrency=3
         working-directory: test-suite
 
   deploy:

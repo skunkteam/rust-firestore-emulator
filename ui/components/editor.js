@@ -13,6 +13,8 @@ import {
   getValueType,
   isVectorMapValue,
   normalizeReference,
+  setFieldProperty,
+  stringifyProtoJson,
   validateDouble,
   validateGeoPoint,
   validateInteger64,
@@ -56,6 +58,7 @@ import {
  *   saving: boolean,
  *   saveError: string | null,
  *   externalDoc: FirestoreDocument | null,
+ *   deletedExternally: boolean,
  * }} EditorSession
  */
 
@@ -132,8 +135,8 @@ function valueToDraftNode(key, val) {
       node.text = val.bytesValue ?? "";
       break;
     case "geoPointValue":
-      node.latText = String(val.geoPointValue?.latitude ?? 0);
-      node.lngText = String(val.geoPointValue?.longitude ?? 0);
+      node.latText = formatDoubleInput(val.geoPointValue?.latitude ?? 0);
+      node.lngText = formatDoubleInput(val.geoPointValue?.longitude ?? 0);
       break;
     case "arrayValue":
       node.children = (val.arrayValue?.values ?? []).map((item, idx) =>
@@ -179,17 +182,17 @@ function collectMapNodes(nodes, projectId, databaseId, errors) {
   const seenKeys = new Set();
 
   for (const node of nodes) {
-    const trimmedKey = node.key.trim();
-    if (!trimmedKey) {
+    const key = node.key;
+    if (!key) {
       errors.set(node.id, "Field name is required");
-    } else if (seenKeys.has(trimmedKey)) {
-      errors.set(node.id, `Duplicate field name "${trimmedKey}"`);
+    } else if (seenKeys.has(key)) {
+      errors.set(node.id, `Duplicate field name "${key}"`);
     } else {
-      seenKeys.add(trimmedKey);
+      seenKeys.add(key);
     }
     const val = convertSingleNode(node, projectId, databaseId, false, errors);
-    if (trimmedKey && val) {
-      out[trimmedKey] = val;
+    if (key && val) {
+      setFieldProperty(out, key, val);
     }
   }
   return out;
@@ -308,7 +311,7 @@ function convertSingleNode(node, projectId, databaseId, inArray, errors) {
 export function createEditorSession(docPath, projectId, databaseId, doc) {
   const cleanDoc = doc ? structuredClone(doc) : null;
   const fields = cleanDoc?.fields ?? {};
-  const cleanJson = JSON.stringify({ fields }, null, 2);
+  const cleanJson = stringifyProtoJson({ fields }, 2);
   return {
     docPath,
     projectId,
@@ -324,6 +327,7 @@ export function createEditorSession(docPath, projectId, databaseId, doc) {
     saving: false,
     saveError: null,
     externalDoc: null,
+    deletedExternally: false,
   };
 }
 
@@ -335,7 +339,7 @@ export function createEditorSession(docPath, projectId, databaseId, doc) {
 export function syncSessionWithDocument(session, doc) {
   const cleanDoc = structuredClone(doc);
   const fields = cleanDoc.fields ?? {};
-  const cleanJson = JSON.stringify({ fields }, null, 2);
+  const cleanJson = stringifyProtoJson({ fields }, 2);
   session.cleanDoc = cleanDoc;
   session.cleanJson = cleanJson;
   session.rawBaselineText = cleanJson;
@@ -346,6 +350,7 @@ export function syncSessionWithDocument(session, doc) {
   session.saving = false;
   session.saveError = null;
   session.externalDoc = null;
+  session.deletedExternally = false;
 }
 
 /**
@@ -457,7 +462,7 @@ export function renderHybridEditor(props) {
         return;
       }
       session.rawText = session.isDirty
-        ? JSON.stringify({ fields: check.fields }, null, 2)
+        ? stringifyProtoJson({ fields: check.fields }, 2)
         : session.cleanJson;
       session.rawBaselineText = session.rawText;
       session.rawError = null;
@@ -504,10 +509,11 @@ export function renderHybridEditor(props) {
       syncSessionWithDocument(session, session.cleanDoc);
     } else {
       session.nodes = [];
-      session.rawText = JSON.stringify({ fields: {} }, null, 2);
+      session.rawText = stringifyProtoJson({ fields: {} }, 2);
       session.rawBaselineText = session.rawText;
       session.rawError = null;
       session.saveError = null;
+      session.deletedExternally = false;
       session.isDirty = false;
     }
     onChange();
@@ -595,33 +601,36 @@ export function renderHybridEditor(props) {
           `
         : nothing}
 
-      ${session.externalDoc
+      ${session.deletedExternally
         ? html`
             <div class="conflict-banner">
               <span>
-                This document was updated externally while you have unsaved edits.
+                This document was deleted externally while you have unsaved edits.
               </span>
               <div style="display: flex; gap: 6px;">
                 <button
                   type="button"
                   class="btn btn-sm"
                   @click=${() => {
-                    if (session.externalDoc) {
-                      syncSessionWithDocument(session, session.externalDoc);
-                      onChange();
-                    }
+                    session.cleanDoc = null;
+                    session.cleanJson = stringifyProtoJson({ fields: {} }, 2);
+                    session.rawBaselineText = session.cleanJson;
+                    session.deletedExternally = false;
+                    session.isDirty = false;
+                    onChange();
                   }}
                 >
-                  Reload external version
+                  Discard my edits
                 </button>
                 <button
                   type="button"
                   class="btn btn-sm"
                   @click=${() => {
-                    if (session.externalDoc && session.cleanDoc) {
-                      session.cleanDoc.updateTime = session.externalDoc.updateTime;
-                    }
-                    session.externalDoc = null;
+                    session.cleanDoc = null;
+                    session.cleanJson = stringifyProtoJson({ fields: {} }, 2);
+                    session.rawBaselineText = session.cleanJson;
+                    session.deletedExternally = false;
+                    recomputeDirty(session);
                     onChange();
                   }}
                 >
@@ -630,7 +639,42 @@ export function renderHybridEditor(props) {
               </div>
             </div>
           `
-        : nothing}
+        : session.externalDoc
+          ? html`
+              <div class="conflict-banner">
+                <span>
+                  This document was updated externally while you have unsaved edits.
+                </span>
+                <div style="display: flex; gap: 6px;">
+                  <button
+                    type="button"
+                    class="btn btn-sm"
+                    @click=${() => {
+                      if (session.externalDoc) {
+                        syncSessionWithDocument(session, session.externalDoc);
+                        onChange();
+                      }
+                    }}
+                  >
+                    Reload external version
+                  </button>
+                  <button
+                    type="button"
+                    class="btn btn-sm"
+                    @click=${() => {
+                      if (session.externalDoc && session.cleanDoc) {
+                        session.cleanDoc.updateTime = session.externalDoc.updateTime;
+                      }
+                      session.externalDoc = null;
+                      onChange();
+                    }}
+                  >
+                    Keep my edits
+                  </button>
+                </div>
+              </div>
+            `
+          : nothing}
 
       ${session.saveError
         ? html`<div class="error-banner">${session.saveError}</div>`
@@ -766,7 +810,7 @@ function renderDraftNode(
           : html`
               <input
                 type="text"
-                class="input field-key-input ${!node.key.trim() ? "input-error" : ""}"
+                class="input field-key-input ${!node.key ? "input-error" : ""}"
                 placeholder="field name"
                 .value=${node.key}
                 @input=${(/** @type {Event} */ e) => {

@@ -83,7 +83,29 @@ export async function readDataRef<T = DocumentData>(ref: DocumentReference) {
     return readData<T>(snap.data());
 }
 
-afterAll(async () => await standard.recursiveDelete(standardCollection));
+afterAll(async () => {
+    try {
+        await standard.recursiveDelete(standardCollection);
+    } finally {
+        await standard.terminate();
+    }
+});
 // Note that `recursiveDelete` currently does not work on sub-collections with Firestore Enterprise edition
-afterAll(async () => await enterprise.recursiveDelete(enterpriseDoc));
-afterAll(async () => await enterprisePessimistic.recursiveDelete(enterprisePessimisticDoc));
+afterAll(async () => {
+    try {
+        if (connection !== 'JAVA EMULATOR') {
+            await enterprise.recursiveDelete(enterpriseDoc);
+        }
+    } finally {
+        await enterprise.terminate();
+    }
+});
+afterAll(async () => {
+    try {
+        if (connection !== 'JAVA EMULATOR') {
+            await enterprisePessimistic.recursiveDelete(enterprisePessimisticDoc);
+        }
+    } finally {
+        await enterprisePessimistic.terminate();
+    }
+});

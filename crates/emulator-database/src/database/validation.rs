@@ -100,7 +100,15 @@ pub(crate) fn validate_field_transforms(transforms: &[FieldTransform]) -> Result
                     validate_writable_value(item, true)?;
                 }
             }
-            TransformType::Increment(v) | TransformType::Maximum(v) | TransformType::Minimum(v) => {
+            TransformType::Increment(v) => {
+                validate_writable_value(v, false)?;
+                if !v.is_number() {
+                    return Err(GenericDatabaseError::invalid_argument(
+                        "increment value must be an integer or double",
+                    ));
+                }
+            }
+            TransformType::Maximum(v) | TransformType::Minimum(v) => {
                 validate_writable_value(v, false)?;
             }
         }
@@ -417,6 +425,41 @@ mod tests {
             ]),
             ok(())
         );
+
+        // Non-numeric Increment operands are rejected with InvalidArgument.
+        for non_numeric in [
+            Value::string("abc"),
+            Value::boolean(true),
+            Value::null(),
+            Value::array(vec![Value::integer(1)]),
+            Value::map(HashMap::from([("k".to_string(), Value::integer(1))])),
+        ] {
+            assert_that!(
+                validate_field_transforms(&[FieldTransform {
+                    field_path:     "cnt".to_string(),
+                    transform_type: Some(TransformType::Increment(non_numeric)),
+                }]),
+                err(eq(&GenericDatabaseError::invalid_argument(
+                    "increment value must be an integer or double"
+                )))
+            );
+        }
+
+        // Integer and double (including NaN/Infinity) Increment operands remain valid.
+        for numeric in [
+            Value::integer(1),
+            Value::double(1.5),
+            Value::double(f64::NAN),
+            Value::double(f64::INFINITY),
+        ] {
+            assert_that!(
+                validate_field_transforms(&[FieldTransform {
+                    field_path:     "cnt".to_string(),
+                    transform_type: Some(TransformType::Increment(numeric)),
+                }]),
+                ok(())
+            );
+        }
     }
 
     #[gtest]

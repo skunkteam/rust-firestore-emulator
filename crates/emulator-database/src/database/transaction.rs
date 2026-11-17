@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, HashSet, hash_map::Entry},
+    collections::{BTreeMap, HashMap, HashSet, hash_map::Entry},
     fmt::Display,
     sync::{
         Arc, LazyLock, Weak,
@@ -9,11 +9,11 @@ use std::{
 
 use googleapis::google::protobuf::Timestamp;
 use tokio::sync::{Mutex, MutexGuard, RwLock};
-use tracing::{Level, instrument};
 
 use super::{
     FirestoreDatabase,
     document::{OwnedDocumentContentsReadGuard, OwnedDocumentContentsWriteGuard},
+    read_consistency::validate_read_time,
     reference::DocumentRef,
 };
 use crate::{
@@ -54,7 +54,14 @@ impl RunningTransactions {
         id
     }
 
-    pub(crate) async fn start_read_only(&self, read_time: Option<Timestamp>) -> TransactionId {
+    pub(crate) async fn start_read_only(
+        &self,
+        read_time: Option<Timestamp>,
+    ) -> Result<TransactionId> {
+        let read_time = match read_time {
+            Some(time) => validate_read_time(time)?,
+            None => Timestamp::now(),
+        };
         let id = TransactionId::new();
         let txn = Arc::new(Transaction::ReadOnly(ReadOnlyTransaction::new(
             id,
@@ -62,7 +69,7 @@ impl RunningTransactions {
             read_time,
         )));
         self.txns.write().await.insert(id, txn);
-        id
+        Ok(id)
     }
 
     pub(crate) async fn start_read_write_with_id(
@@ -125,7 +132,7 @@ impl Transaction {
                 ConcurrencyMode::Pessimistic(_) => None,
                 ConcurrencyMode::Optimistic(state) => Some(*state.read_time),
             },
-            Transaction::ReadOnly(txn) => txn.read_time,
+            Transaction::ReadOnly(txn) => Some(txn.read_time),
         }
     }
 }
@@ -148,11 +155,14 @@ impl PessimisticState {
         &self,
         name: &DocumentRef,
     ) -> Result<Option<Arc<StoredDocumentVersion>>> {
-        Ok(self
-            .managed_read_guard(name)
-            .await?
-            .current_version()
-            .cloned())
+        let mut guards = self.guards.lock().await;
+        if let Some(guard) = guards.get(name) {
+            return Ok(guard.current_version().cloned());
+        }
+        let guard: Arc<OwnedDocumentContentsReadGuard> = self.new_read_guard(name).await?.into();
+        let version = guard.current_version().cloned();
+        guards.insert(name.clone(), guard);
+        Ok(version)
     }
 
     /// Returns a handle that can be used to temporarily lock documents in order to evaluate whether
@@ -188,20 +198,6 @@ impl PessimisticState {
         read_guard.upgrade().await
     }
 
-    #[instrument(level = Level::DEBUG, skip_all)]
-    async fn managed_read_guard(
-        &self,
-        name: &DocumentRef,
-    ) -> Result<Arc<OwnedDocumentContentsReadGuard>> {
-        let mut guards = self.guards.lock().await;
-        if let Some(guard) = guards.get(name) {
-            return Ok(Arc::clone(guard));
-        }
-        let guard = self.new_read_guard(name).await?.into();
-        guards.insert(name.clone(), Arc::clone(&guard));
-        Ok(guard)
-    }
-
     async fn new_read_guard(&self, name: &DocumentRef) -> Result<OwnedDocumentContentsReadGuard> {
         self.database
             .upgrade()
@@ -214,10 +210,16 @@ impl PessimisticState {
 }
 
 #[derive(Debug)]
+pub(crate) struct ExecutedQuery {
+    pub(crate) query:    Query,
+    pub(crate) snapshot: Vec<(DocumentRef, Timestamp)>,
+}
+
+#[derive(Debug)]
 pub(crate) struct OptimisticState {
     database: Weak<FirestoreDatabase>,
     pub(crate) observed_docs: Mutex<HashSet<DocumentRef>>,
-    pub(crate) executed_queries: Mutex<Vec<Query>>,
+    pub(crate) executed_queries: Mutex<Vec<ExecutedQuery>>,
     pub(crate) read_time: LazyLock<Timestamp>,
 }
 
@@ -258,7 +260,10 @@ impl OptimisticState {
             .await
     }
 
-    pub(crate) async fn check_concurrency_violations(&self) -> Result<()> {
+    pub(crate) async fn check_concurrency_violations(
+        &self,
+        held_write_guards: &BTreeMap<DocumentRef, OwnedDocumentContentsWriteGuard>,
+    ) -> Result<()> {
         let db = self
             .database
             .upgrade()
@@ -269,9 +274,13 @@ impl OptimisticState {
         {
             let observed = self.observed_docs.lock().await;
             for name in observed.iter() {
-                let meta = db.get_doc_meta(name).await?;
-                let rg = meta.read().await?;
-                let check_time = rg.last_updated();
+                let check_time = if let Some(wg) = held_write_guards.get(name) {
+                    wg.last_updated()
+                } else {
+                    let meta = db.get_doc_meta(name).await?;
+                    let rg = meta.read().await?;
+                    rg.last_updated()
+                };
                 if check_time.is_some_and(|time| time > rt) {
                     return Err(GenericDatabaseError::aborted(
                         "contention: document modified",
@@ -283,18 +292,28 @@ impl OptimisticState {
         // VERIFY QUERIES
         {
             let mut executed_queries = self.executed_queries.lock().await;
-            for query in executed_queries.iter_mut() {
-                let (_, result_docs) = query.once(&db).await.map_err(|_| {
-                    GenericDatabaseError::aborted(
-                        "contention: concurrent modification invalidated query",
-                    )
-                })?;
-                for m in result_docs {
-                    if m.version.update_time > rt {
-                        return Err(GenericDatabaseError::aborted(
-                            "contention: query result changed",
-                        ));
-                    }
+            for ExecutedQuery { query, snapshot } in executed_queries.iter_mut() {
+                let (_, result_docs) = query
+                    .once_for_validation(&db, held_write_guards)
+                    .await
+                    .map_err(|_| {
+                        GenericDatabaseError::aborted(
+                            "contention: concurrent modification invalidated query",
+                        )
+                    })?;
+                if result_docs.len() != snapshot.len()
+                    || result_docs
+                        .iter()
+                        .zip(snapshot.iter())
+                        .any(|(m, (name, update_time))| {
+                            m.version.name != *name
+                                || m.version.update_time != *update_time
+                                || m.version.update_time > rt
+                        })
+                {
+                    return Err(GenericDatabaseError::aborted(
+                        "contention: query result changed",
+                    ));
                 }
             }
         }
@@ -362,10 +381,19 @@ impl ReadWriteTransaction {
         }
     }
 
-    pub(crate) async fn check_concurrency_violations(&self) -> Result<()> {
+    pub(crate) fn is_optimistic(&self) -> bool {
+        matches!(self.mode, ConcurrencyMode::Optimistic(_))
+    }
+
+    pub(crate) async fn check_concurrency_violations(
+        &self,
+        held_write_guards: &BTreeMap<DocumentRef, OwnedDocumentContentsWriteGuard>,
+    ) -> Result<()> {
         match &self.mode {
             ConcurrencyMode::Pessimistic(_) => Ok(()),
-            ConcurrencyMode::Optimistic(state) => state.check_concurrency_violations().await,
+            ConcurrencyMode::Optimistic(state) => {
+                state.check_concurrency_violations(held_write_guards).await
+            }
         }
     }
 
@@ -420,14 +448,14 @@ pub(crate) struct ReadOnlyTransaction {
     #[allow(dead_code)] // For logging
     pub(crate) id: TransactionId,
     pub(crate) database: Weak<FirestoreDatabase>,
-    pub(crate) read_time: Option<Timestamp>,
+    pub(crate) read_time: Timestamp,
 }
 
 impl ReadOnlyTransaction {
     pub(crate) fn new(
         id: TransactionId,
         database: Weak<FirestoreDatabase>,
-        read_time: Option<Timestamp>,
+        read_time: Timestamp,
     ) -> Self {
         Self {
             id,
@@ -444,11 +472,7 @@ impl ReadOnlyTransaction {
             .get_doc_meta(name)
             .await?;
         let lock = doc.read().await?;
-        let version = match self.read_time {
-            Some(read_time) => lock.version_at_time(read_time),
-            None => lock.current_version(),
-        };
-        Ok(version.cloned())
+        Ok(lock.version_at_time(self.read_time).cloned())
     }
 }
 
@@ -459,14 +483,14 @@ static NEXT_TXN_ID: AtomicUsize = AtomicUsize::new(1);
 
 impl TransactionId {
     fn new() -> Self {
-        Self(NEXT_TXN_ID.fetch_add(1, atomic::Ordering::Relaxed))
+        Self(NEXT_TXN_ID.fetch_add(1, atomic::Ordering::Release))
     }
 
     /// Check if the given [`TransactionId`] could have been issued by the currently running
     /// instance. This doesn't guarantee that the given id is valid, but it prevents collisions with
     /// future IDs.
     fn check(self) -> Result<()> {
-        if self.0 < NEXT_TXN_ID.load(atomic::Ordering::Relaxed) {
+        if (1..NEXT_TXN_ID.load(atomic::Ordering::Acquire)).contains(&self.0) {
             Ok(())
         } else {
             Err(GenericDatabaseError::InvalidArgument(format!(
@@ -496,5 +520,65 @@ impl TryFrom<Vec<u8>> for TransactionId {
 impl From<TransactionId> for Vec<u8> {
     fn from(val: TransactionId) -> Self {
         val.0.to_ne_bytes().into()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn transaction_id_check_rejects_zero_and_future_ids() {
+        assert!(matches!(
+            TransactionId(0).check(),
+            Err(GenericDatabaseError::InvalidArgument(_))
+        ));
+
+        let issued = TransactionId::new();
+        assert!(issued.check().is_ok());
+
+        let unissued = TransactionId(NEXT_TXN_ID.load(atomic::Ordering::Acquire) + 100);
+        assert!(matches!(
+            unissued.check(),
+            Err(GenericDatabaseError::InvalidArgument(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn start_read_only_validates_and_pins_read_time() {
+        let txns = RunningTransactions::new(Weak::new());
+
+        // Missing read_time is pinned at creation.
+        let id = txns.start_read_only(None).await.unwrap();
+        let pinned = txns.get(id).await.unwrap().read_time().unwrap();
+        let later = Timestamp::now();
+        assert!(later > pinned);
+        assert_eq!(txns.get(id).await.unwrap().read_time(), Some(pinned));
+
+        // Unix epoch is accepted.
+        let epoch = Timestamp {
+            seconds: 0,
+            nanos:   0,
+        };
+        let epoch_id = txns.start_read_only(Some(epoch)).await.unwrap();
+        assert_eq!(txns.get(epoch_id).await.unwrap().read_time(), Some(epoch));
+
+        // Negative seconds and future timestamps are rejected.
+        assert!(matches!(
+            txns.start_read_only(Some(Timestamp {
+                seconds: -1,
+                nanos:   0,
+            }))
+            .await,
+            Err(GenericDatabaseError::InvalidArgument(_))
+        ));
+        assert!(matches!(
+            txns.start_read_only(Some(Timestamp {
+                seconds: later.seconds + 60,
+                nanos:   0,
+            }))
+            .await,
+            Err(GenericDatabaseError::InvalidArgument(_))
+        ));
     }
 }

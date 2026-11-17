@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeSet, HashMap, hash_map::Entry},
+    collections::{BTreeMap, BTreeSet, HashMap},
     sync::{
         Arc, Weak,
         atomic::{self, AtomicBool},
@@ -18,7 +18,7 @@ use googleapis::google::{
 use itertools::Itertools;
 use string_cache::DefaultAtom;
 use tokio::sync::{
-    RwLock,
+    Mutex, RwLock,
     broadcast::{self, Receiver},
 };
 use tracing::{Level, Span, debug, field::display, instrument};
@@ -26,15 +26,16 @@ use tracing::{Level, Span, debug, field::display, instrument};
 use self::{
     collection::Collection,
     document::{
-        DocumentMeta, DocumentVersion, OwnedDocumentContentsWriteGuard, StoredDocumentVersion,
+        DeletedDocumentVersion, DocumentMeta, DocumentPrecondition, DocumentVersion,
+        OwnedDocumentContentsWriteGuard, StoredDocumentVersion, check_version_precondition,
     },
     event::{DatabaseEvent, ProjectEvent},
     field_path::FieldPath,
     projection::{Project, Projection},
     query::{Direction, Query, QueryBuilder},
-    read_consistency::ReadConsistency,
+    read_consistency::{ReadConsistency, validate_read_time},
     reference::{CollectionRef, DocumentRef, Ref, RootRef},
-    transaction::{RunningTransactions, TransactionId},
+    transaction::{ReadWriteTransaction, RunningTransactions, TransactionId},
 };
 use crate::{
     FirestoreProject, GenericDatabaseError, database::field_path::FieldReference, error::Result,
@@ -64,9 +65,11 @@ pub struct FirestoreDatabase {
     pub name: RootRef,
     enterprise_edition: AtomicBool,
     optimistic_concurrency: AtomicBool,
+    cleared: AtomicBool,
     collections: RwLock<HashMap<DefaultAtom, Arc<Collection>>>,
     transactions: RunningTransactions,
-    events: broadcast::Sender<Arc<DatabaseEvent>>,
+    optimistic_commit_lock: Mutex<()>,
+    events: std::sync::Mutex<Option<broadcast::Sender<Arc<DatabaseEvent>>>>,
 }
 
 impl FirestoreDatabase {
@@ -80,10 +83,40 @@ impl FirestoreDatabase {
             name,
             enterprise_edition: AtomicBool::new(enterprise_edition),
             optimistic_concurrency: AtomicBool::new(enterprise_edition),
+            cleared: AtomicBool::new(false),
             collections: Default::default(),
             transactions: RunningTransactions::new(Weak::clone(database)),
-            events: broadcast::channel(MAX_EVENT_BACKLOG).0,
+            optimistic_commit_lock: Default::default(),
+            events: std::sync::Mutex::new(Some(broadcast::channel(MAX_EVENT_BACKLOG).0)),
         })
+    }
+
+    pub(crate) fn mark_cleared(&self) {
+        self.cleared.store(true, atomic::Ordering::Release);
+        let sender = self
+            .events
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        drop(sender);
+    }
+
+    pub(crate) fn is_cleared(&self) -> bool {
+        self.cleared.load(atomic::Ordering::Acquire)
+    }
+
+    fn ensure_owns_root(&self, root_ref: &RootRef) -> Result<()> {
+        if root_ref != &self.name {
+            return Err(GenericDatabaseError::invalid_argument(format!(
+                "resource root {root_ref} does not match database {}",
+                self.name
+            )));
+        }
+        Ok(())
+    }
+
+    fn ensure_owns_doc(&self, doc_ref: &DocumentRef) -> Result<()> {
+        self.ensure_owns_root(&doc_ref.collection_ref.root_ref)
     }
 
     #[instrument(level = Level::DEBUG, skip_all, err, fields(txn_id, found))]
@@ -101,13 +134,15 @@ impl FirestoreDatabase {
                 .await?
                 .current_version()
                 .cloned(),
-            ReadConsistency::ReadTime(time) => self
-                .get_doc_meta(name)
-                .await?
-                .read()
-                .await?
-                .version_at_time(time)
-                .cloned(),
+            ReadConsistency::ReadTime(time) => {
+                let time = validate_read_time(time)?;
+                self.get_doc_meta(name)
+                    .await?
+                    .read()
+                    .await?
+                    .version_at_time(time)
+                    .cloned()
+            }
             ReadConsistency::Transaction(id) => {
                 Span::current().record("txn_id", display(id));
                 self.transactions.get(id).await?.read_doc(name).await?
@@ -130,6 +165,7 @@ impl FirestoreDatabase {
     }
 
     pub(crate) async fn get_doc_meta(&self, name: &DocumentRef) -> Result<Arc<DocumentMeta>> {
+        self.ensure_owns_doc(name)?;
         let meta = self
             .get_collection(&name.collection_ref)
             .await
@@ -143,6 +179,7 @@ impl FirestoreDatabase {
     /// - the result will be empty if `parent` is a [`Ref::Collection`].
     #[instrument(level = Level::DEBUG, skip_all)]
     pub async fn get_collection_ids(&self, parent: &Ref) -> Result<BTreeSet<String>> {
+        self.ensure_owns_root(parent.root())?;
         // Cannot use `filter_map` because of the `await`.
         let mut result = BTreeSet::new();
         if matches!(parent, Ref::Collection(_)) {
@@ -168,10 +205,13 @@ impl FirestoreDatabase {
     /// - IDs may point to documents that do not exist.
     #[instrument(level = Level::DEBUG, skip_all)]
     pub async fn get_document_ids(&self, parent: &CollectionRef) -> Result<BTreeSet<String>> {
+        self.ensure_owns_root(&parent.root_ref)?;
         // Cannot use `filter_map` because of the `await`.
         let mut result = BTreeSet::new();
         for doc in self.get_collection(parent).await.docs().await {
-            result.insert(doc.name.document_id.to_string());
+            if doc.read().await?.exists() {
+                result.insert(doc.name.document_id.to_string());
+            }
         }
         for col in self.get_all_collections().await {
             let Some(path) = col.name.strip_collection_prefix(parent) else {
@@ -215,6 +255,7 @@ impl FirestoreDatabase {
         aggregations: Vec<Aggregation>,
         consistency: ReadConsistency,
     ) -> Result<(Timestamp, HashMap<String, Value>)> {
+        self.ensure_owns_root(parent.root())?;
         unimplemented_option!(query.select);
         let mut query =
             Query::from_structured(parent, query, consistency, self.enterprise_edition())?;
@@ -339,9 +380,19 @@ impl FirestoreDatabase {
         write: Write,
     ) -> Result<(WriteResult, Option<Arc<StoredDocumentVersion>>)> {
         let name = get_doc_name_from_write(&write)?;
+        self.ensure_owns_doc(&name)?;
+        validation::validate_write(&write)?;
         let mut guard = self.get_doc_meta(&name).await?.write_owned().await?;
+        if self.is_cleared() {
+            return Err(GenericDatabaseError::aborted("database was cleared"));
+        }
         let update_time = guard.acquire_time;
-        let (result, new_version) = self.perform_write(write, &mut guard, update_time).await?;
+        let mut staged = StagedDocument::new(&mut guard);
+        let result = self.stage_write(write, &mut staged, update_time)?;
+        let new_version = staged.pending.take();
+        if let Some(ref version) = new_version {
+            guard.maybe_add_version(version)?;
+        }
         let current_stored = guard.current_version().cloned();
         drop(guard);
         if let Some(new_version) = new_version {
@@ -365,6 +416,11 @@ impl FirestoreDatabase {
         if document_id.is_empty() {
             return Err(GenericDatabaseError::invalid_argument(
                 "document_id is required",
+            ));
+        }
+        if document_id.contains('/') {
+            return Err(GenericDatabaseError::invalid_argument(
+                "document_id cannot contain '/'",
             ));
         }
         let doc_ref: DocumentRef = format!("{parent}/{document_id}").parse()?;
@@ -442,6 +498,7 @@ impl FirestoreDatabase {
 
     #[instrument(level = Level::DEBUG, skip_all, err)]
     pub async fn delete_prefix(self: &Arc<Self>, prefix: &Ref) -> Result<usize> {
+        self.ensure_owns_root(prefix.root())?;
         let mut to_delete = BTreeSet::new();
         if let Ref::Document(doc_ref) = prefix {
             let meta = self.get_doc_meta(doc_ref).await?;
@@ -479,6 +536,7 @@ impl FirestoreDatabase {
         show_missing: bool,
         consistency: ReadConsistency,
     ) -> Result<(Vec<Document>, String)> {
+        self.ensure_owns_root(parent.root())?;
         if page_size < 0 {
             return Err(GenericDatabaseError::invalid_argument(
                 "page_size must be non-negative",
@@ -561,51 +619,78 @@ impl FirestoreDatabase {
         writes: Vec<Write>,
         transaction: TransactionId,
     ) -> Result<(Timestamp, Vec<WriteResult>)> {
-        let txn = self.transactions.get(transaction).await?;
+        // Consume the transaction up front so concurrent commit/rollback calls cannot race and
+        // failed or cancelled commits immediately release any held read locks and free the ID.
+        let txn = self.transactions.remove(transaction).await?;
         let rw_txn = txn.as_read_write();
 
-        // No write-skew possible when no writes, do not abort even if things changed.
-        if let Some(rw_txn) = rw_txn
-            && !writes.is_empty()
-        {
-            rw_txn.check_concurrency_violations().await?;
-        }
-
-        let mut write_results = vec![];
-        let mut updates = HashMap::new();
-        let mut write_guard_cache = HashMap::<DocumentRef, OwnedDocumentContentsWriteGuard>::new();
-        // This must be done in two phases. First acquire the lock on all docs, only then start to
-        // update them.
+        let mut target_docs = BTreeSet::new();
         for write in &writes {
             let name = get_doc_name_from_write(write)?;
-            let txn = rw_txn.as_ref().ok_or_else(|| {
-                GenericDatabaseError::invalid_argument(
+            if rw_txn.is_none() {
+                return Err(GenericDatabaseError::invalid_argument(
                     "Cannot modify entities in a read-only transaction",
-                )
-            })?;
-            validation::validate_write(write)?;
-            if let Entry::Vacant(entry) = write_guard_cache.entry(name.clone()) {
-                entry.insert(txn.get_write_guard(&name).await?);
+                ));
             }
+            self.ensure_owns_doc(&name)?;
+            validation::validate_write(write)?;
+            target_docs.insert(name);
+        }
+
+        // Serialize optimistic validation-through-commit critical sections so concurrent
+        // optimistic transactions cannot pass validation against each other's pre-commit state.
+        let _optimistic_guard =
+            if rw_txn.is_some_and(ReadWriteTransaction::is_optimistic) && !writes.is_empty() {
+                Some(self.optimistic_commit_lock.lock().await)
+            } else {
+                None
+            };
+
+        // Acquire write locks in sorted DocumentRef order to prevent AB-BA deadlocks across
+        // concurrent multi-document commits, validate optimistic read sets against those held
+        // write guards, and stage all mutations before updating any document so failed writes
+        // leave all documents untouched.
+        let mut write_guard_cache = BTreeMap::<DocumentRef, OwnedDocumentContentsWriteGuard>::new();
+        if let Some(txn) = rw_txn {
+            for name in target_docs {
+                write_guard_cache.insert(name.clone(), txn.get_write_guard(&name).await?);
+            }
+            // No write-skew possible when no writes, do not abort even if things changed.
+            if !writes.is_empty() {
+                txn.check_concurrency_violations(&write_guard_cache).await?;
+            }
+            if self.is_cleared() {
+                return Err(GenericDatabaseError::aborted("database was cleared"));
+            }
+        }
+
+        let time = Timestamp::now();
+
+        let mut staged_docs: BTreeMap<DocumentRef, StagedDocument<'_>> = write_guard_cache
+            .iter_mut()
+            .map(|(name, guard)| (name.clone(), StagedDocument::new(guard)))
+            .collect();
+        let mut write_results = Vec::with_capacity(writes.len());
+
+        for write in writes {
+            let name = get_doc_name_from_write(&write)?;
+            let staged = staged_docs.get_mut(&name).unwrap();
+            write_results.push(self.stage_write(write, staged, time)?);
         }
 
         if let Some(txn) = rw_txn {
             txn.prepare_commit().await;
         }
 
-        let time = Timestamp::now();
-
-        for write in writes {
-            let name = get_doc_name_from_write(&write)?;
-            let guard = write_guard_cache.get_mut(&name).unwrap();
-            let (write_result, version) = self.perform_write(write, guard, time).await?;
-            write_results.push(write_result);
-            if let Some(version) = version {
-                updates.insert(name.clone(), version);
+        let mut updates = HashMap::new();
+        for (name, staged) in staged_docs {
+            if let Some(version) = staged.pending {
+                staged.guard.maybe_add_version(&version)?;
+                updates.insert(name, version);
             }
         }
-
-        self.transactions.remove(transaction).await?;
+        drop(write_guard_cache);
+        drop(_optimistic_guard);
 
         self.send_event(DatabaseEvent {
             database: Arc::downgrade(self),
@@ -617,12 +702,12 @@ impl FirestoreDatabase {
     }
 
     #[instrument(level = Level::DEBUG, skip_all, err)]
-    async fn perform_write(
+    fn stage_write(
         &self,
         write: Write,
-        document: &mut OwnedDocumentContentsWriteGuard,
+        document: &mut StagedDocument<'_>,
         commit_time: Timestamp,
-    ) -> Result<(WriteResult, Option<DocumentVersion>)> {
+    ) -> Result<WriteResult> {
         let Write {
             update_mask,
             update_transforms,
@@ -642,9 +727,9 @@ impl FirestoreDatabase {
         let mut transform_results = vec![];
 
         use write::Operation::*;
-        let (update_time, document_version) = match operation {
+        let update_time = match operation {
             Update(doc) => {
-                debug!(name = %document.name, "Update");
+                debug!(name = %document.guard.name, "Update");
                 validation::validate_writable_fields(&doc.fields)?;
                 if let Some(mask) = &update_mask {
                     validation::validate_update_mask(mask)?;
@@ -652,7 +737,11 @@ impl FirestoreDatabase {
                 validation::validate_field_transforms(&update_transforms)?;
 
                 let mut fields = if let Some(mask) = update_mask {
-                    apply_updates(document, mask, &doc.fields)?
+                    apply_updates(
+                        document.current_version().map(|v| &v.fields),
+                        mask,
+                        &doc.fields,
+                    )?
                 } else {
                     doc.fields
                 };
@@ -669,24 +758,22 @@ impl FirestoreDatabase {
                     )?);
                 }
                 validate_writable_fields(&fields)?;
-                document.maybe_update(fields, commit_time).await?
+                document.stage_update(fields, commit_time)?
             }
             Delete(_) => {
-                debug!(name = %document.name, "Delete");
+                debug!(name = %document.guard.name, "Delete");
 
                 unimplemented_option!(update_mask);
                 unimplemented_collection!(update_transforms);
-                (commit_time, Some(document.delete(commit_time).await?))
+                document.stage_delete(commit_time)?;
+                commit_time
             }
             Transform(_) => unimplemented!("transform"),
         };
-        Ok((
-            WriteResult {
-                update_time: Some(update_time),
-                transform_results,
-            },
-            document_version,
-        ))
+        Ok(WriteResult {
+            update_time: Some(update_time),
+            transform_results,
+        })
     }
 
     pub async fn get_read_time(&self, consistency: ReadConsistency) -> Result<Timestamp> {
@@ -696,21 +783,21 @@ impl FirestoreDatabase {
                 let txn = self.transactions.get(id).await?;
                 Ok(txn.read_time().unwrap_or_else(Timestamp::now))
             }
-            ReadConsistency::ReadTime(time) => Ok(time),
+            ReadConsistency::ReadTime(time) => validate_read_time(time),
         }
     }
 
     pub async fn new_txn(&self, transaction_options: TransactionOptions) -> Result<TransactionId> {
         use transaction_options::*;
         let id = match transaction_options.mode {
-            None => self.transactions.start_read_only(None).await,
+            None => self.transactions.start_read_only(None).await?,
             Some(Mode::ReadOnly(ro)) => {
                 self.transactions
                     .start_read_only(
                         ro.consistency_selector
                             .map(|read_only::ConsistencySelector::ReadTime(read_time)| read_time),
                     )
-                    .await
+                    .await?
             }
             Some(Mode::ReadWrite(rw)) if rw.retry_transaction.is_empty() => {
                 self.transactions
@@ -734,6 +821,13 @@ impl FirestoreDatabase {
     }
 
     pub fn send_event(&self, event: DatabaseEvent) {
+        let events = self
+            .events
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(sender) = events.as_ref() else {
+            return;
+        };
         if !event.updates.is_empty() {
             let mut paths: Vec<String> = event.updates.keys().map(ToString::to_string).collect();
             paths.sort();
@@ -746,11 +840,15 @@ impl FirestoreDatabase {
         }
         // A send operation can only fail if there are no active receivers,
         // which is ok by me.
-        let _unused = self.events.send(event.into());
+        let _unused = sender.send(event.into());
     }
 
     pub fn subscribe(&self) -> Receiver<Arc<DatabaseEvent>> {
-        self.events.subscribe()
+        self.events
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .map_or_else(|| broadcast::channel(1).1, broadcast::Sender::subscribe)
     }
 
     pub fn enterprise_edition(&self) -> bool {
@@ -758,10 +856,15 @@ impl FirestoreDatabase {
     }
 
     pub fn set_enterprise_edition(&self, enterprise_edition: bool) {
+        let events = self
+            .events
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if self
             .enterprise_edition
             .swap(enterprise_edition, atomic::Ordering::Relaxed)
             != enterprise_edition
+            && events.is_some()
         {
             self.project
                 .send_project_event(ProjectEvent::DatabaseConfigChanged {
@@ -775,10 +878,15 @@ impl FirestoreDatabase {
     }
 
     pub fn set_optimistic_concurrency(&self, optimistic_concurrency: bool) {
+        let events = self
+            .events
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if self
             .optimistic_concurrency
             .swap(optimistic_concurrency, atomic::Ordering::Relaxed)
             != optimistic_concurrency
+            && events.is_some()
         {
             self.project
                 .send_project_event(ProjectEvent::DatabaseConfigChanged {
@@ -829,15 +937,72 @@ impl Drop for FirestoreDatabase {
     }
 }
 
+struct StagedDocument<'a> {
+    guard:   &'a mut OwnedDocumentContentsWriteGuard,
+    pending: Option<DocumentVersion>,
+}
+
+impl<'a> StagedDocument<'a> {
+    fn new(guard: &'a mut OwnedDocumentContentsWriteGuard) -> Self {
+        Self {
+            guard,
+            pending: None,
+        }
+    }
+
+    fn latest_version(&self) -> Option<&DocumentVersion> {
+        self.pending
+            .as_ref()
+            .or_else(|| self.guard.latest_version())
+    }
+
+    fn current_version(&self) -> Option<&Arc<StoredDocumentVersion>> {
+        self.latest_version()
+            .and_then(DocumentVersion::stored_document)
+    }
+
+    fn check_precondition(&self, condition: DocumentPrecondition) -> Result<()> {
+        check_version_precondition(&self.guard.name, self.latest_version(), condition)
+    }
+
+    fn stage_update(
+        &mut self,
+        fields: HashMap<String, Value>,
+        commit_time: Timestamp,
+    ) -> Result<Timestamp> {
+        let (update_time, version) = document::stage_stored_version(
+            &self.guard.name,
+            self.guard.acquire_time,
+            self.latest_version(),
+            fields,
+            commit_time,
+        )?;
+        if let Some(version) = version {
+            self.pending = Some(version);
+        }
+        Ok(update_time)
+    }
+
+    fn stage_delete(&mut self, delete_time: Timestamp) -> Result<()> {
+        if delete_time < self.guard.acquire_time {
+            return Err(GenericDatabaseError::internal(
+                "lock should always be acquired before claiming write/update time",
+            ));
+        }
+        self.pending = Some(DocumentVersion::Deleted(Arc::new(DeletedDocumentVersion {
+            name: self.guard.name.clone(),
+            delete_time,
+        })));
+        Ok(())
+    }
+}
+
 fn apply_updates(
-    document: &mut OwnedDocumentContentsWriteGuard,
+    existing_fields: Option<&HashMap<String, Value>>,
     mask: DocumentMask,
     updated_values: &HashMap<String, Value>,
 ) -> Result<HashMap<String, Value>, GenericDatabaseError> {
-    let mut fields = document
-        .current_version()
-        .map(|v| v.fields.clone())
-        .unwrap_or_default();
+    let mut fields = existing_fields.cloned().unwrap_or_default();
     for field_path in mask.field_paths {
         let field_path: FieldPath = field_path.parse()?;
         match field_path.get_value(updated_values) {
@@ -877,17 +1042,13 @@ fn apply_transform(
         TransformType::Minimum(_) => unimplemented!("TransformType::Minimum"),
         TransformType::AppendMissingElements(elements) => {
             field_path.transform_value(fields, |cur_value| {
-                match cur_value.and_then(Value::into_array) {
-                    Some(mut array) => {
-                        for el in elements.values {
-                            if !array.contains(&el) {
-                                array.push(el)
-                            }
-                        }
-                        Value::array(array)
+                let mut array = cur_value.and_then(Value::into_array).unwrap_or_default();
+                for el in elements.values {
+                    if !array.contains(&el) {
+                        array.push(el);
                     }
-                    None => Value::array(elements.values),
                 }
+                Value::array(array)
             });
             Value::null()
         }
@@ -921,4 +1082,131 @@ fn get_doc_name_from_write(write: &Write) -> Result<DocumentRef> {
         Transform(trans) => &trans.document,
     };
     name.parse()
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::{BTreeSet, HashMap};
+
+    use googleapis::google::firestore::v1::{Document, TransactionOptions, Value, Write, write};
+
+    use super::*;
+    use crate::{FirestoreConfig, FirestoreProject, reference::CollectionRef};
+
+    #[tokio::test]
+    async fn get_document_ids_excludes_deleted_and_probed_missing_documents() {
+        let project: &'static FirestoreProject =
+            Box::leak(Box::new(FirestoreProject::new(FirestoreConfig::default())));
+        let root: RootRef = "projects/p/databases/(default)".parse().unwrap();
+        let db = project.database(&root).await;
+        let col: CollectionRef = "projects/p/databases/(default)/documents/users"
+            .parse()
+            .unwrap();
+
+        db.create_doc(
+            &col,
+            "alice",
+            HashMap::from([("v".to_string(), Value::integer(1))]),
+            None,
+        )
+        .await
+        .unwrap();
+        db.create_doc(
+            &col,
+            "bob",
+            HashMap::from([("v".to_string(), Value::integer(2))]),
+            None,
+        )
+        .await
+        .unwrap();
+
+        // Probe a non-existent document and delete `bob`.
+        let ghost: DocumentRef = "projects/p/databases/(default)/documents/users/ghost"
+            .parse()
+            .unwrap();
+        assert!(
+            db.get_doc(&ghost, ReadConsistency::Default)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let bob: DocumentRef = "projects/p/databases/(default)/documents/users/bob"
+            .parse()
+            .unwrap();
+        db.delete_doc(&bob, None).await.unwrap();
+
+        // Phantom doc `diana` has an existing subcollection document, so it should be included.
+        let sub_col: CollectionRef = "projects/p/databases/(default)/documents/users/diana/notes"
+            .parse()
+            .unwrap();
+        db.create_doc(
+            &sub_col,
+            "n1",
+            HashMap::from([("v".to_string(), Value::integer(3))]),
+            None,
+        )
+        .await
+        .unwrap();
+
+        let ids = db.get_document_ids(&col).await.unwrap();
+        assert_eq!(
+            ids,
+            BTreeSet::from(["alice".to_string(), "diana".to_string()])
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn concurrent_opposite_order_commits_serialize_without_deadlock() {
+        let project: &'static FirestoreProject =
+            Box::leak(Box::new(FirestoreProject::new(FirestoreConfig::default())));
+        let root: RootRef = "projects/p/databases/(default)".parse().unwrap();
+        let db = project.database(&root).await;
+
+        let doc_a: DocumentRef = "projects/p/databases/(default)/documents/c/a"
+            .parse()
+            .unwrap();
+        let doc_b: DocumentRef = "projects/p/databases/(default)/documents/c/b"
+            .parse()
+            .unwrap();
+
+        // Hold a read lock on `doc_a` so both commits queue up concurrently before either starts
+        // Phase 2 locking.
+        let rw_opts = TransactionOptions {
+            mode: Some(transaction_options::Mode::ReadWrite(
+                transaction_options::ReadWrite::default(),
+            )),
+        };
+        let blocker_txn = db.new_txn(rw_opts.clone()).await.unwrap();
+        drop(
+            db.get_doc(&doc_a, ReadConsistency::Transaction(blocker_txn))
+                .await
+                .unwrap(),
+        );
+
+        let make_write = |doc: &DocumentRef, v: i64| Write {
+            operation: Some(write::Operation::Update(Document {
+                name: doc.to_string(),
+                fields: HashMap::from([("v".to_string(), Value::integer(v))]),
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+
+        let db1 = Arc::clone(&db);
+        let t1_id = db1.new_txn(rw_opts.clone()).await.unwrap();
+        let w1 = vec![make_write(&doc_a, 1), make_write(&doc_b, 1)];
+        let h1 = tokio::spawn(async move { db1.commit(w1, t1_id).await });
+        tokio::task::yield_now().await;
+
+        let db2 = Arc::clone(&db);
+        let t2_id = db2.new_txn(rw_opts).await.unwrap();
+        let w2 = vec![make_write(&doc_b, 2), make_write(&doc_a, 2)];
+        let h2 = tokio::spawn(async move { db2.commit(w2, t2_id).await });
+        tokio::task::yield_now().await;
+
+        db.rollback(blocker_txn).await.unwrap();
+
+        h1.await.unwrap().expect("commit 1 should not deadlock");
+        h2.await.unwrap().expect("commit 2 should not deadlock");
+    }
 }

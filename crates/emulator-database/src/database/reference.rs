@@ -149,16 +149,19 @@ impl FromStr for Ref {
             let s = s.strip_prefix("projects/")?;
             // Next is the project_id until the next "/"
             let (project_id, s) = s.split_once('/')?;
+            if project_id.is_empty() {
+                return None;
+            }
             // Fixed token "databases/".
             let s = s.strip_prefix("databases/")?;
             // Next is the database_id until the next "/" or the end of the string
-            let (database_id, s) = s.split_once('/').unwrap_or((s, ""));
-            // If not the end of the string, then the token "documents" is mandatory
-            let s = if s.is_empty() {
-                s
-            } else {
-                s.strip_prefix("documents")?
+            let (database_id, s) = match s.split_once('/') {
+                Some((database_id, rest)) => (database_id, rest.strip_prefix("documents")?),
+                None => (s, ""),
             };
+            if database_id.is_empty() {
+                return None;
+            }
             let root_ref = RootRef::new(project_id, database_id);
             if s.is_empty() {
                 return Some(Ref::Root(root_ref));
@@ -531,6 +534,23 @@ mod tests {
             (None, Some(_)) => unreachable!(),
         };
         assert_that!(input.parse::<Ref>(), ok(eq(&expected)));
+    }
+
+    #[gtest]
+    #[rstest]
+    #[case::empty_project("projects//databases/(default)")]
+    #[case::empty_project_with_doc("projects//databases/(default)/documents/c/d")]
+    #[case::empty_database("projects/p/databases/")]
+    #[case::empty_database_with_doc("projects/p/databases//documents/c/d")]
+    #[case::trailing_slash_after_database("projects/p/databases/(default)/")]
+    fn rejects_empty_project_database_and_trailing_slash(#[case] input: &str) {
+        assert_that!(
+            input.parse::<Ref>(),
+            err(matches_pattern!(GenericDatabaseError::InvalidReference(
+                _,
+                _
+            )))
+        );
     }
 
     mod proptests {

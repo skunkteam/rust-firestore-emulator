@@ -1,14 +1,10 @@
 use std::collections::{BTreeMap, HashMap};
 
-use googleapis::google::firestore::v1::{
-    Document, Function, Value, pipeline::Stage, value::ValueType,
-};
+use googleapis::google::firestore::v1::{Document, Value, pipeline::Stage, value::ValueType};
 use itertools::Itertools;
 
-use super::get_document_value;
 use crate::{
     GenericDatabaseError,
-    database::field_path::FieldReference,
     error::Result,
     pipeline::{expressions, get_exact_expr_args},
     unimplemented_collection,
@@ -36,11 +32,18 @@ pub(super) fn execute(
         )
     })?;
 
-    let mut group_by_fields = args
-        .get(1)
-        .and_then(|v| v.as_map())
-        .map(|v| v.iter().collect_vec())
-        .unwrap_or_default();
+    let mut group_by_fields = match args.get(1) {
+        None => Vec::new(),
+        Some(v) => v
+            .as_map()
+            .ok_or_else(|| {
+                GenericDatabaseError::invalid_argument(
+                    "aggregate stage expects a MapValue argument as second argument",
+                )
+            })?
+            .iter()
+            .collect_vec(),
+    };
     // Sort to ensure stable group key ordering
     group_by_fields.sort_by(|a, b| a.0.cmp(b.0));
 
@@ -59,6 +62,9 @@ pub(super) fn execute(
         }
     }
 
+    let mut sorted_aggs = aggregations.iter().collect_vec();
+    sorted_aggs.sort_by(|a, b| a.0.cmp(b.0));
+
     let mut aggregated_docs = Vec::new();
 
     for (group_key, bucket_docs) in buckets {
@@ -68,7 +74,7 @@ pub(super) fn execute(
             result_fields.insert(alias.to_string(), group_key[i].clone());
         }
 
-        for (alias, value) in aggregations {
+        for &(alias, value) in &sorted_aggs {
             let func = match value.value_type.as_ref() {
                 Some(ValueType::FunctionValue(f)) => f,
                 _ => {
@@ -77,16 +83,31 @@ pub(super) fn execute(
                     ));
                 }
             };
+            unimplemented_collection!(func.options);
 
             let result_val = match func.name.as_str() {
-                "count" => Value::integer(bucket_docs.len() as i64),
+                "count" => match func.args.as_slice() {
+                    [] => Value::integer(bucket_docs.len() as i64),
+                    [expr] => {
+                        let mut count = 0_i64;
+                        for doc in &bucket_docs {
+                            if let Some(val) = expressions::maybe_evaluate(expr, doc)?
+                                && !val.is_null()
+                            {
+                                count += 1;
+                            }
+                        }
+                        Value::integer(count)
+                    }
+                    _ => {
+                        return Err(GenericDatabaseError::invalid_argument(
+                            "count expects 0 or 1 arguments",
+                        ));
+                    }
+                },
                 "sum" => {
-                    let field_ref = extract_field_ref(func)?;
-                    let values: Vec<Value> = bucket_docs
-                        .iter()
-                        .filter_map(|doc| get_document_value(&field_ref, doc))
-                        .filter(|v| v.is_number())
-                        .collect();
+                    let [expr] = get_exact_expr_args(&func.args, &func.name)?;
+                    let values = collect_numeric_values(expr, &bucket_docs)?;
                     if values.is_empty() {
                         Value::null()
                     } else {
@@ -94,12 +115,8 @@ pub(super) fn execute(
                     }
                 }
                 "average" => {
-                    let field_ref = extract_field_ref(func)?;
-                    let values: Vec<Value> = bucket_docs
-                        .iter()
-                        .filter_map(|doc| get_document_value(&field_ref, doc))
-                        .filter(|v| v.is_number())
-                        .collect();
+                    let [expr] = get_exact_expr_args(&func.args, &func.name)?;
+                    let values = collect_numeric_values(expr, &bucket_docs)?;
                     if values.is_empty() {
                         Value::null()
                     } else {
@@ -108,21 +125,27 @@ pub(super) fn execute(
                         Value::double(sum.as_double().unwrap_or(0.0) / len as f64)
                     }
                 }
-                "minimum" => {
-                    let field_ref = extract_field_ref(func)?;
-                    bucket_docs
-                        .iter()
-                        .filter_map(|doc| get_document_value(&field_ref, doc))
-                        .min()
-                        .unwrap_or_else(Value::null)
-                }
-                "maximum" => {
-                    let field_ref = extract_field_ref(func)?;
-                    bucket_docs
-                        .iter()
-                        .filter_map(|doc| get_document_value(&field_ref, doc))
-                        .max()
-                        .unwrap_or_else(Value::null)
+                "minimum" | "maximum" => {
+                    let [expr] = get_exact_expr_args(&func.args, &func.name)?;
+                    let pick_max = func.name == "maximum";
+                    let mut best: Option<Value> = None;
+                    for doc in &bucket_docs {
+                        if let Some(val) = expressions::maybe_evaluate(expr, doc)?
+                            && !val.is_null()
+                        {
+                            best = Some(match best {
+                                None => val,
+                                Some(cur) => {
+                                    if pick_max {
+                                        cur.max(val)
+                                    } else {
+                                        cur.min(val)
+                                    }
+                                }
+                            });
+                        }
+                    }
+                    best.unwrap_or_else(Value::null)
                 }
                 _ => {
                     return Err(GenericDatabaseError::not_implemented(format!(
@@ -146,15 +169,14 @@ pub(super) fn execute(
     Ok(aggregated_docs)
 }
 
-// Ensure the helper fetches the field reference string and parses it into FieldReference
-fn extract_field_ref(func: &Function) -> Result<FieldReference> {
-    let [arg] = get_exact_expr_args(&func.args, &func.name)?;
-    arg.as_field_reference()
-        .ok_or_else(|| {
-            GenericDatabaseError::invalid_argument(format!(
-                "function '{}' expects a FieldReferenceValue argument",
-                func.name
-            ))
-        })
-        .and_then(|s| s.parse())
+fn collect_numeric_values(expr: &Value, docs: &[Document]) -> Result<Vec<Value>> {
+    let mut values = Vec::new();
+    for doc in docs {
+        if let Some(val) = expressions::maybe_evaluate(expr, doc)?
+            && val.is_number()
+        {
+            values.push(val);
+        }
+    }
+    Ok(values)
 }

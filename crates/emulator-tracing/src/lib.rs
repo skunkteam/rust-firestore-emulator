@@ -1,9 +1,10 @@
 use std::{
     fmt::Debug,
-    sync::{Arc, Mutex, OnceLock},
+    io,
+    sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError},
 };
 
-use bytes::{BufMut, Bytes, BytesMut, buf::Writer};
+use bytes::{Bytes, BytesMut};
 use metadata_filter::Filter;
 use thiserror::Error;
 use time::{
@@ -12,7 +13,7 @@ use time::{
 };
 use tracing_subscriber::{
     EnvFilter, Layer, Registry,
-    fmt::{MakeWriter, format::FmtSpan, time::OffsetTime, writer::MutexGuardWriter},
+    fmt::{MakeWriter, format::FmtSpan, time::OffsetTime},
     prelude::*,
     reload,
 };
@@ -151,27 +152,78 @@ impl Drop for DefaultDynamicSubscriber<'_> {
     }
 }
 
+const DEFAULT_MAX_BUFFER_BYTES: usize = 16 * 1024 * 1024;
+
 #[derive(Clone)]
 struct SharedBuffer {
-    buffer: Arc<Mutex<Writer<BytesMut>>>,
+    buffer:    Arc<Mutex<BytesMut>>,
+    max_bytes: usize,
 }
 
 impl SharedBuffer {
     fn new() -> Self {
+        Self::with_max_bytes(DEFAULT_MAX_BUFFER_BYTES)
+    }
+
+    fn with_max_bytes(max_bytes: usize) -> Self {
         Self {
-            buffer: Arc::new(Mutex::new(BytesMut::new().writer())),
+            buffer: Arc::new(Mutex::new(BytesMut::new())),
+            max_bytes,
         }
     }
 
     fn drain(&self) -> Bytes {
-        self.buffer.lock().unwrap().get_mut().split().freeze()
+        self.buffer
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .split()
+            .freeze()
     }
 }
+
+struct SharedBufferWriter<'a> {
+    guard:     MutexGuard<'a, BytesMut>,
+    max_bytes: usize,
+}
+
+impl io::Write for SharedBufferWriter<'_> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        if self.max_bytes == 0 {
+            return Ok(buf.len());
+        }
+        if buf.len() >= self.max_bytes {
+            self.guard.clear();
+            self.guard
+                .extend_from_slice(&buf[buf.len() - self.max_bytes..]);
+        } else {
+            let overflow = self
+                .guard
+                .len()
+                .saturating_add(buf.len())
+                .saturating_sub(self.max_bytes);
+            if overflow > 0 {
+                let remaining = self.guard.len() - overflow;
+                self.guard.copy_within(overflow.., 0);
+                self.guard.truncate(remaining);
+            }
+            self.guard.extend_from_slice(buf);
+        }
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
 impl<'a> MakeWriter<'a> for SharedBuffer {
-    type Writer = MutexGuardWriter<'a, Writer<BytesMut>>;
+    type Writer = SharedBufferWriter<'a>;
 
     fn make_writer(&'a self) -> Self::Writer {
-        self.buffer.make_writer()
+        SharedBufferWriter {
+            guard:     self.buffer.lock().unwrap_or_else(PoisonError::into_inner),
+            max_bytes: self.max_bytes,
+        }
     }
 }
 
@@ -188,7 +240,7 @@ mod tests {
 
     use googletest::prelude::*;
 
-    use super::{DefaultTracing, DynamicSubscriber, SetLogLevelsError, Tracing};
+    use super::{DefaultTracing, DynamicSubscriber, SetLogLevelsError, SharedBuffer, Tracing};
 
     #[gtest]
     fn start_is_idempotent_and_captures_filtered_events() {
@@ -228,5 +280,41 @@ mod tests {
         drop(entered);
         drop(active_span);
         drop(mid_span_sub);
+    }
+
+    #[gtest]
+    fn shared_buffer_caps_retained_bytes_and_recovers_from_poison() {
+        use std::io::Write;
+
+        use tracing_subscriber::fmt::MakeWriter;
+
+        let buf = SharedBuffer::with_max_bytes(10);
+        {
+            let mut w = buf.make_writer();
+            w.write_all(b"123456").unwrap();
+            w.write_all(b"7890abcd").unwrap();
+        }
+        expect_eq!(buf.drain().as_ref(), b"567890abcd");
+
+        // Single write exceeding max_bytes keeps the newest tail.
+        {
+            let mut w = buf.make_writer();
+            w.write_all(b"0123456789XYZ").unwrap();
+        }
+        expect_eq!(buf.drain().as_ref(), b"3456789XYZ");
+
+        // Poisoning the inner mutex does not panic subsequent make_writer or drain calls.
+        let poisoned = buf.clone();
+        let panic_res = std::thread::spawn(move || {
+            let _guard = poisoned.make_writer();
+            panic!("intentional writer panic");
+        })
+        .join();
+        expect_true!(panic_res.is_err());
+        {
+            let mut w = buf.make_writer();
+            w.write_all(b"ok").unwrap();
+        }
+        expect_eq!(buf.drain().as_ref(), b"ok");
     }
 }

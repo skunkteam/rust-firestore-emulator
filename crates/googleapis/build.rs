@@ -1,4 +1,22 @@
-use std::{env, fs, path::PathBuf};
+use std::{
+    env, fs,
+    path::{Path, PathBuf},
+};
+
+fn strip_partial_eq_derives(path: &Path, replacements: &[(&str, &str)]) {
+    let mut contents = fs::read_to_string(path)
+        .unwrap_or_else(|e| panic!("failed to read {}: {e}", path.display()));
+    for &(target, replacement) in replacements {
+        assert_eq!(
+            contents.matches(target).count(),
+            1,
+            "expected exactly one match for `{target}` in {}",
+            path.display()
+        );
+        contents = contents.replace(target, replacement);
+    }
+    fs::write(path, contents).unwrap_or_else(|e| panic!("failed to write {}: {e}", path.display()));
+}
 
 fn main() {
     let serde_camel_default = "#[derive(serde::Serialize, \
@@ -10,7 +28,6 @@ fn main() {
         .compile_well_known_types(true)
         .bytes("bytes_value")
         .type_attribute(".google.protobuf.Timestamp", "#[derive(PartialOrd, Ord)]")
-        .type_attribute(".google.type.LatLng", serde_camel_default)
         .type_attribute(".google.firestore.v1.ArrayValue", serde_camel_default)
         .type_attribute(".google.firestore.v1.MapValue", serde_camel_default)
         .field_attribute(
@@ -68,32 +85,24 @@ fn main() {
         .unwrap();
 
     let out_dir = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR not set"));
-    let firestore_rs = out_dir.join("google.firestore.v1.rs");
-    let contents =
-        fs::read_to_string(&firestore_rs).expect("failed to read google.firestore.v1.rs");
-
-    const VALUE_STRUCT_TARGET: &str =
-        "#[derive(Clone, PartialEq, ::prost::Message)]\npub struct Value";
-    const VALUE_STRUCT_REPLACEMENT: &str = "#[derive(Clone, ::prost::Message)]\npub struct Value";
-
-    const VALUE_TYPE_ENUM_TARGET: &str =
-        "    #[derive(Clone, PartialEq, ::prost::Oneof)]\n    pub enum ValueType";
-    const VALUE_TYPE_ENUM_REPLACEMENT: &str =
-        "    #[derive(Clone, ::prost::Oneof)]\n    pub enum ValueType";
-
-    assert_eq!(
-        contents.matches(VALUE_STRUCT_TARGET).count(),
-        1,
-        "expected exactly one match for `pub struct Value` derive in google.firestore.v1.rs"
+    strip_partial_eq_derives(
+        &out_dir.join("google.firestore.v1.rs"),
+        &[
+            (
+                "#[derive(Clone, PartialEq, ::prost::Message)]\npub struct Value",
+                "#[derive(Clone, ::prost::Message)]\npub struct Value",
+            ),
+            (
+                "    #[derive(Clone, PartialEq, ::prost::Oneof)]\n    pub enum ValueType",
+                "    #[derive(Clone, ::prost::Oneof)]\n    pub enum ValueType",
+            ),
+        ],
     );
-    assert_eq!(
-        contents.matches(VALUE_TYPE_ENUM_TARGET).count(),
-        1,
-        "expected exactly one match for `pub enum ValueType` derive in google.firestore.v1.rs"
+    strip_partial_eq_derives(
+        &out_dir.join("google.r#type.rs"),
+        &[(
+            "#[derive(Clone, Copy, PartialEq, ::prost::Message)]\npub struct LatLng",
+            "#[derive(Clone, Copy, ::prost::Message)]\npub struct LatLng",
+        )],
     );
-
-    let updated = contents
-        .replace(VALUE_STRUCT_TARGET, VALUE_STRUCT_REPLACEMENT)
-        .replace(VALUE_TYPE_ENUM_TARGET, VALUE_TYPE_ENUM_REPLACEMENT);
-    fs::write(&firestore_rs, updated).expect("failed to write google.firestore.v1.rs");
 }
