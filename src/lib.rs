@@ -12,12 +12,14 @@ use tracing::{Level, enabled, info};
 
 mod multiplex;
 
+pub type Result<T, E = Box<dyn std::error::Error + Send + Sync>> = std::result::Result<T, E>;
+
 pub async fn run(
     project: &'static FirestoreProject,
     listener: TcpListener,
     shutdown: impl Future<Output = ()> + Send + 'static,
     tracing: &'static impl Tracing,
-) -> color_eyre::Result<()> {
+) -> Result<()> {
     let rest_router = emulator_http::RouterBuilder::new(project)
         .add_dynamic_tracing(tracing)
         .build()

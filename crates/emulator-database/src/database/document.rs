@@ -8,7 +8,6 @@ use std::{
 };
 
 use fifo_rwlock::{FifoRwLock, OwnedReadGuard, OwnedWriteGuard, ReadGuard};
-use futures::Future;
 use googleapis::google::{
     firestore::v1::{Document, Value, precondition},
     protobuf::Timestamp,

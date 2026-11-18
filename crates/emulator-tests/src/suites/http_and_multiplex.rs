@@ -1,10 +1,11 @@
 use std::{
+    net::SocketAddr,
     task::{Context, Poll},
     time::Duration,
 };
 
+use bytes::Bytes;
 use emulator_tracing::DefaultTracing;
-use futures::StreamExt;
 use googleapis::{
     fields,
     google::firestore::v1::{
@@ -12,9 +13,18 @@ use googleapis::{
     },
 };
 use googletest::prelude::*;
-use http::{HeaderValue, Method, StatusCode, Uri, header::CONTENT_TYPE};
+use http::{
+    HeaderValue, Method, StatusCode, Uri,
+    header::{self, CONTENT_TYPE},
+};
+use http_body_util::{BodyExt, Full};
+use hyper_util::rt::TokioIo;
 use serde_json::json;
-use tokio::{net::TcpListener, sync::oneshot};
+use tokio::{
+    net::{TcpListener, TcpStream},
+    sync::oneshot,
+};
+use tokio_stream::StreamExt;
 use tower::Service;
 
 use crate::harness::{
@@ -185,6 +195,69 @@ async fn cross_protocol_grpc_and_http_rest_roundtrips_with_in_memory_sse_events(
     assert!(config_idx < cleared_idx);
 }
 
+async fn send_http1_raw_request(
+    addr: SocketAddr,
+    method: Method,
+    path_and_query: &str,
+    content_type: Option<&str>,
+    payload: Bytes,
+) -> (StatusCode, Bytes) {
+    let stream = TcpStream::connect(addr)
+        .await
+        .expect("connect HTTP/1.1 TCP stream to multiplexed server");
+    stream.set_nodelay(true).expect("set TCP_NODELAY");
+    let (mut sender, conn) = hyper::client::conn::http1::handshake(TokioIo::new(stream))
+        .await
+        .expect("HTTP/1.1 client handshake");
+    let conn_task = tokio::spawn(conn);
+
+    let mut builder = http::Request::builder()
+        .method(method)
+        .uri(path_and_query)
+        .header(header::HOST, addr.to_string())
+        .header(header::CONNECTION, "close");
+    if let Some(content_type) = content_type {
+        builder = builder.header(CONTENT_TYPE, content_type);
+    }
+    let req = builder
+        .body(Full::new(payload))
+        .expect("build HTTP/1.1 request");
+    let resp = sender
+        .send_request(req)
+        .await
+        .expect("send HTTP/1.1 request over multiplexed TCP");
+    let status = resp.status();
+    let bytes = resp
+        .into_body()
+        .collect()
+        .await
+        .expect("read HTTP/1.1 response body")
+        .to_bytes();
+    drop(sender);
+    conn_task
+        .await
+        .expect("HTTP/1.1 connection task did not panic")
+        .expect("HTTP/1.1 connection completed cleanly");
+    (status, bytes)
+}
+
+async fn send_http1_request(
+    addr: SocketAddr,
+    method: Method,
+    path_and_query: &str,
+    json_body: Option<&serde_json::Value>,
+) -> (StatusCode, Bytes) {
+    let (content_type, payload) = if let Some(val) = json_body {
+        (
+            Some("application/json"),
+            Bytes::from(serde_json::to_vec(val).expect("serialize JSON request body")),
+        )
+    } else {
+        (None, Bytes::new())
+    };
+    send_http1_raw_request(addr, method, path_and_query, content_type, payload).await
+}
+
 #[gtest]
 #[tokio::test]
 async fn loopback_tcp_multiplexer_serves_grpc_and_http_on_same_port_and_shuts_down_cleanly() {
@@ -210,8 +283,8 @@ async fn loopback_tcp_multiplexer_serves_grpc_and_http_on_same_port_and_shuts_do
         .await
     });
 
-    // Connect a real HTTP/2 Tonic gRPC client AND an HTTP/1.1 reqwest client to the SAME port.
-    let endpoint = tonic::transport::Endpoint::from_shared(base_url.clone())
+    // Connect a real HTTP/2 Tonic gRPC client AND an HTTP/1.1 hyper client to the SAME port.
+    let endpoint = tonic::transport::Endpoint::from_shared(base_url)
         .expect("valid endpoint URI")
         .tcp_nodelay(true);
     let channel = endpoint
@@ -219,10 +292,6 @@ async fn loopback_tcp_multiplexer_serves_grpc_and_http_on_same_port_and_shuts_do
         .await
         .expect("connect Tonic channel to multiplexed server");
     let mut grpc_client = FirestoreClient::new(channel);
-    let http_client = reqwest::Client::builder()
-        .no_proxy()
-        .build()
-        .expect("build no-proxy reqwest client");
 
     // 1. Write over gRPC (HTTP/2 `application/grpc`) -> Read over HTTP/1.1 REST on the same socket
     //    port.
@@ -241,31 +310,32 @@ async fn loopback_tcp_multiplexer_serves_grpc_and_http_on_same_port_and_shuts_do
         .await
         .expect("gRPC UpdateDocument over multiplexed TCP");
 
-    let rest_get = http_client
-        .get(format!("{base_url}/v1/{DOCUMENTS_ROOT}/mux/from-grpc"))
-        .send()
-        .await
-        .expect("HTTP GET over multiplexed TCP");
-    expect_eq!(rest_get.status(), StatusCode::OK);
-    let rest_json: serde_json::Value = rest_get.json().await.unwrap();
+    let (rest_get_status, rest_get_bytes) = send_http1_request(
+        addr,
+        Method::GET,
+        &format!("/v1/{DOCUMENTS_ROOT}/mux/from-grpc"),
+        None,
+    )
+    .await;
+    expect_eq!(rest_get_status, StatusCode::OK);
+    let rest_json: serde_json::Value = serde_json::from_slice(&rest_get_bytes).unwrap();
     expect_eq!(rest_json["fields"]["origin"]["stringValue"], "grpc");
     expect_eq!(rest_json["fields"]["n"]["integerValue"], "7");
 
     // 2. Write over HTTP/1.1 REST -> Read over gRPC + inspect `/emulator/v1` metadata.
-    let rest_post = http_client
-        .post(format!(
-            "{base_url}/v1/{DOCUMENTS_ROOT}/mux?documentId=from-http"
-        ))
-        .json(&json!({
+    let (rest_post_status, _) = send_http1_request(
+        addr,
+        Method::POST,
+        &format!("/v1/{DOCUMENTS_ROOT}/mux?documentId=from-http"),
+        Some(&json!({
             "fields": {
                 "origin": { "stringValue": "http" },
                 "n": { "integerValue": "11" }
             }
-        }))
-        .send()
-        .await
-        .expect("HTTP POST over multiplexed TCP");
-    expect_eq!(rest_post.status(), StatusCode::OK);
+        })),
+    )
+    .await;
+    expect_eq!(rest_post_status, StatusCode::OK);
 
     let grpc_got = grpc_client
         .get_document(GetDocumentRequest {
@@ -282,18 +352,13 @@ async fn loopback_tcp_multiplexer_serves_grpc_and_http_on_same_port_and_shuts_do
         &fields!({ "origin": "http", "n": 11i64 }),
     );
 
-    let dbs_res = http_client
-        .get(format!("{base_url}/emulator/v1"))
-        .send()
-        .await
-        .unwrap();
-    expect_eq!(dbs_res.status(), StatusCode::OK);
-    let dbs: Vec<String> = dbs_res.json().await.unwrap();
+    let (dbs_status, dbs_bytes) = send_http1_request(addr, Method::GET, "/emulator/v1", None).await;
+    expect_eq!(dbs_status, StatusCode::OK);
+    let dbs: Vec<String> = serde_json::from_slice(&dbs_bytes).unwrap();
     expect_eq!(dbs, vec![DOCUMENTS_ROOT.to_string()]);
 
     // 3. Drop active client connections, fire shutdown signal, and assert clean server exit.
     drop(grpc_client);
-    drop(http_client);
     shutdown_tx.send(()).expect("send shutdown signal");
 
     let run_result = tokio::time::timeout(Duration::from_secs(5), server_task)
@@ -399,7 +464,7 @@ async fn listen_surfaces_malformed_protobuf_frame_as_grpc_error() {
     };
     let mut client = FirestoreClient::with_origin(svc, Uri::from_static("http://localhost"));
     let mut stream = client
-        .listen(futures::stream::empty())
+        .listen(tokio_stream::empty())
         .await
         .expect("Listen RPC stream opens")
         .into_inner();
@@ -475,25 +540,19 @@ async fn loopback_tcp_multiplexer_routes_case_insensitive_grpc_content_type_and_
     assert_doc_wire_eq(&got, "ct_mux/doc1", &fields!({ "via": "Application/Grpc" }));
 
     // `application/grpc-web` must NOT match gRPC routing and instead hits Axum 404 JSON.
-    let http_client = reqwest::Client::builder()
-        .no_proxy()
-        .build()
-        .expect("build no-proxy reqwest client");
-    let non_grpc_resp = http_client
-        .post(format!(
-            "{base_url}/google.firestore.v1.Firestore/GetDocument"
-        ))
-        .header(CONTENT_TYPE, "application/grpc-web")
-        .body(Vec::<u8>::new())
-        .send()
-        .await
-        .expect("send non-gRPC request");
-    expect_eq!(non_grpc_resp.status(), StatusCode::NOT_FOUND);
+    let (non_grpc_status, _) = send_http1_raw_request(
+        addr,
+        Method::POST,
+        "/google.firestore.v1.Firestore/GetDocument",
+        Some("application/grpc-web"),
+        Bytes::new(),
+    )
+    .await;
+    expect_eq!(non_grpc_status, StatusCode::NOT_FOUND);
 
     // Drop clients before shutdown.
     drop(grpc_client);
     drop(channel);
-    drop(http_client);
     shutdown_tx.send(()).expect("send shutdown signal");
     tokio::time::timeout(Duration::from_secs(5), server_task)
         .await

@@ -77,13 +77,37 @@ async fn stop_capture<S: Tracing + 'static>(
 
 #[cfg(test)]
 mod tests {
+    use axum::{
+        Router,
+        body::{Body, to_bytes},
+        http::{Method, Request, StatusCode},
+    };
     use emulator_database::{FirestoreConfig, FirestoreProject};
     use emulator_tracing::DefaultTracing;
     use googletest::prelude::*;
-    use reqwest::Client;
-    use tokio::net::TcpListener;
+    use tower::ServiceExt;
 
     use crate::RouterBuilder;
+
+    async fn send_request(
+        router: &Router,
+        method: Method,
+        uri: &str,
+        body: &str,
+    ) -> Result<(StatusCode, String)> {
+        let resp = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(method)
+                    .uri(uri)
+                    .body(Body::from(body.to_owned()))?,
+            )
+            .await?;
+        let status = resp.status();
+        let bytes = to_bytes(resp.into_body(), usize::MAX).await?;
+        Ok((status, String::from_utf8(bytes.to_vec())?))
+    }
 
     #[gtest]
     #[tokio::test]
@@ -95,89 +119,54 @@ mod tests {
             .add_dynamic_tracing(tracing)
             .build();
 
-        let tcp_listener = TcpListener::bind("127.0.0.1:0").await?;
-        let host = tcp_listener.local_addr()?;
-        let tcp_listener = axum::serve::ListenerExt::tap_io(tcp_listener, |tcp_stream| {
-            tcp_stream.set_nodelay(true).unwrap();
-        });
-        tokio::spawn(async {
-            axum::serve(tcp_listener, router).await.unwrap();
-        });
-
-        let client = Client::new();
-        let handle_url = format!("http://{host}/emulator/v1/logging/my-handle");
-        let poll_url = format!("{handle_url}:poll");
+        let handle_uri = "/emulator/v1/logging/my-handle";
+        let poll_uri = "/emulator/v1/logging/my-handle:poll";
 
         // Start capturing logging of all tower_http DEBUG messages
-        let logs = client
-            .post(&handle_url)
-            .body("tower_http=debug")
-            .send()
-            .await?
-            .error_for_status()?
-            .text()
-            .await;
+        let (status, logs) =
+            send_request(&router, Method::POST, handle_uri, "tower_http=debug").await?;
+        expect_eq!(status, StatusCode::OK);
+        expect_that!(logs, eq(""), "we start with no logging captured");
 
-        expect_that!(logs, ok(eq("")), "we start with no logging captured");
-
-        let logs = client
-            .post(&poll_url)
-            .send()
-            .await?
-            .error_for_status()?
-            .text()
-            .await;
+        let (status, logs) = send_request(&router, Method::POST, poll_uri, "").await?;
+        expect_eq!(status, StatusCode::OK);
         expect_that!(
             logs,
-            ok(all!(
+            all!(
                 contains_substring("DEBUG"),
                 contains_substring("tower_http::trace")
-            )),
+            ),
             "the first poll shows some DEBUG messages from the tower_http crate"
         );
 
         // Now we will adjust the logging directives of this capture handle...
-        let logs = client
-            .post(&handle_url)
-            .body("warn")
-            .send()
-            .await?
-            .error_for_status()?
-            .text()
-            .await;
+        let (status, logs) = send_request(&router, Method::POST, handle_uri, "warn").await?;
+        expect_eq!(status, StatusCode::OK);
         expect_that!(
             logs,
-            ok(all!(
+            all!(
                 contains_substring("DEBUG"),
                 contains_substring("tower_http::trace")
-            )),
+            ),
             "we still receive the logs that were captured up until now"
         );
 
-        let logs = client
-            .post(&poll_url)
-            .send()
-            .await?
-            .error_for_status()?
-            .text()
-            .await;
+        let (status, logs) = send_request(&router, Method::POST, poll_uri, "").await?;
+        expect_eq!(status, StatusCode::OK);
         expect_that!(
             logs,
-            ok(eq("")),
+            eq(""),
             "but this time there is no logging, because no WARN-level logs have been captured"
         );
 
         // Stop the capture
-        client
-            .delete(&handle_url)
-            .send()
-            .await?
-            .error_for_status()?;
+        let (status, _) = send_request(&router, Method::DELETE, handle_uri, "").await?;
+        expect_eq!(status, StatusCode::OK);
 
-        let unknown_poll_status = client.post(&poll_url).send().await?.status();
+        let (unknown_poll_status, _) = send_request(&router, Method::POST, poll_uri, "").await?;
         expect_eq!(
             unknown_poll_status,
-            404,
+            StatusCode::NOT_FOUND,
             "polling on an unknown handle gives a 404"
         );
         Ok(())

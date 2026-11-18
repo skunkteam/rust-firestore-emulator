@@ -4,8 +4,10 @@
 Root binary and library entry point for the `firestore-emulator` crate. Initializes process-wide allocator, tracing, CLI configuration, and `FirestoreProject` state, and runs a unified Tokio/Tonic TCP server that multiplexes incoming connections between the gRPC service (`emulator-grpc`) and the Axum HTTP/REST service (`emulator-http`) based on the request `content-type` header.
 
 ## Interface
-- `[src/lib.rs:run]`: `pub async fn run(project: &'static FirestoreProject, listener: TcpListener, shutdown: impl Future<Output = ()> + Send + 'static, tracing: &'static impl Tracing) -> color_eyre::Result<()>` — Configures and runs the multiplexed HTTP/1.1 + HTTP/2 Tonic and Axum server on `listener` until `shutdown` resolves.
-- `[src/main.rs:main]`: Binary entry point (`#[tokio::main] async fn main() -> color_eyre::Result<()>`) that installs `color_eyre`, starts `DefaultTracing`, parses CLI `Args`, leaks `FirestoreProject` for `'static` lifetime, binds `TcpListener`, and awaits `run` until `tokio::signal::ctrl_c`.
+- `[src/lib.rs:Result]`: `pub type Result<T, E = Box<dyn std::error::Error + Send + Sync>> = std::result::Result<T, E>` — Crate-level boxed error result alias returned by `run`.
+- `[src/lib.rs:run]`: `pub async fn run(project: &'static FirestoreProject, listener: TcpListener, shutdown: impl Future<Output = ()> + Send + 'static, tracing: &'static impl Tracing) -> Result<()>` — Configures and runs the multiplexed HTTP/1.1 + HTTP/2 Tonic and Axum server on `listener` until `shutdown` resolves.
+- `[src/main.rs:main]`: Binary entry point (`#[tokio::main] async fn main() -> Result<(), CliError>`) that starts `DefaultTracing`, parses CLI `Args`, leaks `FirestoreProject` for `'static` lifetime, binds `TcpListener`, and awaits `run` until `tokio::signal::ctrl_c`.
+- `[src/main.rs:CliError]`: Binary-private CLI error wrapper formatting optional context, chained `Error::source` causes, and optional actionable suggestions via `Display`/`Debug`.
 - `[src/main.rs:Args]`: `clap::Parser` CLI configuration struct supporting:
   - `--host-port` (`env = "FIRESTORE_EMULATOR_HOST"`): `SocketAddr` address to bind the TCP listener.
   - `--long-contention-timeout` (`env = "LONG_CONTENTION_TIMEOUT"`): `bool` flag enabling 15s lock contention timeouts instead of the default 2s.
@@ -18,8 +20,8 @@ Root binary and library entry point for the `firestore-emulator` crate. Initiali
 - `[src/multiplex.rs:MultiplexService]`: Routes requests via `tower::ServiceExt::oneshot` on a clone of the selected branch (`base` or `other`), so `poll_ready` is invoked exclusively on the chosen service and `Poll::Pending` / readiness errors propagate without panicking or holding unused readiness slots on the unchosen service.
 
 ## Side Effects
-- `[src/main.rs:GLOBAL_ALLOC]`: Sets `tikv_jemallocator::Jemalloc` as the process-wide `#[global_allocator]`.
-- `[src/main.rs:main]`: Installs global `color_eyre` panic/error hooks (`color_eyre::install()`), initializes global tracing subscribers (`DefaultTracing::start()`), intentionally leaks `Box<FirestoreProject>` (`Box::leak`), registers an OS `ctrl_c` signal listener, and binds a TCP socket (`TcpListener::bind(host_port)`).
+- `[src/main.rs:GLOBAL_ALLOC]`: Sets `tikv_jemallocator::Jemalloc` as the process-wide `#[global_allocator]` on Linux (`#[cfg(target_os = "linux")]`).
+- `[src/main.rs:main]`: Initializes global tracing subscribers (`DefaultTracing::start()`), intentionally leaks `Box<FirestoreProject>` (`Box::leak`), registers an OS `ctrl_c` signal listener, and binds a TCP socket (`TcpListener::bind(host_port)`).
 - `[src/lib.rs:run]`: Enables `TCP_NODELAY` on the server and incoming TCP streams (`TcpIncoming::from(listener).with_nodelay(Some(true))`), accepts HTTP/1.1 and HTTP/2 network connections, and writes startup/shutdown status to `tracing::info!` or `stderr` (`eprintln!`).
 
 ## Verification

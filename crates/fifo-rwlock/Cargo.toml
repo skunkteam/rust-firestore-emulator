@@ -7,7 +7,7 @@ edition = "2024"
 tokio = { workspace = true, features = ["sync"] }
 
 [dev-dependencies]
-futures = { workspace = true }
+futures-executor = { workspace = true }
 static_assertions = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 tokio-test = { workspace = true }

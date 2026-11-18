@@ -40,8 +40,6 @@
         };
         # Packages necessary for building the firestore-emulator crate.
         buildInputs = with pkgs; [
-          openssl
-          pkg-config
           protobuf
         ];
       in

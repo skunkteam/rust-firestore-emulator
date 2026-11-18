@@ -7,14 +7,18 @@ version = { workspace = true }
 
 [dependencies]
 emulator-database = { workspace = true }
-futures = { workspace = true }
+futures-util = { workspace = true }
 googleapis = { workspace = true }
 itertools = { workspace = true }
 prost = { workspace = true }
-tokio = { workspace = true }
+tokio = { workspace = true, features = ["rt", "sync"] }
 tokio-stream = { workspace = true }
-tonic = { workspace = true, features = ["gzip"] }
+tonic = { workspace = true, features = ["codegen", "gzip"] }
 tracing = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt"] }
+tonic = { workspace = true, features = ["router", "server"] }
 
 [lints]
 workspace = true
