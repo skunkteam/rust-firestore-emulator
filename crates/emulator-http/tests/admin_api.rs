@@ -3,8 +3,8 @@
 use std::time::Duration;
 
 use axum::{
-    body::Body,
-    http::{Method, Request, StatusCode},
+    body::{Body, Bytes},
+    http::{HeaderMap, Method, Request, StatusCode},
     serve::ListenerExt,
 };
 use emulator_database::{FirestoreProject, config::FirestoreConfig};
@@ -1401,6 +1401,206 @@ async fn test_rest_masks_read_time_consistency_and_create_document_slash_id() ->
         expect_eq!(status, StatusCode::BAD_REQUEST, "doc_id: {bad_doc_id}");
         expect_eq!(err["error"]["status"], "INVALID_ARGUMENT");
     }
+
+    Ok(())
+}
+
+async fn send_raw_oneshot(
+    router: &axum::Router,
+    method: Method,
+    uri: &str,
+    json_body: Option<serde_json::Value>,
+) -> Result<(StatusCode, HeaderMap, Bytes)> {
+    let mut builder = Request::builder().method(method).uri(uri);
+    let body = if let Some(val) = json_body {
+        builder = builder.header("content-type", "application/json");
+        Body::from(serde_json::to_vec(&val)?)
+    } else {
+        Body::empty()
+    };
+    let resp = router.clone().oneshot(builder.body(body)?).await?;
+    let status = resp.status();
+    let headers = resp.headers().clone();
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await?;
+    Ok((status, headers, bytes))
+}
+
+#[gtest]
+#[tokio::test]
+async fn test_patch_database_update_mask_preserves_unmasked_concurrency_and_single_sse_and_snake_case()
+-> Result<()> {
+    let project = Box::leak(Box::new(FirestoreProject::new(FirestoreConfig::default())));
+    let router = RouterBuilder::new(project).build();
+
+    // 1. Configure (default) as ENTERPRISE + PESSIMISTIC.
+    let (status, _) = send_oneshot(
+        &router,
+        Method::PATCH,
+        "/v1/projects/p/databases/(default)",
+        Some(json!({ "databaseEdition": "ENTERPRISE" })),
+    )
+    .await?;
+    assert_eq!(status, StatusCode::OK);
+    let (status, body) = send_oneshot(
+        &router,
+        Method::PATCH,
+        "/v1/projects/p/databases/(default)",
+        Some(json!({ "concurrencyMode": "PESSIMISTIC" })),
+    )
+    .await?;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["databaseEdition"], "ENTERPRISE");
+    assert_eq!(body["concurrencyMode"], "PESSIMISTIC");
+
+    // 2. PATCH with updateMask=databaseEdition only must preserve explicit PESSIMISTIC
+    //    concurrencyMode.
+    let (status, masked_body) = send_oneshot(
+        &router,
+        Method::PATCH,
+        "/v1/projects/p/databases/(default)?updateMask=databaseEdition",
+        Some(json!({ "databaseEdition": "ENTERPRISE" })),
+    )
+    .await?;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        masked_body["concurrencyMode"], "PESSIMISTIC",
+        "updateMask=databaseEdition on already-ENTERPRISE database must not reset PESSIMISTIC to \
+         OPTIMISTIC"
+    );
+
+    // 3. Single PATCH changing edition (and implicitly concurrency) must emit at most one
+    //    database_config_changed SSE event.
+    let (status, _) = send_oneshot(
+        &router,
+        Method::GET,
+        "/v1/projects/p/databases/db-multi",
+        None,
+    )
+    .await?;
+    assert_eq!(status, StatusCode::OK);
+
+    let sse_res = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/emulator/v1/events")
+                .body(Body::empty())?,
+        )
+        .await?;
+    assert_eq!(sse_res.status(), StatusCode::OK);
+    let mut sse_stream = sse_res.into_body().into_data_stream();
+
+    let (status, _) = send_oneshot(
+        &router,
+        Method::PATCH,
+        "/v1/projects/p/databases/db-multi",
+        Some(json!({ "databaseEdition": "ENTERPRISE" })),
+    )
+    .await?;
+    assert_eq!(status, StatusCode::OK);
+
+    // Sentinel document write so we know all prior SSE events have been flushed.
+    let (status, _) = send_oneshot(
+        &router,
+        Method::POST,
+        "/v1/projects/p/databases/db-multi/documents/items?documentId=s1",
+        Some(json!({ "fields": {} })),
+    )
+    .await?;
+    assert_eq!(status, StatusCode::OK);
+
+    let mut sse_text = String::new();
+    while !sse_text.contains("\"documents_changed\"") {
+        let chunk = tokio::time::timeout(Duration::from_secs(2), sse_stream.next())
+            .await
+            .expect("timed out waiting for SSE sentinel")
+            .expect("SSE stream ended unexpectedly")?;
+        sse_text.push_str(&String::from_utf8_lossy(&chunk));
+    }
+    assert_eq!(
+        sse_text.matches("\"database_config_changed\"").count(),
+        1,
+        "expected exactly 1 database_config_changed SSE event for single PATCH, got SSE \
+         stream:\n{sse_text}"
+    );
+
+    // 4. ProtoJSON snake_case field names (`database_edition`, `concurrency_mode`) and snake_case
+    //    updateMask paths must be accepted.
+    let (status, snake_body) = send_oneshot(
+        &router,
+        Method::PATCH,
+        "/v1/projects/p/databases/db-snake?updateMask=database_edition",
+        Some(json!({ "database_edition": "ENTERPRISE" })),
+    )
+    .await?;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(snake_body["databaseEdition"], "ENTERPRISE");
+
+    Ok(())
+}
+
+#[gtest]
+#[tokio::test]
+async fn test_rest_invalid_percent_encoding_and_snake_read_time_return_json_errors() -> Result<()> {
+    let project = Box::leak(Box::new(FirestoreProject::new(FirestoreConfig::default())));
+    let router = RouterBuilder::new(project).build();
+
+    // 1. Invalid UTF-8 percent-encoding (%FF) and malformed hex (%ZZ) across v1 REST, /emulator/v1,
+    //    and Admin routes must return structured JSON error envelopes (`application/json`,
+    //    `INVALID_ARGUMENT`), not plain-text rejections.
+    for (method, uri) in [
+        (
+            Method::GET,
+            "/v1/projects/p/databases/(default)/documents/col/%FF",
+        ),
+        (
+            Method::DELETE,
+            "/emulator/v1/projects/p/databases/(default)/documents/col/%FF",
+        ),
+        (Method::GET, "/v1/projects/p%ZZ/databases/(default)"),
+    ] {
+        let (status, headers, bytes) = send_raw_oneshot(&router, method.clone(), uri, None).await?;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "uri: {uri}");
+        let content_type = headers
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        assert!(
+            content_type.starts_with("application/json"),
+            "expected application/json error envelope for {method} {uri}, got \
+             content-type={content_type:?} body={:?}",
+            String::from_utf8_lossy(&bytes)
+        );
+        let parsed: serde_json::Value = serde_json::from_slice(&bytes)?;
+        assert_eq!(parsed["error"]["status"], "INVALID_ARGUMENT", "uri: {uri}");
+    }
+
+    // 2. Snake_case `?read_time=` query parameter must be parsed and validated just like
+    //    `?readTime=` (not silently ignored!).
+    let (status, _) = send_oneshot(
+        &router,
+        Method::POST,
+        "/v1/projects/p/databases/(default)/documents/col?documentId=d1",
+        Some(json!({ "fields": { "v": { "integerValue": "1" } } })),
+    )
+    .await?;
+    assert_eq!(status, StatusCode::OK);
+
+    let (status, snake_rt_body) = send_oneshot(
+        &router,
+        Method::GET,
+        "/v1/projects/p/databases/(default)/documents/col/d1?read_time=not-a-timestamp",
+        None,
+    )
+    .await?;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "invalid ?read_time= must be rejected with 400 INVALID_ARGUMENT instead of silently \
+         ignored: {snake_rt_body}"
+    );
+    assert_eq!(snake_rt_body["error"]["status"], "INVALID_ARGUMENT");
 
     Ok(())
 }

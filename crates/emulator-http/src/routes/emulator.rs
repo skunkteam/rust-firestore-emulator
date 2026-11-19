@@ -2,7 +2,7 @@ use std::{convert::Infallible, time::Duration};
 
 use axum::{
     Json, Router,
-    extract::{Path, State},
+    extract::State,
     http::{Method, Uri},
     response::{
         IntoResponse, Response,
@@ -92,7 +92,6 @@ async fn sse_events(
 
 async fn delete_by_ref(
     State(project): State<&'static FirestoreProject>,
-    Path(_raw_ref): Path<String>,
     uri: Uri,
 ) -> Result<Json<serde_json::Value>> {
     let raw_path = uri.path().strip_prefix('/').unwrap_or(uri.path());

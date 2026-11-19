@@ -194,18 +194,26 @@ pub(super) fn evaluate(
         // String functions
         "string_concat" => {
             let mut res = String::new();
+            let mut saw_null = false;
             for a in args {
                 if a.is_null() {
-                    return Ok(Some(Value::null()));
+                    saw_null = true;
+                    continue;
                 }
                 let s = a.as_string().ok_or_else(|| {
                     GenericDatabaseError::invalid_argument(
                         "string_concat arguments must evaluate to strings",
                     )
                 })?;
-                res.push_str(s);
+                if !saw_null {
+                    res.push_str(s);
+                }
             }
-            Ok(Some(Value::string(res)))
+            Ok(Some(if saw_null {
+                Value::null()
+            } else {
+                Value::string(res)
+            }))
         }
         "to_upper" | "to_lower" => {
             let [a] = get_exact_expr_args(&args, name)?;
@@ -235,6 +243,13 @@ pub(super) fn evaluate(
         "split" => {
             let [a, sep] = get_exact_expr_args(&args, name)?;
             if a.is_null() || sep.is_null() {
+                if (!a.is_null() && a.as_string().is_none())
+                    || (!sep.is_null() && sep.as_string().is_none())
+                {
+                    return Err(GenericDatabaseError::invalid_argument(
+                        "Argument must be a string",
+                    ));
+                }
                 return Ok(Some(Value::null()));
             }
             let a = a.as_string().ok_or_else(|| {
@@ -324,21 +339,16 @@ pub(super) fn evaluate(
                     a % b
                 }
                 "pow" => {
-                    if a.is_nan() || b.is_nan() {
-                        f64::NAN
-                    } else if a == 0.0 && b < 0.0 {
+                    if a == 0.0 && b < 0.0 {
                         return Err(GenericDatabaseError::invalid_argument(
                             "pow division by zero",
                         ));
-                    } else {
-                        let res = a.powf(b);
-                        if res.is_nan() {
-                            return Err(GenericDatabaseError::invalid_argument(
-                                "pow invalid domain",
-                            ));
-                        }
-                        res
                     }
+                    let res = a.powf(b);
+                    if res.is_nan() && !a.is_nan() && !b.is_nan() {
+                        return Err(GenericDatabaseError::invalid_argument("pow invalid domain"));
+                    }
+                    res
                 }
                 _ => unreachable!(),
             };
@@ -595,3 +605,54 @@ pub(super) fn evaluate(
 //         f.name
 //     )))
 // }
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use super::*;
+
+    fn eval_fn(name: &str, args: Vec<Value>) -> Result<Option<Value>> {
+        evaluate(
+            &Function {
+                name: name.to_string(),
+                args,
+                options: HashMap::new(),
+            },
+            &Document::default(),
+        )
+    }
+
+    #[test]
+    fn pow_one_nan_and_nan_zero_evaluate_to_one() {
+        for args in [
+            vec![Value::double(1.0), Value::double(f64::NAN)],
+            vec![Value::integer(1), Value::double(f64::NAN)],
+            vec![Value::double(f64::NAN), Value::double(0.0)],
+            vec![Value::double(f64::NAN), Value::integer(0)],
+        ] {
+            let val = eval_fn("pow", args.clone())
+                .unwrap()
+                .expect("pow should return a value");
+            assert!(
+                val.storage_eq(&Value::double(1.0)),
+                "expected 1.0 for pow({args:?}), got {val:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn string_concat_and_split_with_null_still_reject_non_string_arguments() {
+        for (name, args) in [
+            ("string_concat", vec![Value::null(), Value::integer(123)]),
+            ("split", vec![Value::null(), Value::integer(123)]),
+            ("split", vec![Value::integer(123), Value::null()]),
+        ] {
+            let res = eval_fn(name, args.clone());
+            assert!(
+                matches!(res, Err(GenericDatabaseError::InvalidArgument(_))),
+                "expected InvalidArgument for {name}({args:?}), got {res:?}"
+            );
+        }
+    }
+}

@@ -1,3 +1,4 @@
+const js = require('@eslint/js');
 const tsPlugin = require('@typescript-eslint/eslint-plugin');
 const prettierConfig = require('eslint-config-prettier/flat');
 
@@ -8,6 +9,7 @@ module.exports = [
             reportUnusedDisableDirectives: 'error',
         },
     },
+    js.configs.recommended,
     ...tsPlugin.configs['flat/recommended-type-checked'].map(config => ({
         ...config,
         files: ['**/*.ts', '**/*.tsx'],

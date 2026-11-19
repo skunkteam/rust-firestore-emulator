@@ -805,6 +805,12 @@ function normalizeProtoValue(rawVal, pathLabel, inArray) {
 
     case "doubleValue": {
       if (typeof inner === "number") {
+        if (!Number.isFinite(inner)) {
+          return {
+            valid: false,
+            error: `${pathLabel}.doubleValue overflows IEEE-754 double; use "Infinity" or "-Infinity" as a string`,
+          };
+        }
         return { valid: true, value: { doubleValue: inner } };
       }
       if (inner === "NaN" || inner === "Infinity" || inner === "-Infinity") {
@@ -812,7 +818,7 @@ function normalizeProtoValue(rawVal, pathLabel, inArray) {
       }
       return {
         valid: false,
-        error: `${pathLabel}.doubleValue must be a number or "NaN"/"Infinity"/"-Infinity"`,
+        error: `${pathLabel}.doubleValue must be a finite number or "NaN"/"Infinity"/"-Infinity"`,
       };
     }
 

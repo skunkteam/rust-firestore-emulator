@@ -409,6 +409,10 @@ export function computeChangedFieldMask(cleanFields, nextFields) {
  * @param {EditorSession} session
  */
 function recomputeDirty(session) {
+  if (session.cleanDoc === null) {
+    session.isDirty = true;
+    return;
+  }
   if (session.mode === "raw") {
     session.isDirty = session.rawText.trim() !== session.cleanJson.trim();
     return;

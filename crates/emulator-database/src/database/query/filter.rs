@@ -1,4 +1,4 @@
-use std::iter;
+use std::{cmp::Ordering, iter};
 
 use googleapis::google::firestore::v1::{Value, structured_query};
 use itertools::Itertools;
@@ -33,10 +33,13 @@ impl Filter {
             .cloned()
             .unique()
             .collect();
-        fields.sort_by(|a, b| {
-            let sa = a.to_string();
-            let sb = b.to_string();
-            sa.split('.').cmp(sb.split('.')).then_with(|| sa.cmp(&sb))
+        fields.sort_by(|a, b| match (a, b) {
+            (FieldReference::FieldPath(pa), FieldReference::FieldPath(pb)) => {
+                pa.segments().cmp(pb.segments())
+            }
+            (FieldReference::DocumentName, FieldReference::DocumentName) => Ordering::Equal,
+            (FieldReference::DocumentName, FieldReference::FieldPath(_)) => Ordering::Less,
+            (FieldReference::FieldPath(_), FieldReference::DocumentName) => Ordering::Greater,
         });
         fields
     }
@@ -566,5 +569,47 @@ mod tests {
                 "missing operand_type in UnaryFilter"
             )))
         );
+    }
+
+    #[gtest]
+    fn sorted_non_name_inequality_fields_orders_escaped_dot_segments_by_parsed_segments() {
+        use super::{CompositeFilter, CompositeOperator, Filter};
+
+        let f_escaped = Filter::Field(FieldFilter {
+            field: "`a.b`".parse().unwrap(),
+            op:    FieldOperator::GreaterThan,
+            value: Value::integer(0),
+        });
+        let f_nested_c = Filter::Field(FieldFilter {
+            field: "a.c".parse().unwrap(),
+            op:    FieldOperator::GreaterThan,
+            value: Value::integer(0),
+        });
+        let f_nested_b = Filter::Field(FieldFilter {
+            field: "a.b".parse().unwrap(),
+            op:    FieldOperator::GreaterThan,
+            value: Value::integer(0),
+        });
+
+        let filter = Filter::Composite(CompositeFilter {
+            op:      CompositeOperator::And,
+            filters: vec![f_escaped.clone(), f_nested_c],
+        });
+        assert_eq!(
+            filter.sorted_non_name_inequality_fields(),
+            vec!["a.c".parse().unwrap(), "`a.b`".parse().unwrap()]
+        );
+
+        let order_1 = Filter::Composite(CompositeFilter {
+            op:      CompositeOperator::And,
+            filters: vec![f_escaped.clone(), f_nested_b.clone()],
+        });
+        let order_2 = Filter::Composite(CompositeFilter {
+            op:      CompositeOperator::And,
+            filters: vec![f_nested_b, f_escaped],
+        });
+        let expected = vec!["a.b".parse().unwrap(), "`a.b`".parse().unwrap()];
+        assert_eq!(order_1.sorted_non_name_inequality_fields(), expected);
+        assert_eq!(order_2.sorted_non_name_inequality_fields(), expected);
     }
 }
