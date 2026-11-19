@@ -565,3 +565,184 @@ async fn loopback_tcp_multiplexer_routes_case_insensitive_grpc_content_type_and_
         .expect("server task did not panic")
         .expect("server exited cleanly");
 }
+
+#[gtest]
+#[tokio::test]
+async fn http_rest_run_query_array_filters_and_validation_across_editions() {
+    let mut db = TestEnv::new().build_db();
+    db.put(
+        "restq/d_num",
+        fields!({ "n": 42i64, "tags": [-0.0f64, "rust"] }),
+    )
+    .await
+    .unwrap();
+    db.put("restq/d_null", fields!({ "n": null, "tags": ["go"] }))
+        .await
+        .unwrap();
+    db.put("restq/d_missing", fields!({ "tags": ["py"] }))
+        .await
+        .unwrap();
+
+    let run_query_uri = format!("/v1/{DOCUMENTS_ROOT}:runQuery");
+    let extract_ids = |bytes: &[u8]| -> Vec<String> {
+        let rows: Vec<serde_json::Value> = serde_json::from_slice(bytes).unwrap();
+        rows.into_iter()
+            .filter_map(|r| {
+                r.get("document")
+                    .and_then(|d| d.get("name"))
+                    .and_then(|n| n.as_str())
+                    .map(|s| s.rsplit('/').next().unwrap().to_string())
+            })
+            .collect()
+    };
+
+    // 1. Standard Edition: `IN` with `integerValue` `"42"` & `doubleValue` `-0.0` (raw JSON
+    //    `-0.0`), `ARRAY_CONTAINS_ANY` matching `-0.0` via `integerValue` `"0"`, and `NOT_IN`
+    //    excluding missing/null.
+    let (status, bytes) = db
+        .http_raw_body(
+            Method::POST,
+            &run_query_uri,
+            Some("application/json"),
+            r#"{"structuredQuery":{"from":[{"collectionId":"restq"}],"where":{"fieldFilter":{"field":{"fieldPath":"tags"},"op":"ARRAY_CONTAINS_ANY","value":{"arrayValue":{"values":[{"integerValue":"0"},{"stringValue":"nope"}]}}}}}}"#,
+        )
+        .await;
+    expect_eq!(status, StatusCode::OK);
+    expect_eq!(extract_ids(&bytes), vec!["d_num"]);
+
+    let (status, bytes) = db
+        .http_raw_body(
+            Method::POST,
+            &run_query_uri,
+            Some("application/json"),
+            r#"{"structuredQuery":{"from":[{"collectionId":"restq"}],"where":{"fieldFilter":{"field":{"fieldPath":"tags"},"op":"ARRAY_CONTAINS_ANY","value":{"arrayValue":{"values":[{"doubleValue":-0.0}]}}}}}}"#,
+        )
+        .await;
+    expect_eq!(status, StatusCode::OK);
+    expect_eq!(extract_ids(&bytes), vec!["d_num"]);
+
+    let (status, bytes) = db
+        .http_oneshot(
+            Method::POST,
+            &run_query_uri,
+            Some(&json!({
+                "structuredQuery": {
+                    "from": [{ "collectionId": "restq" }],
+                    "where": {
+                        "fieldFilter": {
+                            "field": { "fieldPath": "n" },
+                            "op": "IN",
+                            "value": { "arrayValue": { "values": [{ "integerValue": "42" }] } }
+                        }
+                    }
+                }
+            })),
+        )
+        .await;
+    expect_eq!(status, StatusCode::OK);
+    expect_eq!(extract_ids(&bytes), vec!["d_num"]);
+
+    let (status, bytes) = db
+        .http_oneshot(
+            Method::POST,
+            &run_query_uri,
+            Some(&json!({
+                "structuredQuery": {
+                    "from": [{ "collectionId": "restq" }],
+                    "where": {
+                        "fieldFilter": {
+                            "field": { "fieldPath": "n" },
+                            "op": "NOT_IN",
+                            "value": { "arrayValue": { "values": [{ "integerValue": "1" }] } }
+                        }
+                    }
+                }
+            })),
+        )
+        .await;
+    expect_eq!(status, StatusCode::OK);
+    expect_eq!(extract_ids(&bytes), vec!["d_num"]);
+
+    // 2. Empty `AND` returns 200 OK (all docs), while empty `OR`, Standard > 10 `NOT_IN`, and
+    //    reserved paths return 400 Bad Request with `"status": "INVALID_ARGUMENT"`.
+    let (status, bytes) = db
+        .http_oneshot(
+            Method::POST,
+            &run_query_uri,
+            Some(&json!({
+                "structuredQuery": {
+                    "from": [{ "collectionId": "restq" }],
+                    "where": { "compositeFilter": { "op": "AND", "filters": [] } }
+                }
+            })),
+        )
+        .await;
+    expect_eq!(status, StatusCode::OK);
+    expect_eq!(extract_ids(&bytes), vec!["d_missing", "d_null", "d_num"]);
+
+    let too_many_not_in: Vec<serde_json::Value> = (1..=11)
+        .map(|i| json!({ "integerValue": i.to_string() }))
+        .collect();
+    for bad_where in [
+        json!({ "compositeFilter": { "op": "OR", "filters": [] } }),
+        json!({
+            "fieldFilter": {
+                "field": { "fieldPath": "n" },
+                "op": "NOT_IN",
+                "value": { "arrayValue": { "values": too_many_not_in } }
+            }
+        }),
+        json!({
+            "fieldFilter": {
+                "field": { "fieldPath": "__custom__" },
+                "op": "EQUAL",
+                "value": { "integerValue": "1" }
+            }
+        }),
+    ] {
+        let (status, bytes) = db
+            .http_oneshot(
+                Method::POST,
+                &run_query_uri,
+                Some(&json!({
+                    "structuredQuery": {
+                        "from": [{ "collectionId": "restq" }],
+                        "where": bad_where
+                    }
+                })),
+            )
+            .await;
+        expect_eq!(status, StatusCode::BAD_REQUEST);
+        let err_json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        expect_eq!(err_json["error"]["status"], "INVALID_ARGUMENT");
+    }
+
+    // 3. Enterprise Edition via REST: `NOT_IN` includes missing `d_missing` and `null` `d_null`,
+    //    and
+    //    > 10 `NOT_IN` elements succeed.
+    db.set_admin_mode(Some("ENTERPRISE"), None).await;
+    let eleven_vals: Vec<serde_json::Value> = (1..=11)
+        .map(|i| json!({ "integerValue": i.to_string() }))
+        .collect();
+    let (status, bytes) = db
+        .http_oneshot(
+            Method::POST,
+            &run_query_uri,
+            Some(&json!({
+                "structuredQuery": {
+                    "from": [{ "collectionId": "restq" }],
+                    "where": {
+                        "fieldFilter": {
+                            "field": { "fieldPath": "n" },
+                            "op": "NOT_IN",
+                            "value": { "arrayValue": { "values": eleven_vals } }
+                        }
+                    },
+                    "orderBy": [{ "field": { "fieldPath": "__name__" }, "direction": "ASCENDING" }]
+                }
+            })),
+        )
+        .await;
+    expect_eq!(status, StatusCode::OK);
+    expect_eq!(extract_ids(&bytes), vec!["d_missing", "d_null", "d_num"]);
+}

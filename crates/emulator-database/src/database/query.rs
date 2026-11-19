@@ -6,17 +6,21 @@ use std::{
     sync::Arc,
 };
 
-use googleapis::google::{
-    firestore::v1::{
-        Cursor, Document, StructuredQuery, Value,
-        structured_query::{self, CollectionSelector},
+use googleapis::{
+    VectorClassification, VectorFormatError, classify_vector_map,
+    google::{
+        firestore::v1::{
+            Cursor, Document, StructuredQuery, Value,
+            structured_query::{self, CollectionSelector},
+            value::ValueType,
+        },
+        protobuf::Timestamp,
     },
-    protobuf::Timestamp,
 };
 use itertools::Itertools;
 use string_cache::DefaultAtom;
 
-use self::filter::Filter;
+use self::filter::{CompositeOperator, FieldOperator, Filter, UnaryOperator};
 pub use self::find_nearest::FindNearest;
 pub use super::vector::DistanceMeasure;
 use super::{
@@ -26,8 +30,8 @@ use super::{
     field_path::{FieldPath, FieldReference},
     projection::{Project, Projection, project_with_distance},
     read_consistency::{ReadConsistency, validate_read_time},
-    reference::{CollectionRef, Ref},
-    vector,
+    reference::{self, CollectionRef, Ref, RootRef},
+    validation, vector,
 };
 use crate::{
     GenericDatabaseError,
@@ -252,7 +256,7 @@ impl QueryBuilder {
             consistency: self.consistency,
             collection_cache: Default::default(),
         };
-        query.validate(self.enterprise_edition)?;
+        query.validate()?;
         Ok(query)
     }
 }
@@ -361,6 +365,338 @@ pub struct Query {
     collection_cache: HashMap<DefaultAtom, bool>,
 }
 
+const MAX_STANDARD_DISJUNCTIONS: u8 = 30;
+const DNF_DISJUNCTION_CAP: u8 = 31;
+const MAX_ARRAY_CONTAINS_CAP: u8 = 2;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct DnfSummary {
+    disjunctions: u8,
+    max_array_contains: u8,
+}
+
+fn value_dnf_dedup_eq(a: &Value, b: &Value) -> bool {
+    (a.is_nan() && b.is_nan()) || a.storage_eq(b)
+}
+
+fn unique_value_count(values: &[Value]) -> u8 {
+    values
+        .iter()
+        .enumerate()
+        .filter(|&(i, v)| values[..i].iter().all(|prev| !value_dnf_dedup_eq(prev, v)))
+        .count()
+        .min(DNF_DISJUNCTION_CAP as usize) as u8
+}
+
+impl DnfSummary {
+    fn from_filter(filter: &Filter) -> Self {
+        match filter {
+            Filter::Unary(_) => Self {
+                disjunctions: 1,
+                max_array_contains: 0,
+            },
+            Filter::Field(ff) => match ff.op {
+                FieldOperator::ArrayContains => Self {
+                    disjunctions: 1,
+                    max_array_contains: 1,
+                },
+                FieldOperator::In => Self {
+                    disjunctions: ff.value.as_array().map_or(1, unique_value_count),
+                    max_array_contains: 0,
+                },
+                FieldOperator::ArrayContainsAny => Self {
+                    disjunctions: ff.value.as_array().map_or(1, unique_value_count),
+                    max_array_contains: 1,
+                },
+                _ => Self {
+                    disjunctions: 1,
+                    max_array_contains: 0,
+                },
+            },
+            Filter::Composite(cf) => match cf.op {
+                CompositeOperator::And => cf.filters.iter().fold(
+                    Self {
+                        disjunctions: 1,
+                        max_array_contains: 0,
+                    },
+                    |acc, sub| {
+                        let child = Self::from_filter(sub);
+                        Self {
+                            disjunctions: acc
+                                .disjunctions
+                                .saturating_mul(child.disjunctions)
+                                .min(DNF_DISJUNCTION_CAP),
+                            max_array_contains: acc
+                                .max_array_contains
+                                .saturating_add(child.max_array_contains)
+                                .min(MAX_ARRAY_CONTAINS_CAP),
+                        }
+                    },
+                ),
+                CompositeOperator::Or => cf.filters.iter().fold(
+                    Self {
+                        disjunctions: 0,
+                        max_array_contains: 0,
+                    },
+                    |acc, sub| {
+                        let child = Self::from_filter(sub);
+                        Self {
+                            disjunctions: acc
+                                .disjunctions
+                                .saturating_add(child.disjunctions)
+                                .min(DNF_DISJUNCTION_CAP),
+                            max_array_contains: acc
+                                .max_array_contains
+                                .max(child.max_array_contains),
+                        }
+                    },
+                ),
+            },
+        }
+    }
+}
+
+fn validate_query_operand_value(value: &Value, enterprise_edition: bool) -> Result<()> {
+    match value.value_type.as_ref() {
+        None => Err(GenericDatabaseError::invalid_argument(
+            "Cannot convert firestore.v1.Value with type unset.",
+        )),
+        Some(ValueType::ReferenceValue(s)) => reference::parse_query_ref_root(s).map(|_| ()),
+        Some(ValueType::GeoPointValue(geo)) => validation::validate_geo_point(geo),
+        Some(ValueType::TimestampValue(ts)) => validation::validate_timestamp(ts),
+        Some(
+            ValueType::FieldReferenceValue(_)
+            | ValueType::VariableReferenceValue(_)
+            | ValueType::FunctionValue(_)
+            | ValueType::PipelineValue(_),
+        ) => Err(GenericDatabaseError::invalid_argument(
+            "Value type is not supported in StructuredQuery operands.",
+        )),
+        Some(ValueType::MapValue(map)) => match classify_vector_map(&map.fields) {
+            VectorClassification::Valid(_) => Ok(()),
+            VectorClassification::Invalid(VectorFormatError::NanElement) if !enterprise_edition => {
+                Ok(())
+            }
+            VectorClassification::Invalid(err) => Err(GenericDatabaseError::invalid_argument(
+                err.as_error_message(),
+            )),
+            VectorClassification::NotVectorMap => {
+                for v in map.fields.values() {
+                    validate_query_operand_value(v, enterprise_edition)?;
+                }
+                Ok(())
+            }
+        },
+        Some(ValueType::ArrayValue(arr)) => {
+            for v in &arr.values {
+                validate_query_operand_value(v, enterprise_edition)?;
+            }
+            Ok(())
+        }
+        Some(
+            ValueType::NullValue(_)
+            | ValueType::BooleanValue(_)
+            | ValueType::IntegerValue(_)
+            | ValueType::DoubleValue(_)
+            | ValueType::StringValue(_)
+            | ValueType::BytesValue(_),
+        ) => Ok(()),
+    }
+}
+
+fn validate_filter_common(filter: &Filter, enterprise_edition: bool) -> Result<()> {
+    match filter {
+        Filter::Composite(cf) => {
+            if cf.op == CompositeOperator::Or && cf.filters.is_empty() {
+                return Err(GenericDatabaseError::invalid_argument(
+                    "Composite filter must have at least one sub-filter.",
+                ));
+            }
+            for sub in &cf.filters {
+                validate_filter_common(sub, enterprise_edition)?;
+            }
+            Ok(())
+        }
+        Filter::Unary(uf) => uf.field.validate_query_reference(),
+        Filter::Field(ff) => {
+            ff.field.validate_query_reference()?;
+            if ff.op.is_array_operand() {
+                let Some(arr) = ff.value.as_array() else {
+                    return Err(GenericDatabaseError::invalid_argument(format!(
+                        "'{}' requires an ArrayValue.",
+                        ff.op.wire_name()
+                    )));
+                };
+                if arr.is_empty() {
+                    return Err(GenericDatabaseError::invalid_argument(format!(
+                        "'{}' requires a non-empty ArrayValue.",
+                        ff.op.wire_name()
+                    )));
+                }
+            }
+            validate_query_operand_value(&ff.value, enterprise_edition)
+        }
+    }
+}
+
+fn validate_standard_key_ref(value: &Value, expected_root: &RootRef) -> Result<()> {
+    let Some(s) = value.as_reference() else {
+        return Err(GenericDatabaseError::invalid_argument(
+            "__key__ filter value must be a Key",
+        ));
+    };
+    let meta = reference::parse_query_ref_root(s)?;
+    if !meta.has_doc_path {
+        return Err(GenericDatabaseError::invalid_argument("Key path is empty."));
+    }
+    if meta.has_zero_datastore_id {
+        return Err(GenericDatabaseError::invalid_argument(
+            "Document ID of type long must be non-zero",
+        ));
+    }
+    if meta.project_id != expected_root.project_id.as_str()
+        || meta.database_id != expected_root.database_id.as_str()
+    {
+        return Err(GenericDatabaseError::invalid_argument(
+            "__key__ filter reference must match the target project and database",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_cursor_key_ref(value: &Value, expected_root: &RootRef) -> Result<()> {
+    let Some(s) = value.as_reference() else {
+        return Err(GenericDatabaseError::invalid_argument(
+            "Cursor __key__ value is not a document reference.",
+        ));
+    };
+    let meta = reference::parse_query_ref_root(s)?;
+    if meta.project_id != expected_root.project_id.as_str()
+        || meta.database_id != expected_root.database_id.as_str()
+    {
+        return Err(GenericDatabaseError::invalid_argument(
+            "The cursor key is in a different database than the query",
+        ));
+    }
+    Ok(())
+}
+
+#[derive(Debug, Default)]
+struct StandardFilterStats {
+    negation_count: usize,
+    has_not_in: bool,
+    has_disjunction_op: bool,
+}
+
+fn collect_standard_filter_stats(
+    filter: &Filter,
+    expected_root: &RootRef,
+    stats: &mut StandardFilterStats,
+) -> Result<()> {
+    match filter {
+        Filter::Composite(cf) => {
+            if cf.op == CompositeOperator::Or {
+                stats.has_disjunction_op = true;
+            }
+            for sub in &cf.filters {
+                collect_standard_filter_stats(sub, expected_root, stats)?;
+            }
+        }
+        Filter::Unary(uf) => {
+            if uf.field.is_document_name() {
+                return Err(GenericDatabaseError::invalid_argument(
+                    "__key__ filter value must be a Key",
+                ));
+            }
+            if matches!(uf.op, UnaryOperator::IsNotNan | UnaryOperator::IsNotNull) {
+                stats.negation_count += 1;
+            }
+        }
+        Filter::Field(ff) => {
+            match ff.op {
+                FieldOperator::In => {
+                    if ff.value.as_array().is_some_and(|arr| arr.len() > 30) {
+                        return Err(GenericDatabaseError::invalid_argument(
+                            "'IN' supports up to 30 comparison values.",
+                        ));
+                    }
+                    stats.has_disjunction_op = true;
+                }
+                FieldOperator::ArrayContainsAny => {
+                    if ff.value.as_array().is_some_and(|arr| arr.len() > 30) {
+                        return Err(GenericDatabaseError::invalid_argument(
+                            "'ARRAY_CONTAINS_ANY' supports up to 30 comparison values.",
+                        ));
+                    }
+                    stats.has_disjunction_op = true;
+                }
+                FieldOperator::NotIn => {
+                    if ff.value.as_array().is_some_and(|arr| arr.len() > 10) {
+                        return Err(GenericDatabaseError::invalid_argument(
+                            "'NOT_IN' supports up to 10 comparison values.",
+                        ));
+                    }
+                    stats.has_not_in = true;
+                    stats.negation_count += 1;
+                }
+                FieldOperator::NotEqual => {
+                    stats.negation_count += 1;
+                }
+                _ => {}
+            }
+
+            if ff.field.is_document_name() {
+                match ff.op {
+                    FieldOperator::ArrayContains | FieldOperator::ArrayContainsAny => {
+                        return Err(GenericDatabaseError::invalid_argument(
+                            "the name __key__ is reserved",
+                        ));
+                    }
+                    FieldOperator::In | FieldOperator::NotIn => {
+                        if let Some(arr) = ff.value.as_array() {
+                            for el in arr {
+                                validate_standard_key_ref(el, expected_root)?;
+                            }
+                        }
+                    }
+                    _ => {
+                        validate_standard_key_ref(&ff.value, expected_root)?;
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_standard_filter(filter: &Filter, expected_root: &RootRef) -> Result<()> {
+    let mut stats = StandardFilterStats::default();
+    collect_standard_filter_stats(filter, expected_root, &mut stats)?;
+    if stats.negation_count > 1 {
+        return Err(GenericDatabaseError::invalid_argument(
+            "Only a single 'NOT_EQUAL', 'NOT_IN', 'IS_NOT_NAN', or 'IS_NOT_NULL' filter allowed \
+             per query.",
+        ));
+    }
+    if stats.has_not_in && stats.has_disjunction_op {
+        return Err(GenericDatabaseError::invalid_argument(
+            "'NOT_IN' cannot be used in the same query with 'IN', 'ARRAY_CONTAINS_ANY' or 'OR'.",
+        ));
+    }
+    let dnf = DnfSummary::from_filter(filter);
+    if dnf.max_array_contains > 1 {
+        return Err(GenericDatabaseError::invalid_argument(
+            "A maximum of 1 'ARRAY_CONTAINS' filter is allowed per disjunction.",
+        ));
+    }
+    if dnf.disjunctions > MAX_STANDARD_DISJUNCTIONS {
+        return Err(GenericDatabaseError::invalid_argument(
+            "Too many disjunctions after normalization; maximum is 30.",
+        ));
+    }
+    Ok(())
+}
+
 impl Query {
     pub fn from_structured(
         parent: Ref,
@@ -410,11 +746,31 @@ impl Query {
             consistency,
             collection_cache: Default::default(),
         });
-        query.validate(enterprise_edition)?;
+        query.validate()?;
         Ok(query)
     }
 
-    fn validate(&mut self, enterprise_edition: bool) -> Result<()> {
+    fn synthesize_standard_order_by(&mut self, dir: Direction) {
+        if let Some(filter) = &self.filter {
+            for field in filter.sorted_non_name_inequality_fields() {
+                if !self.order_by.iter().any(|o| o.field == field) {
+                    self.order_by.push(Order {
+                        field,
+                        direction: dir,
+                    });
+                }
+            }
+        }
+        if !self.order_by.iter().any(|o| o.field.is_document_name()) {
+            self.order_by.push(Order {
+                field:     FieldReference::DocumentName,
+                direction: dir,
+            });
+        }
+    }
+
+    fn validate(&mut self) -> Result<()> {
+        let enterprise_edition = self.enterprise_edition;
         if matches!(self.parent, Ref::Collection(_)) {
             return Err(GenericDatabaseError::invalid_argument(
                 "parent must point to a Document or Root",
@@ -427,14 +783,32 @@ impl Query {
             ));
         }
 
+        for order in &self.order_by {
+            order.field.validate_query_reference()?;
+        }
         if let Some(filter) = &self.filter {
-            for ff in filter.field_filters() {
-                vector::validate_query_operand_value(&ff.value, enterprise_edition)?;
-            }
+            validate_filter_common(filter, enterprise_edition)?;
         }
         for cursor in [&self.start_at, &self.end_at].into_iter().flatten() {
             for v in &cursor.values {
-                vector::validate_query_operand_value(v, enterprise_edition)?;
+                validate_query_operand_value(v, enterprise_edition)?;
+            }
+        }
+
+        if !enterprise_edition {
+            if let Some(filter) = &self.filter {
+                validate_standard_filter(filter, self.parent.root())?;
+            }
+            for (i, order) in self.order_by.iter().enumerate() {
+                if self.order_by[..i]
+                    .iter()
+                    .any(|prev| prev.field == order.field)
+                {
+                    return Err(GenericDatabaseError::invalid_argument(format!(
+                        "order by clause cannot contain duplicate fields: {}",
+                        order.field
+                    )));
+                }
             }
         }
 
@@ -455,68 +829,55 @@ impl Query {
                     "A cursor cannot be used with FindNearest",
                 ));
             }
-            if !enterprise_edition && let Some(filter) = &self.filter {
-                filter
-                    .field_filters()
-                    .filter(|f| f.op.is_array_contains())
-                    .at_most_one()
-                    .map_err(|_| {
-                        GenericDatabaseError::invalid_argument(
-                            "A maximum of 1 'ARRAY_CONTAINS' filter is allowed per disjunction.",
-                        )
-                    })?;
+            if !enterprise_edition {
+                let last_dir = self
+                    .order_by
+                    .last()
+                    .map_or(Direction::Ascending, |o| o.direction);
+                self.synthesize_standard_order_by(last_dir);
             }
         } else {
+            for cursor in [&self.start_at, &self.end_at].into_iter().flatten() {
+                if cursor.values.len() > self.order_by.len() {
+                    return Err(GenericDatabaseError::invalid_argument(
+                        "Cursor has too many values.",
+                    ));
+                }
+                for (order, cursor_val) in self.order_by.iter().zip(&cursor.values) {
+                    if order.field.is_document_name() {
+                        validate_cursor_key_ref(cursor_val, self.parent.root())?;
+                    }
+                }
+            }
+
             let last_dir = self
                 .order_by
                 .last()
                 .map_or(Direction::Ascending, |o| o.direction);
 
-            if !enterprise_edition && let Some(filter) = &self.filter {
-                for field in filter.sorted_non_name_inequality_fields() {
-                    if !self.order_by.iter().any(|o| o.field == field) {
-                        self.order_by.push(Order {
-                            field,
-                            direction: last_dir,
-                        });
-                    }
-                }
-
-                filter
-                    .field_filters()
-                    .filter(|f| f.op.is_array_contains())
-                    .at_most_one()
-                    .map_err(|_| {
-                        GenericDatabaseError::invalid_argument(
-                            "A maximum of 1 'ARRAY_CONTAINS' filter is allowed per disjunction.",
-                        )
-                    })?;
-            }
-
-            let has_all_descendants = self.from.iter().any(|selector| selector.all_descendants);
-            if (!enterprise_edition || has_all_descendants)
+            if !enterprise_edition {
+                self.synthesize_standard_order_by(last_dir);
+            } else if self.from.iter().any(|selector| selector.all_descendants)
                 && !self.order_by.iter().any(|o| o.field.is_document_name())
             {
                 self.order_by.push(Order {
                     field:     FieldReference::DocumentName,
                     direction: last_dir,
-                })
-            }
-
-            if self
-                .start_at
-                .as_ref()
-                .is_some_and(|c| c.values.len() > self.order_by.len())
-                || self
-                    .end_at
-                    .as_ref()
-                    .is_some_and(|c| c.values.len() > self.order_by.len())
-            {
-                return Err(GenericDatabaseError::invalid_argument(
-                    "Cursor has too many values.",
-                ));
+                });
             }
         }
+
+        if !enterprise_edition
+            && self
+                .order_by
+                .split_last()
+                .is_some_and(|(_, prefix)| prefix.iter().any(|o| o.field.is_document_name()))
+        {
+            return Err(GenericDatabaseError::invalid_argument(
+                "order by clause cannot contain more fields after the key",
+            ));
+        }
+
         Ok(())
     }
 
@@ -582,7 +943,7 @@ impl Query {
                         {
                             scanned_guards.push(Arc::clone(guard));
                         }
-                        if !self.matches_prefilters(&doc.version)? {
+                        if !self.matches_prefilters(&doc.version) {
                             continue;
                         }
                         let Some(dist) =
@@ -596,12 +957,20 @@ impl Query {
                 }
             }
 
+            let enterprise_tie_fields = if self.enterprise_edition {
+                self.filter
+                    .as_ref()
+                    .map_or_else(Vec::new, Filter::sorted_non_name_inequality_fields)
+            } else {
+                Vec::new()
+            };
+
             vector::select_and_sort_nearest(&mut candidates, Some(spec.limit), |a, b| {
                 let da = a.computed_distance.unwrap_or(f64::NAN);
                 let db = b.computed_distance.unwrap_or(f64::NAN);
-                spec.distance_measure
-                    .cmp_distance(da, db)
-                    .then_with(|| self.find_nearest_tie_cmp(&a.version, &b.version))
+                spec.distance_measure.cmp_distance(da, db).then_with(|| {
+                    self.find_nearest_tie_cmp(&a.version, &b.version, &enterprise_tie_fields)
+                })
             });
 
             if self.enterprise_edition {
@@ -752,25 +1121,25 @@ impl Query {
         included
     }
 
-    pub(crate) fn matches_prefilters(&mut self, doc: &StoredDocumentVersion) -> Result<bool> {
+    pub(crate) fn matches_prefilters(&mut self, doc: &StoredDocumentVersion) -> bool {
         if !self.includes_collection(&doc.name.collection_ref) {
-            return Ok(false);
+            return false;
         }
         if let Some(filter) = &self.filter
-            && !filter.eval(doc, self.enterprise_edition)?
+            && !filter.eval(doc, self.enterprise_edition)
         {
-            return Ok(false);
+            return false;
         }
         for order_by in &self.order_by {
             if order_by.field.get_value(doc).is_none() {
-                return Ok(false);
+                return false;
             }
         }
-        Ok(true)
+        true
     }
 
     pub fn includes_document(&mut self, doc: &StoredDocumentVersion) -> Result<bool> {
-        if !self.matches_prefilters(doc)? {
+        if !self.matches_prefilters(doc) {
             return Ok(false);
         }
         if let Some(cursor) = &self.start_at
@@ -835,24 +1204,15 @@ impl Query {
         &self,
         a: &Arc<StoredDocumentVersion>,
         b: &Arc<StoredDocumentVersion>,
+        enterprise_tie_fields: &[FieldReference],
     ) -> cmp::Ordering {
-        if !self.enterprise_edition && !self.order_by.is_empty() {
-            let ord = self.order_by_cmp(a, b);
+        if !self.enterprise_edition {
+            return self.order_by_cmp(a, b);
+        }
+        for field in enterprise_tie_fields {
+            let ord = field.get_value(a).cmp(&field.get_value(b));
             if ord != cmp::Ordering::Equal {
                 return ord;
-            }
-            let name_cmp = a.name.cmp_firestore_order(&b.name);
-            return match self.order_by.last().map(|o| o.direction) {
-                Some(Direction::Descending) => name_cmp.reverse(),
-                _ => name_cmp,
-            };
-        }
-        if let Some(filter) = &self.filter {
-            for field in filter.sorted_non_name_inequality_fields() {
-                let ord = field.get_value(a).cmp(&field.get_value(b));
-                if ord != cmp::Ordering::Equal {
-                    return ord;
-                }
             }
         }
         a.name.cmp_firestore_order(&b.name)
@@ -899,15 +1259,18 @@ impl Query {
     ) -> cmp::Ordering {
         use cmp::Ordering::*;
         for order in &self.order_by {
-            let a = order.field.get_value(a);
-            let b = order.field.get_value(b);
-            let result = match a.cmp(&b) {
-                result @ (Less | Greater) => result,
-                Equal => continue,
+            let result = match &order.field {
+                FieldReference::DocumentName => a.name.cmp_firestore_order(&b.name),
+                FieldReference::FieldPath(path) => {
+                    path.get_value(&a.fields).cmp(&path.get_value(&b.fields))
+                }
             };
+            if result == Equal {
+                continue;
+            }
             return match order.direction {
                 Direction::Descending => result.reverse(),
-                _ => result,
+                Direction::Ascending => result,
             };
         }
         Equal
@@ -917,9 +1280,9 @@ impl Query {
     fn doc_on_left_of_cursor(&self, doc: &StoredDocumentVersion, cursor: &Cursor) -> bool {
         use cmp::Ordering::*;
         for (order, cursor_value) in self.order_by.iter().zip(&cursor.values) {
-            let doc_value = order.field.get_value(doc).expect(
-                "fields used in order_by MUST also be used in filter, so cannot be empty here",
-            );
+            let Some(doc_value) = order.field.get_value(doc) else {
+                return false;
+            };
             match (&order.direction, doc_value.deref().cmp(cursor_value)) {
                 (Direction::Ascending, Less) | (Direction::Descending, Greater) => return true,
                 (Direction::Ascending, Greater) | (Direction::Descending, Less) => return false,

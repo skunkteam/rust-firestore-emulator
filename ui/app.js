@@ -754,7 +754,7 @@ export async function saveDocumentFromInspector(docLevel) {
 /**
  * Executes the current query in QueryRunnerState.
  */
-async function executeCurrentQuery() {
+export async function executeCurrentQuery() {
   if (!state.activeProjectId || !state.activeDatabaseId) return;
   const qState = state.queryState;
   qState.error = null;
@@ -804,7 +804,12 @@ async function executeCurrentQuery() {
       .map((r) => r.document)
       .filter((d) => d !== undefined);
   } catch (err) {
-    qState.error = err instanceof Error ? err.message : String(err);
+    qState.error =
+      err instanceof ApiError
+        ? `[${err.code} ${err.status}] ${err.message}`
+        : err instanceof Error
+          ? err.message
+          : String(err);
   } finally {
     qState.running = false;
     renderApp();

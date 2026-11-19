@@ -2,20 +2,58 @@ use std::collections::HashMap;
 
 use googleapis::{
     VectorClassification, classify_vector_map,
-    google::firestore::v1::{
-        DocumentMask, Precondition, Value, Write,
-        document_transform::{
-            FieldTransform,
-            field_transform::{ServerValue, TransformType},
+    google::{
+        firestore::v1::{
+            DocumentMask, Precondition, Value, Write,
+            document_transform::{
+                FieldTransform,
+                field_transform::{ServerValue, TransformType},
+            },
+            precondition,
+            value::ValueType,
+            write,
         },
-        precondition,
-        value::ValueType,
-        write,
+        protobuf::Timestamp,
+        r#type::LatLng,
     },
 };
 
 use super::{field_path::FieldPath, reference};
 use crate::{GenericDatabaseError, error::Result, unimplemented_collection, unimplemented_option};
+
+pub(crate) fn validate_geo_point(geo: &LatLng) -> Result<()> {
+    if !geo.latitude.is_finite() || !(-90.0..=90.0).contains(&geo.latitude) {
+        return Err(GenericDatabaseError::invalid_argument(format!(
+            "latitude must be in the range [-90, 90], got {}",
+            geo.latitude
+        )));
+    }
+    if !geo.longitude.is_finite() || !(-180.0..=180.0).contains(&geo.longitude) {
+        return Err(GenericDatabaseError::invalid_argument(format!(
+            "longitude must be in the range [-180, 180], got {}",
+            geo.longitude
+        )));
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_timestamp(ts: &Timestamp) -> Result<()> {
+    const MIN_TIMESTAMP_SECONDS: i64 = -62_135_596_800; // 0001-01-01T00:00:00Z
+    const MAX_TIMESTAMP_SECONDS: i64 = 253_402_300_799; // 9999-12-31T23:59:59Z
+    if !(MIN_TIMESTAMP_SECONDS..=MAX_TIMESTAMP_SECONDS).contains(&ts.seconds) {
+        return Err(GenericDatabaseError::invalid_argument(format!(
+            "Timestamp seconds {} out of range [{MIN_TIMESTAMP_SECONDS}, {MAX_TIMESTAMP_SECONDS}]",
+            ts.seconds
+        )));
+    }
+    if !(0..1_000_000_000).contains(&ts.nanos) {
+        return Err(GenericDatabaseError::invalid_argument(format!(
+            "Timestamp nanos {} out of range [0, 999999999]",
+            ts.nanos
+        )));
+    }
+    Ok(())
+}
 
 pub(crate) fn validate_writable_fields(fields: &HashMap<String, Value>) -> Result<()> {
     for (key, value) in fields {
@@ -69,21 +107,7 @@ pub(crate) fn validate_writable_value(value: &Value, in_array: bool) -> Result<(
             )),
             VectorClassification::NotVectorMap => validate_writable_fields(&map.fields),
         },
-        Some(ValueType::GeoPointValue(geo)) => {
-            if !geo.latitude.is_finite() || !(-90.0..=90.0).contains(&geo.latitude) {
-                return Err(GenericDatabaseError::invalid_argument(format!(
-                    "latitude must be in the range [-90, 90], got {}",
-                    geo.latitude
-                )));
-            }
-            if !geo.longitude.is_finite() || !(-180.0..=180.0).contains(&geo.longitude) {
-                return Err(GenericDatabaseError::invalid_argument(format!(
-                    "longitude must be in the range [-180, 180], got {}",
-                    geo.longitude
-                )));
-            }
-            Ok(())
-        }
+        Some(ValueType::GeoPointValue(geo)) => validate_geo_point(geo),
         Some(
             ValueType::NullValue(_)
             | ValueType::BooleanValue(_)

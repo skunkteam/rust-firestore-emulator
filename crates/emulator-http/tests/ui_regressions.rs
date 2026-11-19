@@ -1448,6 +1448,179 @@ assert.equal(
 }
 
 #[test]
+fn query_builder_array_operators_validation_and_error_banners() {
+    let script = format!(
+        r#"{NODE_BOOTSTRAP}
+const app = await import("./ui/app.js");
+const query = await import("./ui/components/query.js");
+const values = await import("./ui/values.js");
+
+const makeRow = (op, valueText) => ({{
+  id: 1,
+  fieldPath: "tags",
+  op,
+  valueType: "stringValue",
+  valueText,
+  latText: "0",
+  lngText: "0",
+}});
+
+// 1. IN, ARRAY_CONTAINS_ANY, and NOT_IN emit selected operator and encode integers, -0.0, floats,
+//    unsafe floats, explicit ±Infinity and 2^53 doubleValue, and single-level arrayValue (IN/NOT_IN).
+for (const op of ["IN", "ARRAY_CONTAINS_ANY", "NOT_IN"]) {{
+  const qState = query.createQueryRunnerState("items");
+  const baseArr =
+    '[42, -0, 1.5, 1e25, {{"doubleValue": "Infinity"}}, {{"doubleValue": "-Infinity"}}, null, true, "ok", {{"doubleValue": 9007199254740992}}';
+  qState.filters.push(makeRow(
+    op,
+    op === "ARRAY_CONTAINS_ANY"
+      ? `${{baseArr}}]`
+      : `${{baseArr}}, {{"arrayValue": {{"values": [{{"integerValue": "7"}}]}}}}]`
+  ));
+  const built = query.buildStructuredQueryFromVisual(qState, "p", "(default)");
+  assert.equal(built.valid, true, "expected valid build for " + op + ": " + built.error);
+  const ff = built.query.where.fieldFilter;
+  assert.equal(ff.op, op);
+  const items = ff.value.arrayValue.values;
+  assert.deepEqual(items[0], {{ integerValue: "42" }});
+  assert.equal(Object.is(items[1].doubleValue, -0), true);
+  assert.deepEqual(items[2], {{ doubleValue: 1.5 }});
+  assert.deepEqual(items[3], {{ doubleValue: 1e25 }});
+  assert.deepEqual(items[4], {{ doubleValue: "Infinity" }});
+  assert.deepEqual(items[5], {{ doubleValue: "-Infinity" }});
+  assert.deepEqual(items[6], {{ nullValue: null }});
+  assert.deepEqual(items[7], {{ booleanValue: true }});
+  assert.deepEqual(items[8], {{ stringValue: "ok" }});
+  assert.deepEqual(items[9], {{ doubleValue: 9007199254740992 }});
+  if (op !== "ARRAY_CONTAINS_ANY") {{
+    assert.deepEqual(items[10], {{ arrayValue: {{ values: [{{ integerValue: "7" }}] }} }});
+  }}
+
+  const serialized = values.stringifyProtoJson(built.query);
+  assert.ok(serialized.includes('"doubleValue":-0.0'), "expected -0.0 in " + serialized);
+  assert.ok(serialized.includes('"doubleValue":"Infinity"'), "expected Infinity string in " + serialized);
+  assert.ok(serialized.includes('"doubleValue":"-Infinity"'), "expected -Infinity string in " + serialized);
+}}
+
+// 2. Rejects unquoted |n| >= 2^53 integers (except inside doubleValue), overflowing numeric
+//    literals in both shorthand and ProtoJSON, nested arrays, and invalid plain objects.
+assert.equal(
+  values.validateRawProtoJsonFields('{{"fields":{{"d":{{"doubleValue":9007199254740992}}}}}}').valid,
+  true
+);
+assert.equal(
+  values.validateRawProtoJsonFields('{{"fields":{{"i":{{"integerValue":9007199254740993}}}}}}').valid,
+  false
+);
+for (const [op, rawText, expectedSubstr] of [
+  ["IN", "[9007199254740992]", "Unquoted 64-bit integer 9007199254740992 in IN"],
+  ["ARRAY_CONTAINS_ANY", "[9007199254740993]", "ARRAY_CONTAINS_ANY"],
+  ["NOT_IN", "[-9007199254740993]", "NOT_IN"],
+  ["IN", '[{{"integerValue": 9007199254740993}}]', "Unquoted 64-bit integer 9007199254740993 in IN"],
+  ["IN", "[1e309]", "overflows IEEE-754 double"],
+  ["NOT_IN", "[-1e309]", "overflows IEEE-754 double"],
+  ["IN", '[{{"doubleValue": 1e309}}]', "overflows IEEE-754 double"],
+  ["IN", "[[1]]", 'must use explicit ProtoJSON {{"arrayValue": {{"values": [...]}}}}'],
+  ["NOT_IN", "[[1]]", 'must use explicit ProtoJSON {{"arrayValue": {{"values": [...]}}}}'],
+  ["ARRAY_CONTAINS_ANY", "[[1]]", "Nested arrays are not supported in ARRAY_CONTAINS_ANY"],
+  ["ARRAY_CONTAINS_ANY", '[{{"arrayValue":{{"values":[{{"integerValue":"1"}}]}}}}]', "nested arrays"],
+  ["IN", '[{{"arrayValue":{{"values":[{{"arrayValue":{{"values":[{{"integerValue":"1"}}]}}}}]}}}}]', "nested arrays"],
+  ["ARRAY_CONTAINS_ANY", '[{{"foo": 1}}]', "unsupported Value key"],
+  ["NOT_IN", "not json", 'Filter "tags NOT_IN"'],
+  ["ARRAY_CONTAINS_ANY", "{{}}", 'Filter "tags ARRAY_CONTAINS_ANY" requires a JSON array'],
+]) {{
+  const qState = query.createQueryRunnerState("items");
+  qState.filters.push(makeRow(op, rawText));
+  const res = query.buildStructuredQueryFromVisual(qState, "p", "(default)");
+  assert.equal(res.valid, false, "expected invalid result for " + op + " " + rawText);
+  assert.ok(
+    res.error.includes(expectedSubstr),
+    `expected error containing ${{JSON.stringify(expectedSubstr)}}, got ${{res.error}}`
+  );
+}}
+
+// 3. renderFilterRow initializes "[]" when switching into an array operator and renders JSON input.
+{{
+  const qState = query.createQueryRunnerState("items");
+  qState.filters.push(makeRow("EQUAL", "alice"));
+  const tpl1 = query.renderQueryRunner({{
+    projectId: "p",
+    databaseId: "(default)",
+    knownCollections: ["items"],
+    state: qState,
+    onRerender: () => {{}},
+    onExecuteQuery: () => {{}},
+    onOpenResultDocument: () => {{}},
+  }});
+  const findSelectChange = (node) => {{
+    if (!node || typeof node !== "object") return null;
+    if (Array.isArray(node)) {{
+      for (const item of node) {{
+        const hit = findSelectChange(item);
+        if (hit) return hit;
+      }}
+      return null;
+    }}
+    if (Array.isArray(node.strings) && Array.isArray(node.values)) {{
+      for (let i = 0; i < node.values.length; i++) {{
+        const v = node.values[i];
+        if (typeof v === "function" && /@change=\s*$/.test(node.strings[i])) {{
+          let before = "";
+          for (let k = i; k >= 0; k--) {{
+            before = node.strings[k] + before;
+            if (before.includes("<select")) break;
+          }}
+          if (before.includes("<select") && node.values[i - 1] === "EQUAL") {{
+            return v;
+          }}
+        }}
+        const nested = findSelectChange(v);
+        if (nested) return nested;
+      }}
+    }}
+    return null;
+  }};
+  const onOpChange = findSelectChange(tpl1);
+  assert.ok(onOpChange, "expected operator <select> @change handler");
+  onOpChange({{ target: {{ value: "NOT_IN" }} }});
+  assert.equal(qState.filters[0].op, "NOT_IN");
+  assert.equal(qState.filters[0].valueText, "[]");
+  const tpl2 = query.renderQueryRunner({{
+    projectId: "p",
+    databaseId: "(default)",
+    knownCollections: ["items"],
+    state: qState,
+    onRerender: () => {{}},
+    onExecuteQuery: () => {{}},
+    onOpenResultDocument: () => {{}},
+  }});
+  assert.ok(findInputHandler(tpl2, "JSON array"), "expected JSON array input after switch");
+}}
+
+// 4. executeCurrentQuery formats ApiError banners with "[code status] message".
+{{
+  app.state.activeProjectId = "p";
+  app.state.activeDatabaseId = "(default)";
+  app.state.queryState = query.createQueryRunnerState("items");
+  fetchImpl = async (url) => {{
+    assert.ok(url.endsWith(":runQuery"));
+    return jsonResponse(
+      {{ error: {{ code: 400, status: "INVALID_ARGUMENT", message: "bad filter" }} }},
+      400
+    );
+  }};
+  await app.executeCurrentQuery();
+  assert.equal(app.state.queryState.error, "[400 INVALID_ARGUMENT] bad filter");
+}}
+
+console.log("query_builder_array_operators_validation_and_error_banners passed");
+"#
+    );
+
+    run_node_ui_test(&script);
+}
+
+#[test]
 fn regression_test_suite_script_sigterm_exit_code_and_eslint_flat_config_rules() {
     // Part A: `test-suite/package.json` `test:rust-emulator` must exit non-zero on SIGTERM instead
     // of swallowing TERM in `trap cleanup EXIT INT TERM`.

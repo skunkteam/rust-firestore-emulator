@@ -1,13 +1,14 @@
-use std::{cmp::Ordering, iter};
+use std::{fmt, iter};
 
 use googleapis::google::firestore::v1::{Value, structured_query};
 use itertools::Itertools;
 
 use crate::{
     GenericDatabaseError,
-    database::{document::StoredDocumentVersion, field_path::FieldReference},
-    error::Result,
-    unimplemented,
+    database::{
+        document::StoredDocumentVersion,
+        field_path::{FieldPath, FieldReference},
+    },
 };
 
 #[derive(Clone, Debug)]
@@ -27,21 +28,16 @@ impl Filter {
     }
 
     pub(crate) fn sorted_non_name_inequality_fields(&self) -> Vec<FieldReference> {
-        let mut fields: Vec<FieldReference> = self
+        let mut paths: Vec<FieldPath> = self
             .get_inequality_fields()
-            .filter(|f| !f.is_document_name())
-            .cloned()
-            .unique()
+            .filter_map(|f| match f {
+                FieldReference::DocumentName => None,
+                FieldReference::FieldPath(p) => Some(p.clone()),
+            })
             .collect();
-        fields.sort_by(|a, b| match (a, b) {
-            (FieldReference::FieldPath(pa), FieldReference::FieldPath(pb)) => {
-                pa.segments().cmp(pb.segments())
-            }
-            (FieldReference::DocumentName, FieldReference::DocumentName) => Ordering::Equal,
-            (FieldReference::DocumentName, FieldReference::FieldPath(_)) => Ordering::Less,
-            (FieldReference::FieldPath(_), FieldReference::DocumentName) => Ordering::Greater,
-        });
-        fields
+        paths.sort();
+        paths.dedup();
+        paths.into_iter().map(FieldReference::FieldPath).collect()
     }
 
     pub fn field_filters(&self) -> impl Iterator<Item = &FieldFilter> {
@@ -58,11 +54,11 @@ impl Filter {
         }
     }
 
-    pub fn eval(&self, version: &StoredDocumentVersion, is_enterprise: bool) -> Result<bool> {
+    pub fn eval(&self, version: &StoredDocumentVersion, is_enterprise: bool) -> bool {
         match self {
             Filter::Composite(f) => f.eval(version, is_enterprise),
             Filter::Field(f) => f.eval(version, is_enterprise),
-            Filter::Unary(f) => Ok(f.eval(version, is_enterprise)),
+            Filter::Unary(f) => f.eval(version, is_enterprise),
         }
     }
 
@@ -114,15 +110,15 @@ pub struct CompositeFilter {
 }
 
 impl CompositeFilter {
-    fn eval(&self, version: &StoredDocumentVersion, is_enterprise: bool) -> Result<bool> {
+    fn eval(&self, version: &StoredDocumentVersion, is_enterprise: bool) -> bool {
         for filter in &self.filters {
-            let filter_result = filter.eval(version, is_enterprise)?;
+            let filter_result = filter.eval(version, is_enterprise);
             match (&self.op, filter_result) {
                 (CompositeOperator::And, true) | (CompositeOperator::Or, false) => continue,
-                (_, result) => return Ok(result),
+                (_, result) => return result,
             }
         }
-        Ok(self.op.is_and())
+        self.op.is_and()
     }
 }
 
@@ -141,7 +137,7 @@ impl TryFrom<structured_query::CompositeFilter> for CompositeFilter {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CompositeOperator {
     And,
     Or,
@@ -172,43 +168,85 @@ impl TryFrom<structured_query::composite_filter::Operator> for CompositeOperator
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct FieldFilter {
     pub field: FieldReference,
     pub op:    FieldOperator,
     pub value: Value,
 }
 
+impl fmt::Debug for FieldFilter {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut ds = f.debug_struct("FieldFilter");
+        ds.field("field", &self.field).field("op", &self.op);
+        if let Some(values) = self.value.as_array() {
+            let prefix = &values[..values.len().min(3)];
+            ds.field("array_len", &values.len())
+                .field("array_prefix", &prefix);
+        } else {
+            ds.field("value", &self.value);
+        }
+        ds.finish()
+    }
+}
+
+fn value_matches_eq(lhs: &Value, rhs: &Value, is_enterprise: bool) -> bool {
+    (is_enterprise || (!lhs.is_null() && !lhs.is_nan())) && lhs == rhs
+}
+
 impl FieldFilter {
-    fn eval(&self, version: &StoredDocumentVersion, is_enterprise: bool) -> Result<bool> {
+    fn operand_contains(&self, cand: &Value, is_enterprise: bool) -> bool {
+        if !is_enterprise && (cand.is_null() || cand.is_nan()) {
+            return false;
+        }
+        self.value
+            .as_array()
+            .is_some_and(|arr| arr.iter().any(|rhs| cand == rhs))
+    }
+
+    fn eval(&self, version: &StoredDocumentVersion, is_enterprise: bool) -> bool {
         use FieldOperator::*;
         let Some(value) = self.field.get_value(version) else {
-            // If the field is missing, it only evaluates to true for `!=` in Enterprise Edition
-            return Ok(is_enterprise && matches!(self.op, NotEqual));
+            // If the field is missing, it only evaluates to true for `!=` and `NOT_IN` in
+            // Enterprise Edition.
+            return is_enterprise && matches!(self.op, NotEqual | NotIn);
         };
         let value = value.as_ref();
-        if self.op.needs_type_compat() && !value.is_compatible_with(&self.value) {
-            return Ok(false);
+        if self.op.needs_type_compat()
+            && (!value.is_compatible_with(&self.value)
+                || (!is_enterprise && (value.is_null() || value.is_nan())))
+        {
+            return false;
         }
-        Ok(match self.op {
+        match self.op {
             LessThan => value < &self.value,
             LessThanOrEqual => value <= &self.value,
             GreaterThan => value > &self.value,
             GreaterThanOrEqual => value >= &self.value,
-            Equal => {
-                (is_enterprise || (!value.is_null() && !value.is_nan())) && value == &self.value
+            Equal => value_matches_eq(value, &self.value, is_enterprise),
+            NotEqual => {
+                (is_enterprise || (!value.is_null() && !self.value.is_null()))
+                    && !value_matches_eq(value, &self.value, is_enterprise)
             }
-            NotEqual => (is_enterprise || !value.is_null()) && value != &self.value,
-            ArrayContains => value
-                .as_array()
-                .is_some_and(|arr| arr.contains(&self.value)),
-            In => {
-                (is_enterprise || (!value.is_null() && !value.is_nan()))
-                    && self.value.as_array().is_some_and(|arr| arr.contains(value))
+            ArrayContains => value.as_array().is_some_and(|arr| {
+                arr.iter()
+                    .any(|el| value_matches_eq(el, &self.value, is_enterprise))
+            }),
+            In => self.operand_contains(value, is_enterprise),
+            ArrayContainsAny => value.as_array().is_some_and(|arr| {
+                arr.iter()
+                    .any(|el| self.operand_contains(el, is_enterprise))
+            }),
+            NotIn => {
+                (is_enterprise
+                    || (!value.is_null()
+                        && !self
+                            .value
+                            .as_array()
+                            .is_some_and(|arr| arr.iter().any(Value::is_null))))
+                    && !self.operand_contains(value, is_enterprise)
             }
-            ArrayContainsAny => unimplemented!("ArrayContainsAny"),
-            NotIn => unimplemented!("NotIn"),
-        })
+        }
     }
 }
 
@@ -234,7 +272,7 @@ impl TryFrom<structured_query::FieldFilter> for FieldFilter {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FieldOperator {
     /// The given `field` is less than the given `value`.
     ///
@@ -299,6 +337,25 @@ pub enum FieldOperator {
 }
 
 impl FieldOperator {
+    pub(super) const fn wire_name(self) -> &'static str {
+        match self {
+            Self::LessThan => "LESS_THAN",
+            Self::LessThanOrEqual => "LESS_THAN_OR_EQUAL",
+            Self::GreaterThan => "GREATER_THAN",
+            Self::GreaterThanOrEqual => "GREATER_THAN_OR_EQUAL",
+            Self::Equal => "EQUAL",
+            Self::NotEqual => "NOT_EQUAL",
+            Self::ArrayContains => "ARRAY_CONTAINS",
+            Self::In => "IN",
+            Self::ArrayContainsAny => "ARRAY_CONTAINS_ANY",
+            Self::NotIn => "NOT_IN",
+        }
+    }
+
+    pub(super) const fn is_array_operand(self) -> bool {
+        matches!(self, Self::In | Self::ArrayContainsAny | Self::NotIn)
+    }
+
     pub(crate) fn is_inequality(&self) -> bool {
         match self {
             Self::LessThan
@@ -311,28 +368,10 @@ impl FieldOperator {
         }
     }
 
-    pub(crate) fn is_array_contains(&self) -> bool {
-        match self {
-            Self::LessThan
-            | Self::LessThanOrEqual
-            | Self::GreaterThan
-            | Self::GreaterThanOrEqual
-            | Self::Equal
-            | Self::NotEqual
-            | Self::In
-            | Self::NotIn => false,
-            Self::ArrayContains | Self::ArrayContainsAny => true,
-        }
-    }
-
     pub(crate) fn needs_type_compat(&self) -> bool {
         matches!(
             self,
-            Self::LessThan
-                | Self::LessThanOrEqual
-                | Self::GreaterThan
-                | Self::GreaterThanOrEqual
-                | Self::Equal
+            Self::LessThan | Self::LessThanOrEqual | Self::GreaterThan | Self::GreaterThanOrEqual
         )
     }
 }
@@ -399,7 +438,7 @@ impl TryFrom<structured_query::UnaryFilter> for UnaryFilter {
 }
 
 #[allow(clippy::enum_variant_names)]
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum UnaryOperator {
     /// The given `field` is equal to `NaN`.
     IsNan,
@@ -478,35 +517,35 @@ mod tests {
             op:    FieldOperator::Equal,
             value: Value::double(42.0),
         };
-        expect_that!(eq_filter.eval(&version, false), ok(eq(&true)));
+        expect_that!(eq_filter.eval(&version, false), eq(true));
 
         let ne_filter = FieldFilter {
             field: "count".parse().unwrap(),
             op:    FieldOperator::NotEqual,
             value: Value::double(42.0),
         };
-        expect_that!(ne_filter.eval(&version, false), ok(eq(&false)));
+        expect_that!(ne_filter.eval(&version, false), eq(false));
 
         let big_filter = FieldFilter {
             field: "big".parse().unwrap(),
             op:    FieldOperator::Equal,
             value: Value::double(i64::MAX as f64),
         };
-        expect_that!(big_filter.eval(&version, false), ok(eq(&false)));
+        expect_that!(big_filter.eval(&version, false), eq(false));
 
         let array_contains_filter = FieldFilter {
             field: "tags".parse().unwrap(),
             op:    FieldOperator::ArrayContains,
             value: Value::double(10.0),
         };
-        expect_that!(array_contains_filter.eval(&version, false), ok(eq(&true)));
+        expect_that!(array_contains_filter.eval(&version, false), eq(true));
 
         let in_filter = FieldFilter {
             field: "count".parse().unwrap(),
             op:    FieldOperator::In,
             value: Value::array(vec![Value::double(42.0)]),
         };
-        expect_that!(in_filter.eval(&version, false), ok(eq(&true)));
+        expect_that!(in_filter.eval(&version, false), eq(true));
 
         let nan_version = StoredDocumentVersion {
             name: "projects/p/databases/d/documents/col/nan".parse().unwrap(),
@@ -519,8 +558,8 @@ mod tests {
             op:    FieldOperator::In,
             value: Value::array(vec![Value::double(f64::NAN)]),
         };
-        expect_that!(nan_in_filter.eval(&nan_version, false), ok(eq(&false)));
-        expect_that!(nan_in_filter.eval(&nan_version, true), ok(eq(&true)));
+        expect_that!(nan_in_filter.eval(&nan_version, false), eq(false));
+        expect_that!(nan_in_filter.eval(&nan_version, true), eq(true));
     }
 
     #[gtest]
@@ -611,5 +650,533 @@ mod tests {
         let expected = vec!["a.b".parse().unwrap(), "`a.b`".parse().unwrap()];
         assert_eq!(order_1.sorted_non_name_inequality_fields(), expected);
         assert_eq!(order_2.sorted_non_name_inequality_fields(), expected);
+    }
+
+    #[gtest]
+    fn field_filter_edition_null_nan_missing_and_array_operators() {
+        let make_doc = |fields: HashMap<String, Value>| StoredDocumentVersion {
+            name: "projects/p/databases/d/documents/col/doc".parse().unwrap(),
+            create_time: Timestamp::default(),
+            update_time: Timestamp::default(),
+            fields,
+        };
+        let eval_doc =
+            |fields: HashMap<String, Value>, op: FieldOperator, rhs: Value, ent: bool| {
+                let doc = make_doc(fields);
+                FieldFilter {
+                    field: "v".parse().unwrap(),
+                    op,
+                    value: rhs,
+                }
+                .eval(&doc, ent)
+            };
+
+        // Missing field across all 10 operators: only NotEqual and NotIn match on Enterprise.
+        let all_ops = [
+            (FieldOperator::LessThan, Value::integer(1), false),
+            (FieldOperator::LessThanOrEqual, Value::integer(1), false),
+            (FieldOperator::GreaterThan, Value::integer(1), false),
+            (FieldOperator::GreaterThanOrEqual, Value::integer(1), false),
+            (FieldOperator::Equal, Value::integer(1), false),
+            (FieldOperator::NotEqual, Value::integer(1), true),
+            (FieldOperator::ArrayContains, Value::integer(1), false),
+            (
+                FieldOperator::In,
+                Value::array(vec![Value::integer(1)]),
+                false,
+            ),
+            (
+                FieldOperator::ArrayContainsAny,
+                Value::array(vec![Value::integer(1)]),
+                false,
+            ),
+            (
+                FieldOperator::NotIn,
+                Value::array(vec![Value::null()]),
+                true,
+            ),
+        ];
+        for (op, rhs, ent_expected) in all_ops {
+            assert!(!eval_doc(HashMap::new(), op, rhs.clone(), false));
+            assert_eq!(eval_doc(HashMap::new(), op, rhs, true), ent_expected);
+        }
+
+        // Range comparisons (`<`, `<=`, `>`, `>=`) and Standard null/NaN exclusion.
+        let one = HashMap::from([("v".to_string(), Value::integer(1))]);
+        assert!(eval_doc(
+            one.clone(),
+            FieldOperator::LessThan,
+            Value::integer(2),
+            false
+        ));
+        assert!(!eval_doc(
+            one.clone(),
+            FieldOperator::LessThan,
+            Value::integer(1),
+            false
+        ));
+        assert!(eval_doc(
+            one.clone(),
+            FieldOperator::LessThanOrEqual,
+            Value::integer(1),
+            false
+        ));
+        assert!(eval_doc(
+            one.clone(),
+            FieldOperator::GreaterThan,
+            Value::integer(0),
+            false
+        ));
+        assert!(!eval_doc(
+            one.clone(),
+            FieldOperator::GreaterThan,
+            Value::integer(1),
+            false
+        ));
+        assert!(eval_doc(
+            one.clone(),
+            FieldOperator::GreaterThanOrEqual,
+            Value::integer(1),
+            false
+        ));
+        assert!(!eval_doc(
+            one.clone(),
+            FieldOperator::LessThan,
+            Value::string("a"),
+            false
+        ));
+        assert!(!eval_doc(
+            one.clone(),
+            FieldOperator::LessThanOrEqual,
+            Value::null(),
+            false
+        ));
+        assert!(!eval_doc(
+            one.clone(),
+            FieldOperator::LessThanOrEqual,
+            Value::null(),
+            true
+        ));
+
+        let null_doc = HashMap::from([("v".to_string(), Value::null())]);
+        let nan_doc = HashMap::from([("v".to_string(), Value::double(f64::NAN))]);
+        assert!(!eval_doc(
+            null_doc.clone(),
+            FieldOperator::LessThanOrEqual,
+            Value::null(),
+            false
+        ));
+        assert!(eval_doc(
+            null_doc.clone(),
+            FieldOperator::LessThanOrEqual,
+            Value::null(),
+            true
+        ));
+        assert!(!eval_doc(
+            nan_doc.clone(),
+            FieldOperator::LessThanOrEqual,
+            Value::double(f64::NAN),
+            false
+        ));
+        assert!(eval_doc(
+            nan_doc.clone(),
+            FieldOperator::LessThanOrEqual,
+            Value::double(f64::NAN),
+            true
+        ));
+
+        // Equal & NotEqual with null, NaN, and cross-type 0 / -0.0.
+        assert!(!eval_doc(
+            null_doc.clone(),
+            FieldOperator::Equal,
+            Value::null(),
+            false
+        ));
+        assert!(eval_doc(
+            null_doc.clone(),
+            FieldOperator::Equal,
+            Value::null(),
+            true
+        ));
+        assert!(!eval_doc(
+            nan_doc.clone(),
+            FieldOperator::Equal,
+            Value::double(f64::NAN),
+            false
+        ));
+        assert!(eval_doc(
+            nan_doc.clone(),
+            FieldOperator::Equal,
+            Value::double(f64::NAN),
+            true
+        ));
+
+        assert!(!eval_doc(
+            null_doc.clone(),
+            FieldOperator::NotEqual,
+            Value::integer(1),
+            false
+        ));
+        assert!(eval_doc(
+            null_doc.clone(),
+            FieldOperator::NotEqual,
+            Value::integer(1),
+            true
+        ));
+        assert!(!eval_doc(
+            one.clone(),
+            FieldOperator::NotEqual,
+            Value::null(),
+            false
+        ));
+        assert!(eval_doc(
+            one.clone(),
+            FieldOperator::NotEqual,
+            Value::null(),
+            true
+        ));
+        assert!(!eval_doc(
+            null_doc.clone(),
+            FieldOperator::NotEqual,
+            Value::null(),
+            false
+        ));
+        assert!(!eval_doc(
+            null_doc.clone(),
+            FieldOperator::NotEqual,
+            Value::null(),
+            true
+        ));
+        assert!(eval_doc(
+            nan_doc.clone(),
+            FieldOperator::NotEqual,
+            Value::double(f64::NAN),
+            false
+        ));
+        assert!(!eval_doc(
+            nan_doc.clone(),
+            FieldOperator::NotEqual,
+            Value::double(f64::NAN),
+            true
+        ));
+
+        let neg_zero_doc = HashMap::from([("v".to_string(), Value::double(-0.0))]);
+        assert!(eval_doc(
+            neg_zero_doc.clone(),
+            FieldOperator::Equal,
+            Value::integer(0),
+            false
+        ));
+        assert!(!eval_doc(
+            neg_zero_doc.clone(),
+            FieldOperator::NotEqual,
+            Value::integer(0),
+            false
+        ));
+
+        // NotIn across Standard vs Enterprise with null, NaN, and cross-type numerics.
+        assert!(!eval_doc(
+            null_doc.clone(),
+            FieldOperator::NotIn,
+            Value::array(vec![Value::integer(1)]),
+            false
+        ));
+        assert!(eval_doc(
+            null_doc.clone(),
+            FieldOperator::NotIn,
+            Value::array(vec![Value::integer(1)]),
+            true
+        ));
+        assert!(!eval_doc(
+            one.clone(),
+            FieldOperator::NotIn,
+            Value::array(vec![Value::null()]),
+            false
+        ));
+        assert!(eval_doc(
+            one.clone(),
+            FieldOperator::NotIn,
+            Value::array(vec![Value::null()]),
+            true
+        ));
+        assert!(!eval_doc(
+            one.clone(),
+            FieldOperator::NotIn,
+            Value::array(vec![Value::integer(2), Value::null()]),
+            false
+        ));
+        assert!(eval_doc(
+            one.clone(),
+            FieldOperator::NotIn,
+            Value::array(vec![Value::integer(2), Value::null()]),
+            true
+        ));
+        assert!(!eval_doc(
+            null_doc.clone(),
+            FieldOperator::NotIn,
+            Value::array(vec![Value::null()]),
+            false
+        ));
+        assert!(!eval_doc(
+            null_doc,
+            FieldOperator::NotIn,
+            Value::array(vec![Value::null()]),
+            true
+        ));
+        assert!(eval_doc(
+            nan_doc.clone(),
+            FieldOperator::NotIn,
+            Value::array(vec![Value::double(f64::NAN)]),
+            false
+        ));
+        assert!(!eval_doc(
+            nan_doc,
+            FieldOperator::NotIn,
+            Value::array(vec![Value::double(f64::NAN)]),
+            true
+        ));
+        assert!(!eval_doc(
+            neg_zero_doc,
+            FieldOperator::NotIn,
+            Value::array(vec![Value::integer(0)]),
+            false
+        ));
+        assert!(eval_doc(
+            one.clone(),
+            FieldOperator::NotIn,
+            Value::array(vec![Value::integer(2)]),
+            false
+        ));
+        assert!(!eval_doc(
+            one.clone(),
+            FieldOperator::NotIn,
+            Value::array(vec![Value::double(1.0)]),
+            false
+        ));
+
+        // ArrayContains & ArrayContainsAny with null, NaN, nested NaN map, and cross-type numerics.
+        let nested_nan = Value::map(HashMap::from([(
+            "nested".to_string(),
+            Value::double(f64::NAN),
+        )]));
+        let arr_doc = HashMap::from([(
+            "v".to_string(),
+            Value::array(vec![
+                Value::null(),
+                Value::double(f64::NAN),
+                Value::double(-0.0),
+                Value::integer(42),
+                nested_nan.clone(),
+            ]),
+        )]);
+        assert!(!eval_doc(
+            arr_doc.clone(),
+            FieldOperator::ArrayContains,
+            Value::null(),
+            false
+        ));
+        assert!(eval_doc(
+            arr_doc.clone(),
+            FieldOperator::ArrayContains,
+            Value::null(),
+            true
+        ));
+        assert!(!eval_doc(
+            arr_doc.clone(),
+            FieldOperator::ArrayContains,
+            Value::double(f64::NAN),
+            false
+        ));
+        assert!(eval_doc(
+            arr_doc.clone(),
+            FieldOperator::ArrayContains,
+            Value::double(f64::NAN),
+            true
+        ));
+        assert!(eval_doc(
+            arr_doc.clone(),
+            FieldOperator::ArrayContains,
+            nested_nan.clone(),
+            false
+        ));
+        assert!(eval_doc(
+            arr_doc.clone(),
+            FieldOperator::ArrayContains,
+            Value::double(42.0),
+            false
+        ));
+
+        assert!(!eval_doc(
+            arr_doc.clone(),
+            FieldOperator::ArrayContainsAny,
+            Value::array(vec![Value::null(), Value::double(f64::NAN)]),
+            false
+        ));
+        assert!(eval_doc(
+            arr_doc.clone(),
+            FieldOperator::ArrayContainsAny,
+            Value::array(vec![Value::null()]),
+            true
+        ));
+        assert!(eval_doc(
+            arr_doc.clone(),
+            FieldOperator::ArrayContainsAny,
+            Value::array(vec![Value::double(f64::NAN)]),
+            true
+        ));
+        assert!(eval_doc(
+            arr_doc.clone(),
+            FieldOperator::ArrayContainsAny,
+            Value::array(vec![Value::integer(0), Value::string("miss")]),
+            false
+        ));
+        assert!(eval_doc(
+            arr_doc.clone(),
+            FieldOperator::ArrayContainsAny,
+            Value::array(vec![nested_nan]),
+            false
+        ));
+        assert!(!eval_doc(
+            arr_doc,
+            FieldOperator::ArrayContainsAny,
+            Value::array(vec![Value::integer(99)]),
+            false
+        ));
+        // Non-array field value evaluates to false for ArrayContains / ArrayContainsAny.
+        assert!(!eval_doc(
+            one.clone(),
+            FieldOperator::ArrayContains,
+            Value::integer(1),
+            true
+        ));
+        assert!(!eval_doc(
+            one,
+            FieldOperator::ArrayContainsAny,
+            Value::array(vec![Value::integer(1)]),
+            true
+        ));
+    }
+
+    #[gtest]
+    fn sorted_non_name_inequality_fields_wire_names_and_bounded_debug() {
+        use super::{CompositeFilter, CompositeOperator, Filter, UnaryFilter, UnaryOperator};
+
+        let filter = Filter::Composite(CompositeFilter {
+            op:      CompositeOperator::And,
+            filters: vec![
+                Filter::Field(FieldFilter {
+                    field: "__name__".parse().unwrap(),
+                    op:    FieldOperator::GreaterThan,
+                    value: Value::reference("projects/p/databases/d/documents/c/1".to_string()),
+                }),
+                Filter::Field(FieldFilter {
+                    field: "`a.b`".parse().unwrap(),
+                    op:    FieldOperator::GreaterThan,
+                    value: Value::integer(1),
+                }),
+                Filter::Field(FieldFilter {
+                    field: "a.b".parse().unwrap(),
+                    op:    FieldOperator::LessThan,
+                    value: Value::integer(10),
+                }),
+                Filter::Field(FieldFilter {
+                    field: "a.b".parse().unwrap(),
+                    op:    FieldOperator::GreaterThan,
+                    value: Value::integer(0),
+                }),
+                Filter::Field(FieldFilter {
+                    field: "c".parse().unwrap(),
+                    op:    FieldOperator::NotIn,
+                    value: Value::array(vec![Value::integer(1)]),
+                }),
+                Filter::Unary(UnaryFilter {
+                    field: "d".parse().unwrap(),
+                    op:    UnaryOperator::IsNotNull,
+                }),
+                Filter::Unary(UnaryFilter {
+                    field: "e".parse().unwrap(),
+                    op:    UnaryOperator::IsNotNan,
+                }),
+                Filter::Field(FieldFilter {
+                    field: "eq_ignored".parse().unwrap(),
+                    op:    FieldOperator::Equal,
+                    value: Value::integer(5),
+                }),
+                Filter::Unary(UnaryFilter {
+                    field: "null_ignored".parse().unwrap(),
+                    op:    UnaryOperator::IsNull,
+                }),
+            ],
+        });
+
+        let sorted = filter.sorted_non_name_inequality_fields();
+        assert_eq!(
+            sorted,
+            vec![
+                "a.b".parse().unwrap(),
+                "`a.b`".parse().unwrap(),
+                "c".parse().unwrap(),
+                "d".parse().unwrap(),
+                "e".parse().unwrap(),
+            ]
+        );
+
+        assert_eq!(FieldOperator::LessThan.wire_name(), "LESS_THAN");
+        assert_eq!(
+            FieldOperator::LessThanOrEqual.wire_name(),
+            "LESS_THAN_OR_EQUAL"
+        );
+        assert_eq!(FieldOperator::GreaterThan.wire_name(), "GREATER_THAN");
+        assert_eq!(
+            FieldOperator::GreaterThanOrEqual.wire_name(),
+            "GREATER_THAN_OR_EQUAL"
+        );
+        assert_eq!(FieldOperator::Equal.wire_name(), "EQUAL");
+        assert_eq!(FieldOperator::NotEqual.wire_name(), "NOT_EQUAL");
+        assert_eq!(FieldOperator::ArrayContains.wire_name(), "ARRAY_CONTAINS");
+        assert_eq!(FieldOperator::In.wire_name(), "IN");
+        assert_eq!(
+            FieldOperator::ArrayContainsAny.wire_name(),
+            "ARRAY_CONTAINS_ANY"
+        );
+        assert_eq!(FieldOperator::NotIn.wire_name(), "NOT_IN");
+
+        assert!(FieldOperator::In.is_array_operand());
+        assert!(FieldOperator::ArrayContainsAny.is_array_operand());
+        assert!(FieldOperator::NotIn.is_array_operand());
+        assert!(!FieldOperator::ArrayContains.is_array_operand());
+        assert!(!FieldOperator::Equal.is_array_operand());
+
+        let large_arr = FieldFilter {
+            field: "tags".parse().unwrap(),
+            op:    FieldOperator::In,
+            value: Value::array((1001..=1005).map(Value::integer).collect()),
+        };
+        let large_dbg = format!("{large_arr:?}");
+        assert!(large_dbg.contains("array_len: 5"));
+        assert!(large_dbg.contains("array_prefix:"));
+        assert!(large_dbg.contains("1001"));
+        assert!(large_dbg.contains("1003"));
+        assert!(!large_dbg.contains("1004"));
+        assert!(!large_dbg.contains("1005"));
+
+        let small_arr = FieldFilter {
+            field: "tags".parse().unwrap(),
+            op:    FieldOperator::NotIn,
+            value: Value::array(vec![Value::integer(1), Value::integer(2)]),
+        };
+        let small_dbg = format!("{small_arr:?}");
+        assert!(small_dbg.contains("array_len: 2"));
+        assert!(small_dbg.contains('2'));
+
+        let scalar = FieldFilter {
+            field: "count".parse().unwrap(),
+            op:    FieldOperator::Equal,
+            value: Value::integer(42),
+        };
+        let scalar_dbg = format!("{scalar:?}");
+        assert!(scalar_dbg.contains("value:"));
+        assert!(scalar_dbg.contains("42"));
+        assert!(!scalar_dbg.contains("array_len"));
     }
 }

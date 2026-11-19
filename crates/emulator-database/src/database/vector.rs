@@ -1,7 +1,7 @@
 use std::cmp;
 
 use googleapis::{
-    VectorClassification, VectorFormatError, classify_vector_map,
+    VectorClassification, classify_vector_map,
     google::firestore::v1::{
         Value, structured_query::find_nearest::DistanceMeasure as ProtoDistanceMeasure,
         value::ValueType,
@@ -110,33 +110,6 @@ pub(crate) fn validate_query_vector(
         )?;
     }
     Ok(coords)
-}
-
-pub(crate) fn validate_query_operand_value(value: &Value, enterprise_edition: bool) -> Result<()> {
-    match value.value_type.as_ref() {
-        Some(ValueType::MapValue(map)) => match classify_vector_map(&map.fields) {
-            VectorClassification::Valid(_) => Ok(()),
-            VectorClassification::Invalid(VectorFormatError::NanElement) if !enterprise_edition => {
-                Ok(())
-            }
-            VectorClassification::Invalid(err) => Err(GenericDatabaseError::invalid_argument(
-                err.as_error_message(),
-            )),
-            VectorClassification::NotVectorMap => {
-                for v in map.fields.values() {
-                    validate_query_operand_value(v, enterprise_edition)?;
-                }
-                Ok(())
-            }
-        },
-        Some(ValueType::ArrayValue(arr)) => {
-            for v in &arr.values {
-                validate_query_operand_value(v, enterprise_edition)?;
-            }
-            Ok(())
-        }
-        _ => Ok(()),
-    }
 }
 
 fn has_zero_norm(mut iter: impl Iterator<Item = f64>) -> bool {
@@ -561,66 +534,6 @@ mod tests {
         assert_eq!(
             cmp_reference_paths(&doc_c.to_string(), &doc_d.to_string()),
             cmp::Ordering::Less
-        );
-    }
-
-    #[gtest]
-    fn query_operand_vector_validation() {
-        let zero_d = Value::vector([]);
-        let over_2048 = Value::vector(std::iter::repeat_n(1.0, 2049));
-        let non_double = Value::map(HashMap::from([
-            (
-                VECTOR_MAP_TYPE_KEY.to_string(),
-                Value::string(VECTOR_MAP_TYPE_SENTINEL),
-            ),
-            (
-                googleapis::VECTOR_MAP_VALUE_KEY.to_string(),
-                Value::array(vec![Value::integer(1)]),
-            ),
-        ]));
-        let nan_vec = Value::vector([f64::NAN, 0.0]);
-
-        for enterprise in [false, true] {
-            assert_that!(
-                validate_query_operand_value(&zero_d, enterprise),
-                err(eq(&GenericDatabaseError::invalid_argument(
-                    "Cannot have a zero length vector."
-                )))
-            );
-            assert_that!(
-                validate_query_operand_value(&over_2048, enterprise),
-                err(eq(&GenericDatabaseError::invalid_argument(
-                    "Vectors must be at most 2048 dimensions."
-                )))
-            );
-            assert_that!(
-                validate_query_operand_value(&non_double, enterprise),
-                err(eq(&GenericDatabaseError::invalid_argument(
-                    "Vector must only contain values of type 'double'"
-                )))
-            );
-            let nested_arr = Value::array(vec![zero_d.clone()]);
-            assert_that!(
-                validate_query_operand_value(&nested_arr, enterprise),
-                err(eq(&GenericDatabaseError::invalid_argument(
-                    "Cannot have a zero length vector."
-                )))
-            );
-            let nested_map = Value::map(HashMap::from([("v".to_string(), zero_d.clone())]));
-            assert_that!(
-                validate_query_operand_value(&nested_map, enterprise),
-                err(eq(&GenericDatabaseError::invalid_argument(
-                    "Cannot have a zero length vector."
-                )))
-            );
-        }
-
-        assert!(validate_query_operand_value(&nan_vec, false).is_ok());
-        assert_that!(
-            validate_query_operand_value(&nan_vec, true),
-            err(eq(&GenericDatabaseError::invalid_argument(
-                "Vector cannot contain NaN values."
-            )))
         );
     }
 }

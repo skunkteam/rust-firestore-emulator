@@ -83,7 +83,15 @@ impl TryFrom<structured_query::Projection> for Projection {
     type Error = GenericDatabaseError;
 
     fn try_from(value: structured_query::Projection) -> Result<Self, Self::Error> {
-        let fields = value.fields.iter().map(TryInto::try_into).try_collect()?;
+        let fields: Vec<FieldReference> = value
+            .fields
+            .iter()
+            .map(|f| -> Result<FieldReference, GenericDatabaseError> {
+                let field: FieldReference = f.try_into()?;
+                field.validate_query_reference()?;
+                Ok(field)
+            })
+            .try_collect()?;
         Ok(Self { fields })
     }
 }
@@ -92,7 +100,15 @@ impl TryFrom<DocumentMask> for Projection {
     type Error = GenericDatabaseError;
 
     fn try_from(value: DocumentMask) -> Result<Self, Self::Error> {
-        let fields = value.field_paths.iter().map(|s| s.parse()).try_collect()?;
+        let fields: Vec<FieldReference> = value
+            .field_paths
+            .iter()
+            .map(|s| -> Result<FieldReference, GenericDatabaseError> {
+                let field: FieldReference = s.parse()?;
+                field.validate_query_reference()?;
+                Ok(field)
+            })
+            .try_collect()?;
         Ok(Self { fields })
     }
 }
@@ -213,5 +229,46 @@ mod tests {
         let proj = make_projection(&["meta.author"]);
         let doc = project_with_distance(&proj, &version, Some((&dist_path, 0.75)));
         expect_that!(doc.fields, is_empty());
+    }
+
+    #[gtest]
+    fn projection_and_document_mask_reject_reserved_and_empty_paths() {
+        use googleapis::google::firestore::v1::{DocumentMask, structured_query};
+
+        use super::GenericDatabaseError;
+
+        for valid in ["__name__", "`__name__`", "____", "a.b"] {
+            let sq_proj = structured_query::Projection {
+                fields: vec![structured_query::FieldReference {
+                    field_path: valid.to_string(),
+                }],
+            };
+            assert!(Projection::try_from(sq_proj).is_ok());
+
+            let mask = DocumentMask {
+                field_paths: vec![valid.to_string()],
+            };
+            assert!(Projection::try_from(mask).is_ok());
+        }
+
+        for invalid in ["__custom__", "a.__name__", "a..b"] {
+            let sq_proj = structured_query::Projection {
+                fields: vec![structured_query::FieldReference {
+                    field_path: invalid.to_string(),
+                }],
+            };
+            assert_that!(
+                Projection::try_from(sq_proj),
+                err(matches_pattern!(GenericDatabaseError::InvalidArgument(_)))
+            );
+
+            let mask = DocumentMask {
+                field_paths: vec![invalid.to_string()],
+            };
+            assert_that!(
+                Projection::try_from(mask),
+                err(matches_pattern!(GenericDatabaseError::InvalidArgument(_)))
+            );
+        }
     }
 }

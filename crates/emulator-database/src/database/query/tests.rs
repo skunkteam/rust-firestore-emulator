@@ -449,24 +449,40 @@ async fn implicit_order_by_matches_firestore_semantics() -> Result<()> {
         vec!["document-2", "document-1", "document-3"]
     );
 
-    // 5. Duplicate inequality on same field (`a > 0 AND a < 30`) deduplicates `a` so 2-value cursor
-    //    `[10, document-1]` matches `[a, __name__]` cleanly
+    // 5. Duplicate inequality on same field (`a > 0 AND a < 30`) deduplicates `a`, while cursor
+    //    length is validated against explicit `order_by`: omitting explicit `order_by` rejects a
+    //    2-value cursor, and specifying explicit `(a, __name__)` succeeds.
+    let dup_filter = Filter::Composite(CompositeFilter {
+        op:      CompositeOperator::And,
+        filters: vec![
+            Filter::Field(FieldFilter {
+                field: "a".parse()?,
+                op:    FieldOperator::GreaterThan,
+                value: Value::integer(0),
+            }),
+            Filter::Field(FieldFilter {
+                field: "a".parse()?,
+                op:    FieldOperator::LessThan,
+                value: Value::integer(30),
+            }),
+        ],
+    });
+    assert_that!(
+        QueryBuilder::from_collection(col_ref.clone())
+            .filter(dup_filter.clone())
+            .start_at(Cursor {
+                before: false,
+                values: vec![Value::integer(10), Value::reference(doc1_ref.clone())],
+            })
+            .build(),
+        err(eq(&GenericDatabaseError::invalid_argument(
+            "Cursor has too many values."
+        )))
+    );
     let q_dup_cursor = QueryBuilder::from_collection(col_ref.clone())
-        .filter(Filter::Composite(CompositeFilter {
-            op:      CompositeOperator::And,
-            filters: vec![
-                Filter::Field(FieldFilter {
-                    field: "a".parse()?,
-                    op:    FieldOperator::GreaterThan,
-                    value: Value::integer(0),
-                }),
-                Filter::Field(FieldFilter {
-                    field: "a".parse()?,
-                    op:    FieldOperator::LessThan,
-                    value: Value::integer(30),
-                }),
-            ],
-        }))
+        .filter(dup_filter)
+        .order_by("a".parse()?, Direction::Ascending)
+        .order_by("__name__".parse()?, Direction::Ascending)
         .start_at(Cursor {
             before: false, // startAfter (10, document-1) -> document-2, document-3
             values: vec![Value::integer(10), Value::reference(doc1_ref)],
@@ -485,6 +501,1006 @@ async fn implicit_order_by_matches_firestore_semantics() -> Result<()> {
         .build()?;
     assert_eq!(
         ids_of(q_partial)?,
+        vec!["document-3", "document-1", "document-2"]
+    );
+
+    Ok(())
+}
+
+#[gtest]
+fn query_operand_vector_validation() {
+    use std::collections::HashMap;
+
+    use googleapis::{VECTOR_MAP_TYPE_KEY, VECTOR_MAP_TYPE_SENTINEL, VECTOR_MAP_VALUE_KEY};
+
+    use super::validate_query_operand_value;
+
+    let zero_d = Value::vector([]);
+    let over_2048 = Value::vector(std::iter::repeat_n(1.0, 2049));
+    let non_double = Value::map(HashMap::from([
+        (
+            VECTOR_MAP_TYPE_KEY.to_string(),
+            Value::string(VECTOR_MAP_TYPE_SENTINEL),
+        ),
+        (
+            VECTOR_MAP_VALUE_KEY.to_string(),
+            Value::array(vec![Value::integer(1)]),
+        ),
+    ]));
+    let nan_vec = Value::vector([f64::NAN, 0.0]);
+
+    for enterprise in [false, true] {
+        assert_that!(
+            validate_query_operand_value(&zero_d, enterprise),
+            err(eq(&GenericDatabaseError::invalid_argument(
+                "Cannot have a zero length vector."
+            )))
+        );
+        assert_that!(
+            validate_query_operand_value(&over_2048, enterprise),
+            err(eq(&GenericDatabaseError::invalid_argument(
+                "Vectors must be at most 2048 dimensions."
+            )))
+        );
+        assert_that!(
+            validate_query_operand_value(&non_double, enterprise),
+            err(eq(&GenericDatabaseError::invalid_argument(
+                "Vector must only contain values of type 'double'"
+            )))
+        );
+        let nested_arr = Value::array(vec![zero_d.clone()]);
+        assert_that!(
+            validate_query_operand_value(&nested_arr, enterprise),
+            err(eq(&GenericDatabaseError::invalid_argument(
+                "Cannot have a zero length vector."
+            )))
+        );
+        let nested_map = Value::map(HashMap::from([("v".to_string(), zero_d.clone())]));
+        assert_that!(
+            validate_query_operand_value(&nested_map, enterprise),
+            err(eq(&GenericDatabaseError::invalid_argument(
+                "Cannot have a zero length vector."
+            )))
+        );
+
+        // Unset Value payloads and malformed ReferenceValues inside arrays and maps fail cleanly.
+        assert_that!(
+            validate_query_operand_value(&Value::default(), enterprise),
+            err(eq(&GenericDatabaseError::invalid_argument(
+                "Cannot convert firestore.v1.Value with type unset."
+            )))
+        );
+        for bad_ref in [
+            "projects/p/databases/d/documents/col",
+            "projects/p/databases/d/documents/col/doc/sub",
+            "projects/p/databases/d/documents/col/__custom__",
+        ] {
+            let arr_ref = Value::array(vec![Value::reference(bad_ref.to_string())]);
+            assert_that!(
+                validate_query_operand_value(&arr_ref, enterprise),
+                err(matches_pattern!(GenericDatabaseError::InvalidArgument(_)))
+            );
+            let map_ref = Value::map(HashMap::from([(
+                "r".to_string(),
+                Value::reference(bad_ref.to_string()),
+            )]));
+            assert_that!(
+                validate_query_operand_value(&map_ref, enterprise),
+                err(matches_pattern!(GenericDatabaseError::InvalidArgument(_)))
+            );
+        }
+
+        let docs_root_ref = Value::reference("projects/p/databases/d/documents".to_string());
+        assert!(validate_query_operand_value(&docs_root_ref, enterprise).is_ok());
+
+        let ds_ref = Value::reference(
+            "projects/p/databases/(default)/documents/col/__id-9223372036854775808__".to_string(),
+        );
+        assert!(validate_query_operand_value(&ds_ref, enterprise).is_ok());
+
+        use googleapis::google::{
+            firestore::v1::{Function, Pipeline, value::ValueType},
+            protobuf::Timestamp,
+            r#type::LatLng,
+        };
+        for bad_geo in [
+            LatLng {
+                latitude:  90.0001,
+                longitude: 0.0,
+            },
+            LatLng {
+                latitude:  -90.0001,
+                longitude: 0.0,
+            },
+            LatLng {
+                latitude:  0.0,
+                longitude: 180.0001,
+            },
+            LatLng {
+                latitude:  0.0,
+                longitude: -180.0001,
+            },
+            LatLng {
+                latitude:  f64::NAN,
+                longitude: 0.0,
+            },
+            LatLng {
+                latitude:  0.0,
+                longitude: f64::INFINITY,
+            },
+        ] {
+            assert_that!(
+                validate_query_operand_value(&Value::from(bad_geo), enterprise),
+                err(matches_pattern!(GenericDatabaseError::InvalidArgument(_)))
+            );
+        }
+        assert!(
+            validate_query_operand_value(
+                &Value::from(LatLng {
+                    latitude:  -90.0,
+                    longitude: 180.0,
+                }),
+                enterprise,
+            )
+            .is_ok()
+        );
+
+        for bad_ts in [
+            Timestamp {
+                seconds: 0,
+                nanos:   -1,
+            },
+            Timestamp {
+                seconds: 0,
+                nanos:   1_000_000_000,
+            },
+            Timestamp {
+                seconds: -62_135_596_801,
+                nanos:   0,
+            },
+            Timestamp {
+                seconds: 253_402_300_800,
+                nanos:   0,
+            },
+        ] {
+            assert_that!(
+                validate_query_operand_value(&Value::from(bad_ts), enterprise),
+                err(matches_pattern!(GenericDatabaseError::InvalidArgument(_)))
+            );
+        }
+        for ok_ts in [
+            Timestamp {
+                seconds: -62_135_596_800,
+                nanos:   0,
+            },
+            Timestamp {
+                seconds: 253_402_300_799,
+                nanos:   999_999_999,
+            },
+        ] {
+            assert!(validate_query_operand_value(&Value::from(ok_ts), enterprise).is_ok());
+        }
+
+        for unsupported_vt in [
+            ValueType::FieldReferenceValue("a".to_string()),
+            ValueType::VariableReferenceValue("a".to_string()),
+            ValueType::FunctionValue(Function::default()),
+            ValueType::PipelineValue(Pipeline::default()),
+        ] {
+            let unsupported = Value {
+                value_type: Some(unsupported_vt),
+            };
+            assert_that!(
+                validate_query_operand_value(&unsupported, enterprise),
+                err(matches_pattern!(GenericDatabaseError::InvalidArgument(_)))
+            );
+        }
+    }
+
+    assert!(validate_query_operand_value(&nan_vec, false).is_ok());
+    assert_that!(
+        validate_query_operand_value(&nan_vec, true),
+        err(eq(&GenericDatabaseError::invalid_argument(
+            "Vector cannot contain NaN values."
+        )))
+    );
+}
+
+#[gtest]
+fn dnf_summary_clamping_overflow_guard_and_conservatism() {
+    use super::{
+        DnfSummary,
+        filter::{CompositeFilter, CompositeOperator, UnaryFilter, UnaryOperator},
+    };
+
+    let eq_filter = |n: i64| {
+        Filter::Field(FieldFilter {
+            field: "a".parse().unwrap(),
+            op:    FieldOperator::Equal,
+            value: Value::integer(n),
+        })
+    };
+    let in_filter = |field: &str, vals: Vec<Value>| {
+        Filter::Field(FieldFilter {
+            field: field.parse().unwrap(),
+            op:    FieldOperator::In,
+            value: Value::array(vals),
+        })
+    };
+    let ac_filter = |field: &str| {
+        Filter::Field(FieldFilter {
+            field: field.parse().unwrap(),
+            op:    FieldOperator::ArrayContains,
+            value: Value::string("x"),
+        })
+    };
+    let aca_filter = |field: &str, vals: Vec<Value>| {
+        Filter::Field(FieldFilter {
+            field: field.parse().unwrap(),
+            op:    FieldOperator::ArrayContainsAny,
+            value: Value::array(vals),
+        })
+    };
+
+    // Unary & empty AND
+    assert_eq!(
+        DnfSummary::from_filter(&Filter::Unary(UnaryFilter {
+            field: "x".parse().unwrap(),
+            op:    UnaryOperator::IsNull,
+        })),
+        DnfSummary {
+            disjunctions: 1,
+            max_array_contains: 0,
+        }
+    );
+    assert_eq!(
+        DnfSummary::from_filter(&Filter::Composite(CompositeFilter {
+            op:      CompositeOperator::And,
+            filters: vec![],
+        })),
+        DnfSummary {
+            disjunctions: 1,
+            max_array_contains: 0,
+        }
+    );
+
+    // unique_value_count uses storage/wire equality (`1 != 1.0`, `0.0 != -0.0`, `NaN == NaN`)
+    // and clamps > 31 to 31.
+    assert_eq!(
+        DnfSummary::from_filter(&in_filter(
+            "a",
+            vec![Value::integer(1), Value::double(1.0), Value::integer(2)]
+        )),
+        DnfSummary {
+            disjunctions: 3,
+            max_array_contains: 0,
+        }
+    );
+    assert_eq!(
+        DnfSummary::from_filter(&in_filter(
+            "a",
+            vec![Value::double(0.0), Value::double(-0.0)]
+        )),
+        DnfSummary {
+            disjunctions: 2,
+            max_array_contains: 0,
+        }
+    );
+    assert_eq!(
+        DnfSummary::from_filter(&in_filter("a", vec![Value::integer(1), Value::integer(1)])),
+        DnfSummary {
+            disjunctions: 1,
+            max_array_contains: 0,
+        }
+    );
+    assert_eq!(
+        DnfSummary::from_filter(&in_filter(
+            "a",
+            vec![
+                Value::double(f64::NAN),
+                Value::double(f64::from_bits(0xfff8_0000_0000_0000))
+            ]
+        )),
+        DnfSummary {
+            disjunctions: 1,
+            max_array_contains: 0,
+        }
+    );
+    assert_eq!(
+        DnfSummary::from_filter(&in_filter("a", (0..35).map(Value::integer).collect())),
+        DnfSummary {
+            disjunctions: 31,
+            max_array_contains: 0,
+        }
+    );
+
+    // 16 * 16 = 256 u8-overflow regression: saturates and clamps cleanly to 31.
+    let sixteen_a = in_filter("a", (0..16).map(Value::integer).collect());
+    let sixteen_b = in_filter("b", (0..16).map(Value::integer).collect());
+    assert_eq!(
+        DnfSummary::from_filter(&Filter::Composite(CompositeFilter {
+            op:      CompositeOperator::And,
+            filters: vec![sixteen_a, sixteen_b],
+        })),
+        DnfSummary {
+            disjunctions: 31,
+            max_array_contains: 0,
+        }
+    );
+
+    // OR with 1 ArrayContains per branch stays at max_array_contains = 1; AND of 2 or 3 clamps to
+    // 2.
+    assert_eq!(
+        DnfSummary::from_filter(&Filter::Composite(CompositeFilter {
+            op:      CompositeOperator::Or,
+            filters: vec![
+                ac_filter("t1"),
+                aca_filter("t2", vec![Value::integer(1), Value::integer(2)])
+            ],
+        })),
+        DnfSummary {
+            disjunctions: 3,
+            max_array_contains: 1,
+        }
+    );
+    assert_eq!(
+        DnfSummary::from_filter(&Filter::Composite(CompositeFilter {
+            op:      CompositeOperator::And,
+            filters: vec![ac_filter("t1"), ac_filter("t2"), ac_filter("t3")],
+        })),
+        DnfSummary {
+            disjunctions: 1,
+            max_array_contains: 2,
+        }
+    );
+
+    // OR sums disjunctions and clamps at 31; conservative same-field over-counts count branches.
+    assert_eq!(
+        DnfSummary::from_filter(&Filter::Composite(CompositeFilter {
+            op:      CompositeOperator::Or,
+            filters: (0..31).map(|_| eq_filter(1)).collect(),
+        })),
+        DnfSummary {
+            disjunctions: 31,
+            max_array_contains: 0,
+        }
+    );
+    assert_eq!(
+        DnfSummary::from_filter(&Filter::Composite(CompositeFilter {
+            op:      CompositeOperator::And,
+            filters: vec![
+                in_filter("a", (1..=6).map(Value::integer).collect()),
+                in_filter("a", (2..=7).map(Value::integer).collect()),
+            ],
+        })),
+        DnfSummary {
+            disjunctions: 31,
+            max_array_contains: 0,
+        }
+    );
+}
+
+#[gtest]
+#[tokio::test]
+async fn query_builder_validation_and_escaped_dot_sorting() -> Result<()> {
+    use crate::query::filter::{CompositeFilter, CompositeOperator, UnaryFilter, UnaryOperator};
+
+    let database = fresh_database()?;
+    let col_ref = CollectionRef::new(database.name.clone(), "escaped-dots");
+    let valid_doc = format!("{}/escaped-dots/doc-1", database.name);
+    let other_proj_doc = "projects/other/databases/my-database/documents/escaped-dots/doc-1";
+    let other_db_doc = "projects/my-project/databases/other/documents/escaped-dots/doc-1";
+
+    // Escaped dot sorting (`a.b` < `` `a.b` ``) in both regular implicit order_by and findNearest
+    // tie-breaking.
+    insert_docs(&database, "escaped-dots", [1, 2], |i| {
+        if i == 1 {
+            [
+                (
+                    "a",
+                    Value::map(std::collections::HashMap::from([(
+                        "b".to_string(),
+                        Value::integer(20),
+                    )])),
+                ),
+                ("a.b", Value::integer(1)),
+                ("emb", Value::vector([1.0, 0.0])),
+            ]
+        } else {
+            [
+                (
+                    "a",
+                    Value::map(std::collections::HashMap::from([(
+                        "b".to_string(),
+                        Value::integer(10),
+                    )])),
+                ),
+                ("a.b", Value::integer(99)),
+                ("emb", Value::vector([1.0, 0.0])),
+            ]
+        }
+    })?;
+
+    let escaped_filter = Filter::Composite(CompositeFilter {
+        op:      CompositeOperator::And,
+        filters: vec![
+            Filter::Field(FieldFilter {
+                field: "`a.b`".parse()?,
+                op:    FieldOperator::GreaterThan,
+                value: Value::integer(0),
+            }),
+            Filter::Field(FieldFilter {
+                field: "a.b".parse()?,
+                op:    FieldOperator::GreaterThan,
+                value: Value::integer(0),
+            }),
+        ],
+    });
+    let mut q_regular = QueryBuilder::from_collection(col_ref.clone())
+        .filter(escaped_filter.clone())
+        .build()?;
+    let (_, regular_matches) = assert_ready_ok!(spawn(q_regular.once(&database)).poll_until_idle());
+    assert_eq!(
+        regular_matches
+            .iter()
+            .map(|m| m.version.name.document_id.as_str())
+            .collect_vec(),
+        vec!["document-2", "document-1"]
+    );
+
+    // Empty `order_by` Standard `find_nearest` safely skips `__name__`-last check and tie-breaks by
+    // segment order (`a.b` before `` `a.b` ``).
+    let mut q_vec = QueryBuilder::from_collection(col_ref.clone())
+        .filter(escaped_filter)
+        .find_nearest(FindNearest::new(
+            "emb".parse()?,
+            vec![1.0, 0.0],
+            DistanceMeasure::Euclidean,
+            5,
+        ))
+        .build()?;
+    let (_, vec_matches) = assert_ready_ok!(spawn(q_vec.once(&database)).poll_until_idle());
+    assert_eq!(
+        vec_matches
+            .iter()
+            .map(|m| m.version.name.document_id.as_str())
+            .collect_vec(),
+        vec!["document-2", "document-1"]
+    );
+
+    // Explicit `orderBy('a', DESC)` rejects 2-value cursor without explicit `__name__`.
+    assert_that!(
+        QueryBuilder::from_collection(col_ref.clone())
+            .order_by("a.b".parse()?, Direction::Descending)
+            .end_at(Cursor {
+                before: true,
+                values: vec![Value::integer(10), Value::reference(valid_doc.clone())],
+            })
+            .build(),
+        err(eq(&GenericDatabaseError::invalid_argument(
+            "Cursor has too many values."
+        )))
+    );
+
+    // Cursor `__name__` slot type & root validation across Standard and Enterprise.
+    for enterprise in [false, true] {
+        assert!(
+            QueryBuilder::from_collection(col_ref.clone())
+                .enterprise_edition(enterprise)
+                .order_by("__name__".parse()?, Direction::Ascending)
+                .start_at(Cursor {
+                    before: true,
+                    values: vec![Value::reference(database.name.to_string())],
+                })
+                .build()
+                .is_ok()
+        );
+        assert_that!(
+            QueryBuilder::from_collection(col_ref.clone())
+                .enterprise_edition(enterprise)
+                .order_by("__name__".parse()?, Direction::Ascending)
+                .start_at(Cursor {
+                    before: true,
+                    values: vec![Value::string("not-a-ref")],
+                })
+                .build(),
+            err(eq(&GenericDatabaseError::invalid_argument(
+                "Cursor __key__ value is not a document reference."
+            )))
+        );
+        for wrong_root in [other_proj_doc, other_db_doc] {
+            assert_that!(
+                QueryBuilder::from_collection(col_ref.clone())
+                    .enterprise_edition(enterprise)
+                    .order_by("__name__".parse()?, Direction::Ascending)
+                    .start_at(Cursor {
+                        before: true,
+                        values: vec![Value::reference(wrong_root.to_string())],
+                    })
+                    .build(),
+                err(eq(&GenericDatabaseError::invalid_argument(
+                    "The cursor key is in a different database than the query"
+                )))
+            );
+        }
+    }
+
+    // Standard duplicate `order_by` and `__name__`-not-last on both regular and `find_nearest`.
+    assert_that!(
+        QueryBuilder::from_collection(col_ref.clone())
+            .order_by("a".parse()?, Direction::Ascending)
+            .order_by("a".parse()?, Direction::Descending)
+            .build(),
+        err(matches_pattern!(GenericDatabaseError::InvalidArgument(_)))
+    );
+    assert_that!(
+        QueryBuilder::from_collection(col_ref.clone())
+            .order_by("a".parse()?, Direction::Ascending)
+            .order_by("a".parse()?, Direction::Ascending)
+            .find_nearest(FindNearest::new(
+                "emb".parse()?,
+                vec![1.0, 0.0],
+                DistanceMeasure::Euclidean,
+                2,
+            ))
+            .build(),
+        err(matches_pattern!(GenericDatabaseError::InvalidArgument(_)))
+    );
+    assert_that!(
+        QueryBuilder::from_collection(col_ref.clone())
+            .order_by("__name__".parse()?, Direction::Ascending)
+            .order_by("a".parse()?, Direction::Ascending)
+            .find_nearest(FindNearest::new(
+                "emb".parse()?,
+                vec![1.0, 0.0],
+                DistanceMeasure::Euclidean,
+                2,
+            ))
+            .build(),
+        err(eq(&GenericDatabaseError::invalid_argument(
+            "order by clause cannot contain more fields after the key"
+        )))
+    );
+    assert_that!(
+        QueryBuilder::from_collection(col_ref.clone())
+            .filter(Filter::Field(FieldFilter {
+                field: "a".parse()?,
+                op:    FieldOperator::GreaterThan,
+                value: Value::integer(0),
+            }))
+            .order_by("__name__".parse()?, Direction::Ascending)
+            .build(),
+        err(eq(&GenericDatabaseError::invalid_argument(
+            "order by clause cannot contain more fields after the key"
+        )))
+    );
+
+    // Array caps (30 ok vs 31 err; 10 ok vs 11 err), non-array/empty, empty OR vs empty AND.
+    for (op, cap) in [
+        (FieldOperator::In, 30),
+        (FieldOperator::ArrayContainsAny, 30),
+        (FieldOperator::NotIn, 10),
+    ] {
+        assert_that!(
+            QueryBuilder::from_collection(col_ref.clone())
+                .filter(Filter::Field(FieldFilter {
+                    field: "x".parse()?,
+                    op,
+                    value: Value::integer(1),
+                }))
+                .build(),
+            err(matches_pattern!(GenericDatabaseError::InvalidArgument(_)))
+        );
+        assert_that!(
+            QueryBuilder::from_collection(col_ref.clone())
+                .filter(Filter::Field(FieldFilter {
+                    field: "x".parse()?,
+                    op,
+                    value: Value::array(vec![]),
+                }))
+                .build(),
+            err(matches_pattern!(GenericDatabaseError::InvalidArgument(_)))
+        );
+        assert!(
+            QueryBuilder::from_collection(col_ref.clone())
+                .filter(Filter::Field(FieldFilter {
+                    field: "x".parse()?,
+                    op,
+                    value: Value::array((0..cap).map(Value::integer).collect()),
+                }))
+                .build()
+                .is_ok()
+        );
+        assert_that!(
+            QueryBuilder::from_collection(col_ref.clone())
+                .filter(Filter::Field(FieldFilter {
+                    field: "x".parse()?,
+                    op,
+                    value: Value::array((0..=cap).map(Value::integer).collect()),
+                }))
+                .build(),
+            err(matches_pattern!(GenericDatabaseError::InvalidArgument(_)))
+        );
+    }
+
+    assert!(
+        QueryBuilder::from_collection(col_ref.clone())
+            .filter(Filter::Composite(CompositeFilter {
+                op:      CompositeOperator::And,
+                filters: vec![],
+            }))
+            .build()
+            .is_ok()
+    );
+    assert_that!(
+        QueryBuilder::from_collection(col_ref.clone())
+            .filter(Filter::Composite(CompositeFilter {
+                op:      CompositeOperator::Or,
+                filters: vec![],
+            }))
+            .build(),
+        err(eq(&GenericDatabaseError::invalid_argument(
+            "Composite filter must have at least one sub-filter."
+        )))
+    );
+
+    // Negation exclusivity & NOT_IN disjunction exclusion.
+    let neg_filters = [
+        Filter::Field(FieldFilter {
+            field: "a".parse()?,
+            op:    FieldOperator::NotEqual,
+            value: Value::integer(1),
+        }),
+        Filter::Field(FieldFilter {
+            field: "b".parse()?,
+            op:    FieldOperator::NotIn,
+            value: Value::array(vec![Value::integer(1)]),
+        }),
+        Filter::Unary(UnaryFilter {
+            field: "c".parse()?,
+            op:    UnaryOperator::IsNotNan,
+        }),
+        Filter::Unary(UnaryFilter {
+            field: "d".parse()?,
+            op:    UnaryOperator::IsNotNull,
+        }),
+    ];
+    for single in &neg_filters {
+        assert!(
+            QueryBuilder::from_collection(col_ref.clone())
+                .filter(single.clone())
+                .build()
+                .is_ok()
+        );
+    }
+    assert_that!(
+        QueryBuilder::from_collection(col_ref.clone())
+            .filter(Filter::Composite(CompositeFilter {
+                op:      CompositeOperator::And,
+                filters: vec![neg_filters[0].clone(), neg_filters[2].clone()],
+            }))
+            .build(),
+        err(matches_pattern!(GenericDatabaseError::InvalidArgument(_)))
+    );
+    for disj in [
+        Filter::Composite(CompositeFilter {
+            op:      CompositeOperator::Or,
+            filters: vec![Filter::Field(FieldFilter {
+                field: "a".parse()?,
+                op:    FieldOperator::Equal,
+                value: Value::integer(1),
+            })],
+        }),
+        Filter::Field(FieldFilter {
+            field: "a".parse()?,
+            op:    FieldOperator::In,
+            value: Value::array(vec![Value::integer(1)]),
+        }),
+        Filter::Field(FieldFilter {
+            field: "a".parse()?,
+            op:    FieldOperator::ArrayContainsAny,
+            value: Value::array(vec![Value::integer(1)]),
+        }),
+    ] {
+        assert_that!(
+            QueryBuilder::from_collection(col_ref.clone())
+                .filter(Filter::Composite(CompositeFilter {
+                    op:      CompositeOperator::And,
+                    filters: vec![neg_filters[1].clone(), disj],
+                }))
+                .build(),
+            err(matches_pattern!(GenericDatabaseError::InvalidArgument(_)))
+        );
+    }
+
+    // Standard `__name__` filter constraints and reserved path rejections.
+    assert_that!(
+        QueryBuilder::from_collection(col_ref.clone())
+            .filter(Filter::Field(FieldFilter {
+                field: "__name__".parse()?,
+                op:    FieldOperator::Equal,
+                value: Value::reference(format!("{}/items/__id0__", database.name)),
+            }))
+            .build(),
+        err(eq(&GenericDatabaseError::invalid_argument(
+            "Document ID of type long must be non-zero"
+        )))
+    );
+    assert!(
+        QueryBuilder::from_collection(col_ref.clone())
+            .enterprise_edition(true)
+            .filter(Filter::Field(FieldFilter {
+                field: "__name__".parse()?,
+                op:    FieldOperator::Equal,
+                value: Value::reference(format!("{}/items/__id0__", database.name)),
+            }))
+            .build()
+            .is_ok()
+    );
+    assert_that!(
+        QueryBuilder::from_collection(col_ref.clone())
+            .filter(Filter::Field(FieldFilter {
+                field: "__name__".parse()?,
+                op:    FieldOperator::Equal,
+                value: Value::reference(database.name.to_string()),
+            }))
+            .build(),
+        err(eq(&GenericDatabaseError::invalid_argument(
+            "Key path is empty."
+        )))
+    );
+    assert_that!(
+        QueryBuilder::from_collection(col_ref.clone())
+            .filter(Filter::Unary(UnaryFilter {
+                field: "__name__".parse()?,
+                op:    UnaryOperator::IsNotNull,
+            }))
+            .build(),
+        err(eq(&GenericDatabaseError::invalid_argument(
+            "__key__ filter value must be a Key"
+        )))
+    );
+    for bad_op in [
+        FieldOperator::ArrayContains,
+        FieldOperator::ArrayContainsAny,
+    ] {
+        assert_that!(
+            QueryBuilder::from_collection(col_ref.clone())
+                .filter(Filter::Field(FieldFilter {
+                    field: "__name__".parse()?,
+                    op:    bad_op,
+                    value: Value::array(vec![Value::reference(valid_doc.clone())]),
+                }))
+                .build(),
+            err(eq(&GenericDatabaseError::invalid_argument(
+                "the name __key__ is reserved"
+            )))
+        );
+    }
+    for wrong_root in [other_proj_doc, other_db_doc] {
+        assert_that!(
+            QueryBuilder::from_collection(col_ref.clone())
+                .filter(Filter::Field(FieldFilter {
+                    field: "__name__".parse()?,
+                    op:    FieldOperator::Equal,
+                    value: Value::reference(wrong_root.to_string()),
+                }))
+                .build(),
+            err(eq(&GenericDatabaseError::invalid_argument(
+                "__key__ filter reference must match the target project and database"
+            )))
+        );
+        assert_that!(
+            QueryBuilder::from_collection(col_ref.clone())
+                .filter(Filter::Field(FieldFilter {
+                    field: "__name__".parse()?,
+                    op:    FieldOperator::In,
+                    value: Value::array(vec![
+                        Value::reference(valid_doc.clone()),
+                        Value::reference(wrong_root.to_string()),
+                    ]),
+                }))
+                .build(),
+            err(eq(&GenericDatabaseError::invalid_argument(
+                "__key__ filter reference must match the target project and database"
+            )))
+        );
+    }
+    assert_that!(
+        QueryBuilder::from_collection(col_ref.clone())
+            .filter(Filter::Field(FieldFilter {
+                field: "__name__".parse()?,
+                op:    FieldOperator::NotIn,
+                value: Value::array(vec![Value::string("bad")]),
+            }))
+            .build(),
+        err(eq(&GenericDatabaseError::invalid_argument(
+            "__key__ filter value must be a Key"
+        )))
+    );
+
+    // Reserved field paths on order_by, FieldFilter, and UnaryFilter.
+    assert_that!(
+        QueryBuilder::from_collection(col_ref.clone())
+            .order_by("__custom__".parse()?, Direction::Ascending)
+            .build(),
+        err(matches_pattern!(GenericDatabaseError::InvalidArgument(_)))
+    );
+    assert_that!(
+        QueryBuilder::from_collection(col_ref.clone())
+            .filter(Filter::Unary(UnaryFilter {
+                field: "a..b".parse()?,
+                op:    UnaryOperator::IsNull,
+            }))
+            .build(),
+        err(matches_pattern!(GenericDatabaseError::InvalidArgument(_)))
+    );
+    // Backtick-quoted `` `__name__` `` resolves to DocumentName in filters and order_by.
+    assert_that!(
+        QueryBuilder::from_collection(col_ref.clone())
+            .filter(Filter::Field(FieldFilter {
+                field: "`__name__`".parse()?,
+                op:    FieldOperator::Equal,
+                value: Value::integer(1),
+            }))
+            .build(),
+        err(eq(&GenericDatabaseError::invalid_argument(
+            "__key__ filter value must be a Key"
+        )))
+    );
+    for enterprise in [false, true] {
+        assert!(
+            QueryBuilder::from_collection(col_ref.clone())
+                .enterprise_edition(enterprise)
+                .filter(Filter::Field(FieldFilter {
+                    field: "`__name__`".parse()?,
+                    op:    FieldOperator::Equal,
+                    value: Value::reference(valid_doc.clone()),
+                }))
+                .order_by("`__name__`".parse()?, Direction::Ascending)
+                .build()
+                .is_ok()
+        );
+    }
+    assert_that!(
+        QueryBuilder::from_collection(col_ref.clone())
+            .order_by("__name__".parse()?, Direction::Ascending)
+            .order_by("`__name__`".parse()?, Direction::Ascending)
+            .build(),
+        err(matches_pattern!(GenericDatabaseError::InvalidArgument(_)))
+    );
+
+    // Standard find_nearest enforces `__name__`-last after inequality synthesis, tie-breaks
+    // synthesized inequalities with `last_dir`, and filters OR+inequality docs missing the field.
+    assert_that!(
+        QueryBuilder::from_collection(col_ref.clone())
+            .filter(Filter::Field(FieldFilter {
+                field: "a".parse()?,
+                op:    FieldOperator::GreaterThan,
+                value: Value::integer(0),
+            }))
+            .order_by("__name__".parse()?, Direction::Ascending)
+            .find_nearest(FindNearest::new(
+                "emb".parse()?,
+                vec![1.0, 0.0],
+                DistanceMeasure::Euclidean,
+                5,
+            ))
+            .build(),
+        err(eq(&GenericDatabaseError::invalid_argument(
+            "order by clause cannot contain more fields after the key"
+        )))
+    );
+    assert!(
+        QueryBuilder::from_collection(col_ref)
+            .enterprise_edition(true)
+            .filter(Filter::Field(FieldFilter {
+                field: "a".parse()?,
+                op:    FieldOperator::GreaterThan,
+                value: Value::integer(0),
+            }))
+            .order_by("__name__".parse()?, Direction::Ascending)
+            .find_nearest(FindNearest::new(
+                "emb".parse()?,
+                vec![1.0, 0.0],
+                DistanceMeasure::Euclidean,
+                5,
+            ))
+            .build()
+            .is_ok()
+    );
+
+    let fn_col = CollectionRef::new(database.name.clone(), "fn-std-ineq");
+    insert_docs(&database, "fn-std-ineq", [1, 2, 3], |i| match i {
+        1 => [
+            ("a", Value::integer(10)),
+            ("b", Value::integer(5)),
+            ("emb", Value::vector([1.0, 0.0])),
+        ],
+        2 => [
+            ("a", Value::integer(20)),
+            ("b", Value::integer(5)),
+            ("emb", Value::vector([1.0, 0.0])),
+        ],
+        _ => [
+            // Missing `a` so only `b == 1` holds in `OR`.
+            ("a_unused", Value::integer(0)),
+            ("b", Value::integer(1)),
+            ("emb", Value::vector([1.0, 0.0])),
+        ],
+    })?;
+    let mut fn_desc_tie = QueryBuilder::from_collection(fn_col.clone())
+        .filter(Filter::Field(FieldFilter {
+            field: "a".parse()?,
+            op:    FieldOperator::GreaterThan,
+            value: Value::integer(0),
+        }))
+        .order_by("b".parse()?, Direction::Descending)
+        .find_nearest(FindNearest::new(
+            "emb".parse()?,
+            vec![0.0, 0.0],
+            DistanceMeasure::Euclidean,
+            10,
+        ))
+        .build()?;
+    let (_, desc_tie_matches) =
+        assert_ready_ok!(spawn(fn_desc_tie.once(&database)).poll_until_idle());
+    assert_eq!(
+        desc_tie_matches
+            .iter()
+            .map(|m| m.version.name.document_id.as_str())
+            .collect_vec(),
+        vec!["document-2", "document-1"]
+    );
+
+    let or_ineq_filter = Filter::Composite(CompositeFilter {
+        op:      CompositeOperator::Or,
+        filters: vec![
+            Filter::Field(FieldFilter {
+                field: "a".parse()?,
+                op:    FieldOperator::GreaterThan,
+                value: Value::integer(0),
+            }),
+            Filter::Field(FieldFilter {
+                field: "b".parse()?,
+                op:    FieldOperator::Equal,
+                value: Value::integer(1),
+            }),
+        ],
+    });
+    let mut fn_or_std = QueryBuilder::from_collection(fn_col.clone())
+        .filter(or_ineq_filter.clone())
+        .find_nearest(FindNearest::new(
+            "emb".parse()?,
+            vec![0.0, 0.0],
+            DistanceMeasure::Euclidean,
+            10,
+        ))
+        .build()?;
+    let (_, std_or_matches) = assert_ready_ok!(spawn(fn_or_std.once(&database)).poll_until_idle());
+    assert_eq!(
+        std_or_matches
+            .iter()
+            .map(|m| m.version.name.document_id.as_str())
+            .collect_vec(),
+        vec!["document-1", "document-2"]
+    );
+    let mut fn_or_ent = QueryBuilder::from_collection(fn_col)
+        .enterprise_edition(true)
+        .filter(or_ineq_filter)
+        .find_nearest(FindNearest::new(
+            "emb".parse()?,
+            vec![0.0, 0.0],
+            DistanceMeasure::Euclidean,
+            10,
+        ))
+        .build()?;
+    let (_, ent_or_matches) = assert_ready_ok!(spawn(fn_or_ent.once(&database)).poll_until_idle());
+    assert_eq!(
+        ent_or_matches
+            .iter()
+            .map(|m| m.version.name.document_id.as_str())
+            .collect_vec(),
         vec!["document-3", "document-1", "document-2"]
     );
 

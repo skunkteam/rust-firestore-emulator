@@ -1,4 +1,4 @@
-import { CollectionReference, DocumentData, DocumentReference, Query, QuerySnapshot } from '@google-cloud/firestore';
+import { CollectionReference, DocumentData, DocumentReference, FieldPath, Query, QuerySnapshot } from '@google-cloud/firestore';
 import { fromEventPattern } from '@skunkteam/sherlock-utils';
 import assert from 'assert';
 import { omit, range } from 'lodash';
@@ -196,12 +196,116 @@ describe.each(editions)('$description', fs => {
         });
     });
 
+    describe('array-contains-any and not-in live queries', () => {
+        test.concurrent(
+            'array-contains-any with limit(3) tracks additions, in-place updates, removals, batches, and deletions',
+            async () => {
+                const coll = subCollection();
+                const q = coll.where('tags', 'array-contains-any', ['alpha', 'beta']).orderBy(FieldPath.documentId()).limit(3);
+                const { stop, getCurrent, getNext } = listen(q, {
+                    transform: snap => snap.docs.map(d => ({ id: d.id, ...readData(d.data()) })),
+                });
+                try {
+                    expect(await getCurrent()).toEqual([]);
+
+                    const [snap1] = await Promise.all([getNext(), coll.doc('d2').create(writeData({ tags: ['alpha'], note: 'v1' }))]);
+                    expect(snap1).toEqual([{ id: 'd2', tags: ['alpha'], note: 'v1' }]);
+
+                    // Non-matching doc does not alter snapshot; add d5 and d1 next.
+                    await coll.doc('d0').create(writeData({ tags: ['gamma'] }));
+
+                    const [snap2] = await Promise.all([getNext(), coll.doc('d5').create(writeData({ tags: ['beta'] }))]);
+                    expect(snap2.map(d => d.id)).toEqual(['d2', 'd5']);
+
+                    const [snap3] = await Promise.all([getNext(), coll.doc('d1').create(writeData({ tags: ['alpha', 'gamma'] }))]);
+                    expect(snap3.map(d => d.id)).toEqual(['d1', 'd2', 'd5']);
+
+                    // Adding d3 pushes d5 beyond limit(3).
+                    const [snap4] = await Promise.all([getNext(), coll.doc('d3').create(writeData({ tags: ['beta'] }))]);
+                    expect(snap4.map(d => d.id)).toEqual(['d1', 'd2', 'd3']);
+
+                    // In-place update on matching d2 preserves membership while delivering updated field.
+                    const [snap5] = await Promise.all([getNext(), coll.doc('d2').update({ note: 'v2' })]);
+                    expect(snap5).toEqual([
+                        { id: 'd1', tags: ['alpha', 'gamma'] },
+                        { id: 'd2', tags: ['alpha'], note: 'v2' },
+                        { id: 'd3', tags: ['beta'] },
+                    ]);
+
+                    // Removing 'alpha' from d2 lets d5 re-enter the limit(3) window.
+                    const [snap6] = await Promise.all([getNext(), coll.doc('d2').update({ tags: ['gamma'] })]);
+                    expect(snap6.map(d => d.id)).toEqual(['d1', 'd3', 'd5']);
+
+                    // Batch write adds d4 and deletes d5.
+                    const batch = fs.firestore.batch();
+                    batch.set(coll.doc('d4'), writeData({ tags: ['alpha'] }));
+                    batch.delete(coll.doc('d5'));
+                    const [snap7] = await Promise.all([getNext(), batch.commit()]);
+                    expect(snap7.map(d => d.id)).toEqual(['d1', 'd3', 'd4']);
+
+                    // Direct deletion of d1 leaves d3 and d4.
+                    const [snap8] = await Promise.all([getNext(), coll.doc('d1').delete()]);
+                    expect(snap8.map(d => d.id)).toEqual(['d3', 'd4']);
+                } finally {
+                    stop();
+                }
+            },
+        );
+
+        test.concurrent('not-in with orderBy and limit(3) tracks additions, updates, batches, and deletions', async () => {
+            const coll = subCollection();
+            const q = coll.where('status', 'not-in', ['archived', 'deleted']).orderBy('status').limit(3);
+            const { stop, getCurrent, getNext } = listen<{ id: string; status: string; v: number }>(q, {
+                transform: snap => snap.docs.map(d => ({ id: d.id, ...readData<{ status: string; v: number }>(d.data()) })),
+            });
+            try {
+                expect(await getCurrent()).toEqual([]);
+
+                // Excluded docs (`archived` and missing `status`) do not enter snapshot.
+                await Promise.all([
+                    coll.doc('skip-arch').create(writeData({ status: 'archived' })),
+                    coll.doc('skip-missing').create(writeData({ other: true })),
+                ]);
+
+                const [snap1] = await Promise.all([getNext(), coll.doc('s-d').create(writeData({ status: 'd', v: 1 }))]);
+                expect(snap1).toEqual([{ id: 's-d', status: 'd', v: 1 }]);
+
+                const [snap2] = await Promise.all([getNext(), coll.doc('s-b').create(writeData({ status: 'b', v: 1 }))]);
+                expect(snap2.map(d => d.id)).toEqual(['s-b', 's-d']);
+
+                const [snap3] = await Promise.all([getNext(), coll.doc('s-a').create(writeData({ status: 'a', v: 1 }))]);
+                expect(snap3.map(d => d.id)).toEqual(['s-a', 's-b', 's-d']);
+
+                // Adding status 'c' pushes 's-d' out of limit(3).
+                const [snap4] = await Promise.all([getNext(), coll.doc('s-c').create(writeData({ status: 'c', v: 1 }))]);
+                expect(snap4.map(d => d.id)).toEqual(['s-a', 's-b', 's-c']);
+
+                // In-place update on matching s-b updates field value cleanly.
+                const [snap5] = await Promise.all([getNext(), coll.doc('s-b').update({ v: 2 })]);
+                expect(snap5.find(d => d.id === 's-b')?.v).toBe(2);
+
+                // Updating s-b to 'deleted' removes it and admits s-d back into window.
+                const [snap6] = await Promise.all([getNext(), coll.doc('s-b').update({ status: 'deleted' })]);
+                expect(snap6.map(d => d.id)).toEqual(['s-a', 's-c', 's-d']);
+
+                // Batch adds 'e' and deletes s-a.
+                const batch = fs.firestore.batch();
+                batch.set(coll.doc('s-e'), writeData({ status: 'e', v: 1 }));
+                batch.delete(coll.doc('s-a'));
+                const [snap7] = await Promise.all([getNext(), batch.commit()]);
+                expect(snap7.map(d => d.id)).toEqual(['s-c', 's-d', 's-e']);
+            } finally {
+                stop();
+            }
+        });
+    });
+
     function subCollection(coll = fs.collection) {
         return coll.doc().collection('collection');
     }
 });
 
-function listen(query: Query) {
+function listen<T = DocumentData>(query: Query, options?: { transform?: (snap: QuerySnapshot) => T[] }) {
     const snapshot$ = fromEventPattern<QuerySnapshot>(value$ =>
         query.onSnapshot(
             snapshot => value$.set(snapshot),
@@ -209,15 +313,18 @@ function listen(query: Query) {
         ),
     );
 
-    const document$ = snapshot$
-        .map(snap => snap.docs.map(doc => readData(doc.data())))
-        .map(data => {
-            return data.map(({ included, ...rest }) => {
+    const document$ = snapshot$.map(snap => {
+        if (options?.transform) {
+            return options.transform(snap);
+        }
+        return snap.docs
+            .map(doc => readData(doc.data()))
+            .map(({ included, ...rest }) => {
                 expect(included).toBeTrue();
-                return omit(rest, ['number']);
+                return omit(rest, ['number']) as T;
             });
-        });
-    const queryResults: DocumentData[][] = [];
+    });
+    const queryResults: T[][] = [];
     return {
         // Start listening:
         stop: document$.react(docs => queryResults.push(docs)),

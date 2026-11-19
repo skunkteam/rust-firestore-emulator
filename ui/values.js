@@ -604,9 +604,14 @@ export function formatValuePreview(val) {
  * @param {string} rawText
  * @returns {string | null}
  */
-function findUnsafeUnquotedInteger(rawText) {
+export function findUnsafeUnquotedInteger(rawText) {
   let inString = false;
   let escaped = false;
+  let stringStart = -1;
+  /** @type {string | null} */
+  let lastString = null;
+  /** @type {string | null} */
+  let activeKey = null;
   for (let i = 0; i < rawText.length; i++) {
     const ch = rawText[i];
     if (inString) {
@@ -616,11 +621,24 @@ function findUnsafeUnquotedInteger(rawText) {
         escaped = true;
       } else if (ch === '"') {
         inString = false;
+        lastString = rawText.slice(stringStart, i);
       }
       continue;
     }
     if (ch === '"') {
       inString = true;
+      stringStart = i + 1;
+      activeKey = null;
+      continue;
+    }
+    if (ch === ":") {
+      activeKey = lastString;
+      lastString = null;
+      continue;
+    }
+    if (ch === "," || ch === "{" || ch === "[" || ch === "}" || ch === "]") {
+      activeKey = null;
+      lastString = null;
       continue;
     }
     if (ch === "-" || (ch >= "0" && ch <= "9")) {
@@ -634,7 +652,7 @@ function findUnsafeUnquotedInteger(rawText) {
         j < rawText.length &&
         (rawText[j] === "." || rawText[j] === "e" || rawText[j] === "E");
       const digits = rawText.slice(digitStart, j);
-      if (!isFloat && digits.length >= 16) {
+      if (!isFloat && activeKey !== "doubleValue" && digits.length >= 16) {
         try {
           const n = BigInt(rawText.slice(i, j));
           if (n > 9007199254740991n || n < -9007199254740991n) {
@@ -652,7 +670,12 @@ function findUnsafeUnquotedInteger(rawText) {
           j++;
         }
       }
+      activeKey = null;
+      lastString = null;
       i = Math.max(i, j - 1);
+    } else if (ch !== " " && ch !== "\t" && ch !== "\n" && ch !== "\r") {
+      activeKey = null;
+      lastString = null;
     }
   }
   return null;
@@ -744,7 +767,7 @@ function normalizeFieldsMap(mapObj, pathLabel) {
  * @param {boolean} inArray
  * @returns {{ valid: boolean, value?: FirestoreValue, error?: string }}
  */
-function normalizeProtoValue(rawVal, pathLabel, inArray) {
+export function normalizeProtoValue(rawVal, pathLabel, inArray) {
   if (!rawVal || typeof rawVal !== "object" || Array.isArray(rawVal)) {
     return {
       valid: false,
