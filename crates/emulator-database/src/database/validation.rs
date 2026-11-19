@@ -3,8 +3,12 @@ use std::collections::HashMap;
 use googleapis::{
     VectorClassification, classify_vector_map,
     google::firestore::v1::{
-        DocumentMask, Value, Write,
-        document_transform::{FieldTransform, field_transform::TransformType},
+        DocumentMask, Precondition, Value, Write,
+        document_transform::{
+            FieldTransform,
+            field_transform::{ServerValue, TransformType},
+        },
+        precondition,
         value::ValueType,
         write,
     },
@@ -111,7 +115,20 @@ pub(crate) fn validate_field_transforms(transforms: &[FieldTransform]) -> Result
             ));
         };
         match transform_type {
-            TransformType::SetToServerValue(_) => {}
+            TransformType::SetToServerValue(code) => match ServerValue::try_from(*code) {
+                Ok(ServerValue::RequestTime) => {}
+                Ok(ServerValue::Unspecified) => {
+                    return Err(GenericDatabaseError::invalid_argument(
+                        "ServerValue type must be specified for set_to_server_value \
+                         transformation.",
+                    ));
+                }
+                Err(_) => {
+                    return Err(GenericDatabaseError::invalid_argument(format!(
+                        "invalid server_value: {code}"
+                    )));
+                }
+            },
             TransformType::AppendMissingElements(arr) | TransformType::RemoveAllFromArray(arr) => {
                 for item in &arr.values {
                     validate_writable_value(item, true)?;
@@ -133,12 +150,33 @@ pub(crate) fn validate_field_transforms(transforms: &[FieldTransform]) -> Result
     Ok(())
 }
 
+pub(crate) fn validate_precondition(precondition: &Precondition) -> Result<()> {
+    if let Some(precondition::ConditionType::UpdateTime(time)) = precondition.condition_type {
+        if time.seconds < 0 {
+            return Err(GenericDatabaseError::invalid_argument(format!(
+                "Only timestamps past epoch are supported, got seconds={}",
+                time.seconds
+            )));
+        }
+        if !(0..1_000_000_000).contains(&time.nanos) {
+            return Err(GenericDatabaseError::invalid_argument(format!(
+                "invalid timestamp: nanos ({}) must be in [0, 999_999_999]",
+                time.nanos
+            )));
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn validate_write(write: &Write) -> Result<()> {
     let Some(operation) = &write.operation else {
         return Err(GenericDatabaseError::not_implemented(
             "missing operation in write",
         ));
     };
+    if let Some(precondition) = &write.current_document {
+        validate_precondition(precondition)?;
+    }
     match operation {
         write::Operation::Update(doc) => {
             validate_writable_fields(&doc.fields)?;
@@ -163,9 +201,9 @@ mod tests {
 
     use googleapis::{
         MAX_VECTOR_DIMENSIONS, VECTOR_MAP_TYPE_KEY, VECTOR_MAP_TYPE_SENTINEL, VECTOR_MAP_VALUE_KEY,
-        google::firestore::v1::{
-            ArrayValue, Document, DocumentTransform, Function, Pipeline,
-            document_transform::field_transform::ServerValue,
+        google::{
+            firestore::v1::{ArrayValue, Document, DocumentTransform, Function, Pipeline},
+            protobuf::Timestamp,
         },
     };
     use googletest::prelude::*;
@@ -577,6 +615,65 @@ mod tests {
             )]);
             assert_that!(
                 validate_writable_fields(&fields),
+                err(matches_pattern!(GenericDatabaseError::InvalidArgument(_)))
+            );
+        }
+    }
+
+    #[gtest]
+    fn rejects_unspecified_or_unknown_server_value_and_invalid_precondition_timestamps() {
+        for bad_sv in [ServerValue::Unspecified as i32, 999] {
+            assert_that!(
+                validate_field_transforms(&[FieldTransform {
+                    field_path:     "ts".to_string(),
+                    transform_type: Some(TransformType::SetToServerValue(bad_sv)),
+                }]),
+                err(matches_pattern!(GenericDatabaseError::InvalidArgument(_)))
+            );
+        }
+
+        // Empty precondition and epoch timestamp pass validation.
+        assert_that!(validate_precondition(&Precondition::default()), ok(()));
+        assert_that!(
+            validate_precondition(&Precondition {
+                condition_type: Some(precondition::ConditionType::UpdateTime(Timestamp {
+                    seconds: 0,
+                    nanos:   0,
+                })),
+            }),
+            ok(())
+        );
+
+        // Negative seconds and out-of-range nanos fail validation with InvalidArgument.
+        for bad_ts in [
+            Timestamp {
+                seconds: -1,
+                nanos:   0,
+            },
+            Timestamp {
+                seconds: 10,
+                nanos:   -1,
+            },
+            Timestamp {
+                seconds: 10,
+                nanos:   1_000_000_000,
+            },
+        ] {
+            let pre = Precondition {
+                condition_type: Some(precondition::ConditionType::UpdateTime(bad_ts)),
+            };
+            assert_that!(
+                validate_precondition(&pre),
+                err(matches_pattern!(GenericDatabaseError::InvalidArgument(_)))
+            );
+            assert_that!(
+                validate_write(&Write {
+                    current_document: Some(pre),
+                    operation: Some(write::Operation::Delete(
+                        "projects/p/databases/(default)/documents/c/d".to_string(),
+                    )),
+                    ..Default::default()
+                }),
                 err(matches_pattern!(GenericDatabaseError::InvalidArgument(_)))
             );
         }
