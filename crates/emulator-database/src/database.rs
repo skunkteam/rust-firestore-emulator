@@ -799,11 +799,17 @@ impl FirestoreDatabase {
                     .await?
             }
             Some(Mode::ReadWrite(rw)) if rw.retry_transaction.is_empty() => {
+                if rw.concurrency_mode != ConcurrencyMode::Unspecified as i32 {
+                    crate::unimplemented!("TransactionOptions.read_write.concurrency_mode");
+                }
                 self.transactions
                     .start_read_write(self.optimistic_concurrency())
                     .await
             }
             Some(Mode::ReadWrite(rw)) => {
+                if rw.concurrency_mode != ConcurrencyMode::Unspecified as i32 {
+                    crate::unimplemented!("TransactionOptions.read_write.concurrency_mode");
+                }
                 let id = rw.retry_transaction.try_into()?;
                 self.transactions
                     .start_read_write_with_id(id, self.optimistic_concurrency())
@@ -1292,6 +1298,7 @@ mod tests {
                 mode: Some(transaction_options::Mode::ReadWrite(
                     transaction_options::ReadWrite {
                         retry_transaction: Vec::from(t1_id),
+                        ..Default::default()
                     },
                 )),
             })
@@ -1413,6 +1420,35 @@ mod tests {
             assert!(
                 !ev.updates.contains_key(&d1),
                 "noop multi-write commit must not emit update event for {d1}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn new_txn_rejects_explicit_concurrency_mode_as_not_implemented() {
+        let project: &'static FirestoreProject =
+            Box::leak(Box::new(FirestoreProject::new(FirestoreConfig::default())));
+        let root: RootRef = "projects/p/databases/(default)".parse().unwrap();
+        let db = project.database(&root).await;
+
+        for mode in [
+            transaction_options::ConcurrencyMode::Optimistic,
+            transaction_options::ConcurrencyMode::Pessimistic,
+        ] {
+            let err = db
+                .new_txn(TransactionOptions {
+                    mode: Some(transaction_options::Mode::ReadWrite(
+                        transaction_options::ReadWrite {
+                            retry_transaction: vec![],
+                            concurrency_mode:  mode as i32,
+                        },
+                    )),
+                })
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(err, GenericDatabaseError::NotImplemented(_)),
+                "expected NotImplemented for concurrency_mode {mode:?}, got {err:?}"
             );
         }
     }

@@ -149,6 +149,7 @@ async fn listen_query_target_handles_membership_resets_in_place_updates_and_32_r
         database: DATABASE_ROOT.to_string(),
         labels: HashMap::new(),
         target_change: Some(listen_request::TargetChange::RemoveTarget(1)),
+        request_options: None,
     },
     Code::Unimplemented
 )]
@@ -165,6 +166,7 @@ async fn listen_query_target_handles_membership_resets_in_place_updates_and_32_r
             })),
             resume_type: None,
         })),
+        request_options: None,
     },
     Code::Unimplemented
 )]
@@ -181,6 +183,7 @@ async fn listen_query_target_handles_membership_resets_in_place_updates_and_32_r
             })),
             resume_type: None,
         })),
+        request_options: None,
     },
     Code::Unimplemented
 )]
@@ -189,6 +192,7 @@ async fn listen_query_target_handles_membership_resets_in_place_updates_and_32_r
         database: DATABASE_ROOT.to_string(),
         labels: HashMap::new(),
         target_change: None,
+        request_options: None,
     },
     Code::InvalidArgument
 )]
@@ -205,6 +209,7 @@ async fn listen_query_target_handles_membership_resets_in_place_updates_and_32_r
             })),
             resume_type: None,
         })),
+        request_options: None,
     },
     Code::InvalidArgument
 )]
@@ -241,6 +246,7 @@ async fn listen_rejects_second_target_on_same_stream_with_unimplemented() {
                 })),
                 resume_type: None,
             })),
+            request_options: None,
         })
         .await;
     let err_frame = handle.next_raw().await.expect("error frame");
@@ -268,6 +274,7 @@ async fn listen_rejects_mismatched_database_root_in_target_with_invalid_argument
                 })),
                 resume_type: None,
             })),
+            request_options: None,
         })
         .await;
     let err = doc_handle.next_raw().await.expect("error frame");
@@ -295,6 +302,7 @@ async fn listen_rejects_mismatched_database_root_in_target_with_invalid_argument
                 })),
                 resume_type: None,
             })),
+            request_options: None,
         })
         .await;
     let err = query_handle.next_raw().await.expect("error frame");
@@ -326,6 +334,7 @@ async fn listen_dropping_response_stream_terminates_idle_grpc_listener() {
                 })),
                 resume_type: None,
             })),
+            request_options: None,
         })
         .await
         .unwrap();
@@ -372,6 +381,7 @@ async fn listen_document_target_lag_reset_preserves_existing_document_instead_of
                 })),
                 resume_type: None,
             })),
+            request_options: None,
         })
         .await
         .unwrap();
@@ -503,6 +513,7 @@ async fn listen_query_target_lag_reset_recovers_cleanly_without_stale_deletions(
                 })),
                 resume_type: None,
             })),
+            request_options: None,
         })
         .await
         .unwrap();

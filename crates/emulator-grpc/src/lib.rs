@@ -264,7 +264,9 @@ impl Firestore for FirestoreEmulator {
             name,
             mask,
             consistency_selector,
+            request_options,
         } = request.into_inner();
+        unimplemented_option!(request_options);
 
         let name: DocumentRef = name.parse()?;
 
@@ -300,9 +302,11 @@ impl Firestore for FirestoreEmulator {
             documents,
             mask,
             consistency_selector,
+            request_options,
         } = request.into_inner();
 
         error_in_stream(async {
+            unimplemented_option!(request_options);
             let database = self.project.database(&database.parse()?).await;
             let documents: Vec<DocumentRef> = documents
                 .into_iter()
@@ -430,7 +434,9 @@ impl Firestore for FirestoreEmulator {
             database,
             writes,
             transaction,
+            request_options,
         } = request.into_inner();
+        unimplemented_option!(request_options);
 
         let database = self.project.database(&database.parse()?).await;
         for write in &writes {
@@ -438,15 +444,7 @@ impl Firestore for FirestoreEmulator {
         }
 
         let (txn_id, mut new_txn_guard) = if transaction.is_empty() {
-            let id = database
-                .new_txn(TransactionOptions {
-                    mode: Some(transaction_options::Mode::ReadWrite(
-                        transaction_options::ReadWrite {
-                            retry_transaction: vec![],
-                        },
-                    )),
-                })
-                .await?;
+            let id = database.new_txn(TransactionOptions::READ_WRITE).await?;
             (id, NewTxnGuard::new(Arc::clone(&database), Vec::from(id)))
         } else {
             (
@@ -486,7 +484,9 @@ impl Firestore for FirestoreEmulator {
             document_id,
             document,
             mask,
+            request_options,
         } = request.into_inner();
+        unimplemented_option!(request_options);
 
         if collection_id.is_empty() || collection_id.contains('/') {
             return Err(Status::invalid_argument(
@@ -533,7 +533,9 @@ impl Firestore for FirestoreEmulator {
             mask,
             show_missing,
             consistency_selector,
+            request_options,
         } = request.into_inner();
+        unimplemented_option!(request_options);
 
         let parent: Ref = parent.parse()?;
         let database = self.project.database(parent.root()).await;
@@ -567,7 +569,9 @@ impl Firestore for FirestoreEmulator {
             update_mask,
             mask,
             current_document,
+            request_options,
         } = request.into_inner();
+        unimplemented_option!(request_options);
 
         let doc = mandatory!(document);
         let doc_ref: DocumentRef = doc.name.parse()?;
@@ -590,7 +594,9 @@ impl Firestore for FirestoreEmulator {
         let DeleteDocumentRequest {
             name,
             current_document,
+            request_options,
         } = request.into_inner();
+        unimplemented_option!(request_options);
 
         let doc_ref: DocumentRef = name.parse()?;
         let database = self
@@ -607,7 +613,12 @@ impl Firestore for FirestoreEmulator {
         &self,
         request: Request<BeginTransactionRequest>,
     ) -> Result<Response<BeginTransactionResponse>> {
-        let BeginTransactionRequest { database, options } = request.into_inner();
+        let BeginTransactionRequest {
+            database,
+            options,
+            request_options,
+        } = request.into_inner();
+        unimplemented_option!(request_options);
 
         let txn_id = self
             .project
@@ -628,7 +639,9 @@ impl Firestore for FirestoreEmulator {
         let RollbackRequest {
             database,
             transaction,
+            request_options,
         } = request.into_inner();
+        unimplemented_option!(request_options);
         let database = self.project.database(&database.parse()?).await;
         database.rollback(transaction.try_into()?).await?;
         Ok(Response::new(Empty {}))
@@ -648,10 +661,12 @@ impl Firestore for FirestoreEmulator {
             explain_options,
             query_type,
             consistency_selector,
+            request_options,
         } = request.into_inner();
 
         error_in_stream(async {
             unimplemented_option!(explain_options);
+            unimplemented_option!(request_options);
             let run_query_request::QueryType::StructuredQuery(query) = mandatory!(query_type);
 
             let parent: Ref = parent.parse()?;
@@ -727,9 +742,13 @@ impl Firestore for FirestoreEmulator {
             database,
             pipeline_type,
             consistency_selector,
+            auto_commit_transaction,
+            request_options,
         } = request.into_inner();
 
         error_in_stream(async {
+            unimplemented_bool!(auto_commit_transaction);
+            unimplemented_option!(request_options);
             let execute_pipeline_request::PipelineType::StructuredPipeline(pipeline) =
                 mandatory!(pipeline_type);
 
@@ -798,10 +817,12 @@ impl Firestore for FirestoreEmulator {
             explain_options,
             query_type,
             consistency_selector,
+            request_options,
         } = request.into_inner();
 
         error_in_stream(async {
             unimplemented_option!(explain_options);
+            unimplemented_option!(request_options);
 
             let run_aggregation_query_request::QueryType::StructuredAggregationQuery(agg_query) =
                 mandatory!(query_type);
@@ -909,7 +930,9 @@ impl Firestore for FirestoreEmulator {
             page_size,
             page_token,
             consistency_selector,
+            request_options,
         } = request.into_inner();
+        unimplemented_option!(request_options);
         if page_size < 0 {
             return Err(Status::invalid_argument("page_size must be non-negative"));
         }
@@ -951,8 +974,10 @@ impl Firestore for FirestoreEmulator {
             database,
             writes,
             labels,
+            request_options,
         } = request.into_inner();
         unimplemented_collection!(labels);
+        unimplemented_option!(request_options);
 
         let database = self.project.database(&database.parse()?).await;
 
@@ -1028,11 +1053,7 @@ mod tests {
     }
 
     fn rw_opts() -> TransactionOptions {
-        TransactionOptions {
-            mode: Some(transaction_options::Mode::ReadWrite(ReadWrite {
-                retry_transaction: Vec::new(),
-            })),
-        }
+        TransactionOptions::READ_WRITE
     }
 
     fn update_write(name: String, v: i64) -> Write {
@@ -1061,6 +1082,7 @@ mod tests {
                 documents: vec![format!("{OTHER_DOCS_ROOT}/c/d1")],
                 mask: None,
                 consistency_selector: None,
+                request_options: None,
             }))
             .await
             .unwrap()
@@ -1071,9 +1093,10 @@ mod tests {
         // 2. Commit with write targeting `other-db`
         let commit_err = emu
             .commit(Request::new(CommitRequest {
-                database:    DB_ROOT.to_string(),
-                writes:      vec![update_write(format!("{OTHER_DOCS_ROOT}/c/d1"), 1)],
+                database: DB_ROOT.to_string(),
+                writes: vec![update_write(format!("{OTHER_DOCS_ROOT}/c/d1"), 1)],
                 transaction: Vec::new(),
+                request_options: None,
             }))
             .await
             .unwrap_err();
@@ -1083,11 +1106,12 @@ mod tests {
         let bw_resp = emu
             .batch_write(Request::new(BatchWriteRequest {
                 database: DB_ROOT.to_string(),
-                writes:   vec![
+                writes: vec![
                     update_write(format!("{DOCS_ROOT}/c/ok"), 1),
                     update_write(format!("{OTHER_DOCS_ROOT}/c/bad"), 2),
                 ],
-                labels:   HashMap::new(),
+                labels: HashMap::new(),
+                request_options: None,
             }))
             .await
             .unwrap()
@@ -1114,6 +1138,7 @@ mod tests {
                         99, 0, 0, 0, 0, 0, 0, 0,
                     ]),
                 ),
+                request_options: None,
             }))
             .await
             .unwrap()
@@ -1137,10 +1162,12 @@ mod tests {
                         TransactionOptions {
                             mode: Some(transaction_options::Mode::ReadWrite(ReadWrite {
                                 retry_transaction: t1_bytes.clone(),
+                                ..Default::default()
                             })),
                         },
                     ),
                 ),
+                request_options: None,
             }))
             .await
             .unwrap()
@@ -1151,6 +1178,7 @@ mod tests {
             .new_txn(TransactionOptions {
                 mode: Some(transaction_options::Mode::ReadWrite(ReadWrite {
                     retry_transaction: t1_bytes,
+                    ..Default::default()
                 })),
             })
             .await;
@@ -1179,6 +1207,7 @@ mod tests {
                         update_time: None,
                     }),
                     mask: None,
+                    request_options: None,
                 }))
                 .await
                 .unwrap_err();
@@ -1208,6 +1237,7 @@ mod tests {
                 page_size: -1,
                 page_token: String::new(),
                 consistency_selector: None,
+                request_options: None,
             }))
             .await
             .unwrap_err();
@@ -1225,6 +1255,7 @@ mod tests {
                 page_size: -5,
                 page_token: String::new(),
                 consistency_selector: None,
+                request_options: None,
             }))
             .await
             .unwrap_err();
@@ -1238,12 +1269,14 @@ mod tests {
                 database: DB_ROOT.to_string(),
                 labels: HashMap::new(),
                 target_change: None,
+                request_options: None,
             }),
             Err(Status::out_of_range("frame exceeds limit")),
             Ok(ListenRequest {
                 database: DB_ROOT.to_string(),
                 labels: HashMap::new(),
                 target_change: None,
+                request_options: None,
             }),
         ]);
         let (clean, err_rx) = forward_listen_requests(input);
@@ -1329,6 +1362,7 @@ mod tests {
                         consistency_selector: Some(
                             run_query_request::ConsistencySelector::NewTransaction(rw_opts()),
                         ),
+                        request_options: None,
                     })));
                     assert!(futures_util::poll!(&mut fut).is_pending());
                     drop(fut);
@@ -1360,6 +1394,7 @@ mod tests {
                                     rw_opts(),
                                 ),
                             ),
+                            request_options: None,
                         },
                     )));
                     assert!(futures_util::poll!(&mut fut).is_pending());
@@ -1390,18 +1425,21 @@ mod tests {
                                     rw_opts(),
                                 ),
                             ),
+                            auto_commit_transaction: false,
+                            request_options: None,
                         })));
                     assert!(futures_util::poll!(&mut fut).is_pending());
                     drop(fut);
                 }
                 "commit" => {
                     let mut fut = Box::pin(emu.commit(Request::new(CommitRequest {
-                        database:    DB_ROOT.to_string(),
-                        writes:      vec![
+                        database: DB_ROOT.to_string(),
+                        writes: vec![
                             update_write(d1.to_string(), 9),
                             update_write(format!("{DOCS_ROOT}/locks/b_d2"), 9),
                         ],
                         transaction: Vec::new(),
+                        request_options: None,
                     })));
                     assert!(futures_util::poll!(&mut fut).is_pending());
                     drop(fut);
@@ -1438,6 +1476,7 @@ mod tests {
                     consistency_selector: Some(
                         batch_get_documents_request::ConsistencySelector::NewTransaction(rw_opts()),
                     ),
+                    request_options: None,
                 }))
                 .await
                 .unwrap()
@@ -1481,6 +1520,7 @@ mod tests {
                     consistency_selector: Some(
                         run_query_request::ConsistencySelector::NewTransaction(rw_opts()),
                     ),
+                    request_options: None,
                 }))
                 .await
                 .unwrap()
@@ -1507,6 +1547,8 @@ mod tests {
                     consistency_selector: Some(
                         execute_pipeline_request::ConsistencySelector::NewTransaction(rw_opts()),
                     ),
+                    auto_commit_transaction: false,
+                    request_options: None,
                 }))
                 .await
                 .unwrap()
@@ -1539,6 +1581,7 @@ mod tests {
                             rw_opts(),
                         ),
                     ),
+                    request_options: None,
                 }))
                 .await
                 .unwrap()
@@ -1580,6 +1623,7 @@ mod tests {
                 consistency_selector: Some(
                     batch_get_documents_request::ConsistencySelector::NewTransaction(rw_opts()),
                 ),
+                request_options: None,
             }))
             .await
             .unwrap()
@@ -1600,6 +1644,7 @@ mod tests {
             .new_txn(TransactionOptions {
                 mode: Some(transaction_options::Mode::ReadWrite(ReadWrite {
                     retry_transaction: txn_bytes,
+                    ..Default::default()
                 })),
             })
             .await;
@@ -1635,9 +1680,11 @@ mod tests {
                     TransactionOptions {
                         mode: Some(transaction_options::Mode::ReadWrite(ReadWrite {
                             retry_transaction: t1_bytes.clone(),
+                            ..Default::default()
                         })),
                     },
                 )),
+                request_options: None,
             }))
             .await
             .unwrap()
@@ -1648,6 +1695,7 @@ mod tests {
             .new_txn(TransactionOptions {
                 mode: Some(transaction_options::Mode::ReadWrite(ReadWrite {
                     retry_transaction: t1_bytes,
+                    ..Default::default()
                 })),
             })
             .await;
@@ -1683,10 +1731,12 @@ mod tests {
                         TransactionOptions {
                             mode: Some(transaction_options::Mode::ReadWrite(ReadWrite {
                                 retry_transaction: t1_bytes.clone(),
+                                ..Default::default()
                             })),
                         },
                     ),
                 ),
+                request_options: None,
             }))
             .await
             .unwrap()
@@ -1699,6 +1749,7 @@ mod tests {
                 db.new_txn(TransactionOptions {
                     mode: Some(transaction_options::Mode::ReadWrite(ReadWrite {
                         retry_transaction: retry_bytes,
+                        ..Default::default()
                     })),
                 })
                 .await
@@ -1734,6 +1785,7 @@ mod tests {
                 consistency_selector: Some(
                     batch_get_documents_request::ConsistencySelector::NewTransaction(rw_opts()),
                 ),
+                request_options: None,
             }))
             .await
             .unwrap()
@@ -1751,9 +1803,10 @@ mod tests {
 
         let commit_res = emu
             .commit(Request::new(CommitRequest {
-                database:    DB_ROOT.to_string(),
-                writes:      Vec::new(),
+                database: DB_ROOT.to_string(),
+                writes: Vec::new(),
                 transaction: frame.transaction,
+                request_options: None,
             }))
             .await;
         assert!(
@@ -1761,5 +1814,52 @@ mod tests {
             "empty BatchGetDocuments NewTransaction must remain usable for Commit, got \
              {commit_res:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn unimplemented_request_options_and_auto_commit_return_unimplemented() {
+        use googleapis::google::firestore::v1::{GetDocumentRequest, RequestOptions};
+
+        let project = leaked_project(true);
+        let emu = FirestoreEmulator { project };
+
+        let unary_err = emu
+            .get_document(Request::new(GetDocumentRequest {
+                name: format!("{DOCS_ROOT}/c/d1"),
+                mask: None,
+                consistency_selector: None,
+                request_options: Some(RequestOptions::default()),
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(unary_err.code(), Code::Unimplemented);
+
+        let mut ep_auto_commit = emu
+            .execute_pipeline(Request::new(ExecutePipelineRequest {
+                database: DB_ROOT.to_string(),
+                pipeline_type: None,
+                consistency_selector: None,
+                auto_commit_transaction: true,
+                request_options: None,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        let ep_auto_err = ep_auto_commit.next().await.unwrap().unwrap_err();
+        assert_eq!(ep_auto_err.code(), Code::Unimplemented);
+
+        let mut ep_req_opts = emu
+            .execute_pipeline(Request::new(ExecutePipelineRequest {
+                database: DB_ROOT.to_string(),
+                pipeline_type: None,
+                consistency_selector: None,
+                auto_commit_transaction: false,
+                request_options: Some(RequestOptions::default()),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        let ep_opts_err = ep_req_opts.next().await.unwrap().unwrap_err();
+        assert_eq!(ep_opts_err.code(), Code::Unimplemented);
     }
 }

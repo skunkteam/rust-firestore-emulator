@@ -206,6 +206,7 @@ async fn list_collection_ids_lists_root_and_subcollections_and_rejects_unsupport
                 page_size: 0,
                 page_token: String::new(),
                 consistency_selector: None,
+                request_options: None,
             })
             .await,
         Code::InvalidArgument,

@@ -157,8 +157,10 @@ impl Listener {
             database,
             labels,
             target_change,
+            request_options,
         } = msg;
         unimplemented_collection!(labels);
+        unimplemented_option!(request_options);
         required_option!(target_change);
 
         let database = self.project.database(&database.parse()?).await;
@@ -730,6 +732,7 @@ mod tests {
                     })),
                     resume_type: None,
                 })),
+                request_options: None,
             })
             .await
             .unwrap();
@@ -875,6 +878,7 @@ mod tests {
                         nanos:   0,
                     })),
                 })),
+                request_options: None,
             })
             .await
             .unwrap();

@@ -19,7 +19,23 @@ pub(super) fn maybe_evaluate<'a>(value: &'a Value, doc: &'a Document) -> Result<
             let field_ref = f.parse()?;
             Ok(get_document_value(&field_ref, doc))
         }
+        ValueType::VariableReferenceValue(_) => crate::unimplemented!("variable_reference_value"),
         ValueType::FunctionValue(f) => function::evaluate(f, doc),
         _ => Ok(Some(value.clone())),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn variable_reference_value_returns_not_implemented() {
+        let val = Value {
+            value_type: Some(ValueType::VariableReferenceValue("v".to_string())),
+        };
+        let doc = Document::default();
+        let err = maybe_evaluate(&val, &doc).unwrap_err();
+        assert!(matches!(err, GenericDatabaseError::NotImplemented(_)));
     }
 }

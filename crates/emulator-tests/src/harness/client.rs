@@ -216,6 +216,7 @@ impl TestDb {
                 update_mask: None,
                 mask: None,
                 current_document: None,
+                request_options: None,
             })
             .await?;
         Ok(resp.into_inner())
@@ -240,6 +241,7 @@ impl TestDb {
                     update_time: None,
                 }),
                 mask: None,
+                request_options: None,
             })
             .await?;
         Ok(resp.into_inner())
@@ -252,6 +254,7 @@ impl TestDb {
                 name: doc_path(rel_doc),
                 mask: None,
                 consistency_selector: None,
+                request_options: None,
             })
             .await?;
         Ok(resp.into_inner())
@@ -272,6 +275,7 @@ impl TestDb {
                 name: doc_path(rel_doc),
                 mask: Some(doc_mask(mask_fields)),
                 consistency_selector: None,
+                request_options: None,
             })
             .await?;
         Ok(resp.into_inner())
@@ -290,6 +294,7 @@ impl TestDb {
                 consistency_selector: Some(get_document_request::ConsistencySelector::ReadTime(
                     read_time,
                 )),
+                request_options: None,
             })
             .await?;
         Ok(resp.into_inner())
@@ -308,6 +313,7 @@ impl TestDb {
                 consistency_selector: Some(get_document_request::ConsistencySelector::Transaction(
                     txn_id.to_vec(),
                 )),
+                request_options: None,
             })
             .await?;
         Ok(resp.into_inner())
@@ -333,6 +339,7 @@ impl TestDb {
                 update_mask,
                 mask: return_mask,
                 current_document,
+                request_options: None,
             })
             .await?;
         Ok(resp.into_inner())
@@ -347,6 +354,7 @@ impl TestDb {
             .delete_document(DeleteDocumentRequest {
                 name: doc_path(rel_doc),
                 current_document,
+                request_options: None,
             })
             .await?;
         Ok(())
@@ -375,6 +383,7 @@ impl TestDb {
                 mask,
                 show_missing,
                 consistency_selector: consistency,
+                request_options: None,
             })
             .await?;
         Ok(resp.into_inner())
@@ -396,6 +405,7 @@ impl TestDb {
                 page_size,
                 page_token: page_token.to_string(),
                 consistency_selector,
+                request_options: None,
             })
             .await?;
         Ok(resp.into_inner())
@@ -414,6 +424,7 @@ impl TestDb {
                 documents,
                 mask: None,
                 consistency_selector: None,
+                request_options: None,
             })
             .await?;
         collect_batch_get(resp.into_inner()).await
@@ -438,6 +449,7 @@ impl TestDb {
                 consistency_selector: Some(
                     batch_get_documents_request::ConsistencySelector::Transaction(txn_id.to_vec()),
                 ),
+                request_options: None,
             })
             .await?;
         collect_batch_get(resp.into_inner()).await
@@ -462,6 +474,7 @@ impl TestDb {
                 consistency_selector: Some(
                     batch_get_documents_request::ConsistencySelector::NewTransaction(options),
                 ),
+                request_options: None,
             })
             .await?;
         collect_batch_get(resp.into_inner()).await
@@ -475,8 +488,9 @@ impl TestDb {
             .grpc
             .batch_write(BatchWriteRequest {
                 database: DATABASE_ROOT.to_string(),
-                writes:   spec.into_writes(),
-                labels:   HashMap::new(),
+                writes: spec.into_writes(),
+                labels: HashMap::new(),
+                request_options: None,
             })
             .await?;
         Ok(resp.into_inner())
@@ -555,6 +569,7 @@ impl TestDb {
                 )),
                 consistency_selector,
                 explain_options: None,
+                request_options: None,
             })
             .await?;
         collect_run_query(resp.into_inner()).await
@@ -621,6 +636,7 @@ impl TestDb {
                 ),
                 consistency_selector,
                 explain_options: None,
+                request_options: None,
             })
             .await?;
         collect_aggregation(resp.into_inner()).await
@@ -669,6 +685,8 @@ impl TestDb {
                     spec.into_structured(),
                 )),
                 consistency_selector,
+                auto_commit_transaction: false,
+                request_options: None,
             })
             .await?;
         collect_pipeline(resp.into_inner()).await
@@ -683,11 +701,8 @@ impl TestDb {
             .grpc
             .begin_transaction(BeginTransactionRequest {
                 database: DATABASE_ROOT.to_string(),
-                options:  Some(TransactionOptions {
-                    mode: Some(transaction_options::Mode::ReadWrite(ReadWrite {
-                        retry_transaction: Vec::new(),
-                    })),
-                }),
+                options: Some(TransactionOptions::READ_WRITE),
+                request_options: None,
             })
             .await?;
         Ok(TxnClient::new(self.clone(), resp.into_inner().transaction))
@@ -701,11 +716,13 @@ impl TestDb {
             .grpc
             .begin_transaction(BeginTransactionRequest {
                 database: DATABASE_ROOT.to_string(),
-                options:  Some(TransactionOptions {
+                options: Some(TransactionOptions {
                     mode: Some(transaction_options::Mode::ReadWrite(ReadWrite {
                         retry_transaction: retry_txn.to_vec(),
+                        ..Default::default()
                     })),
                 }),
+                request_options: None,
             })
             .await?;
         Ok(TxnClient::new(self.clone(), resp.into_inner().transaction))
@@ -720,11 +737,12 @@ impl TestDb {
             .grpc
             .begin_transaction(BeginTransactionRequest {
                 database: DATABASE_ROOT.to_string(),
-                options:  Some(TransactionOptions {
+                options: Some(TransactionOptions {
                     mode: Some(transaction_options::Mode::ReadOnly(ReadOnly {
                         consistency_selector,
                     })),
                 }),
+                request_options: None,
             })
             .await?;
         Ok(TxnClient::new(self.clone(), resp.into_inner().transaction))
@@ -741,6 +759,7 @@ impl TestDb {
                 database: DATABASE_ROOT.to_string(),
                 writes,
                 transaction: txn_id.to_vec(),
+                request_options: None,
             })
             .await?
             .into_inner();
@@ -750,8 +769,9 @@ impl TestDb {
     pub(crate) async fn rollback_raw(&mut self, txn_id: &[u8]) -> Result<(), Status> {
         self.grpc
             .rollback(RollbackRequest {
-                database:    DATABASE_ROOT.to_string(),
+                database: DATABASE_ROOT.to_string(),
                 transaction: txn_id.to_vec(),
+                request_options: None,
             })
             .await?;
         Ok(())
@@ -786,6 +806,7 @@ impl TestDb {
                     })),
                     resume_type,
                 })),
+                request_options: None,
             })
             .await;
         let initial = handle.next_batch().await?;
@@ -818,6 +839,7 @@ impl TestDb {
                     })),
                     resume_type: None,
                 })),
+                request_options: None,
             })
             .await;
         let initial = handle.next_batch().await?;

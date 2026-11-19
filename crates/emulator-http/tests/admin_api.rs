@@ -1702,3 +1702,82 @@ async fn test_rest_invalid_percent_encoding_and_snake_read_time_return_json_erro
 
     Ok(())
 }
+
+#[gtest]
+#[tokio::test]
+async fn test_rest_unimplemented_request_options_and_new_database_admin_fields() -> Result<()> {
+    let project = Box::leak(Box::new(FirestoreProject::new(FirestoreConfig::default())));
+    let router = RouterBuilder::new(project).build();
+
+    // 1. Document REST endpoints reject `requestOptions.requestTags` (camelCase and snake_case)
+    //    with 501 UNIMPLEMENTED rather than silently ignoring them.
+    for query in [
+        "requestOptions.requestTags=tag1",
+        "request_options.request_tags=tag1",
+    ] {
+        let (status, body) = send_oneshot(
+            &router,
+            Method::GET,
+            &format!("/v1/projects/p/databases/(default)/documents/col/d1?{query}"),
+            None,
+        )
+        .await?;
+        assert_eq!(status, StatusCode::NOT_IMPLEMENTED, "query: {query}");
+        assert_eq!(body["error"]["status"], "UNIMPLEMENTED");
+    }
+
+    // 2. PATCH Database rejects new admin/v1 Database fields when sent directly without updateMask
+    //    or when named in updateMask, while preserving masked updates when omitted from updateMask.
+    for payload in [
+        json!({ "firestoreDataAccessMode": "DATA_ACCESS_MODE_ENABLED" }),
+        json!({ "firestore_data_access_mode": "DATA_ACCESS_MODE_ENABLED" }),
+        json!({ "mongodbCompatibleDataAccessMode": "DATA_ACCESS_MODE_DISABLED" }),
+        json!({ "mongodb_compatible_data_access_mode": "DATA_ACCESS_MODE_DISABLED" }),
+        json!({ "realtimeUpdatesMode": "REALTIME_UPDATES_MODE_ENABLED" }),
+        json!({ "realtime_updates_mode": "REALTIME_UPDATES_MODE_ENABLED" }),
+    ] {
+        let (status, body) = send_oneshot(
+            &router,
+            Method::PATCH,
+            "/v1/projects/p/databases/db-new-fields",
+            Some(payload.clone()),
+        )
+        .await?;
+        assert_eq!(status, StatusCode::NOT_IMPLEMENTED, "payload: {payload}");
+        assert_eq!(body["error"]["status"], "UNIMPLEMENTED");
+    }
+
+    for field in [
+        "firestoreDataAccessMode",
+        "firestore_data_access_mode",
+        "mongodbCompatibleDataAccessMode",
+        "mongodb_compatible_data_access_mode",
+        "realtimeUpdatesMode",
+        "realtime_updates_mode",
+    ] {
+        let (status, body) = send_oneshot(
+            &router,
+            Method::PATCH,
+            &format!("/v1/projects/p/databases/db-new-fields?updateMask={field}"),
+            Some(json!({})),
+        )
+        .await?;
+        assert_eq!(status, StatusCode::NOT_IMPLEMENTED, "mask field: {field}");
+        assert_eq!(body["error"]["status"], "UNIMPLEMENTED");
+    }
+
+    let (status, masked_ok) = send_oneshot(
+        &router,
+        Method::PATCH,
+        "/v1/projects/p/databases/db-new-fields?updateMask=databaseEdition",
+        Some(json!({
+            "databaseEdition": "ENTERPRISE",
+            "firestoreDataAccessMode": "DATA_ACCESS_MODE_ENABLED",
+        })),
+    )
+    .await?;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(masked_ok["databaseEdition"], "ENTERPRISE");
+
+    Ok(())
+}

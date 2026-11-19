@@ -30,6 +30,8 @@ fn proto_oneof_screaming_name(v: &Value) -> &'static str {
         Some(ValueType::ArrayValue(_)) => "ARRAY_VALUE",
         Some(ValueType::MapValue(_)) => "MAP_VALUE",
         Some(ValueType::FieldReferenceValue(_)) => "FIELD_REFERENCE_VALUE",
+        // TODO: verify exact Cloud Firestore type name once pipeline variables are supported.
+        Some(ValueType::VariableReferenceValue(_)) => "VARIABLE_REFERENCE_VALUE",
         Some(ValueType::FunctionValue(_)) => "FUNCTION_VALUE",
         Some(ValueType::PipelineValue(_)) => "PIPELINE_VALUE",
     }
@@ -50,12 +52,23 @@ fn proto_pascal_type_name(v: &Value) -> &'static str {
         Some(ValueType::ArrayValue(_)) => "ArrayValue",
         Some(ValueType::MapValue(_)) => "MapValue",
         Some(ValueType::FieldReferenceValue(_)) => "FieldReferenceValue",
+        // TODO: verify exact Cloud Firestore type name once pipeline variables are supported.
+        Some(ValueType::VariableReferenceValue(_)) => "VariableReferenceValue",
         Some(ValueType::FunctionValue(_)) => "FunctionValue",
         Some(ValueType::PipelineValue(_)) => "PipelineValue",
     }
 }
 
 pub(super) fn execute(stage: Stage, docs: Vec<Document>) -> Result<Vec<Document>> {
+    if stage
+        .args
+        .iter()
+        .chain(stage.options.values())
+        .any(|v| matches!(v.value_type, Some(ValueType::VariableReferenceValue(_))))
+    {
+        crate::unimplemented!("variable_reference_value");
+    }
+
     let [field_arg, vector_arg, measure_arg] = stage.args.as_slice() else {
         return Err(GenericDatabaseError::invalid_argument(
             "Stage 'find_nearest' expects 3 arguments (field, vector, distance_measure)",
@@ -196,4 +209,47 @@ pub(super) fn execute(stage: Stage, docs: Vec<Document>) -> Result<Vec<Document>
         .collect();
 
     Ok(result)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use super::*;
+
+    #[test]
+    fn find_nearest_rejects_variable_reference_value_as_not_implemented() {
+        let var_val = Value {
+            value_type: Some(ValueType::VariableReferenceValue("v".to_string())),
+        };
+        let stage_arg = Stage {
+            name:    "find_nearest".to_string(),
+            args:    vec![
+                var_val.clone(),
+                Value::vector([1.0, 0.0]),
+                Value::string("euclidean"),
+            ],
+            options: HashMap::new(),
+        };
+        assert!(matches!(
+            execute(stage_arg, vec![]),
+            Err(GenericDatabaseError::NotImplemented(_))
+        ));
+
+        let stage_opt = Stage {
+            name:    "find_nearest".to_string(),
+            args:    vec![
+                Value {
+                    value_type: Some(ValueType::FieldReferenceValue("emb".to_string())),
+                },
+                Value::vector([1.0, 0.0]),
+                Value::string("euclidean"),
+            ],
+            options: HashMap::from([("limit".to_string(), var_val)]),
+        };
+        assert!(matches!(
+            execute(stage_opt, vec![]),
+            Err(GenericDatabaseError::NotImplemented(_))
+        ));
+    }
 }
