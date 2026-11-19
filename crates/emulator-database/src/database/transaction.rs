@@ -1,7 +1,6 @@
 use std::{
-    collections::{BTreeMap, HashMap, HashSet, hash_map::Entry},
+    collections::{BTreeMap, HashMap, HashSet, VecDeque},
     fmt::Display,
-    mem,
     sync::{
         Arc, LazyLock, PoisonError, RwLock, Weak,
         atomic::{self, AtomicUsize},
@@ -24,35 +23,99 @@ use crate::{
     error::Result,
 };
 
+pub(super) const MAX_CLOSED_TXNS: usize = 4_096;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ClosedOutcome {
+    Committed,
+    AbortedOrRolledBack,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ClosedTransaction {
+    outcome:    ClosedOutcome,
+    read_only:  bool,
+    generation: u64,
+}
+
 #[derive(Debug)]
 enum TransactionSlot {
     Active(Arc<Transaction>),
-    Committing,
+    Committing { read_only: bool },
+    Closed(ClosedTransaction),
+}
+
+#[derive(Debug, Default)]
+struct RunningTransactionsState {
+    slots: HashMap<TransactionId, TransactionSlot>,
+    closed_order: VecDeque<(TransactionId, u64)>,
+    closed_count: usize,
+    next_closed_gen: u64,
+}
+
+impl RunningTransactionsState {
+    fn record_closed(&mut self, id: TransactionId, outcome: ClosedOutcome, read_only: bool) {
+        self.next_closed_gen = self.next_closed_gen.wrapping_add(1);
+        let generation = self.next_closed_gen;
+        let prev = self.slots.insert(
+            id,
+            TransactionSlot::Closed(ClosedTransaction {
+                outcome,
+                read_only,
+                generation,
+            }),
+        );
+        if !matches!(prev, Some(TransactionSlot::Closed(_))) {
+            self.closed_count += 1;
+        }
+        self.closed_order.push_back((id, generation));
+        while self.closed_count > MAX_CLOSED_TXNS {
+            let Some((old_id, old_gen)) = self.closed_order.pop_front() else {
+                break;
+            };
+            if matches!(
+                self.slots.get(&old_id),
+                Some(TransactionSlot::Closed(closed)) if closed.generation == old_gen
+            ) {
+                self.slots.remove(&old_id);
+                self.closed_count -= 1;
+            }
+        }
+        if self.closed_order.len() > MAX_CLOSED_TXNS * 2 {
+            self.closed_order.retain(|(entry_id, entry_gen)| {
+                matches!(
+                    self.slots.get(entry_id),
+                    Some(TransactionSlot::Closed(closed)) if closed.generation == *entry_gen
+                )
+            });
+        }
+    }
 }
 
 #[derive(Debug)]
 pub(crate) struct RunningTransactions {
     database: Weak<FirestoreDatabase>,
-    txns:     Arc<RwLock<HashMap<TransactionId, TransactionSlot>>>,
+    state:    Arc<RwLock<RunningTransactionsState>>,
 }
 
 impl RunningTransactions {
     pub(crate) fn new(database: Weak<FirestoreDatabase>) -> Self {
         Self {
             database,
-            txns: Default::default(),
+            state: Default::default(),
         }
     }
 
     pub(crate) async fn get(&self, id: TransactionId) -> Result<Arc<Transaction>> {
         match self
-            .txns
+            .state
             .read()
             .unwrap_or_else(PoisonError::into_inner)
+            .slots
             .get(&id)
         {
             Some(TransactionSlot::Active(txn)) => Ok(Arc::clone(txn)),
-            Some(TransactionSlot::Committing) | None => Err(
+            Some(TransactionSlot::Committing { .. } | TransactionSlot::Closed(_)) | None => Err(
                 GenericDatabaseError::invalid_argument(format!("invalid transaction ID: {}", id.0)),
             ),
         }
@@ -65,9 +128,10 @@ impl RunningTransactions {
             Weak::clone(&self.database),
             optimistic_concurrency,
         )));
-        self.txns
+        self.state
             .write()
             .unwrap_or_else(PoisonError::into_inner)
+            .slots
             .insert(id, TransactionSlot::Active(txn));
         id
     }
@@ -86,9 +150,10 @@ impl RunningTransactions {
             Weak::clone(&self.database),
             read_time,
         )));
-        self.txns
+        self.state
             .write()
             .unwrap_or_else(PoisonError::into_inner)
+            .slots
             .insert(id, TransactionSlot::Active(txn));
         Ok(id)
     }
@@ -99,102 +164,159 @@ impl RunningTransactions {
         optimistic_concurrency: bool,
     ) -> Result<()> {
         id.check()?;
-        match self
-            .txns
-            .write()
-            .unwrap_or_else(PoisonError::into_inner)
-            .entry(id)
-        {
-            Entry::Occupied(_) => Err(GenericDatabaseError::failed_precondition(
-                "transaction_id already/still in use",
-            )),
-            Entry::Vacant(e) => {
-                let txn = Arc::new(Transaction::ReadWrite(ReadWriteTransaction::new(
-                    id,
-                    Weak::clone(&self.database),
-                    optimistic_concurrency,
-                )));
-                e.insert(TransactionSlot::Active(txn));
-                Ok(())
+        let mut state = self.state.write().unwrap_or_else(PoisonError::into_inner);
+        match state.slots.get(&id) {
+            Some(TransactionSlot::Active(txn)) if txn.as_read_write().is_none() => {
+                return Err(GenericDatabaseError::invalid_argument(
+                    "Cannot retry a read-only transaction",
+                ));
             }
+            Some(
+                TransactionSlot::Committing { read_only: true }
+                | TransactionSlot::Closed(ClosedTransaction {
+                    read_only: true, ..
+                }),
+            ) => {
+                return Err(GenericDatabaseError::invalid_argument(
+                    "Cannot retry a read-only transaction",
+                ));
+            }
+            Some(TransactionSlot::Active(_) | TransactionSlot::Committing { .. }) => {
+                return Err(GenericDatabaseError::failed_precondition(
+                    "transaction_id already/still in use",
+                ));
+            }
+            Some(TransactionSlot::Closed(_)) => {
+                state.closed_count = state.closed_count.saturating_sub(1);
+            }
+            None => {}
         }
+        let txn = Arc::new(Transaction::ReadWrite(ReadWriteTransaction::new(
+            id,
+            Weak::clone(&self.database),
+            optimistic_concurrency,
+        )));
+        state.slots.insert(id, TransactionSlot::Active(txn));
+        Ok(())
     }
 
     pub(crate) fn begin_commit(&self, id: TransactionId, has_writes: bool) -> Result<CommitGuard> {
-        let mut txns = self.txns.write().unwrap_or_else(PoisonError::into_inner);
-        match txns.entry(id) {
-            Entry::Occupied(mut entry) => match entry.get() {
-                TransactionSlot::Active(txn) => {
-                    if has_writes && txn.as_read_write().is_none() {
-                        return Err(GenericDatabaseError::invalid_argument(
+        let mut closed_ro_txn = None;
+        let result = {
+            let mut state = self.state.write().unwrap_or_else(PoisonError::into_inner);
+            match state.slots.get(&id) {
+                Some(TransactionSlot::Active(txn)) => {
+                    let read_only = txn.as_read_write().is_none();
+                    if has_writes && read_only {
+                        let Some(TransactionSlot::Active(txn)) = state.slots.remove(&id) else {
+                            unreachable!();
+                        };
+                        state.record_closed(id, ClosedOutcome::AbortedOrRolledBack, true);
+                        closed_ro_txn = Some(txn);
+                        Err(GenericDatabaseError::invalid_argument(
                             "Cannot modify entities in a read-only transaction",
-                        ));
+                        ))
+                    } else {
+                        let Some(TransactionSlot::Active(txn)) = state
+                            .slots
+                            .insert(id, TransactionSlot::Committing { read_only })
+                        else {
+                            unreachable!();
+                        };
+                        Ok(CommitGuard {
+                            txn,
+                            reservation: CommitReservation {
+                                state: Arc::clone(&self.state),
+                                id,
+                                read_only,
+                                committed: false,
+                            },
+                        })
                     }
-                    let TransactionSlot::Active(txn) =
-                        mem::replace(entry.get_mut(), TransactionSlot::Committing)
-                    else {
-                        unreachable!();
-                    };
-                    Ok(CommitGuard {
-                        txn,
-                        _reservation: CommitReservation {
-                            txns: Arc::clone(&self.txns),
-                            id,
-                        },
-                    })
                 }
-                TransactionSlot::Committing => Err(GenericDatabaseError::invalid_argument(
-                    format!("invalid transaction ID: {}", id.0),
-                )),
-            },
-            Entry::Vacant(_) => Err(GenericDatabaseError::invalid_argument(format!(
-                "invalid transaction ID: {}",
-                id.0
-            ))),
-        }
+                Some(TransactionSlot::Committing { .. } | TransactionSlot::Closed(_)) | None => {
+                    Err(GenericDatabaseError::invalid_argument(format!(
+                        "invalid transaction ID: {}",
+                        id.0
+                    )))
+                }
+            }
+        };
+        drop(closed_ro_txn);
+        result
     }
 
-    pub(crate) fn remove_sync(&self, id: TransactionId) -> Result<Arc<Transaction>> {
-        let mut txns = self.txns.write().unwrap_or_else(PoisonError::into_inner);
-        match txns.entry(id) {
-            Entry::Occupied(entry) if matches!(entry.get(), TransactionSlot::Active(_)) => {
-                let TransactionSlot::Active(txn) = entry.remove() else {
-                    unreachable!();
-                };
-                Ok(txn)
+    pub(crate) fn rollback_sync(&self, id: TransactionId) -> Result<()> {
+        let mut dropped_txn = None;
+        let result = {
+            let mut state = self.state.write().unwrap_or_else(PoisonError::into_inner);
+            match state.slots.get(&id) {
+                Some(TransactionSlot::Active(_)) => {
+                    let Some(TransactionSlot::Active(txn)) = state.slots.remove(&id) else {
+                        unreachable!();
+                    };
+                    let read_only = txn.as_read_write().is_none();
+                    state.record_closed(id, ClosedOutcome::AbortedOrRolledBack, read_only);
+                    dropped_txn = Some(txn);
+                    Ok(())
+                }
+                Some(TransactionSlot::Committing { .. }) => Ok(()),
+                Some(TransactionSlot::Closed(closed)) => match closed.outcome {
+                    ClosedOutcome::Committed => Err(GenericDatabaseError::aborted(
+                        "The referenced transaction has expired or is no longer valid.",
+                    )),
+                    ClosedOutcome::AbortedOrRolledBack => Ok(()),
+                },
+                None => Err(GenericDatabaseError::invalid_argument(format!(
+                    "invalid transaction ID: {}",
+                    id.0
+                ))),
             }
-            Entry::Occupied(_) | Entry::Vacant(_) => Err(GenericDatabaseError::invalid_argument(
-                format!("invalid transaction ID: {}", id.0),
-            )),
-        }
+        };
+        drop(dropped_txn);
+        result
     }
 }
 
 #[derive(Debug)]
 pub(crate) struct CommitGuard {
     // Field order is load-bearing: `txn` drops first (releasing any held read locks) before
-    // `_reservation` drops and frees the `TransactionId` for `retry_transaction`.
+    // `reservation` drops and transitions the `TransactionId` slot to `Closed`.
     txn: Arc<Transaction>,
-    _reservation: CommitReservation,
+    reservation: CommitReservation,
 }
 
 impl CommitGuard {
     pub(crate) fn as_read_write(&self) -> Option<&ReadWriteTransaction> {
         self.txn.as_read_write()
     }
+
+    pub(crate) fn finish_committed(mut self) {
+        self.reservation.committed = true;
+    }
 }
 
 #[derive(Debug)]
 struct CommitReservation {
-    txns: Arc<RwLock<HashMap<TransactionId, TransactionSlot>>>,
-    id:   TransactionId,
+    state: Arc<RwLock<RunningTransactionsState>>,
+    id: TransactionId,
+    read_only: bool,
+    committed: bool,
 }
 
 impl Drop for CommitReservation {
     fn drop(&mut self) {
-        let mut txns = self.txns.write().unwrap_or_else(PoisonError::into_inner);
-        if matches!(txns.get(&self.id), Some(TransactionSlot::Committing)) {
-            txns.remove(&self.id);
+        let mut state = self.state.write().unwrap_or_else(PoisonError::into_inner);
+        if matches!(
+            state.slots.get(&self.id),
+            Some(TransactionSlot::Committing { .. })
+        ) {
+            let outcome = if self.committed {
+                ClosedOutcome::Committed
+            } else {
+                ClosedOutcome::AbortedOrRolledBack
+            };
+            state.record_closed(self.id, outcome, self.read_only);
         }
     }
 }
@@ -678,5 +800,155 @@ mod tests {
             .await,
             Err(GenericDatabaseError::InvalidArgument(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn rollback_is_idempotent_for_closed_or_committing_and_aborts_after_commit() {
+        let txns = RunningTransactions::new(Weak::new());
+        let other_db_txns = RunningTransactions::new(Weak::new());
+
+        // Unissued IDs and IDs issued by another database fail with InvalidArgument.
+        assert!(matches!(
+            txns.rollback_sync(TransactionId(0)),
+            Err(GenericDatabaseError::InvalidArgument(_))
+        ));
+        let other_id = other_db_txns.start_read_write(false).await;
+        assert!(matches!(
+            txns.rollback_sync(other_id),
+            Err(GenericDatabaseError::InvalidArgument(_))
+        ));
+
+        // Double rollback on an active transaction is idempotent Ok(()).
+        let id_rb = txns.start_read_write(false).await;
+        assert!(txns.rollback_sync(id_rb).is_ok());
+        assert!(txns.rollback_sync(id_rb).is_ok());
+        assert!(matches!(
+            txns.get(id_rb).await,
+            Err(GenericDatabaseError::InvalidArgument(_))
+        ));
+
+        // Dropped (failed/cancelled) CommitGuard records AbortedOrRolledBack -> Rollback is Ok(()).
+        let id_failed = txns.start_read_write(false).await;
+        let guard = txns.begin_commit(id_failed, true).unwrap();
+        // Rollback while Committing is Ok(()) and leaves Committing intact.
+        assert!(txns.rollback_sync(id_failed).is_ok());
+        drop(guard);
+        assert!(txns.rollback_sync(id_failed).is_ok());
+        assert!(txns.rollback_sync(id_failed).is_ok());
+
+        // Succeeded CommitGuard records Committed -> Rollback returns Aborted (even on repeat).
+        let id_committed = txns.start_read_write(false).await;
+        let guard = txns.begin_commit(id_committed, true).unwrap();
+        assert!(txns.rollback_sync(id_committed).is_ok());
+        guard.finish_committed();
+        assert!(matches!(
+            txns.rollback_sync(id_committed),
+            Err(GenericDatabaseError::Aborted(_))
+        ));
+        assert!(matches!(
+            txns.rollback_sync(id_committed),
+            Err(GenericDatabaseError::Aborted(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn retry_rejects_active_committing_and_closed_read_only_transactions() {
+        let txns = RunningTransactions::new(Weak::new());
+
+        // Active read-only transaction cannot be retried.
+        let ro_active = txns.start_read_only(None).await.unwrap();
+        assert!(matches!(
+            txns.start_read_write_with_id(ro_active, false).await,
+            Err(GenericDatabaseError::InvalidArgument(_))
+        ));
+        assert!(txns.rollback_sync(ro_active).is_ok());
+        // Rolled-back read-only transaction still cannot be retried.
+        assert!(matches!(
+            txns.start_read_write_with_id(ro_active, false).await,
+            Err(GenericDatabaseError::InvalidArgument(_))
+        ));
+
+        // Read-only transaction closed by write rejection cannot be read or retried,
+        // while Rollback succeeds idempotently.
+        let ro_write = txns.start_read_only(None).await.unwrap();
+        assert!(matches!(
+            txns.begin_commit(ro_write, true),
+            Err(GenericDatabaseError::InvalidArgument(_))
+        ));
+        assert!(matches!(
+            txns.get(ro_write).await,
+            Err(GenericDatabaseError::InvalidArgument(_))
+        ));
+        assert!(txns.rollback_sync(ro_write).is_ok());
+        assert!(matches!(
+            txns.start_read_write_with_id(ro_write, false).await,
+            Err(GenericDatabaseError::InvalidArgument(_))
+        ));
+
+        // Read-only empty commit: committing rejects retry, finished commit aborts rollback
+        // and still rejects retry.
+        let ro_empty = txns.start_read_only(None).await.unwrap();
+        let guard = txns.begin_commit(ro_empty, false).unwrap();
+        assert!(matches!(
+            txns.start_read_write_with_id(ro_empty, false).await,
+            Err(GenericDatabaseError::InvalidArgument(_))
+        ));
+        guard.finish_committed();
+        assert!(matches!(
+            txns.rollback_sync(ro_empty),
+            Err(GenericDatabaseError::Aborted(_))
+        ));
+        assert!(matches!(
+            txns.start_read_write_with_id(ro_empty, false).await,
+            Err(GenericDatabaseError::InvalidArgument(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn closed_transactions_evict_bounded_fifo_and_compact_retried_entries() {
+        let txns = RunningTransactions::new(Weak::new());
+
+        // Repeatedly retrying and closing one ID must keep `closed_order` bounded via compaction
+        // and keep `closed_count == 1`.
+        let reused = txns.start_read_write(false).await;
+        txns.rollback_sync(reused).unwrap();
+        for _ in 0..(MAX_CLOSED_TXNS * 2 + 16) {
+            txns.start_read_write_with_id(reused, false).await.unwrap();
+            txns.rollback_sync(reused).unwrap();
+        }
+        {
+            let state = txns.state.read().unwrap();
+            assert_eq!(state.closed_count, 1);
+            assert!(state.closed_order.len() <= MAX_CLOSED_TXNS * 2);
+        }
+
+        // Closing MAX_CLOSED_TXNS + 10 distinct transactions evicts the oldest entries in FIFO
+        // order while retaining the newest MAX_CLOSED_TXNS entries.
+        let mut ids = Vec::with_capacity(MAX_CLOSED_TXNS + 10);
+        for _ in 0..(MAX_CLOSED_TXNS + 10) {
+            let id = txns.start_read_write(false).await;
+            txns.rollback_sync(id).unwrap();
+            ids.push(id);
+        }
+        {
+            let state = txns.state.read().unwrap();
+            assert_eq!(state.closed_count, MAX_CLOSED_TXNS);
+            assert_eq!(state.slots.len(), MAX_CLOSED_TXNS);
+        }
+
+        // Oldest entries (including `reused` and the first 10 distinct IDs) were evicted.
+        assert!(matches!(
+            txns.rollback_sync(reused),
+            Err(GenericDatabaseError::InvalidArgument(_))
+        ));
+        for &evicted in &ids[..10] {
+            assert!(matches!(
+                txns.rollback_sync(evicted),
+                Err(GenericDatabaseError::InvalidArgument(_))
+            ));
+        }
+        // Newest MAX_CLOSED_TXNS entries remain idempotently rollback-able.
+        assert!(txns.rollback_sync(ids[10]).is_ok());
+        assert!(txns.rollback_sync(*ids.last().unwrap()).is_ok());
     }
 }

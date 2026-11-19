@@ -614,19 +614,27 @@ impl FirestoreDatabase {
     }
 
     #[instrument(level = Level::DEBUG, skip_all, err)]
+    pub async fn commit_non_transactional(
+        self: &Arc<Self>,
+        writes: Vec<Write>,
+    ) -> Result<(Timestamp, Vec<WriteResult>)> {
+        self.commit_inner(writes, None).await
+    }
+
+    #[instrument(level = Level::DEBUG, skip_all, err)]
     pub async fn commit(
         self: &Arc<Self>,
         writes: Vec<Write>,
         transaction: TransactionId,
     ) -> Result<(Timestamp, Vec<WriteResult>)> {
-        // Reserve the transaction up front so concurrent commit/rollback/retry calls cannot race,
-        // while preserving read-only transactions when writes are rejected. Dropping `commit_guard`
-        // on completion, error, or cancellation releases held read locks before freeing the ID.
-        let commit_guard = self
-            .transactions
-            .begin_commit(transaction, !writes.is_empty())?;
-        let rw_txn = commit_guard.as_read_write();
+        self.commit_inner(writes, Some(transaction)).await
+    }
 
+    async fn commit_inner(
+        self: &Arc<Self>,
+        writes: Vec<Write>,
+        transaction: Option<TransactionId>,
+    ) -> Result<(Timestamp, Vec<WriteResult>)> {
         let mut target_docs = BTreeSet::new();
         for write in &writes {
             let name = get_doc_name_from_write(write)?;
@@ -634,6 +642,19 @@ impl FirestoreDatabase {
             validation::validate_write(write)?;
             target_docs.insert(name);
         }
+
+        // Reserve the transaction up front after request-level write validation so validation
+        // errors keep the transaction active while concurrent commit/retry calls cannot race.
+        // Dropping `commit_guard` on error or cancellation releases held read locks before
+        // recording the closed slot for idempotent `Rollback` and `retry_transaction`.
+        // Non-transactional commits bypass `RunningTransactions` entirely so they cannot churn
+        // the bounded closed-transaction table.
+        let commit_guard = transaction
+            .map(|txn_id| self.transactions.begin_commit(txn_id, !writes.is_empty()))
+            .transpose()?;
+        let rw_txn = commit_guard
+            .as_ref()
+            .and_then(|guard| guard.as_read_write());
 
         // Serialize optimistic validation-through-commit critical sections so concurrent
         // optimistic transactions cannot pass validation against each other's pre-commit state.
@@ -657,9 +678,14 @@ impl FirestoreDatabase {
             if !writes.is_empty() {
                 txn.check_concurrency_violations(&write_guard_cache).await?;
             }
-            if self.is_cleared() {
-                return Err(GenericDatabaseError::aborted("database was cleared"));
+        } else if commit_guard.is_none() {
+            for name in target_docs {
+                let guard = self.get_doc_meta(&name).await?.write_owned().await?;
+                write_guard_cache.insert(name, guard);
             }
+        }
+        if self.is_cleared() {
+            return Err(GenericDatabaseError::aborted("database was cleared"));
         }
 
         let time = Timestamp::now();
@@ -689,7 +715,9 @@ impl FirestoreDatabase {
         }
         drop(write_guard_cache);
         drop(_optimistic_guard);
-        drop(commit_guard);
+        if let Some(commit_guard) = commit_guard {
+            commit_guard.finish_committed();
+        }
 
         self.send_event(DatabaseEvent {
             database: Arc::downgrade(self),
@@ -821,8 +849,7 @@ impl FirestoreDatabase {
     }
 
     pub fn rollback_sync(&self, transaction: TransactionId) -> Result<()> {
-        self.transactions.remove_sync(transaction)?;
-        Ok(())
+        self.transactions.rollback_sync(transaction)
     }
 
     pub async fn rollback(&self, transaction: TransactionId) -> Result<()> {
@@ -1070,7 +1097,12 @@ fn apply_transform(
                     field_path.set_value(fields, new_value.clone());
                     new_value
                 }
-                other => unimplemented!(format!("{:?}", other)),
+                ServerValue::Unspecified => {
+                    return Err(GenericDatabaseError::invalid_argument(
+                        "ServerValue type must be specified for set_to_server_value \
+                         transformation.",
+                    ));
+                }
             }
         }
         TransformType::Increment(value) => field_path
@@ -1315,7 +1347,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn commit_writes_on_read_only_transaction_preserves_read_only_transaction() {
+    async fn commit_writes_on_read_only_transaction_closes_transaction_and_allows_idempotent_rollback()
+     {
         let project: &'static FirestoreProject =
             Box::leak(Box::new(FirestoreProject::new(FirestoreConfig::default())));
         let root: RootRef = "projects/p/databases/(default)".parse().unwrap();
@@ -1355,15 +1388,333 @@ mod tests {
         assert!(matches!(err, GenericDatabaseError::InvalidArgument(_)));
 
         assert!(
-            db.get_doc(&doc_a, ReadConsistency::Transaction(ro_id))
-                .await
-                .is_ok(),
-            "read-only transaction must remain readable after rejected write commit"
+            matches!(
+                db.get_doc(&doc_a, ReadConsistency::Transaction(ro_id))
+                    .await,
+                Err(GenericDatabaseError::InvalidArgument(_))
+            ),
+            "read-only transaction must be closed after rejected write commit"
         );
         assert!(
             db.rollback(ro_id).await.is_ok(),
-            "read-only transaction must still be rollback-able after rejected write commit"
+            "read-only transaction must accept idempotent rollback after rejected write commit"
         );
+        assert!(
+            db.rollback(ro_id).await.is_ok(),
+            "repeated rollback after rejected write commit must remain idempotent"
+        );
+        assert!(
+            matches!(
+                db.new_txn(TransactionOptions {
+                    mode: Some(transaction_options::Mode::ReadWrite(
+                        transaction_options::ReadWrite {
+                            retry_transaction: Vec::from(ro_id),
+                            ..Default::default()
+                        },
+                    )),
+                })
+                .await,
+                Err(GenericDatabaseError::InvalidArgument(_))
+            ),
+            "read-only transaction must not be retryable"
+        );
+    }
+
+    #[tokio::test]
+    async fn commit_validation_error_preserves_active_read_write_and_read_only_transactions() {
+        let project: &'static FirestoreProject =
+            Box::leak(Box::new(FirestoreProject::new(FirestoreConfig::default())));
+        let root: RootRef = "projects/p/databases/(default)".parse().unwrap();
+        let db = project.database(&root).await;
+
+        let doc_a: DocumentRef = "projects/p/databases/(default)/documents/c/a"
+            .parse()
+            .unwrap();
+        db.update_doc(
+            &doc_a,
+            HashMap::from([("v".to_string(), Value::integer(1))]),
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let invalid_writes = vec![
+            Write {
+                operation: Some(write::Operation::Update(Document {
+                    name: doc_a.to_string(),
+                    fields: HashMap::from([("__bad__".to_string(), Value::integer(1))]),
+                    ..Default::default()
+                })),
+                ..Default::default()
+            },
+            Write {
+                update_transforms: vec![document_transform::FieldTransform {
+                    field_path:     "ts".to_string(),
+                    transform_type: Some(TransformType::SetToServerValue(
+                        ServerValue::Unspecified as i32,
+                    )),
+                }],
+                operation: Some(write::Operation::Update(Document {
+                    name: doc_a.to_string(),
+                    fields: HashMap::from([("v".to_string(), Value::integer(9))]),
+                    ..Default::default()
+                })),
+                ..Default::default()
+            },
+            Write {
+                update_transforms: vec![document_transform::FieldTransform {
+                    field_path:     "ts".to_string(),
+                    transform_type: Some(TransformType::SetToServerValue(999)),
+                }],
+                operation: Some(write::Operation::Update(Document {
+                    name: doc_a.to_string(),
+                    fields: HashMap::from([("v".to_string(), Value::integer(9))]),
+                    ..Default::default()
+                })),
+                ..Default::default()
+            },
+            Write {
+                current_document: Some(Precondition {
+                    condition_type: Some(precondition::ConditionType::UpdateTime(Timestamp {
+                        seconds: -1,
+                        nanos:   0,
+                    })),
+                }),
+                operation: Some(write::Operation::Update(Document {
+                    name: doc_a.to_string(),
+                    fields: HashMap::from([("v".to_string(), Value::integer(9))]),
+                    ..Default::default()
+                })),
+                ..Default::default()
+            },
+            Write {
+                current_document: Some(Precondition {
+                    condition_type: Some(precondition::ConditionType::UpdateTime(Timestamp {
+                        seconds: 10,
+                        nanos:   1_000_000_000,
+                    })),
+                }),
+                operation: Some(write::Operation::Update(Document {
+                    name: doc_a.to_string(),
+                    fields: HashMap::from([("v".to_string(), Value::integer(9))]),
+                    ..Default::default()
+                })),
+                ..Default::default()
+            },
+        ];
+
+        // Read-write transaction remains active after every request validation failure.
+        let rw_id = db
+            .new_txn(TransactionOptions {
+                mode: Some(transaction_options::Mode::ReadWrite(
+                    transaction_options::ReadWrite::default(),
+                )),
+            })
+            .await
+            .unwrap();
+        for invalid_write in &invalid_writes {
+            assert!(matches!(
+                db.commit(vec![invalid_write.clone()], rw_id).await,
+                Err(GenericDatabaseError::InvalidArgument(_))
+            ));
+            assert!(
+                db.get_doc(&doc_a, ReadConsistency::Transaction(rw_id))
+                    .await
+                    .is_ok()
+            );
+        }
+        let valid_write = Write {
+            operation: Some(write::Operation::Update(Document {
+                name: doc_a.to_string(),
+                fields: HashMap::from([("v".to_string(), Value::integer(2))]),
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+        db.commit(vec![valid_write], rw_id).await.unwrap();
+        assert!(matches!(
+            db.rollback(rw_id).await,
+            Err(GenericDatabaseError::Aborted(_))
+        ));
+
+        // Read-only transaction also remains active after every request validation failure.
+        let ro_id = db
+            .new_txn(TransactionOptions {
+                mode: Some(transaction_options::Mode::ReadOnly(
+                    transaction_options::ReadOnly::default(),
+                )),
+            })
+            .await
+            .unwrap();
+        for invalid_write in invalid_writes {
+            assert!(matches!(
+                db.commit(vec![invalid_write], ro_id).await,
+                Err(GenericDatabaseError::InvalidArgument(_))
+            ));
+            assert!(
+                db.get_doc(&doc_a, ReadConsistency::Transaction(ro_id))
+                    .await
+                    .is_ok()
+            );
+        }
+        db.rollback(ro_id).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn non_transactional_commits_do_not_evict_closed_transactions() {
+        let project: &'static FirestoreProject =
+            Box::leak(Box::new(FirestoreProject::new(FirestoreConfig::default())));
+        let root: RootRef = "projects/p/databases/(default)".parse().unwrap();
+        let db = project.database(&root).await;
+
+        let doc_a: DocumentRef = "projects/p/databases/(default)/documents/c/a"
+            .parse()
+            .unwrap();
+        db.update_doc(
+            &doc_a,
+            HashMap::from([("v".to_string(), Value::integer(1))]),
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let rw_failed = db
+            .new_txn(TransactionOptions {
+                mode: Some(transaction_options::Mode::ReadWrite(
+                    transaction_options::ReadWrite::default(),
+                )),
+            })
+            .await
+            .unwrap();
+        let fail_write = Write {
+            current_document: Some(Precondition {
+                condition_type: Some(precondition::ConditionType::Exists(false)),
+            }),
+            operation: Some(write::Operation::Update(Document {
+                name: doc_a.to_string(),
+                fields: HashMap::from([("v".to_string(), Value::integer(2))]),
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+        assert!(matches!(
+            db.commit(vec![fail_write], rw_failed).await,
+            Err(GenericDatabaseError::AlreadyExists(_))
+        ));
+
+        let ro_closed = db
+            .new_txn(TransactionOptions {
+                mode: Some(transaction_options::Mode::ReadOnly(
+                    transaction_options::ReadOnly::default(),
+                )),
+            })
+            .await
+            .unwrap();
+        db.rollback(ro_closed).await.unwrap();
+
+        // Execute more than `MAX_CLOSED_TXNS` non-transactional commits; none may enter
+        // `RunningTransactions` or evict real closed transactions.
+        for i in 0..(transaction::MAX_CLOSED_TXNS + 64) {
+            let w = Write {
+                operation: Some(write::Operation::Update(Document {
+                    name: doc_a.to_string(),
+                    fields: HashMap::from([("v".to_string(), Value::integer(i as i64))]),
+                    ..Default::default()
+                })),
+                ..Default::default()
+            };
+            db.commit_non_transactional(vec![w]).await.unwrap();
+        }
+
+        assert!(
+            db.rollback(rw_failed).await.is_ok(),
+            "non-transactional commits must not evict real failed transaction from closed ring"
+        );
+        assert!(
+            matches!(
+                db.new_txn(TransactionOptions {
+                    mode: Some(transaction_options::Mode::ReadWrite(
+                        transaction_options::ReadWrite {
+                            retry_transaction: Vec::from(ro_closed),
+                            ..Default::default()
+                        },
+                    )),
+                })
+                .await,
+                Err(GenericDatabaseError::InvalidArgument(_))
+            ),
+            "non-transactional commits must not evict closed read-only transaction metadata"
+        );
+    }
+
+    #[tokio::test]
+    async fn rollback_during_blocked_commit_succeeds_without_aborting_commit_and_aborts_after() {
+        let project: &'static FirestoreProject =
+            Box::leak(Box::new(FirestoreProject::new(FirestoreConfig::default())));
+        let root: RootRef = "projects/p/databases/(default)".parse().unwrap();
+        let db = project.database(&root).await;
+
+        let doc_a: DocumentRef = "projects/p/databases/(default)/documents/c/a"
+            .parse()
+            .unwrap();
+        db.update_doc(
+            &doc_a,
+            HashMap::from([("v".to_string(), Value::integer(1))]),
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let rw_opts = TransactionOptions {
+            mode: Some(transaction_options::Mode::ReadWrite(
+                transaction_options::ReadWrite::default(),
+            )),
+        };
+        let blocker = db.new_txn(rw_opts.clone()).await.unwrap();
+        drop(
+            db.get_doc(&doc_a, ReadConsistency::Transaction(blocker))
+                .await
+                .unwrap(),
+        );
+
+        let committer = db.new_txn(rw_opts).await.unwrap();
+        let write = Write {
+            operation: Some(write::Operation::Update(Document {
+                name: doc_a.to_string(),
+                fields: HashMap::from([("v".to_string(), Value::integer(42))]),
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+        let mut commit_fut = Box::pin(db.commit(vec![write], committer));
+        assert!(futures_util::poll!(&mut commit_fut).is_pending());
+
+        // Rollback while Commit is blocked waiting on locks succeeds immediately without cancelling
+        // Commit.
+        db.rollback(committer).await.unwrap();
+        assert!(futures_util::poll!(&mut commit_fut).is_pending());
+
+        db.rollback(blocker).await.unwrap();
+        commit_fut.await.unwrap();
+
+        let after = db
+            .get_doc(&doc_a, ReadConsistency::Default)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(after.fields["v"].as_integer(), Some(42));
+
+        // After Commit succeeded, Rollback rejects with Aborted.
+        assert!(matches!(
+            db.rollback(committer).await,
+            Err(GenericDatabaseError::Aborted(_))
+        ));
     }
 
     #[tokio::test]

@@ -2,7 +2,8 @@ use googleapis::{
     fields,
     google::{
         firestore::v1::{
-            BatchGetDocumentsRequest, TransactionOptions, batch_get_documents_request,
+            BatchGetDocumentsRequest, Precondition, TransactionOptions,
+            batch_get_documents_request, document_transform, precondition,
             structured_query::field_filter::Operator,
             transaction_options::{self, ReadOnly, ReadWrite, read_only},
         },
@@ -449,8 +450,18 @@ async fn pessimistic_commit_cleanup_releases_locks_and_serializes_concurrent_com
         .await
         .expect("write after failed commit must not be blocked by leaked read guard");
 
-    // Failed transaction ID is already removed, so Rollback rejects and retry_transaction works.
-    assert_status_code(db.rollback_raw(&saved_id).await, Code::InvalidArgument);
+    // Failed transaction is closed (`GetDocument` rejects), Rollback is idempotent `Ok(())`, and
+    // `retry_transaction` succeeds immediately.
+    assert_status_code(
+        db.get_in_txn("docs/a", &saved_id).await,
+        Code::InvalidArgument,
+    );
+    db.rollback_raw(&saved_id)
+        .await
+        .expect("rollback after failed commit must be idempotent Ok");
+    db.rollback_raw(&saved_id)
+        .await
+        .expect("second rollback after failed commit must remain idempotent Ok");
     let retried = db
         .begin_retry_rw_txn(&saved_id)
         .await
@@ -474,7 +485,11 @@ async fn pessimistic_commit_cleanup_releases_locks_and_serializes_concurrent_com
         other => panic!("expected exactly one winner and one InvalidArgument, got {other:?}"),
     }
 
-    // 3. Concurrent commit/rollback on same txn ID produces one winner and one InvalidArgument.
+    // 3. Concurrent commit/rollback on same txn ID:
+    //    - Rollback wins before commit starts -> Commit fails with InvalidArgument and doc is
+    //      unwritten.
+    //    - Rollback runs while commit is Committing -> Rollback returns Ok and Commit still writes.
+    //    - Commit finishes before rollback runs -> Commit succeeds and Rollback fails with Aborted.
     let txn_cr = db.begin_rw_txn().await.unwrap();
     let id_cr = txn_cr.id().to_vec();
     let mut cr1 = db.clone();
@@ -484,8 +499,31 @@ async fn pessimistic_commit_cleanup_releases_locks_and_serializes_concurrent_com
         .into_writes();
     let (rc, rr) = tokio::join!(cr1.commit_raw(&id_cr, w_cr), cr2.rollback_raw(&id_cr));
     match (rc, rr) {
-        (Ok(_), Err(e)) | (Err(e), Ok(())) => expect_eq!(e.code(), Code::InvalidArgument),
-        other => panic!("expected exactly one winner and one InvalidArgument, got {other:?}"),
+        (Err(e), Ok(())) => {
+            expect_eq!(e.code(), Code::InvalidArgument);
+            assert_status_code(db.get("docs/cr").await, Code::NotFound);
+        }
+        (Ok(_), Ok(())) => {
+            assert_doc_wire_eq(
+                &db.get("docs/cr").await.unwrap(),
+                "docs/cr",
+                &fields!({ "written": true }),
+            );
+        }
+        (Ok(_), Err(e)) => {
+            expect_eq!(e.code(), Code::Aborted);
+            assert_doc_wire_eq(
+                &db.get("docs/cr").await.unwrap(),
+                "docs/cr",
+                &fields!({ "written": true }),
+            );
+        }
+        other => {
+            panic!(
+                "expected rollback-before-commit (InvalidArgument, Ok), rollback-during-commit \
+                 (Ok, Ok), or rollback-after-commit (Ok, Aborted), got {other:?}"
+            );
+        }
     }
 
     // 4. Concurrent/repeated reads of the same document within one pessimistic transaction never
@@ -505,11 +543,219 @@ async fn pessimistic_commit_cleanup_releases_locks_and_serializes_concurrent_com
         .commit()
         .await
         .expect("commit after duplicate same-doc reads");
+    // Rollback after a succeeded commit fails with Aborted (even on repeat).
+    assert_status_code(db.rollback_raw(&id_dup).await, Code::Aborted);
+    assert_status_code(db.rollback_raw(&id_dup).await, Code::Aborted);
 
     // 5. TransactionId(0) wire bytes are never valid.
     assert_status_code(
         db.begin_retry_rw_txn(&0usize.to_ne_bytes()).await,
         Code::InvalidArgument,
+    );
+    assert_status_code(
+        db.rollback_raw(&0usize.to_ne_bytes()).await,
+        Code::InvalidArgument,
+    );
+}
+
+#[gtest]
+#[tokio::test]
+async fn rollback_idempotency_validation_preservation_and_read_only_commit_lifecycle() {
+    let mut db = TestEnv::new().build_db();
+    db.put("docs/a", fields!({ "v": 1i64 })).await.unwrap();
+
+    // 1. Commit request validation errors (reserved field `__bad__`, unspecified/unknown
+    //    `SetToServerValue`, and invalid `Precondition::UpdateTime`) keep RW transaction Active.
+    let txn_val = db.begin_rw_txn().await.unwrap();
+    let id_val = txn_val.id().to_vec();
+    let bad_write = WriteBatchSpec::new()
+        .put("docs/a", fields!({ "__bad__": 1i64 }))
+        .into_writes();
+    let bad_sv_unspecified = WriteBatchSpec::new()
+        .update_with(
+            "docs/a",
+            fields!({ "v": 9i64 }),
+            None,
+            vec![document_transform::FieldTransform {
+                field_path:     "ts".to_string(),
+                transform_type: Some(
+                    document_transform::field_transform::TransformType::SetToServerValue(0),
+                ),
+            }],
+            None,
+        )
+        .into_writes();
+    let bad_sv_unknown = WriteBatchSpec::new()
+        .update_with(
+            "docs/a",
+            fields!({ "v": 9i64 }),
+            None,
+            vec![document_transform::FieldTransform {
+                field_path:     "ts".to_string(),
+                transform_type: Some(
+                    document_transform::field_transform::TransformType::SetToServerValue(999),
+                ),
+            }],
+            None,
+        )
+        .into_writes();
+    let bad_precond_ts = WriteBatchSpec::new()
+        .update_with(
+            "docs/a",
+            fields!({ "v": 9i64 }),
+            None,
+            vec![],
+            Some(Precondition {
+                condition_type: Some(precondition::ConditionType::UpdateTime(Timestamp {
+                    seconds: -1,
+                    nanos:   0,
+                })),
+            }),
+        )
+        .into_writes();
+    for invalid_writes in [
+        &bad_write,
+        &bad_sv_unspecified,
+        &bad_sv_unknown,
+        &bad_precond_ts,
+    ] {
+        assert_status_code(
+            db.commit_raw(&id_val, invalid_writes.clone()).await,
+            Code::InvalidArgument,
+        );
+        assert_doc_wire_eq(
+            &db.get_in_txn("docs/a", &id_val).await.unwrap(),
+            "docs/a",
+            &fields!({ "v": 1i64 }),
+        );
+    }
+    let good_write = WriteBatchSpec::new()
+        .put("docs/a", fields!({ "v": 2i64 }))
+        .into_writes();
+    db.commit_raw(&id_val, good_write)
+        .await
+        .expect("valid commit after validation error must succeed");
+    assert_doc_wire_eq(
+        &db.get("docs/a").await.unwrap(),
+        "docs/a",
+        &fields!({ "v": 2i64 }),
+    );
+    assert_status_code(db.rollback_raw(&id_val).await, Code::Aborted);
+
+    // 2. Validation error keeps RO transaction Active, while a valid write closes RO and allows
+    //    idempotent Rollback while rejecting retry_transaction.
+    let ro_val = db.begin_ro_txn(None).await.unwrap();
+    let ro_val_id = ro_val.id().to_vec();
+    assert_status_code(
+        db.commit_raw(&ro_val_id, bad_write).await,
+        Code::InvalidArgument,
+    );
+    assert_doc_wire_eq(
+        &db.get_in_txn("docs/a", &ro_val_id).await.unwrap(),
+        "docs/a",
+        &fields!({ "v": 2i64 }),
+    );
+    db.rollback_raw(&ro_val_id).await.unwrap();
+    db.rollback_raw(&ro_val_id).await.unwrap();
+
+    let ro_write = db.begin_ro_txn(None).await.unwrap();
+    let ro_write_id = ro_write.id().to_vec();
+    assert_status_code(
+        db.begin_retry_rw_txn(&ro_write_id).await,
+        Code::InvalidArgument,
+    );
+    let valid_ro_write = WriteBatchSpec::new()
+        .put("docs/a", fields!({ "v": 3i64 }))
+        .into_writes();
+    assert_status_code(
+        db.commit_raw(&ro_write_id, valid_ro_write).await,
+        Code::InvalidArgument,
+    );
+    assert_status_code(
+        db.get_in_txn("docs/a", &ro_write_id).await,
+        Code::InvalidArgument,
+    );
+    db.rollback_raw(&ro_write_id).await.unwrap();
+    assert_status_code(
+        db.begin_retry_rw_txn(&ro_write_id).await,
+        Code::InvalidArgument,
+    );
+
+    // 3. Empty RO commit succeeds and subsequent Rollback returns Aborted.
+    let ro_empty = db.begin_ro_txn(None).await.unwrap();
+    let ro_empty_id = ro_empty.id().to_vec();
+    db.commit_raw(&ro_empty_id, vec![]).await.unwrap();
+    assert_status_code(db.rollback_raw(&ro_empty_id).await, Code::Aborted);
+
+    // 4. Concurrent Rollback while Commit is blocked waiting on locks returns Ok without aborting
+    //    the Commit; after blocker releases, Commit succeeds and later Rollback returns Aborted.
+    let mut blocker = db.begin_rw_txn().await.unwrap();
+    let _unused = blocker.get("docs/a").await.unwrap();
+
+    let committer = db.begin_rw_txn().await.unwrap();
+    let committer_id = committer.id().to_vec();
+    let mut commit_client = db.clone();
+    let commit_writes = WriteBatchSpec::new()
+        .put("docs/a", fields!({ "v": 42i64 }))
+        .into_writes();
+    let mut commit_probe = ContentionProbe::spawn_op(async move {
+        commit_client.commit_raw(&committer_id, commit_writes).await
+    });
+    commit_probe.assert_pending().await;
+
+    db.rollback_raw(committer.id())
+        .await
+        .expect("rollback during blocked commit must return Ok");
+    commit_probe.assert_pending().await;
+
+    blocker.rollback().await.unwrap();
+    commit_probe
+        .expect_ready()
+        .await
+        .expect("blocked commit must still succeed after concurrent rollback");
+    assert_doc_wire_eq(
+        &db.get("docs/a").await.unwrap(),
+        "docs/a",
+        &fields!({ "v": 42i64 }),
+    );
+    assert_status_code(db.rollback_raw(committer.id()).await, Code::Aborted);
+
+    // 5. Failed commit followed by Rollback emits no `emulator_grpc` error logs for invalid txn ID.
+    let log_handle = "/emulator/v1/logging/rollback-idempotent-check";
+    let log_poll = "/emulator/v1/logging/rollback-idempotent-check:poll";
+    let (st, _) = db
+        .http_raw_body(
+            Method::POST,
+            log_handle,
+            Some("text/plain"),
+            "emulator_grpc=error",
+        )
+        .await;
+    expect_eq!(st, StatusCode::OK);
+
+    let mut failed_txn = db.begin_rw_txn().await.unwrap();
+    let failed_id = failed_txn.id().to_vec();
+    let failed_numeric = usize::from_ne_bytes(failed_id.clone().try_into().unwrap());
+    failed_txn.stage_writes(WriteBatchSpec::new().update_with(
+        "docs/a",
+        fields!({ "v": 100i64 }),
+        None,
+        vec![],
+        Some(pre_exists(false)),
+    ));
+    assert_status_code(failed_txn.commit().await, Code::AlreadyExists);
+    db.rollback_raw(&failed_id).await.unwrap();
+
+    let (poll_st, poll_bytes) = db.http_raw_body(Method::POST, log_poll, None, "").await;
+    let (del_st, _) = db.http_oneshot(Method::DELETE, log_handle, None).await;
+    expect_eq!(poll_st, StatusCode::OK);
+    expect_eq!(del_st, StatusCode::OK);
+    let captured = String::from_utf8_lossy(&poll_bytes);
+    let expected_err_fragment = format!("invalid transaction ID: {failed_numeric}");
+    assert!(
+        !captured.contains(&expected_err_fragment),
+        "failed commit + follow-up rollback must not log `{expected_err_fragment}`, \
+         got:\n{captured}"
     );
 }
 

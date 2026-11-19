@@ -443,27 +443,13 @@ impl Firestore for FirestoreEmulator {
             check_write_database(write, &database.name)?;
         }
 
-        let (txn_id, mut new_txn_guard) = if transaction.is_empty() {
-            let id = database.new_txn(TransactionOptions::READ_WRITE).await?;
-            (id, NewTxnGuard::new(Arc::clone(&database), Vec::from(id)))
+        let (commit_time, write_results) = if transaction.is_empty() {
+            database.commit_non_transactional(writes).await?
         } else {
-            (
-                transaction.try_into()?,
-                NewTxnGuard::new(Arc::clone(&database), Vec::new()),
-            )
-        };
-
-        Span::current().record("txn_id", display(txn_id));
-        debug!(?txn_id);
-        let (commit_time, write_results) = match database.commit(writes, txn_id).await {
-            Ok(res) => {
-                drop(new_txn_guard.take_bytes());
-                res
-            }
-            Err(err) => {
-                new_txn_guard.rollback();
-                return Err(err.into());
-            }
+            let txn_id = transaction.try_into()?;
+            Span::current().record("txn_id", display(txn_id));
+            debug!(?txn_id);
+            database.commit(writes, txn_id).await?
         };
 
         Ok(Response::new(CommitResponse {
