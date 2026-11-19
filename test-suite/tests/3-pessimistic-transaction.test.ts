@@ -3,6 +3,8 @@ import assert from 'assert';
 import { setTimeout as time } from 'timers/promises';
 import {
     ConcurrentTest,
+    callRawStreamRpc,
+    callRawUnaryRpc,
     connection,
     editions,
     notImplementedInJava,
@@ -12,7 +14,121 @@ import {
     writeData,
 } from './utils';
 
+interface RawProtoValue {
+    stringValue?: string;
+    booleanValue?: boolean;
+    timestampValue?: { seconds: number; nanos: number };
+}
+
+interface RawDocument {
+    name?: string;
+    fields?: Record<string, RawProtoValue>;
+}
+
+interface RawBeginTransactionResponse {
+    transaction: Uint8Array;
+}
+
+interface RawBatchGetChunk {
+    found?: RawDocument;
+    missing?: string;
+    transaction?: Uint8Array;
+}
+
+interface RawCommitResponse {
+    commitTime?: { seconds?: string | number | { toString(): string }; nanos?: number };
+}
+
+function commitTimeNs(res: RawCommitResponse): bigint {
+    const secs = res.commitTime?.seconds ?? 0;
+    const secsBig = typeof secs === 'string' || typeof secs === 'number' ? BigInt(secs) : BigInt(secs.toString());
+    return secsBig * 1_000_000_000n + BigInt(res.commitTime?.nanos ?? 0);
+}
+
+type RpcOutcome<T> = { ok: true; value: T } | { ok: false; code: number | undefined; message: string };
+
+async function captureRpcOutcome<T>(fn: () => Promise<T>): Promise<RpcOutcome<T>> {
+    try {
+        const value = await fn();
+        return { ok: true, value };
+    } catch (err: unknown) {
+        const code = typeof err === 'object' && err !== null ? (err as { code?: unknown }).code : undefined;
+        const message = err instanceof Error ? err.message : String(err);
+        return { ok: false, code: typeof code === 'number' ? code : undefined, message };
+    }
+}
+
+async function waitOrTimeout(promise: Promise<unknown>, ms: number): Promise<boolean> {
+    const ac = new AbortController();
+    const timeoutPromise = time(ms, false as const, { signal: ac.signal }).catch(() => false as const);
+    const targetPromise = promise.then(
+        () => true as const,
+        () => false as const,
+    );
+    try {
+        return await Promise.race([targetPromise, timeoutPromise]);
+    } finally {
+        ac.abort();
+    }
+}
+
+function rawTtlValue(): RawProtoValue {
+    return { timestampValue: { seconds: Math.floor((Date.now() + 3_600_000) / 1_000), nanos: 0 } };
+}
+
 describe.each(editions.filter(e => e.concurrencyMode === 'pessimistic'))('$description - concurrent tests', fs => {
+    const database = (fs.firestore as unknown as { formattedName: string }).formattedName;
+
+    function docResourceName(ref: DocumentReference): string {
+        return `${database}/documents/${ref.path}`;
+    }
+
+    function orderedRefs(order: 'ref1 < ref2' | 'ref2 < ref1'): readonly [DocumentReference, DocumentReference] {
+        let [a, b] = refs();
+        while (a.id === b.id) {
+            [a, b] = refs();
+        }
+        const [smaller, larger] = a.id < b.id ? [a, b] : [b, a];
+        return order === 'ref1 < ref2' ? [smaller, larger] : [larger, smaller];
+    }
+
+    async function rawBeginTxn(retryTransaction?: Uint8Array): Promise<Uint8Array> {
+        const res = await callRawUnaryRpc<object, RawBeginTransactionResponse>(fs.firestore, 'beginTransaction', {
+            database,
+            options: { readWrite: retryTransaction ? { retryTransaction } : {} },
+        });
+        assert(res.transaction.length > 0, 'expected non-empty transaction token');
+        return res.transaction;
+    }
+
+    async function rawReadDoc(ref: DocumentReference, transaction: Uint8Array): Promise<RawBatchGetChunk> {
+        const chunks = await callRawStreamRpc<object, RawBatchGetChunk>(fs.firestore, 'batchGetDocuments', {
+            database,
+            documents: [docResourceName(ref)],
+            transaction,
+        });
+        expect(chunks).toHaveLength(1);
+        return chunks[0];
+    }
+
+    async function rawCommit(writes: object[], transaction?: Uint8Array): Promise<RawCommitResponse> {
+        return callRawUnaryRpc<object, RawCommitResponse>(
+            fs.firestore,
+            'commit',
+            transaction ? { database, transaction, writes } : { database, writes },
+        );
+    }
+
+    async function rawRollback(transaction: Uint8Array): Promise<void> {
+        await callRawUnaryRpc(fs.firestore, 'rollback', { database, transaction });
+    }
+
+    function rawUpdateWrite(ref: DocumentReference, fields: Record<string, RawProtoValue>, maskFields?: string[]): object {
+        return {
+            update: { name: docResourceName(ref), fields },
+            ...(maskFields ? { updateMask: { fieldPaths: maskFields } } : {}),
+        };
+    }
     test.concurrent('simple txn', async () => {
         const [docRef1] = refs();
 
@@ -639,93 +755,93 @@ describe.each(editions.filter(e => e.concurrencyMode === 'pessimistic'))('$descr
                     ]);
                 });
 
-            test.concurrent(
-                'deadlock',
-                async () => {
-                    const test = new ConcurrentTest({ timeout: 40_000 });
+            async function runDeadlockTest(order: 'ref1 < ref2' | 'ref2 < ref1') {
+                const test = new ConcurrentTest({ timeout: 40_000 });
 
-                    const [ref1, ref2] = refs();
+                const [ref1, ref2] = orderedRefs(order);
 
-                    let txnBFailedInFirstGet = false;
+                let txnBFailedInFirstGet = false;
 
-                    await test.run(
-                        async () => {
-                            let attempt = 0;
-                            await fs.firestore.runTransaction(async txn => {
-                                test.event(`txn A attempt ${++attempt} started`);
+                await test.run(
+                    async () => {
+                        let attempt = 0;
+                        await fs.firestore.runTransaction(async txn => {
+                            test.event(`txn A attempt ${++attempt} started`);
 
-                                await txn.get(ref1);
-                                test.event('in txn A: read doc 1');
+                            await txn.get(ref1);
+                            test.event('in txn A: read doc 1');
 
-                                if (attempt === 1) await test.when('in txn B: read doc 2');
-                                await txn.get(ref2);
-                                test.event('in txn A: read doc 2');
+                            if (attempt === 1) await test.when('in txn B: read doc 2');
+                            await txn.get(ref2);
+                            test.event('in txn A: read doc 2');
 
-                                txn.set(ref1, writeData({ txnA: 'written' }));
-                                txn.set(ref2, writeData({ txnA: 'written' }));
+                            txn.set(ref1, writeData({ txnA: 'written' }));
+                            txn.set(ref2, writeData({ txnA: 'written' }));
+                        });
+                    },
+                    async () => {
+                        let attempt = 0;
+                        await fs.firestore.runTransaction(async txn => {
+                            test.event(`txn B attempt ${++attempt} started`);
+
+                            if (attempt === 1) await test.when('in txn A: read doc 1');
+                            await txn.get(ref2);
+                            test.event('in txn B: read doc 2');
+
+                            if (attempt === 1) await test.when('in txn A: read doc 2');
+                            await txn.get(ref1).catch(e => {
+                                // Sometimes the get fails, sometimes it succeeds and the txn fails;
+                                // we can detect that here.
+                                txnBFailedInFirstGet ||= attempt === 1;
+                                throw e;
                             });
-                        },
-                        async () => {
-                            let attempt = 0;
-                            await fs.firestore.runTransaction(async txn => {
-                                test.event(`txn B attempt ${++attempt} started`);
 
-                                if (attempt === 1) await test.when('in txn A: read doc 1');
-                                await txn.get(ref2);
-                                test.event('in txn B: read doc 2');
+                            test.event('in txn B: read doc 1');
 
-                                if (attempt === 1) await test.when('in txn A: read doc 2');
-                                await txn.get(ref1).catch(e => {
-                                    // Sometimes the get fails, sometimes it succeeds and the txn fails;
-                                    // we can detect that here.
-                                    txnBFailedInFirstGet ||= attempt === 1;
-                                    throw e;
-                                });
+                            txn.set(ref1, writeData({ txnB: 'written' }));
+                            txn.set(ref2, writeData({ txnB: 'written' }));
+                        });
+                    },
+                );
 
-                                test.event('in txn B: read doc 1');
+                const retry = test.log.splice(-3, 3);
+                // If `txn.get(ref1)` did not fail, then txn B tried to read doc 1 in attempt 1,
+                // otherwise it did not.
+                const secondReadInFirstAttempt = !txnBFailedInFirstGet && test.log.pop();
 
-                                txn.set(ref1, writeData({ txnB: 'written' }));
-                                txn.set(ref2, writeData({ txnB: 'written' }));
-                            });
-                        },
-                    );
+                expect(test.log).toEqual([
+                    ' <<1>> | EVENT: txn A attempt 1 started',
+                    '       | <<2>> | EVENT: txn B attempt 1 started',
+                    '       | <<2>> | WAITING UNTIL: in txn A: read doc 1',
+                    ' <<1>> | EVENT: in txn A: read doc 1',
+                    ' <<1>> | WAITING UNTIL: in txn B: read doc 2',
+                    '       | <<2>> | EVENT: in txn B: read doc 2',
+                    '       | <<2>> | WAITING UNTIL: in txn A: read doc 2',
+                    ' <<1>> | EVENT: in txn A: read doc 2',
+                ]);
 
-                    const retry = test.log.splice(-3, 3);
-                    // If `txn.get(ref1)` did not fail, then txn B tried to read doc 1 in attempt 1,
-                    // otherwise it did not.
-                    const secondReadInFirstAttempt = !txnBFailedInFirstGet && test.log.pop();
+                if (secondReadInFirstAttempt) expect(secondReadInFirstAttempt).toBe('       | <<2>> | EVENT: in txn B: read doc 1');
 
-                    expect(test.log).toEqual([
-                        ' <<1>> | EVENT: txn A attempt 1 started',
-                        '       | <<2>> | EVENT: txn B attempt 1 started',
-                        '       | <<2>> | WAITING UNTIL: in txn A: read doc 1',
+                // Somehow in cloud Firestore, txn B is retried, but in our emulator txn A is
+                // retried. I'm not sure what logic is applied in the cloud, but this does not seem
+                // to be an issue currently.
+                expect(retry).toBeOneOf([
+                    [
+                        ' <<1>> | EVENT: txn A attempt 2 started',
                         ' <<1>> | EVENT: in txn A: read doc 1',
-                        ' <<1>> | WAITING UNTIL: in txn B: read doc 2',
-                        '       | <<2>> | EVENT: in txn B: read doc 2',
-                        '       | <<2>> | WAITING UNTIL: in txn A: read doc 2',
                         ' <<1>> | EVENT: in txn A: read doc 2',
-                    ]);
+                    ],
+                    [
+                        '       | <<2>> | EVENT: txn B attempt 2 started',
+                        '       | <<2>> | EVENT: in txn B: read doc 2',
+                        '       | <<2>> | EVENT: in txn B: read doc 1',
+                    ],
+                ]);
+            }
 
-                    if (secondReadInFirstAttempt) expect(secondReadInFirstAttempt).toBe('       | <<2>> | EVENT: in txn B: read doc 1');
+            test.concurrent('deadlock (ref1 < ref2)', async () => runDeadlockTest('ref1 < ref2'), 45_000);
 
-                    // Somehow in cloud Firestore, txn B is retried, but in our emulator txn A is
-                    // retried. I'm not sure what logic is applied in the cloud, but this does not seem
-                    // to be an issue currently.
-                    expect(retry).toBeOneOf([
-                        [
-                            ' <<1>> | EVENT: txn A attempt 2 started',
-                            ' <<1>> | EVENT: in txn A: read doc 1',
-                            ' <<1>> | EVENT: in txn A: read doc 2',
-                        ],
-                        [
-                            '       | <<2>> | EVENT: txn B attempt 2 started',
-                            '       | <<2>> | EVENT: in txn B: read doc 2',
-                            '       | <<2>> | EVENT: in txn B: read doc 1',
-                        ],
-                    ]);
-                },
-                45_000,
-            );
+            notImplementedInRust || test.concurrent('deadlock (ref2 < ref1)', async () => runDeadlockTest('ref2 < ref1'), 45_000);
 
             // Skip these tests because queries seem to behave differently in Enterprise Edition
             // (as if they automatically opt into optimistic concurrency).
@@ -1075,6 +1191,990 @@ describe.each(editions.filter(e => e.concurrencyMode === 'pessimistic'))('$descr
                             ]);
                         });
                 });
+        });
+
+        describe('cloud wound-wait validation probes', () => {
+            notImplementedInRust ||
+                test.concurrent(
+                    'probe A1: idle beginTransaction does not preempt earlier lock holder',
+                    async () => {
+                        const [docA] = refs();
+                        await docA.set(writeData({ value: 'initial' }));
+
+                        const earlyBegun = Promise.withResolvers<void>();
+                        const lateReadDocA = Promise.withResolvers<void>();
+                        const earlySettled = Promise.withResolvers<void>();
+
+                        let txnEarly: Uint8Array | undefined;
+                        let txnLate: Uint8Array | undefined;
+                        let earlyCommitOutcome: RpcOutcome<RawCommitResponse> | undefined;
+                        let lateCommitOutcome: RpcOutcome<RawCommitResponse> | undefined;
+                        let earlySettledWhileLateOpen = false;
+
+                        try {
+                            await Promise.all([
+                                (async () => {
+                                    txnEarly = await rawBeginTxn();
+                                    await time(50);
+                                    earlyBegun.resolve();
+
+                                    await lateReadDocA.promise;
+                                    await rawReadDoc(docA, txnEarly);
+                                    earlyCommitOutcome = await captureRpcOutcome(() =>
+                                        rawCommit([rawUpdateWrite(docA, { value: { stringValue: 'from early' } }, ['value'])], txnEarly),
+                                    );
+                                    earlySettled.resolve();
+                                })(),
+                                (async () => {
+                                    await earlyBegun.promise;
+                                    txnLate = await rawBeginTxn();
+                                    await rawReadDoc(docA, txnLate);
+                                    lateReadDocA.resolve();
+
+                                    earlySettledWhileLateOpen = await waitOrTimeout(earlySettled.promise, 4_000);
+                                    lateCommitOutcome = await captureRpcOutcome(() =>
+                                        rawCommit([rawUpdateWrite(docA, { value: { stringValue: 'from late' } }, ['value'])], txnLate),
+                                    );
+                                })(),
+                            ]);
+
+                            assert(earlyCommitOutcome && lateCommitOutcome);
+                            expect({
+                                earlySettledWhileLateOpen,
+                                earlyOk: earlyCommitOutcome.ok,
+                                earlyCode: earlyCommitOutcome.ok ? undefined : earlyCommitOutcome.code,
+                                lateOk: lateCommitOutcome.ok,
+                                lateCode: lateCommitOutcome.ok ? undefined : lateCommitOutcome.code,
+                            }).toEqual({
+                                earlySettledWhileLateOpen: false,
+                                earlyOk: false,
+                                earlyCode: 10,
+                                lateOk: true,
+                                lateCode: undefined,
+                            });
+                            expect(await getData(docA.get())).toEqual({ value: 'from late' });
+                        } finally {
+                            if (txnEarly && !earlyCommitOutcome?.ok) await rawRollback(txnEarly).catch(() => undefined);
+                            if (txnLate && !lateCommitOutcome?.ok) await rawRollback(txnLate).catch(() => undefined);
+                        }
+                    },
+                    30_000,
+                );
+
+            notImplementedInRust ||
+                test.concurrent(
+                    'probe A2: priority assigned lazily on first lock acquisition across documents',
+                    async () => {
+                        const [docSeed, docA] = refs();
+                        await Promise.all([docSeed.set(writeData({ value: 'initial' })), docA.set(writeData({ value: 'initial' }))]);
+
+                        const earlyLockedSeed = Promise.withResolvers<void>();
+                        const lateReadDocA = Promise.withResolvers<void>();
+                        const earlySettled = Promise.withResolvers<void>();
+
+                        let txnEarly: Uint8Array | undefined;
+                        let txnLate: Uint8Array | undefined;
+                        let earlyCommitOutcome: RpcOutcome<RawCommitResponse> | undefined;
+                        let lateCommitOutcome: RpcOutcome<RawCommitResponse> | undefined;
+                        let earlySettledWhileLateOpen = false;
+
+                        try {
+                            await Promise.all([
+                                (async () => {
+                                    txnEarly = await rawBeginTxn();
+                                    await rawReadDoc(docSeed, txnEarly);
+                                    await time(50);
+                                    earlyLockedSeed.resolve();
+
+                                    await lateReadDocA.promise;
+                                    await rawReadDoc(docA, txnEarly);
+                                    earlyCommitOutcome = await captureRpcOutcome(() =>
+                                        rawCommit([rawUpdateWrite(docA, { value: { stringValue: 'from early' } }, ['value'])], txnEarly),
+                                    );
+                                    earlySettled.resolve();
+                                })(),
+                                (async () => {
+                                    await earlyLockedSeed.promise;
+                                    txnLate = await rawBeginTxn();
+                                    await rawReadDoc(docA, txnLate);
+                                    lateReadDocA.resolve();
+
+                                    earlySettledWhileLateOpen = await waitOrTimeout(earlySettled.promise, 4_000);
+                                    lateCommitOutcome = await captureRpcOutcome(() =>
+                                        rawCommit([rawUpdateWrite(docA, { value: { stringValue: 'from late' } }, ['value'])], txnLate),
+                                    );
+                                })(),
+                            ]);
+
+                            assert(earlyCommitOutcome && lateCommitOutcome);
+                            expect({
+                                earlySettledWhileLateOpen,
+                                earlyOk: earlyCommitOutcome.ok,
+                                earlyCode: earlyCommitOutcome.ok ? undefined : earlyCommitOutcome.code,
+                                lateOk: lateCommitOutcome.ok,
+                                lateCode: lateCommitOutcome.ok ? undefined : lateCommitOutcome.code,
+                            }).toEqual({
+                                earlySettledWhileLateOpen: true,
+                                earlyOk: true,
+                                earlyCode: undefined,
+                                lateOk: false,
+                                lateCode: 10,
+                            });
+                            expect(await getData(docA.get())).toEqual({ value: 'from early' });
+                        } finally {
+                            if (txnEarly && !earlyCommitOutcome?.ok) await rawRollback(txnEarly).catch(() => undefined);
+                            if (txnLate && !lateCommitOutcome?.ok) await rawRollback(txnLate).catch(() => undefined);
+                        }
+                    },
+                    30_000,
+                );
+
+            notImplementedInRust ||
+                test.concurrent(
+                    'probe B1: retryTransaction token wire bytes and inherited original priority',
+                    async () => {
+                        const [docSeedOldest, docSeedMid] = refs();
+                        const [docA, docB] = refs();
+                        await Promise.all([
+                            docSeedOldest.set(writeData({ value: 'initial' })),
+                            docSeedMid.set(writeData({ value: 'initial' })),
+                            docA.set(writeData({ value: 'initial' })),
+                            docB.set(writeData({ value: 'initial' })),
+                        ]);
+
+                        let txnOldest: Uint8Array | undefined;
+                        let txnTarget1: Uint8Array | undefined;
+                        let txnTarget2: Uint8Array | undefined;
+                        let txnMid: Uint8Array | undefined;
+                        let oldestCommitted = false;
+                        let target2Committed = false;
+                        let midCommitted = false;
+
+                        try {
+                            txnOldest = await rawBeginTxn();
+                            await rawReadDoc(docSeedOldest, txnOldest);
+                            await time(50);
+
+                            txnTarget1 = await rawBeginTxn();
+                            await rawReadDoc(docA, txnTarget1);
+                            await time(50);
+
+                            txnMid = await rawBeginTxn();
+                            await rawReadDoc(docSeedMid, txnMid);
+
+                            await rawReadDoc(docA, txnOldest);
+                            const oldestOutcome = await captureRpcOutcome(() =>
+                                rawCommit([rawUpdateWrite(docA, { value: { stringValue: 'from oldest' } }, ['value'])], txnOldest),
+                            );
+                            expect(oldestOutcome.ok).toBe(true);
+                            oldestCommitted = oldestOutcome.ok;
+
+                            const attempt1Outcome = await captureRpcOutcome(() =>
+                                rawCommit([rawUpdateWrite(docA, { value: { stringValue: 'from target1' } }, ['value'])], txnTarget1),
+                            );
+                            const attempt1Code = attempt1Outcome.ok ? undefined : attempt1Outcome.code;
+
+                            txnTarget2 = await rawBeginTxn(txnTarget1);
+                            const sameTokenBytes = Buffer.from(txnTarget2).equals(Buffer.from(txnTarget1));
+                            const activeTarget2 = txnTarget2;
+                            const activeMid = txnMid;
+
+                            const midReadDocB = Promise.withResolvers<void>();
+                            const target2Settled = Promise.withResolvers<void>();
+                            let midOutcome: RpcOutcome<RawCommitResponse> | undefined;
+                            let target2Outcome: RpcOutcome<RawCommitResponse> | undefined;
+                            let target2SettledWhileMidOpen = false;
+
+                            await Promise.all([
+                                (async () => {
+                                    await rawReadDoc(docB, activeMid);
+                                    midReadDocB.resolve();
+                                    target2SettledWhileMidOpen = await waitOrTimeout(target2Settled.promise, 4_000);
+                                    midOutcome = await captureRpcOutcome(() =>
+                                        rawCommit([rawUpdateWrite(docB, { value: { stringValue: 'from mid' } }, ['value'])], activeMid),
+                                    );
+                                    midCommitted = midOutcome.ok;
+                                })(),
+                                (async () => {
+                                    await midReadDocB.promise;
+                                    await rawReadDoc(docB, activeTarget2);
+                                    target2Outcome = await captureRpcOutcome(() =>
+                                        rawCommit(
+                                            [rawUpdateWrite(docB, { value: { stringValue: 'from target2' } }, ['value'])],
+                                            activeTarget2,
+                                        ),
+                                    );
+                                    target2Committed = target2Outcome.ok;
+                                    target2Settled.resolve();
+                                })(),
+                            ]);
+
+                            assert(midOutcome && target2Outcome);
+                            expect({
+                                sameTokenBytes,
+                                attempt1Code,
+                                target2SettledWhileMidOpen,
+                                target2Ok: target2Outcome.ok,
+                                target2Code: target2Outcome.ok ? undefined : target2Outcome.code,
+                                midOk: midOutcome.ok,
+                                midCode: midOutcome.ok ? undefined : midOutcome.code,
+                            }).toEqual({
+                                sameTokenBytes: false,
+                                attempt1Code: 10,
+                                target2SettledWhileMidOpen: true,
+                                target2Ok: true,
+                                target2Code: undefined,
+                                midOk: false,
+                                midCode: 10,
+                            });
+                            expect(await getData(docB.get())).toEqual({ value: 'from target2' });
+                        } finally {
+                            if (txnOldest && !oldestCommitted) await rawRollback(txnOldest).catch(() => undefined);
+                            if (txnTarget1 && !txnTarget2) await rawRollback(txnTarget1).catch(() => undefined);
+                            if (txnTarget2 && !target2Committed) await rawRollback(txnTarget2).catch(() => undefined);
+                            if (txnMid && !midCommitted) await rawRollback(txnMid).catch(() => undefined);
+                        }
+                    },
+                    30_000,
+                );
+
+            notImplementedInRust ||
+                test.concurrent(
+                    'probe B2: delayed rollback(attempt_1) after retryTransaction attempt_2 is active',
+                    async () => {
+                        const [docA, docB] = refs();
+                        await Promise.all([docA.set(writeData({ value: 'initial' })), docB.set(writeData({ value: 'initial' }))]);
+
+                        let txnOldest: Uint8Array | undefined;
+                        let attempt1: Uint8Array | undefined;
+                        let attempt2: Uint8Array | undefined;
+                        let oldestCommitted = false;
+                        let attempt2Committed = false;
+
+                        try {
+                            txnOldest = await rawBeginTxn();
+                            await rawReadDoc(docA, txnOldest);
+                            await time(50);
+
+                            attempt1 = await rawBeginTxn();
+                            await rawReadDoc(docA, attempt1);
+
+                            const oldestOutcome = await captureRpcOutcome(() =>
+                                rawCommit([rawUpdateWrite(docA, { value: { stringValue: 'from oldest' } }, ['value'])], txnOldest),
+                            );
+                            expect(oldestOutcome.ok).toBe(true);
+                            oldestCommitted = oldestOutcome.ok;
+
+                            const attempt1Outcome = await captureRpcOutcome(() =>
+                                rawCommit([rawUpdateWrite(docA, { value: { stringValue: 'from attempt1' } }, ['value'])], attempt1),
+                            );
+                            expect(attempt1Outcome.ok ? undefined : attempt1Outcome.code).toBe(10);
+
+                            attempt2 = await rawBeginTxn(attempt1);
+                            const sameTokenBytes = Buffer.from(attempt2).equals(Buffer.from(attempt1));
+                            await rawReadDoc(docB, attempt2);
+
+                            const delayedRollbackTarget = attempt1;
+                            const delayedRollbackOutcome = await captureRpcOutcome(() => rawRollback(delayedRollbackTarget));
+                            const activeAttempt2 = attempt2;
+                            const attempt2CommitOutcome = await captureRpcOutcome(() =>
+                                rawCommit([rawUpdateWrite(docB, { value: { stringValue: 'from attempt2' } }, ['value'])], activeAttempt2),
+                            );
+                            attempt2Committed = attempt2CommitOutcome.ok;
+
+                            expect({
+                                sameTokenBytes,
+                                delayedRollbackOk: delayedRollbackOutcome.ok,
+                                delayedRollbackCode: delayedRollbackOutcome.ok ? undefined : delayedRollbackOutcome.code,
+                                attempt2CommitOk: attempt2CommitOutcome.ok,
+                                attempt2CommitCode: attempt2CommitOutcome.ok ? undefined : attempt2CommitOutcome.code,
+                            }).toEqual({
+                                sameTokenBytes: false,
+                                delayedRollbackOk: true,
+                                delayedRollbackCode: undefined,
+                                attempt2CommitOk: true,
+                                attempt2CommitCode: undefined,
+                            });
+                            expect(await getData(docB.get())).toEqual({ value: 'from attempt2' });
+                        } finally {
+                            if (txnOldest && !oldestCommitted) await rawRollback(txnOldest).catch(() => undefined);
+                            if (attempt1 && !attempt2) await rawRollback(attempt1).catch(() => undefined);
+                            if (attempt2 && !attempt2Committed) await rawRollback(attempt2).catch(() => undefined);
+                        }
+                    },
+                    30_000,
+                );
+
+            notImplementedInRust ||
+                test.concurrent(
+                    'probe C1: older writer wounds younger granted holder without wounding conflicting blind write waiter',
+                    async () => {
+                        const [docSeed, docA] = refs();
+                        await Promise.all([docSeed.set(writeData({ value: 'initial' })), docA.set(writeData({ value: 'initial' }))]);
+
+                        let txnOld: Uint8Array | undefined;
+                        let txnMid: Uint8Array | undefined;
+                        let txnYoung: Uint8Array | undefined;
+                        let oldCommitted = false;
+                        let midCommitted = false;
+                        let youngCommitted = false;
+
+                        try {
+                            txnOld = await rawBeginTxn();
+                            await rawReadDoc(docSeed, txnOld);
+                            await time(50);
+
+                            txnMid = await rawBeginTxn();
+                            await time(50);
+                            txnYoung = await rawBeginTxn();
+
+                            const activeOld = txnOld;
+                            const activeMid = txnMid;
+                            const activeYoung = txnYoung;
+
+                            const midReadDocA = Promise.withResolvers<void>();
+                            const youngQueued = Promise.withResolvers<void>();
+                            const oldSettled = Promise.withResolvers<void>();
+
+                            let oldOutcome: RpcOutcome<RawCommitResponse> | undefined;
+                            let midOutcome: RpcOutcome<RawCommitResponse> | undefined;
+                            let youngOutcome: RpcOutcome<RawCommitResponse> | undefined;
+                            let youngBlockedInitially = false;
+                            let oldSettledWhileMidOpen = false;
+
+                            await Promise.all([
+                                (async () => {
+                                    await rawReadDoc(docA, activeMid);
+                                    midReadDocA.resolve();
+                                    oldSettledWhileMidOpen = await waitOrTimeout(oldSettled.promise, 4_000);
+                                    midOutcome = await captureRpcOutcome(() =>
+                                        rawCommit([rawUpdateWrite(docA, { fromMid: { booleanValue: true } }, ['fromMid'])], activeMid),
+                                    );
+                                    midCommitted = midOutcome.ok;
+                                })(),
+                                (async () => {
+                                    await midReadDocA.promise;
+                                    let youngDone = false;
+                                    const youngPromise = captureRpcOutcome(() =>
+                                        rawCommit(
+                                            [rawUpdateWrite(docA, { fromYoung: { booleanValue: true } }, ['fromYoung'])],
+                                            activeYoung,
+                                        ),
+                                    ).then(res => {
+                                        youngDone = true;
+                                        return res;
+                                    });
+                                    await time(250);
+                                    youngBlockedInitially = !youngDone;
+                                    youngQueued.resolve();
+                                    youngOutcome = await youngPromise;
+                                    youngCommitted = youngOutcome.ok;
+                                })(),
+                                (async () => {
+                                    await youngQueued.promise;
+                                    oldOutcome = await captureRpcOutcome(() =>
+                                        rawCommit([rawUpdateWrite(docA, { fromOld: { booleanValue: true } }, ['fromOld'])], activeOld),
+                                    );
+                                    oldCommitted = oldOutcome.ok;
+                                    oldSettled.resolve();
+                                })(),
+                            ]);
+
+                            assert(oldOutcome && midOutcome && youngOutcome);
+                            expect({
+                                youngBlockedInitially,
+                                oldSettledWhileMidOpen,
+                                oldOk: oldOutcome.ok,
+                                oldCode: oldOutcome.ok ? undefined : oldOutcome.code,
+                                midOk: midOutcome.ok,
+                                midCode: midOutcome.ok ? undefined : midOutcome.code,
+                                youngOk: youngOutcome.ok,
+                                youngCode: youngOutcome.ok ? undefined : youngOutcome.code,
+                            }).toEqual({
+                                youngBlockedInitially: true,
+                                oldSettledWhileMidOpen: true,
+                                oldOk: true,
+                                oldCode: undefined,
+                                midOk: false,
+                                midCode: 10,
+                                youngOk: true,
+                                youngCode: undefined,
+                            });
+                            assert(oldOutcome.ok && youngOutcome.ok);
+                            expect(commitTimeNs(oldOutcome.value)).toBeLessThan(commitTimeNs(youngOutcome.value));
+                            expect(await getData(docA.get())).toEqual({ value: 'initial', fromOld: true, fromYoung: true });
+                        } finally {
+                            if (txnOld && !oldCommitted) await rawRollback(txnOld).catch(() => undefined);
+                            if (txnMid && !midCommitted) await rawRollback(txnMid).catch(() => undefined);
+                            if (txnYoung && !youngCommitted) await rawRollback(txnYoung).catch(() => undefined);
+                        }
+                    },
+                    30_000,
+                );
+
+            notImplementedInRust ||
+                test.concurrent(
+                    'probe C2a: intermediate reader vs younger queued write waiter',
+                    async () => {
+                        const [docSeed, docA] = refs();
+                        await Promise.all([docSeed.set(writeData({ value: 'initial' })), docA.set(writeData({ value: 'initial' }))]);
+
+                        let t0: Uint8Array | undefined;
+                        let t1: Uint8Array | undefined;
+                        let t2: Uint8Array | undefined;
+                        let t0Committed = false;
+                        let t1Committed = false;
+                        let t2Committed = false;
+
+                        try {
+                            t0 = await rawBeginTxn();
+                            await rawReadDoc(docA, t0);
+                            await time(50);
+
+                            t1 = await rawBeginTxn();
+                            await rawReadDoc(docSeed, t1);
+                            await time(50);
+
+                            t2 = await rawBeginTxn();
+
+                            const activeT0 = t0;
+                            const activeT1 = t1;
+                            const activeT2 = t2;
+
+                            const t2Queued = Promise.withResolvers<void>();
+                            const t1ReadStarted = Promise.withResolvers<void>();
+                            const t1ReadFinished = Promise.withResolvers<void>();
+                            const t0Released = Promise.withResolvers<void>();
+
+                            let t1BypassedT2WhileT0Open = false;
+                            let t2BlockedInitially = false;
+                            let t1ReadOutcome: RpcOutcome<RawBatchGetChunk> | undefined;
+                            let t2Outcome: RpcOutcome<RawCommitResponse> | undefined;
+
+                            await Promise.all([
+                                (async () => {
+                                    await t1ReadStarted.promise;
+                                    t1BypassedT2WhileT0Open = await waitOrTimeout(t1ReadFinished.promise, 1_500);
+                                    const t0Commit = await captureRpcOutcome(() => rawCommit([], activeT0));
+                                    t0Committed = t0Commit.ok;
+                                    t0Released.resolve();
+                                })(),
+                                (async () => {
+                                    let t2Done = false;
+                                    const t2Promise = captureRpcOutcome(() =>
+                                        rawCommit([rawUpdateWrite(docA, { value: { stringValue: 'from t2' } }, ['value'])], activeT2),
+                                    ).then(res => {
+                                        t2Done = true;
+                                        return res;
+                                    });
+                                    await time(250);
+                                    t2BlockedInitially = !t2Done;
+                                    t2Queued.resolve();
+                                    t2Outcome = await t2Promise;
+                                    t2Committed = t2Outcome.ok;
+                                })(),
+                                (async () => {
+                                    await t2Queued.promise;
+                                    t1ReadStarted.resolve();
+                                    t1ReadOutcome = await captureRpcOutcome(() => rawReadDoc(docA, activeT1));
+                                    t1ReadFinished.resolve();
+                                    await t0Released.promise;
+                                    if (t1ReadOutcome.ok) {
+                                        const t1Commit = await captureRpcOutcome(() => rawCommit([], activeT1));
+                                        t1Committed = t1Commit.ok;
+                                    }
+                                })(),
+                            ]);
+
+                            assert(t1ReadOutcome && t2Outcome);
+                            const t1ReadValue = t1ReadOutcome.ok ? t1ReadOutcome.value.found?.fields?.value?.stringValue : undefined;
+                            expect({
+                                t2BlockedInitially,
+                                t1BypassedT2WhileT0Open,
+                                t1ReadOk: t1ReadOutcome.ok,
+                                t1ReadCode: t1ReadOutcome.ok ? undefined : t1ReadOutcome.code,
+                                t1ReadValue,
+                                t2Ok: t2Outcome.ok,
+                                t2Code: t2Outcome.ok ? undefined : t2Outcome.code,
+                            }).toEqual({
+                                t2BlockedInitially: true,
+                                t1BypassedT2WhileT0Open: true,
+                                t1ReadOk: true,
+                                t1ReadCode: undefined,
+                                t1ReadValue: 'initial',
+                                t2Ok: true,
+                                t2Code: undefined,
+                            });
+                            expect(await getData(docA.get())).toEqual({ value: 'from t2' });
+                        } finally {
+                            if (t0 && !t0Committed) await rawRollback(t0).catch(() => undefined);
+                            if (t1 && !t1Committed) await rawRollback(t1).catch(() => undefined);
+                            if (t2 && !t2Committed) await rawRollback(t2).catch(() => undefined);
+                        }
+                    },
+                    30_000,
+                );
+
+            test.concurrent(
+                'probe C2b: younger reader behind older queued write waiter',
+                async () => {
+                    const [docA] = refs();
+                    await docA.set(writeData({ value: 'initial' }));
+
+                    let t0: Uint8Array | undefined;
+                    let t1: Uint8Array | undefined;
+                    let t2: Uint8Array | undefined;
+                    let t0Committed = false;
+                    let t1Committed = false;
+                    let t2Committed = false;
+
+                    try {
+                        t0 = await rawBeginTxn();
+                        await time(50);
+                        t1 = await rawBeginTxn();
+                        await time(50);
+                        t2 = await rawBeginTxn();
+
+                        const activeT0 = t0;
+                        const activeT1 = t1;
+                        const activeT2 = t2;
+
+                        const ct = new ConcurrentTest({ timeout: 20_000 });
+                        let t1BlockedInitially = false;
+                        let t2ReadDone = false;
+                        let t2BlockedWhileT0Open = false;
+                        let t1Outcome: RpcOutcome<RawCommitResponse> | undefined;
+                        let t2ReadOutcome: RpcOutcome<RawBatchGetChunk> | undefined;
+
+                        await ct.run(
+                            async () => {
+                                await rawReadDoc(docA, activeT0);
+                                ct.event('t0 read docA');
+                                await ct.when('t2 read started');
+                                await time(300);
+                                t2BlockedWhileT0Open = !t2ReadDone;
+                                const t0Commit = await captureRpcOutcome(() => rawCommit([], activeT0));
+                                t0Committed = t0Commit.ok;
+                                ct.event('t0 released');
+                            },
+                            async () => {
+                                await ct.when('t0 read docA');
+                                let t1Done = false;
+                                const t1Promise = captureRpcOutcome(() =>
+                                    rawCommit([rawUpdateWrite(docA, { value: { stringValue: 'from t1' } }, ['value'])], activeT1),
+                                ).then(res => {
+                                    t1Done = true;
+                                    return res;
+                                });
+                                await time(250);
+                                t1BlockedInitially = !t1Done;
+                                ct.event('t1 queued');
+                                t1Outcome = await t1Promise;
+                                t1Committed = t1Outcome.ok;
+                            },
+                            async () => {
+                                await ct.when('t1 queued');
+                                ct.event('t2 read started');
+                                t2ReadOutcome = await captureRpcOutcome(() => rawReadDoc(docA, activeT2));
+                                t2ReadDone = true;
+                                if (t2ReadOutcome.ok) {
+                                    const t2Commit = await captureRpcOutcome(() => rawCommit([], activeT2));
+                                    t2Committed = t2Commit.ok;
+                                }
+                            },
+                        );
+
+                        assert(t1Outcome && t2ReadOutcome);
+                        const t2ReadValue = t2ReadOutcome.ok ? t2ReadOutcome.value.found?.fields?.value?.stringValue : undefined;
+                        expect({
+                            t1BlockedInitially,
+                            t2BlockedWhileT0Open,
+                            t1Ok: t1Outcome.ok,
+                            t2ReadOk: t2ReadOutcome.ok,
+                            t2ReadValue,
+                        }).toEqual({
+                            t1BlockedInitially: true,
+                            t2BlockedWhileT0Open: true,
+                            t1Ok: true,
+                            t2ReadOk: true,
+                            t2ReadValue: 'from t1',
+                        });
+                    } finally {
+                        if (t0 && !t0Committed) await rawRollback(t0).catch(() => undefined);
+                        if (t1 && !t1Committed) await rawRollback(t1).catch(() => undefined);
+                        if (t2 && !t2Committed) await rawRollback(t2).catch(() => undefined);
+                    }
+                },
+                30_000,
+            );
+
+            async function runProbeD1(order: 'ref1 < ref2' | 'ref2 < ref1') {
+                const [doc1, doc2] = orderedRefs(order);
+                await Promise.all([doc1.set(writeData({ value: 'initial' })), doc2.set(writeData({ value: 'initial' }))]);
+
+                const ct = new ConcurrentTest({ timeout: 20_000 });
+                let txnOlder: Uint8Array | undefined;
+                let txnOlderCommitted = false;
+                let batchBlockedInitially = false;
+                let txnOlderOutcome: RpcOutcome<RawCommitResponse> | undefined;
+                let batchOutcome: RpcOutcome<RawCommitResponse> | undefined;
+
+                try {
+                    await ct.run(
+                        async () => {
+                            txnOlder = await rawBeginTxn();
+                            await rawReadDoc(doc1, txnOlder);
+                            ct.event('txn_older read doc1');
+                            await ct.when('batch queued');
+                            txnOlderOutcome = await captureRpcOutcome(() =>
+                                rawCommit(
+                                    [
+                                        rawUpdateWrite(doc1, { fromTxn: { booleanValue: true } }, ['fromTxn']),
+                                        rawUpdateWrite(doc2, { fromTxn: { booleanValue: true } }, ['fromTxn']),
+                                    ],
+                                    txnOlder,
+                                ),
+                            );
+                            txnOlderCommitted = txnOlderOutcome.ok;
+                            ct.event('txn_older committed');
+                        },
+                        async () => {
+                            await ct.when('txn_older read doc1');
+                            let batchDone = false;
+                            const batchPromise = captureRpcOutcome(() =>
+                                rawCommit([
+                                    rawUpdateWrite(doc1, { fromBatch: { booleanValue: true } }, ['fromBatch']),
+                                    rawUpdateWrite(doc2, { fromBatch: { booleanValue: true } }, ['fromBatch']),
+                                ]),
+                            ).then(res => {
+                                batchDone = true;
+                                return res;
+                            });
+                            await time(250);
+                            batchBlockedInitially = !batchDone;
+                            ct.event('batch queued');
+                            batchOutcome = await batchPromise;
+                        },
+                    );
+
+                    assert(txnOlderOutcome && batchOutcome);
+                    expect({
+                        order,
+                        batchBlockedInitially,
+                        txnOlderOk: txnOlderOutcome.ok,
+                        txnOlderCode: txnOlderOutcome.ok ? undefined : txnOlderOutcome.code,
+                        batchOk: batchOutcome.ok,
+                        batchCode: batchOutcome.ok ? undefined : batchOutcome.code,
+                    }).toEqual({
+                        order,
+                        batchBlockedInitially: true,
+                        txnOlderOk: true,
+                        txnOlderCode: undefined,
+                        batchOk: true,
+                        batchCode: undefined,
+                    });
+                    assert(txnOlderOutcome.ok && batchOutcome.ok);
+                    expect(commitTimeNs(txnOlderOutcome.value)).toBeLessThan(commitTimeNs(batchOutcome.value));
+                    expect(await getData(doc1.get())).toEqual({ value: 'initial', fromTxn: true, fromBatch: true });
+                    expect(await getData(doc2.get())).toEqual({ value: 'initial', fromTxn: true, fromBatch: true });
+                } finally {
+                    if (txnOlder && !txnOlderCommitted) await rawRollback(txnOlder).catch(() => undefined);
+                }
+            }
+
+            notImplementedInRust ||
+                test.concurrent(
+                    'probe D1: non-transactional 2-doc WriteBatch colliding with older RW txn (ref1 < ref2)',
+                    async () => runProbeD1('ref1 < ref2'),
+                    30_000,
+                );
+
+            notImplementedInRust ||
+                test.concurrent(
+                    'probe D1: non-transactional 2-doc WriteBatch colliding with older RW txn (ref2 < ref1)',
+                    async () => runProbeD1('ref2 < ref1'),
+                    30_000,
+                );
+
+            async function runProbeD2(order: 'ref1 < ref2' | 'ref2 < ref1') {
+                const [doc1, doc2] = orderedRefs(order);
+                await Promise.all([doc1.set(writeData({ value: 'initial' })), doc2.set(writeData({ value: 'initial' }))]);
+
+                const blockerRead = Promise.withResolvers<void>();
+                const batchQueued = Promise.withResolvers<void>();
+                const youngerReadStarted = Promise.withResolvers<void>();
+                const youngerReadFinished = Promise.withResolvers<void>();
+                const blockerReleased = Promise.withResolvers<void>();
+                const batchSettled = Promise.withResolvers<void>();
+
+                let txnBlocker: Uint8Array | undefined;
+                let txnYounger: Uint8Array | undefined;
+                let blockerCommitted = false;
+                let youngerCommitted = false;
+                let batchBlockedInitially = false;
+                let youngerReadDoc2WhileBlockerOpen = false;
+                let batchSettledWhileYoungerOpen = false;
+                let youngerReadOutcome: RpcOutcome<RawBatchGetChunk> | undefined;
+                let youngerCommitOutcome: RpcOutcome<RawCommitResponse> | undefined;
+                let batchOutcome: RpcOutcome<RawCommitResponse> | undefined;
+
+                try {
+                    await Promise.all([
+                        (async () => {
+                            txnBlocker = await rawBeginTxn();
+                            await rawReadDoc(doc1, txnBlocker);
+                            blockerRead.resolve();
+                            await youngerReadStarted.promise;
+                            youngerReadDoc2WhileBlockerOpen = await waitOrTimeout(youngerReadFinished.promise, 1_500);
+                            const blockerCommit = await captureRpcOutcome(() => rawCommit([], txnBlocker));
+                            blockerCommitted = blockerCommit.ok;
+                            blockerReleased.resolve();
+                        })(),
+                        (async () => {
+                            await blockerRead.promise;
+                            let batchDone = false;
+                            const batchPromise = captureRpcOutcome(() =>
+                                rawCommit([
+                                    rawUpdateWrite(doc1, { fromBatch: { booleanValue: true } }, ['fromBatch']),
+                                    rawUpdateWrite(doc2, { fromBatch: { booleanValue: true } }, ['fromBatch']),
+                                ]),
+                            ).then(res => {
+                                batchDone = true;
+                                return res;
+                            });
+                            await time(250);
+                            batchBlockedInitially = !batchDone;
+                            batchQueued.resolve();
+                            batchOutcome = await batchPromise;
+                            batchSettled.resolve();
+                        })(),
+                        (async () => {
+                            await batchQueued.promise;
+                            const activeYounger = await rawBeginTxn();
+                            txnYounger = activeYounger;
+                            youngerReadStarted.resolve();
+                            youngerReadOutcome = await captureRpcOutcome(() => rawReadDoc(doc2, activeYounger));
+                            youngerReadFinished.resolve();
+                            await blockerReleased.promise;
+                            batchSettledWhileYoungerOpen = await waitOrTimeout(batchSettled.promise, 500);
+                            if (youngerReadOutcome.ok) {
+                                youngerCommitOutcome = await captureRpcOutcome(() =>
+                                    rawCommit(
+                                        [
+                                            rawUpdateWrite(doc1, { fromYounger: { booleanValue: true } }, ['fromYounger']),
+                                            rawUpdateWrite(doc2, { fromYounger: { booleanValue: true } }, ['fromYounger']),
+                                        ],
+                                        activeYounger,
+                                    ),
+                                );
+                                youngerCommitted = youngerCommitOutcome.ok;
+                            }
+                        })(),
+                    ]);
+
+                    assert(youngerReadOutcome && batchOutcome);
+                    const youngerReadSawFromBatch = youngerReadOutcome.ok
+                        ? youngerReadOutcome.value.found?.fields?.fromBatch?.booleanValue
+                        : undefined;
+                    expect({
+                        order,
+                        batchBlockedInitially,
+                        youngerReadDoc2WhileBlockerOpen,
+                        youngerReadSawFromBatch,
+                        batchSettledWhileYoungerOpen,
+                        youngerReadOk: youngerReadOutcome.ok,
+                        youngerReadCode: youngerReadOutcome.ok ? undefined : youngerReadOutcome.code,
+                        youngerCommitOk: youngerCommitOutcome?.ok ?? false,
+                        youngerCommitCode: youngerCommitOutcome && !youngerCommitOutcome.ok ? youngerCommitOutcome.code : undefined,
+                        batchOk: batchOutcome.ok,
+                        batchCode: batchOutcome.ok ? undefined : batchOutcome.code,
+                    }).toEqual({
+                        order,
+                        batchBlockedInitially: true,
+                        youngerReadDoc2WhileBlockerOpen: false,
+                        youngerReadSawFromBatch: true,
+                        batchSettledWhileYoungerOpen: true,
+                        youngerReadOk: true,
+                        youngerReadCode: undefined,
+                        youngerCommitOk: true,
+                        youngerCommitCode: undefined,
+                        batchOk: true,
+                        batchCode: undefined,
+                    });
+                    assert(batchOutcome.ok && youngerCommitOutcome?.ok);
+                    expect(commitTimeNs(batchOutcome.value)).toBeLessThan(commitTimeNs(youngerCommitOutcome.value));
+                    expect(await getData(doc1.get())).toEqual({ value: 'initial', fromYounger: true, fromBatch: true });
+                    expect(await getData(doc2.get())).toEqual({ value: 'initial', fromYounger: true, fromBatch: true });
+                } finally {
+                    if (txnBlocker && !blockerCommitted) await rawRollback(txnBlocker).catch(() => undefined);
+                    if (txnYounger && !youngerCommitted) await rawRollback(txnYounger).catch(() => undefined);
+                }
+            }
+
+            notImplementedInRust ||
+                test.concurrent(
+                    'probe D2: non-transactional 2-doc WriteBatch entering before younger RW txn locks doc2 (ref1 < ref2)',
+                    async () => runProbeD2('ref1 < ref2'),
+                    30_000,
+                );
+
+            test.concurrent(
+                'probe D2: non-transactional 2-doc WriteBatch entering before younger RW txn locks doc2 (ref2 < ref1)',
+                async () => runProbeD2('ref2 < ref1'),
+                30_000,
+            );
+
+            notImplementedInRust ||
+                test.concurrent(
+                    'probe D3: single-document non-transactional commit waits behind RW txn',
+                    async () => {
+                        const [doc1] = refs();
+                        await doc1.set(writeData({ value: 'initial' }));
+
+                        const ct = new ConcurrentTest({ timeout: 20_000 });
+                        let txn: Uint8Array | undefined;
+                        let txnCommitted = false;
+                        let singleBlockedInitially = false;
+                        let txnOutcome: RpcOutcome<RawCommitResponse> | undefined;
+                        let singleOutcome: RpcOutcome<RawCommitResponse> | undefined;
+
+                        try {
+                            await ct.run(
+                                async () => {
+                                    txn = await rawBeginTxn();
+                                    await rawReadDoc(doc1, txn);
+                                    ct.event('txn read doc1');
+                                    await ct.when('single write queued');
+                                    txnOutcome = await captureRpcOutcome(() =>
+                                        rawCommit([rawUpdateWrite(doc1, { fromTxn: { booleanValue: true } }, ['fromTxn'])], txn),
+                                    );
+                                    txnCommitted = txnOutcome.ok;
+                                    ct.event('txn committed');
+                                },
+                                async () => {
+                                    await ct.when('txn read doc1');
+                                    let singleDone = false;
+                                    const singlePromise = captureRpcOutcome(() =>
+                                        rawCommit([rawUpdateWrite(doc1, { fromSingle: { booleanValue: true } }, ['fromSingle'])]),
+                                    ).then(res => {
+                                        singleDone = true;
+                                        return res;
+                                    });
+                                    await time(250);
+                                    singleBlockedInitially = !singleDone;
+                                    ct.event('single write queued');
+                                    singleOutcome = await singlePromise;
+                                    ct.event('single write finished');
+                                },
+                            );
+
+                            assert(txnOutcome && singleOutcome);
+                            expect({
+                                singleBlockedInitially,
+                                txnOk: txnOutcome.ok,
+                                singleOk: singleOutcome.ok,
+                            }).toEqual({
+                                singleBlockedInitially: true,
+                                txnOk: true,
+                                singleOk: true,
+                            });
+                            assert(txnOutcome.ok && singleOutcome.ok);
+                            expect(commitTimeNs(txnOutcome.value)).toBeLessThan(commitTimeNs(singleOutcome.value));
+                            expect(await getData(doc1.get())).toEqual({ value: 'initial', fromTxn: true, fromSingle: true });
+                        } finally {
+                            if (txn && !txnCommitted) await rawRollback(txn).catch(() => undefined);
+                        }
+                    },
+                    30_000,
+                );
+
+            test.concurrent(
+                'probe D4: pessimistic read/write locking on missing document path',
+                async () => {
+                    const [missingRef] = refs();
+
+                    let txnA: Uint8Array | undefined;
+                    let txnB: Uint8Array | undefined;
+                    let txnACommitted = false;
+                    let txnBCommitted = false;
+
+                    try {
+                        txnA = await rawBeginTxn();
+                        await time(50);
+                        txnB = await rawBeginTxn();
+
+                        const activeA = txnA;
+                        const activeB = txnB;
+
+                        const ct = new ConcurrentTest({ timeout: 20_000 });
+                        let txnBCommitDone = false;
+                        let txnBBlockedInitially = false;
+                        let txnBBlockedWhileTxnAOpen = false;
+                        let txnAOutcome: RpcOutcome<RawCommitResponse> | undefined;
+                        let txnBOutcome: RpcOutcome<RawCommitResponse> | undefined;
+
+                        await ct.run(
+                            async () => {
+                                const chunkA = await rawReadDoc(missingRef, activeA);
+                                expect(chunkA.missing).toBeDefined();
+                                ct.event('txnA read missing');
+                                await ct.when('txnB commit queued');
+                                await time(300);
+                                txnBBlockedWhileTxnAOpen = !txnBCommitDone;
+                                txnAOutcome = await captureRpcOutcome(() =>
+                                    rawCommit(
+                                        [rawUpdateWrite(missingRef, { value: { stringValue: 'from A' }, ttl: rawTtlValue() })],
+                                        activeA,
+                                    ),
+                                );
+                                txnACommitted = txnAOutcome.ok;
+                                ct.event('txnA committed');
+                            },
+                            async () => {
+                                await ct.when('txnA read missing');
+                                const chunkB = await rawReadDoc(missingRef, activeB);
+                                expect(chunkB.missing).toBeDefined();
+                                const txnBPromise = captureRpcOutcome(() =>
+                                    rawCommit(
+                                        [rawUpdateWrite(missingRef, { value: { stringValue: 'from B' }, ttl: rawTtlValue() })],
+                                        activeB,
+                                    ),
+                                ).then(res => {
+                                    txnBCommitDone = true;
+                                    return res;
+                                });
+                                await time(250);
+                                txnBBlockedInitially = !txnBCommitDone;
+                                ct.event('txnB commit queued');
+                                txnBOutcome = await txnBPromise;
+                                txnBCommitted = txnBOutcome.ok;
+                            },
+                        );
+
+                        assert(txnAOutcome && txnBOutcome);
+                        expect({
+                            txnBBlockedInitially,
+                            txnBBlockedWhileTxnAOpen,
+                            txnAOk: txnAOutcome.ok,
+                            txnACode: txnAOutcome.ok ? undefined : txnAOutcome.code,
+                            txnBOk: txnBOutcome.ok,
+                            txnBCode: txnBOutcome.ok ? undefined : txnBOutcome.code,
+                        }).toEqual({
+                            txnBBlockedInitially: true,
+                            txnBBlockedWhileTxnAOpen: true,
+                            txnAOk: true,
+                            txnACode: undefined,
+                            txnBOk: false,
+                            txnBCode: 10,
+                        });
+                        expect(await getData(missingRef.get())).toEqual({ value: 'from A' });
+                    } finally {
+                        if (txnA && !txnACommitted) await rawRollback(txnA).catch(() => undefined);
+                        if (txnB && !txnBCommitted) await rawRollback(txnB).catch(() => undefined);
+                    }
+                },
+                30_000,
+            );
         });
 
         type UsedRefs = DocumentReference[] | { read: DocumentReference[]; write: DocumentReference[] };
