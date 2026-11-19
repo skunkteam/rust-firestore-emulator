@@ -8,7 +8,6 @@
 # just [watch] test [crate]     - Run tests on workspace (including --no-default-features and doctests) or the specified crate (run `just test` without a crate to include cross-crate black-box suites in `emulator-tests`)
 # just [watch] cov [crate]      - Generate line/region coverage summary via cargo-llvm-cov + nextest
 # just mutants <crate> <file>   - Run file-scoped mutation testing in ./tmp/mutants using the `mutants` nextest profile
-# just miri                     - Run Miri unsafe aliasing checks on `fifo-rwlock`
 # just [watch] clippy [crate]   - Run Clippy on workspace or the specified crate
 # just [watch] lint [crate]     - Run Clippy on workspace or the specified crate (includes `sdk-lint` and `ui-check` when crate is omitted or 'all')
 # just [watch] sdk-lint         - Lint and type-check the TypeScript conformance test suite (ESLint, Prettier, tsc)
@@ -87,13 +86,6 @@ cov target="all":
 mutants crate file *args:
     mkdir -p ./tmp/mutants
     TMPDIR="{{ justfile_directory() }}/tmp/mutants" NEXTEST_PROFILE=mutants cargo mutants --package {{ crate }} --file {{ file }} --output ./tmp/mutants {{ args }}
-
-# Check unsafe aliasing invariants in fifo-rwlock under Miri
-miri:
-    mkdir -p ./tmp/miri/sysroot-build/.cargo
-    printf '[source.crates-io]\nreplace-with = "vendored-sources"\n[source.vendored-sources]\ndirectory = "%s/lib/rustlib/src/rust/library/vendor"\n' "$(rustc +nightly --print sysroot)" > ./tmp/miri/sysroot-build/.cargo/config.toml
-    cd ./tmp/miri/sysroot-build && TMPDIR="{{ justfile_directory() }}/tmp/miri/sysroot-build" MIRI_SYSROOT="${MIRI_SYSROOT:-{{ justfile_directory() }}/tmp/miri/sysroot}" cargo +nightly miri setup
-    TMPDIR="{{ justfile_directory() }}/tmp/miri" MIRI_SYSROOT="${MIRI_SYSROOT:-{{ justfile_directory() }}/tmp/miri/sysroot}" cargo +nightly miri test --package fifo-rwlock
 
 # Run Clippy on the given crate or the entire workspace if target is omitted (matches CI Clippy job)
 clippy target="all":

@@ -2379,16 +2379,13 @@ async fn new_transaction_errors_rollback_cleanly_across_all_five_rpcs() {
 
         let mut blocker_db = db.clone();
         let mut commit_blocker = ContentionProbe::spawn_op(async move {
-            blocker_db
-                .commit_writes(
-                    WriteBatchSpec::new()
-                        .put("locks/d2", fields!({ "emb": vec_val([0.0, 0.0]) }))
-                        .put("locks/h1", fields!({ "v": 2i64 }))
-                        .put("locks/h2", fields!({ "v": 2i64 }))
-                        .put("locks/h3", fields!({ "v": 2i64 }))
-                        .put("locks/h4", fields!({ "v": 2i64 })),
-                )
-                .await
+            let mut tx = blocker_db.begin_rw_txn().await?;
+            tx.put("locks/d2", fields!({ "emb": vec_val([0.0, 0.0]) }))
+                .put("locks/h1", fields!({ "v": 2i64 }))
+                .put("locks/h2", fields!({ "v": 2i64 }))
+                .put("locks/h3", fields!({ "v": 2i64 }))
+                .put("locks/h4", fields!({ "v": 2i64 }));
+            tx.commit().await
         });
         commit_blocker.drive_settled().await;
 

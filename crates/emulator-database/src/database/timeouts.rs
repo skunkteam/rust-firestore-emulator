@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-#[derive(Debug)]
+#[derive(Clone, Copy, Debug)]
 pub(crate) struct Timeouts {
     /// The duration to use for write locks.
     pub(crate) write: Duration,

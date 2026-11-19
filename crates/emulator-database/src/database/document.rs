@@ -1,40 +1,53 @@
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     fmt::{self, Debug},
-    ops::Deref,
-    pin::pin,
-    sync::Arc,
-    time::Duration,
+    sync::{Arc, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard},
 };
 
-use fifo_rwlock::{FifoRwLock, OwnedReadGuard, OwnedWriteGuard, ReadGuard};
 use googleapis::google::{
     firestore::v1::{Document, Value, precondition},
     protobuf::Timestamp,
 };
-use tokio::time::{error::Elapsed, sleep, timeout};
-use tracing::{Level, debug, instrument, warn};
 
-use super::reference::DocumentRef;
-use crate::{FirestoreProject, GenericDatabaseError, error::Result};
+use super::{
+    lock::{CommitSeal, ReadLease, SessionAbortState, WriteLease},
+    reference::DocumentRef,
+};
+use crate::{
+    GenericDatabaseError,
+    error::{CommitError, Result},
+};
+
+#[derive(Debug)]
+struct LockableDocument(RwLock<DocumentContents>);
+
+impl LockableDocument {
+    fn new() -> Self {
+        Self(RwLock::new(DocumentContents::new()))
+    }
+
+    fn read(&self) -> RwLockReadGuard<'_, DocumentContents> {
+        self.0.read().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn write(&self) -> RwLockWriteGuard<'_, DocumentContents> {
+        self.0.write().unwrap_or_else(PoisonError::into_inner)
+    }
+}
 
 /// DocumentMeta is the representation of one document in Firestore. Or more accurately, one
-/// document name or "spot" if you will, the document itself may or may not exist at any point in
+/// document name or "spot" if you will; the document itself may or may not exist at any point in
 /// time.
 ///
-/// In order to write to a document, you can either upgrade an owned read lock or acquire a write
-/// lock immediately. The moment you get a read lock, you are put in the queue for a write permit,
-/// making sure that clients are rewarded a write lock based on the time they started reading the
-/// document and not the time they expressed interest in writing to the document. This is relevant
-/// for transactions that lock documents early on, if they wouldn't have the earliest rights to
-/// write then we would have far more contention during transactions.
+/// Physical access to [`DocumentContents`] is gated behind logical Wound-Wait lock capabilities
+/// ([`ReadLease`], [`WriteLease`], [`CommitSeal`]) or queue-free MVCC / uncontended physical
+/// snapshot accessors.
 pub(crate) struct DocumentMeta {
-    project:  &'static FirestoreProject,
     /// The resource name of the document, for example
     /// `projects/{project_id}/databases/{database_id}/documents/{document_path}`.
     pub name: DocumentRef,
-    /// The actual contents (full history), protected by a RWLock.
-    contents: Arc<FifoRwLock<DocumentContents>>,
+    /// The actual contents (full history), protected by a synchronous RwLock.
+    contents: LockableDocument,
 }
 
 impl Debug for DocumentMeta {
@@ -46,78 +59,132 @@ impl Debug for DocumentMeta {
 }
 
 impl DocumentMeta {
-    pub(crate) fn new(project: &'static FirestoreProject, name: DocumentRef) -> Self {
+    pub(crate) fn new(name: DocumentRef) -> Self {
         Self {
-            project,
-            contents: Arc::new(FifoRwLock::new(DocumentContents::new(name.clone()))),
+            contents: LockableDocument::new(),
             name,
         }
     }
 
-    /// Get a quick temporary read lock.
-    pub(crate) async fn read(&self) -> Result<DocumentContentsReadGuard<'_>> {
-        lock_timeout(
-            self.contents.read(),
-            self.project.timeouts.read,
-            "read lock",
-            &self.name,
-        )
-        .await
+    pub(crate) fn read_with<R>(
+        &self,
+        lease: &ReadLease,
+        f: impl FnOnce(&DocumentContents) -> R,
+    ) -> Result<R> {
+        if lease.doc_ref() != &self.name {
+            return Err(GenericDatabaseError::internal(format!(
+                "read lease for {} cannot access {}",
+                lease.doc_ref(),
+                self.name
+            )));
+        }
+        if matches!(lease.abort_state(), SessionAbortState::Closed) {
+            return Err(GenericDatabaseError::invalid_argument("transaction closed"));
+        }
+        let contents = self.contents.read();
+        lease.check_active()?;
+        Ok(f(&contents))
     }
 
-    /// Get a read lock that can be held indefinitely. Can be upgraded to a write lock if needed.
-    pub(crate) async fn read_owned(self: &Arc<Self>) -> Result<OwnedDocumentContentsReadGuard> {
-        Ok(OwnedDocumentContentsReadGuard {
-            project: self.project,
-            meta:    Arc::clone(self),
-            guard:   lock_timeout(
-                self.contents.read_owned(),
-                self.project.timeouts.read,
-                "read lock",
-                &self.name,
-            )
-            .await?,
-        })
+    pub(crate) fn read_with_write_lease<R>(
+        &self,
+        lease: &WriteLease,
+        f: impl FnOnce(&DocumentContents) -> R,
+    ) -> std::result::Result<R, CommitError> {
+        if lease.doc_ref() != &self.name {
+            return Err(CommitError::Other(GenericDatabaseError::internal(format!(
+                "write lease for {} cannot access {}",
+                lease.doc_ref(),
+                self.name
+            ))));
+        }
+        let contents = self.contents.read();
+        lease.check_active()?;
+        Ok(f(&contents))
     }
 
-    /// Get a write lock asap without any consistency guarantees.
-    pub(crate) async fn write_owned(self: &Arc<Self>) -> Result<OwnedDocumentContentsWriteGuard> {
-        // Using maximum timeout here, because there is no chance of failing because of contention,
-        // the only way this fails is because of a timeout.
+    pub(crate) fn read_mvcc_at(&self, read_time: Timestamp) -> Option<Arc<StoredDocumentVersion>> {
+        self.contents.read().version_at_time(read_time).cloned()
+    }
 
-        let guard = lock_timeout(
-            self.contents.write_owned(),
-            self.project.timeouts.write,
-            "write lock",
-            &self.name,
-        )
-        .await?;
+    pub(crate) fn read_latest_uncontended<R>(&self, f: impl FnOnce(&DocumentContents) -> R) -> R {
+        f(&self.contents.read())
+    }
 
-        Ok(OwnedDocumentContentsWriteGuard {
-            guard,
-            acquire_time: Timestamp::now(),
-        })
+    pub(crate) fn apply_sealed_commit<R>(
+        seal: CommitSeal,
+        docs: BTreeMap<DocumentRef, Arc<DocumentMeta>>,
+        apply: impl FnOnce(
+            Timestamp,
+            &mut BTreeMap<DocumentRef, &mut DocumentContents>,
+        ) -> std::result::Result<R, CommitError>,
+    ) -> std::result::Result<R, CommitError> {
+        seal.check_committing_active()?;
+        if seal.len() != docs.len() {
+            drop(seal);
+            return Err(CommitError::Other(GenericDatabaseError::internal(
+                "commit seal document count mismatch",
+            )));
+        }
+
+        let metas: Vec<(DocumentRef, Arc<DocumentMeta>)> = docs.into_iter().collect();
+        let mut guards: Vec<(&DocumentRef, RwLockWriteGuard<'_, DocumentContents>)> =
+            Vec::with_capacity(metas.len());
+        for (doc_ref, meta) in &metas {
+            if &meta.name != doc_ref {
+                let actual = &meta.name;
+                drop(guards);
+                drop(seal);
+                return Err(CommitError::Other(GenericDatabaseError::internal(format!(
+                    "document meta name {actual} does not match key {doc_ref}",
+                ))));
+            }
+            guards.push((doc_ref, meta.contents.write()));
+        }
+
+        let commit_time = Timestamp::now();
+        for &(doc_ref, _) in &guards {
+            let Some(lease) = seal.get(doc_ref) else {
+                let missing = doc_ref.clone();
+                drop(guards);
+                drop(seal);
+                return Err(CommitError::Other(GenericDatabaseError::internal(format!(
+                    "missing write lease in CommitSeal for {missing}"
+                ))));
+            };
+            if commit_time < lease.acquire_time() {
+                drop(guards);
+                drop(seal);
+                return Err(CommitError::Other(GenericDatabaseError::internal(
+                    "lock should always be acquired before claiming write/update time",
+                )));
+            }
+        }
+
+        let res = {
+            let mut contents_map: BTreeMap<DocumentRef, &mut DocumentContents> = guards
+                .iter_mut()
+                .map(|(doc_ref, guard)| ((*doc_ref).clone(), &mut **guard))
+                .collect();
+            apply(commit_time, &mut contents_map)
+        };
+
+        drop(guards);
+        drop(seal);
+        res
     }
 }
 
 /// DocumentContents maintains the history of versions of a single document (document-name), this
-/// includes "deleted versions". Note that all mutating methods are defined on
-/// `OwnedDocumentContentsWriteGuard`, because these methods check whether the specified update-time
-/// is on or after the time of acquiring the lock.
-#[derive(Debug)]
+/// includes "deleted versions".
+#[derive(Debug, Default)]
 pub(crate) struct DocumentContents {
-    /// The resource name of the document, for example
-    /// `projects/{project_id}/databases/{database_id}/documents/{document_path}`.
-    pub(crate) name: DocumentRef,
     versions: Vec<DocumentVersion>,
 }
 
 impl DocumentContents {
-    pub(crate) fn new(name: DocumentRef) -> Self {
-        Self {
-            name,
-            versions: Default::default(),
-        }
+    pub(crate) fn new() -> Self {
+        Self::default()
     }
 
     pub(crate) fn latest_version(&self) -> Option<&DocumentVersion> {
@@ -149,24 +216,51 @@ impl DocumentContents {
     pub(crate) fn last_updated(&self) -> Option<Timestamp> {
         self.versions.last().map(DocumentVersion::update_time)
     }
+
+    pub(crate) fn maybe_add_version(&mut self, version: &DocumentVersion) -> Result<()> {
+        if let Some(last) = self.versions.last_mut() {
+            assert!(
+                last.update_time() <= version.update_time(),
+                "update time should be monotonically increasing"
+            );
+            // In transactions, we may get multiple updates to the same document, this should result
+            // in only one added version.
+            if last.update_time() == version.update_time() {
+                last.clone_from(version);
+                return Ok(());
+            }
+        }
+        self.versions.push(version.clone());
+        Ok(())
+    }
+
+    /// Add a new version with the given `update_time`; if `fields` equals the last stored version
+    /// in storage representation, returns its existing `update_time` and `None`.
+    #[cfg(test)]
+    pub(crate) fn maybe_update(
+        &mut self,
+        name: &DocumentRef,
+        fields: HashMap<String, Value>,
+        update_time: Timestamp,
+    ) -> Result<(Timestamp, Option<DocumentVersion>)> {
+        let (ts, version) = stage_stored_version(name, self.versions.last(), fields, update_time);
+        if let Some(ref version) = version {
+            self.maybe_add_version(version)?;
+        }
+        Ok((ts, version))
+    }
 }
 
 pub(crate) fn stage_stored_version(
     name: &DocumentRef,
-    acquire_time: Timestamp,
     latest: Option<&DocumentVersion>,
     fields: HashMap<String, Value>,
     update_time: Timestamp,
-) -> Result<(Timestamp, Option<DocumentVersion>)> {
-    if update_time < acquire_time {
-        return Err(GenericDatabaseError::internal(
-            "lock should always be acquired before claiming write/update time",
-        ));
-    }
+) -> (Timestamp, Option<DocumentVersion>) {
     if let Some(last) = latest.and_then(DocumentVersion::stored_document)
         && Value::fields_storage_eq(&last.fields, &fields)
     {
-        return Ok((last.update_time, None));
+        return (last.update_time, None);
     }
     let create_time = latest
         .and_then(DocumentVersion::create_time)
@@ -177,7 +271,7 @@ pub(crate) fn stage_stored_version(
         update_time,
         fields,
     }));
-    Ok((update_time, Some(version)))
+    (update_time, Some(version))
 }
 
 pub(crate) fn check_version_precondition(
@@ -199,121 +293,6 @@ pub(crate) fn check_version_precondition(
             )))
         }
         _ => Ok(()),
-    }
-}
-
-pub(crate) type DocumentContentsReadGuard<'a> = ReadGuard<'a, DocumentContents>;
-
-#[derive(Debug)]
-pub(crate) struct OwnedDocumentContentsReadGuard {
-    project: &'static FirestoreProject,
-    meta:    Arc<DocumentMeta>,
-    guard:   OwnedReadGuard<DocumentContents>,
-}
-
-impl OwnedDocumentContentsReadGuard {
-    /// Try to upgrade this owned read lock to an owned write lock. Can result in a timeout or a
-    /// contention error (GRPC Aborted).
-    #[instrument(level = Level::DEBUG, skip_all, err)]
-    pub(crate) async fn upgrade(self) -> Result<OwnedDocumentContentsWriteGuard> {
-        debug!(name = %self.meta.name);
-        let OwnedDocumentContentsReadGuard {
-            project,
-            meta,
-            guard,
-        } = self;
-
-        // Remember what the current last version is of the document, and then release the read
-        // lock. We know that this current last version is also the version that our consumer has
-        // seen, because they had a read lock all along.
-        let check_time = guard.last_updated();
-
-        let guard = lock_timeout(
-            guard.upgrade(),
-            project.timeouts.write,
-            "write lock",
-            &meta.name,
-        )
-        .await?;
-
-        // Make sure nobody touched our document in the mean time, otherwise we have to report
-        // contention to our client.
-        if check_time != guard.last_updated() {
-            return Err(GenericDatabaseError::aborted("contention"));
-        }
-
-        Ok(OwnedDocumentContentsWriteGuard {
-            guard,
-            acquire_time: Timestamp::now(),
-        })
-    }
-}
-
-impl Deref for OwnedDocumentContentsReadGuard {
-    type Target = DocumentContents;
-
-    fn deref(&self) -> &Self::Target {
-        self.guard.deref()
-    }
-}
-
-#[derive(Debug)]
-pub(crate) struct OwnedDocumentContentsWriteGuard {
-    guard: OwnedWriteGuard<DocumentContents>,
-    pub(crate) acquire_time: Timestamp,
-}
-
-impl OwnedDocumentContentsWriteGuard {
-    /// Add a new version with the given `update_time`; if `fields` equals the last stored version
-    /// in storage representation, returns its existing `update_time` and `None`.
-    #[cfg(test)]
-    pub(crate) async fn maybe_update(
-        &mut self,
-        fields: HashMap<String, Value>,
-        update_time: Timestamp,
-    ) -> Result<(Timestamp, Option<DocumentVersion>)> {
-        let (ts, version) = stage_stored_version(
-            &self.name,
-            self.acquire_time,
-            self.versions.last(),
-            fields,
-            update_time,
-        )?;
-        if let Some(ref version) = version {
-            self.maybe_add_version(version)?;
-        }
-        Ok((ts, version))
-    }
-
-    pub(crate) fn maybe_add_version(&mut self, version: &DocumentVersion) -> Result<()> {
-        if version.update_time() < self.acquire_time {
-            return Err(GenericDatabaseError::internal(
-                "lock should always be acquired before claiming write/update time",
-            ));
-        }
-        if let Some(last) = self.guard.versions.last_mut() {
-            // This should never fail because of the check against the acquire time above.
-            assert!(
-                last.update_time() <= version.update_time(),
-                "update time should be monotonically increasing"
-            );
-            // In transactions, we may get multiple updates to the same document, this should result
-            // in only one added version.
-            if last.update_time() == version.update_time() {
-                last.clone_from(version);
-                return Ok(());
-            }
-        }
-        self.guard.versions.push(version.clone());
-        Ok(())
-    }
-}
-
-impl Deref for OwnedDocumentContentsWriteGuard {
-    type Target = DocumentContents;
-
-    fn deref(&self) -> &Self::Target {
-        self.guard.deref()
     }
 }
 
@@ -421,6 +400,7 @@ pub struct DeletedDocumentVersion {
     pub delete_time: Timestamp,
 }
 
+#[derive(Clone, Copy, Debug)]
 pub(crate) enum DocumentPrecondition {
     NotExists,
     Exists,
@@ -437,49 +417,29 @@ impl From<precondition::ConditionType> for DocumentPrecondition {
     }
 }
 
-async fn lock_timeout<F: Future>(
-    future: F,
-    time: Duration,
-    kind: &str,
-    doc_name: &DocumentRef,
-) -> Result<F::Output> {
-    let future_with_timeout = async {
-        timeout(time, future).await.map_err(|_: Elapsed| {
-            GenericDatabaseError::aborted("timeout waiting for lock on document")
-        })
-    };
-    let mut future_with_timeout = pin!(future_with_timeout);
-    tokio::select! {
-        result = &mut future_with_timeout => return result,
-        _ = sleep(Duration::from_secs(1)) => warn!("waiting more than 1 second on a {kind} for {doc_name}"),
-    }
-    future_with_timeout.await
-}
-
 #[cfg(test)]
 mod tests {
-    use std::{collections::HashMap, sync::Arc};
+    use std::{
+        collections::{BTreeMap, HashMap},
+        sync::Arc,
+    };
 
-    use fifo_rwlock::FifoRwLock;
     use googleapis::google::{firestore::v1::Value, protobuf::Timestamp};
     use googletest::prelude::*;
 
-    use super::{DocumentContents, OwnedDocumentContentsWriteGuard};
-    use crate::reference::DocumentRef;
+    use super::{DocumentContents, DocumentMeta};
+    use crate::{
+        database::{
+            lock::{LockManager, LockPriority},
+            timeouts::Timeouts,
+        },
+        reference::{DocumentRef, RootRef},
+    };
 
     #[gtest]
-    #[tokio::test]
-    async fn maybe_update_distinguishes_integer_and_double_and_preserves_nan_noop() {
+    fn maybe_update_distinguishes_integer_and_double_and_preserves_nan_noop() {
         let name: DocumentRef = "projects/p/databases/d/documents/col/doc".parse().unwrap();
-        let contents = Arc::new(FifoRwLock::new(DocumentContents::new(name)));
-        let t0 = Timestamp {
-            seconds: 100,
-            nanos:   0,
-        };
-        let mut guard = OwnedDocumentContentsWriteGuard {
-            guard: contents.write_owned().await,
-            acquire_time: t0,
-        };
+        let mut contents = DocumentContents::new();
 
         let initial_fields = HashMap::from([
             ("score".to_string(), Value::integer(1)),
@@ -497,9 +457,8 @@ mod tests {
             seconds: 101,
             nanos:   0,
         };
-        let (_, v1) = guard
-            .maybe_update(initial_fields.clone(), t1)
-            .await
+        let (_, v1) = contents
+            .maybe_update(&name, initial_fields.clone(), t1)
             .unwrap();
         expect_that!(v1, some(anything()));
 
@@ -508,7 +467,7 @@ mod tests {
             seconds: 102,
             nanos:   0,
         };
-        let (ts, v2) = guard.maybe_update(initial_fields, t2).await.unwrap();
+        let (ts, v2) = contents.maybe_update(&name, initial_fields, t2).unwrap();
         expect_eq!(ts, t1);
         expect_that!(v2, none());
 
@@ -528,7 +487,7 @@ mod tests {
             seconds: 103,
             nanos:   0,
         };
-        let (ts, v3) = guard.maybe_update(top_level_double, t3).await.unwrap();
+        let (ts, v3) = contents.maybe_update(&name, top_level_double, t3).unwrap();
         expect_eq!(ts, t3);
         expect_that!(v3, some(anything()));
 
@@ -548,8 +507,62 @@ mod tests {
             seconds: 104,
             nanos:   0,
         };
-        let (ts, v4) = guard.maybe_update(nested_double, t4).await.unwrap();
+        let (ts, v4) = contents.maybe_update(&name, nested_double, t4).unwrap();
         expect_eq!(ts, t4);
         expect_that!(v4, some(anything()));
+    }
+
+    #[gtest]
+    #[tokio::test]
+    async fn capability_accessors_and_poison_recovery_work_cleanly() {
+        let root: RootRef = "projects/p/databases/(default)".parse().unwrap();
+        let name: DocumentRef = "projects/p/databases/(default)/documents/col/doc"
+            .parse()
+            .unwrap();
+        let meta = Arc::new(DocumentMeta::new(name.clone()));
+
+        // Poison the inner RwLock deliberately via a panicked thread, then confirm subsequent
+        // `read_latest_uncontended` and `apply_sealed_commit` recover cleanly.
+        let poisoned_meta = Arc::clone(&meta);
+        let _unused = std::thread::spawn(move || {
+            let _guard = poisoned_meta.contents.write();
+            panic!("deliberate poison test");
+        })
+        .join();
+        expect_false!(meta.read_latest_uncontended(DocumentContents::exists));
+
+        let locks = Arc::new(LockManager::new(root, Timeouts::FAST));
+        let s = locks.new_session(None, LockPriority::NextSeq, true, true);
+        let w = s.acquire_write(&name).await.unwrap();
+        expect_that!(
+            meta.read_with_write_lease(&w, DocumentContents::exists),
+            ok(eq(&false))
+        );
+
+        let seal = s
+            .seal_for_commit(BTreeMap::from([(name.clone(), w)]))
+            .unwrap();
+        let docs = BTreeMap::from([(name.clone(), Arc::clone(&meta))]);
+        let commit_ts = DocumentMeta::apply_sealed_commit(seal, docs, |ts, map| {
+            let contents = map.get_mut(&name).unwrap();
+            contents.maybe_update(
+                &name,
+                HashMap::from([("v".to_string(), Value::integer(7))]),
+                ts,
+            )?;
+            Ok(ts)
+        })
+        .unwrap();
+
+        let snap = meta.read_mvcc_at(commit_ts).unwrap();
+        expect_eq!(snap.fields["v"].as_integer(), Some(7));
+
+        let s2 = locks.new_session(None, LockPriority::NextSeq, true, true);
+        let r = s2.acquire_read(&name).await.unwrap();
+        expect_that!(
+            meta.read_with(&r, |c| c.current_version().unwrap().fields["v"]
+                .as_integer()),
+            ok(some(eq(&7)))
+        );
     }
 }

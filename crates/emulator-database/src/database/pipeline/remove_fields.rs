@@ -33,7 +33,7 @@ pub(super) fn execute(
             if let FieldReference::FieldPath(ref path) = field_ref {
                 path.validate_non_reserved()?;
             }
-            Ok(field_ref)
+            Ok::<_, GenericDatabaseError>(field_ref)
         })
         .try_collect()?;
 

@@ -34,8 +34,9 @@ impl ContentionProbe {
     }
 
     /// Advances Tokio's paused virtual clock in bounded steps (`<= 250ms` per tick) and yields
-    /// runtime tasks between steps so intermediate timers (such as `document.rs`'s `1s` slow-lock
-    /// warning `tokio::select!` branch) wake, re-poll, and re-arm the outer lock timeout cleanly.
+    /// runtime tasks between steps so intermediate timers (such as `database/lock/mod.rs`'s `1s`
+    /// slow-lock warning `tokio::select!` branch) wake, re-poll, and re-arm the outer lock timeout
+    /// cleanly.
     pub(crate) async fn advance_and_poll<F1, F2>(
         total: Duration,
         first: &mut SpawnedOp<F1>,

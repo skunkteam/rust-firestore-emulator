@@ -1,6 +1,86 @@
+use std::fmt;
+
 use thiserror::Error;
 
+use crate::database::transaction::TransactionId;
+
 pub(crate) type Result<T, E = GenericDatabaseError> = std::result::Result<T, E>;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum AbortReason {
+    Wounded {
+        wounder_txn_id: Option<TransactionId>,
+        wounder_seq:    u64,
+    },
+    UpgradeContention,
+    ReadTimeout,
+    WriteTimeout,
+    OptimisticWriteSkew,
+    DatabaseCleared,
+    DatabaseDropped,
+}
+
+impl fmt::Display for AbortReason {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Wounded {
+                wounder_txn_id: Some(txn_id),
+                wounder_seq,
+            } => write!(
+                f,
+                "transaction aborted due to contention (wounded by {txn_id}, seq={wounder_seq})"
+            ),
+            Self::Wounded {
+                wounder_txn_id: None,
+                wounder_seq,
+            } => write!(
+                f,
+                "transaction aborted due to contention (wounded by seq={wounder_seq})"
+            ),
+            Self::UpgradeContention => f.write_str("contention"),
+            Self::ReadTimeout => f.write_str("timeout waiting for read lock on document"),
+            Self::WriteTimeout => f.write_str("timeout waiting for write lock on document"),
+            Self::OptimisticWriteSkew => {
+                f.write_str("contention: optimistic concurrency violation")
+            }
+            Self::DatabaseCleared => f.write_str("database was cleared"),
+            Self::DatabaseDropped => f.write_str("database was dropped"),
+        }
+    }
+}
+
+impl From<AbortReason> for GenericDatabaseError {
+    fn from(reason: AbortReason) -> Self {
+        Self::aborted(reason.to_string())
+    }
+}
+
+#[derive(Debug)]
+pub(crate) enum CommitError {
+    Aborted(AbortReason),
+    Other(GenericDatabaseError),
+}
+
+impl From<AbortReason> for CommitError {
+    fn from(reason: AbortReason) -> Self {
+        Self::Aborted(reason)
+    }
+}
+
+impl From<GenericDatabaseError> for CommitError {
+    fn from(err: GenericDatabaseError) -> Self {
+        Self::Other(err)
+    }
+}
+
+impl From<CommitError> for GenericDatabaseError {
+    fn from(err: CommitError) -> Self {
+        match err {
+            CommitError::Aborted(reason) => reason.into(),
+            CommitError::Other(other) => other,
+        }
+    }
+}
 
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 pub enum GenericDatabaseError {

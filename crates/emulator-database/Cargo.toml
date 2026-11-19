@@ -4,7 +4,6 @@ version = { workspace = true }
 edition = "2024"
 
 [dependencies]
-fifo-rwlock = { workspace = true }
 googleapis = { workspace = true }
 itertools = { workspace = true }
 serde = { workspace = true }

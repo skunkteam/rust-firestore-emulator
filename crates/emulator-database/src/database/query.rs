@@ -26,8 +26,9 @@ pub use super::vector::DistanceMeasure;
 use super::{
     FirestoreDatabase,
     collection::Collection,
-    document::StoredDocumentVersion,
+    document::{DocumentMeta, StoredDocumentVersion},
     field_path::{FieldPath, FieldReference},
+    lock::{LockSession, ReadLease, WriteLease},
     projection::{Project, Projection, project_with_distance},
     read_consistency::{ReadConsistency, validate_read_time},
     reference::{self, CollectionRef, Ref, RootRef},
@@ -35,11 +36,7 @@ use super::{
 };
 use crate::{
     GenericDatabaseError,
-    database::transaction::{
-        ConcurrencyMode, ExecutedQuery, OptimisticState, PessimisticTransactionQuerySupport,
-        Transaction,
-    },
-    document::{DocumentMeta, OwnedDocumentContentsReadGuard, OwnedDocumentContentsWriteGuard},
+    database::transaction::{ConcurrencyMode, ExecutedQuery, OptimisticState, Transaction},
     error::Result,
     reference::DocumentRef,
 };
@@ -905,8 +902,8 @@ impl Query {
                 LockStrategy::ReadTime(validate_read_time(timestamp)?)
             }
             ReadConsistency::Transaction(transaction_id) => {
-                txn = db.transactions.get(transaction_id).await?;
-                LockStrategy::from_transaction(&txn).await
+                txn = db.transactions.get_active(transaction_id)?;
+                LockStrategy::from_transaction(&txn)
             }
         };
         self.once_with_strategy(db, lock_strategy).await
@@ -915,9 +912,9 @@ impl Query {
     pub(crate) async fn once_for_validation(
         &mut self,
         db: &FirestoreDatabase,
-        held_write_guards: &BTreeMap<DocumentRef, OwnedDocumentContentsWriteGuard>,
+        held_write_leases: &BTreeMap<DocumentRef, WriteLease>,
     ) -> Result<(Timestamp, Vec<QueryMatch>)> {
-        self.once_with_strategy(db, LockStrategy::ValidationReadOnly(held_write_guards))
+        self.once_with_strategy(db, LockStrategy::ValidationReadOnly(held_write_leases))
             .await
     }
 
@@ -931,7 +928,7 @@ impl Query {
         collections.sort_by(|a, b| a.name.cmp(&b.name));
 
         let result = if let Some(spec) = self.find_nearest.clone() {
-            let mut scanned_guards = vec![];
+            let mut scanned_leases = vec![];
             let mut candidates = vec![];
             for col in collections {
                 let mut docs = col.docs().await;
@@ -939,9 +936,9 @@ impl Query {
                 for meta in docs {
                     if let Some(mut doc) = lock_strategy.read(&meta).await? {
                         if self.enterprise_edition
-                            && let Some(guard) = doc.guard.as_ref()
+                            && let Some(lease) = doc.lease.take()
                         {
-                            scanned_guards.push(Arc::clone(guard));
+                            scanned_leases.push(lease);
                         }
                         if !self.matches_prefilters(&doc.version) {
                             continue;
@@ -974,12 +971,12 @@ impl Query {
             });
 
             if self.enterprise_edition {
-                lock_strategy.retain_pessimistic_guards(scanned_guards.into_iter());
+                lock_strategy.retain_pessimistic_leases(scanned_leases.into_iter())?;
             }
 
             lock_strategy
                 .confirm_all(candidates.into_iter(), self)
-                .await
+                .await?
         } else {
             let mut buffer = vec![];
             for (col_idx, col) in collections.into_iter().enumerate() {
@@ -1015,7 +1012,7 @@ impl Query {
             // concurrency.
             lock_strategy
                 .confirm_all(buffer.into_iter().map(|(_, _, doc)| doc), self)
-                .await
+                .await?
         };
 
         Ok((lock_strategy.read_time(), result))
@@ -1336,18 +1333,18 @@ impl From<structured_query::Direction> for Direction {
 
 #[derive(Debug)]
 enum LockStrategy<'a> {
-    PessimisticTransaction(PessimisticTransactionQuerySupport<'a>),
+    PessimisticTransaction(&'a Arc<LockSession>),
     OptimisticTransaction(&'a OptimisticState),
-    ValidationReadOnly(&'a BTreeMap<DocumentRef, OwnedDocumentContentsWriteGuard>),
+    ValidationReadOnly(&'a BTreeMap<DocumentRef, WriteLease>),
     ReadTime(Timestamp),
 }
 
 impl<'a> LockStrategy<'a> {
-    async fn from_transaction(txn: &'a Transaction) -> Self {
+    fn from_transaction(txn: &'a Transaction) -> Self {
         if let Some(rw_txn) = txn.as_read_write() {
             match &rw_txn.mode {
                 ConcurrencyMode::Pessimistic(state) => {
-                    Self::PessimisticTransaction(state.query_support().await)
+                    Self::PessimisticTransaction(state.session())
                 }
                 ConcurrencyMode::Optimistic(state) => Self::OptimisticTransaction(state),
             }
@@ -1358,71 +1355,71 @@ impl<'a> LockStrategy<'a> {
 
     async fn read(&self, meta: &Arc<DocumentMeta>) -> Result<Option<LockStrategyDocument>> {
         let read_time = match self {
-            LockStrategy::PessimisticTransaction(txn) => {
-                let read_guard = txn.get_read_guard(meta).await?;
-                return Ok(read_guard.current_version().cloned().map(|version| {
-                    LockStrategyDocument {
-                        version,
-                        guard: Some(read_guard),
-                        computed_distance: None,
-                    }
+            LockStrategy::PessimisticTransaction(session) => {
+                let lease = session.acquire_read(&meta.name).await?;
+                let (version, last_updated) =
+                    meta.read_with(&lease, |c| (c.current_version().cloned(), c.last_updated()))?;
+                return Ok(version.map(|version| LockStrategyDocument {
+                    version,
+                    lease: Some((lease, last_updated)),
+                    computed_distance: None,
                 }));
             }
-            LockStrategy::ValidationReadOnly(held_write_guards) => {
-                let version = if let Some(wg) = held_write_guards.get(&meta.name) {
-                    wg.current_version().cloned()
+            LockStrategy::ValidationReadOnly(held_write_leases) => {
+                let version = if let Some(lease) = held_write_leases.get(&meta.name) {
+                    meta.read_with_write_lease(lease, |c| c.current_version().cloned())
+                        .map_err(GenericDatabaseError::from)?
                 } else {
-                    meta.read().await?.current_version().cloned()
+                    meta.read_latest_uncontended(|c| c.current_version().cloned())
                 };
                 return Ok(version.map(|version| LockStrategyDocument {
                     version,
-                    guard: None,
+                    lease: None,
                     computed_distance: None,
                 }));
             }
             LockStrategy::OptimisticTransaction(state) => *state.read_time,
             LockStrategy::ReadTime(rt) => *rt,
         };
-        let read_guard = meta.read().await?;
-        Ok(read_guard
-            .version_at_time(read_time)
-            .cloned()
+        Ok(meta
+            .read_mvcc_at(read_time)
             .map(|version| LockStrategyDocument {
                 version,
-                guard: None,
+                lease: None,
                 computed_distance: None,
             }))
     }
 
-    fn retain_pessimistic_guards(
+    fn retain_pessimistic_leases(
         &mut self,
-        guards: impl Iterator<Item = Arc<OwnedDocumentContentsReadGuard>>,
-    ) {
-        if let LockStrategy::PessimisticTransaction(txn) = self {
-            for guard in guards {
-                txn.manage_read_guard(guard);
+        leases: impl Iterator<Item = (ReadLease, Option<Timestamp>)>,
+    ) -> Result<()> {
+        if let LockStrategy::PessimisticTransaction(session) = self {
+            for (lease, observed_update_time) in leases {
+                session.retain_read(lease, observed_update_time)?;
             }
         }
+        Ok(())
     }
 
     async fn confirm_all(
         &mut self,
         docs: impl Iterator<Item = LockStrategyDocument>,
         query: &Query,
-    ) -> Vec<QueryMatch> {
+    ) -> Result<Vec<QueryMatch>> {
         let result = docs
             .map(|doc| {
-                if let LockStrategy::PessimisticTransaction(txn) = self
-                    && let Some(guard) = doc.guard
+                if let LockStrategy::PessimisticTransaction(session) = self
+                    && let Some((lease, observed_update_time)) = doc.lease
                 {
-                    txn.manage_read_guard(guard);
+                    session.retain_read(lease, observed_update_time)?;
                 }
-                QueryMatch {
+                Ok(QueryMatch {
                     version: doc.version,
                     computed_distance: doc.computed_distance,
-                }
+                })
             })
-            .collect_vec();
+            .collect::<Result<Vec<_>>>()?;
 
         if let Self::OptimisticTransaction(state) = self {
             state
@@ -1442,7 +1439,7 @@ impl<'a> LockStrategy<'a> {
             });
         }
 
-        result
+        Ok(result)
     }
 
     fn read_time(self) -> Timestamp {
@@ -1463,6 +1460,6 @@ impl<'a> LockStrategy<'a> {
 
 struct LockStrategyDocument {
     version: Arc<StoredDocumentVersion>,
-    guard: Option<Arc<OwnedDocumentContentsReadGuard>>,
+    lease: Option<(ReadLease, Option<Timestamp>)>,
     computed_distance: Option<f64>,
 }
