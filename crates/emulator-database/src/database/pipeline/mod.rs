@@ -79,7 +79,9 @@ pub async fn execute(
 /// capabilities directly into the stateless `Document` instances passed through pipeline arrays.
 fn get_document_value(field_ref: &FieldReference, doc: &Document) -> Option<Value> {
     match field_ref {
-        FieldReference::DocumentName => Some(Value::reference(doc.name.clone())),
+        FieldReference::DocumentName => {
+            (!doc.name.is_empty()).then(|| Value::reference(doc.name.clone()))
+        }
         FieldReference::FieldPath(path) => path.get_value(&doc.fields).cloned(),
     }
 }
@@ -121,4 +123,72 @@ pub(super) fn parse_projection_paths(
         .into_iter()
         .map(|(_, path, expr)| (path, expr))
         .collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use googleapis::google::firestore::v1::{Function, pipeline::Stage, value::ValueType};
+
+    use super::*;
+
+    fn field_ref(path: &str) -> Value {
+        Value {
+            value_type: Some(ValueType::FieldReferenceValue(path.to_string())),
+        }
+    }
+
+    fn fn_val(name: &str, args: Vec<Value>) -> Value {
+        Value {
+            value_type: Some(ValueType::FunctionValue(Function {
+                name: name.to_string(),
+                args,
+                options: HashMap::new(),
+            })),
+        }
+    }
+
+    #[test]
+    fn remove_fields_document_name_treats_name_as_absent_in_subsequent_stages() {
+        let doc = Document {
+            name: "projects/p/databases/(default)/documents/c/d1".to_string(),
+            fields: HashMap::from([("x".to_string(), Value::integer(1))]),
+            create_time: None,
+            update_time: None,
+        };
+
+        let after_rm = remove_fields::execute(
+            Stage {
+                name:    "remove_fields".to_string(),
+                args:    vec![field_ref("__name__")],
+                options: HashMap::new(),
+            },
+            vec![doc],
+        )
+        .unwrap();
+
+        let selected = select::execute(
+            Stage {
+                name:    "select".to_string(),
+                args:    vec![Value::map(HashMap::from([
+                    (
+                        "name_absent".to_string(),
+                        fn_val("is_absent", vec![field_ref("__name__")]),
+                    ),
+                    (
+                        "eq_missing".to_string(),
+                        fn_val("equal", vec![field_ref("__name__"), field_ref("missing")]),
+                    ),
+                    ("projected_name".to_string(), field_ref("__name__")),
+                ]))],
+                options: HashMap::new(),
+            },
+            after_rm,
+        )
+        .unwrap();
+
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].fields["name_absent"], Value::boolean(true));
+        assert_eq!(selected[0].fields["eq_missing"], Value::boolean(true));
+        assert_eq!(selected[0].fields["projected_name"], Value::null());
+    }
 }

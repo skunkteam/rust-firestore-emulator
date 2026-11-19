@@ -3,7 +3,7 @@ use std::sync::Arc;
 use axum::{
     Json, Router,
     body::Bytes,
-    extract::{DefaultBodyLimit, Path, State},
+    extract::{DefaultBodyLimit, State},
     http::{HeaderMap, Method, Uri},
     response::{IntoResponse, Response},
     routing::{any, get, post},
@@ -120,14 +120,17 @@ impl DatabaseMetadata {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct PatchDatabase {
+    #[serde(alias = "database_edition")]
     database_edition: Option<DatabaseEdition>,
+    #[serde(alias = "concurrency_mode")]
     concurrency_mode: Option<ConcurrencyMode>,
 }
 
 async fn get_database(
     State(project): State<&'static FirestoreProject>,
-    Path((project_id, database_id)): Path<(String, String)>,
+    uri: Uri,
 ) -> Result<Json<DatabaseMetadata>> {
+    let (project_id, database_id) = extract_raw_project_and_database(uri.path())?;
     let name = parse_root_ref(&project_id, &database_id)?;
 
     let db = project.database(&name).await;
@@ -140,10 +143,10 @@ async fn get_database(
 
 async fn patch_database(
     State(project): State<&'static FirestoreProject>,
-    Path((project_id, database_id)): Path<(String, String)>,
     uri: Uri,
     ApiJson(payload): ApiJson<PatchDatabase>,
 ) -> Result<Json<DatabaseMetadata>> {
+    let (project_id, database_id) = extract_raw_project_and_database(uri.path())?;
     let name = parse_root_ref(&project_id, &database_id)?;
     let update_mask = parse_patch_database_mask(uri.query())?;
 
@@ -163,18 +166,20 @@ async fn patch_database(
         None
     };
 
-    if let Some(edition) = effective_edition {
-        let is_enterprise = matches!(edition, DatabaseEdition::Enterprise);
-        db.set_enterprise_edition(is_enterprise);
-        // Derive optimistic concurrency mode automatically from enterprise edition by default
-        if effective_concurrency.is_none() {
-            db.set_optimistic_concurrency(is_enterprise);
-        }
-    }
+    let prev_enterprise = db.enterprise_edition();
+    let target_enterprise = effective_edition
+        .map(|edition| matches!(edition, DatabaseEdition::Enterprise))
+        .unwrap_or(prev_enterprise);
+    let target_optimistic = if let Some(mode) = effective_concurrency {
+        matches!(mode, ConcurrencyMode::Optimistic)
+    } else if target_enterprise != prev_enterprise {
+        // Derive optimistic concurrency mode automatically when edition changes
+        target_enterprise
+    } else {
+        db.optimistic_concurrency()
+    };
 
-    if let Some(mode) = effective_concurrency {
-        db.set_optimistic_concurrency(matches!(mode, ConcurrencyMode::Optimistic));
-    }
+    db.set_config(target_enterprise, target_optimistic);
 
     Ok(Json(DatabaseMetadata::new(
         &name,
@@ -185,12 +190,12 @@ async fn patch_database(
 
 async fn dispatch_documents_root(
     State(project): State<&'static FirestoreProject>,
-    Path((project_id, database_id)): Path<(String, String)>,
     method: Method,
     uri: Uri,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response> {
+    let (project_id, database_id) = extract_raw_project_and_database(uri.path())?;
     dispatch_documents(
         project,
         &project_id,
@@ -207,11 +212,11 @@ async fn dispatch_documents_root(
 
 async fn dispatch_root_list_collection_ids(
     State(project): State<&'static FirestoreProject>,
-    Path((project_id, database_id)): Path<(String, String)>,
     uri: Uri,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response> {
+    let (project_id, database_id) = extract_raw_project_and_database(uri.path())?;
     dispatch_documents(
         project,
         &project_id,
@@ -228,11 +233,11 @@ async fn dispatch_root_list_collection_ids(
 
 async fn dispatch_root_run_query(
     State(project): State<&'static FirestoreProject>,
-    Path((project_id, database_id)): Path<(String, String)>,
     uri: Uri,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response> {
+    let (project_id, database_id) = extract_raw_project_and_database(uri.path())?;
     dispatch_documents(
         project,
         &project_id,
@@ -249,12 +254,12 @@ async fn dispatch_root_run_query(
 
 async fn dispatch_documents_tail(
     State(project): State<&'static FirestoreProject>,
-    Path((project_id, database_id, _tail)): Path<(String, String, String)>,
     method: Method,
     uri: Uri,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response> {
+    let (project_id, database_id) = extract_raw_project_and_database(uri.path())?;
     parse_root_ref(&project_id, &database_id)?;
     let raw_tail = extract_raw_tail(uri.path())?;
     let (clean_raw_tail, verb) = split_raw_custom_verb(raw_tail, &method);
@@ -569,6 +574,20 @@ fn parse_root_ref(project_id: &str, database_id: &str) -> Result<RootRef> {
     Ok(format!("projects/{project_id}/databases/{database_id}").parse()?)
 }
 
+fn extract_raw_project_and_database(raw_path: &str) -> Result<(String, String)> {
+    let mut parts = raw_path.strip_prefix('/').unwrap_or(raw_path).split('/');
+    let (Some(raw_proj), Some("databases"), Some(raw_db)) =
+        (parts.next(), parts.next(), parts.next())
+    else {
+        return Err(RestError::bad_request(format!(
+            "Invalid Firestore project/database path: {raw_path}"
+        )));
+    };
+    let project_id = percent_decode_path_segment(raw_proj)?;
+    let database_id = percent_decode_path_segment(raw_db)?;
+    Ok((project_id, database_id))
+}
+
 fn extract_raw_tail(raw_path: &str) -> Result<&str> {
     let mut parts = raw_path
         .strip_prefix('/')
@@ -720,31 +739,37 @@ impl DocumentQueryParams {
             let val = percent_decode(raw_v)?;
 
             match key.as_str() {
-                "documentId" => params.document_id = Some(val),
-                "pageSize" => {
+                "documentId" | "document_id" => params.document_id = Some(val),
+                "pageSize" | "page_size" => {
                     let parsed = val.parse::<i32>().map_err(|_| {
                         RestError::bad_request(format!("Invalid pageSize value: {val}"))
                     })?;
                     params.page_size = Some(parsed);
                 }
-                "pageToken" => params.page_token = Some(val),
-                "orderBy" => params.order_by = Some(val),
-                "showMissing" => {
+                "pageToken" | "page_token" => params.page_token = Some(val),
+                "orderBy" | "order_by" => params.order_by = Some(val),
+                "showMissing" | "show_missing" => {
                     params.show_missing = Some(parse_bool_param("showMissing", &val)?);
                 }
-                "mask.fieldPaths" => {
+                "mask.fieldPaths" | "mask.field_paths" => {
                     params.has_mask_param = true;
                     params.mask.push(val);
                 }
-                "updateMask.fieldPaths" => {
+                "updateMask.fieldPaths"
+                | "updateMask.field_paths"
+                | "update_mask.fieldPaths"
+                | "update_mask.field_paths" => {
                     params.has_update_mask_param = true;
                     params.update_mask.push(val);
                 }
-                "currentDocument.exists" => {
+                "currentDocument.exists" | "current_document.exists" => {
                     params.current_document_exists =
                         Some(parse_bool_param("currentDocument.exists", &val)?);
                 }
-                "currentDocument.updateTime" => {
+                "currentDocument.updateTime"
+                | "currentDocument.update_time"
+                | "current_document.updateTime"
+                | "current_document.update_time" => {
                     let ts: Timestamp = serde_json::from_value(serde_json::Value::String(val))
                         .map_err(|err| {
                             RestError::bad_request(format!(
@@ -753,7 +778,7 @@ impl DocumentQueryParams {
                         })?;
                     params.current_document_update_time = Some(ts);
                 }
-                "readTime" => {
+                "readTime" | "read_time" => {
                     let ts: Timestamp = serde_json::from_value(serde_json::Value::String(val))
                         .map_err(|err| {
                             RestError::bad_request(format!("Invalid readTime: {err}"))

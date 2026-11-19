@@ -240,16 +240,18 @@ function syncBrowserUrl(replace = false) {
 
 /**
  * Refreshes the list of active databases from `GET /emulator/v1` without creating any database.
+ * @returns {Promise<boolean>} True if this request applied its result (not superseded by a newer call).
  */
 async function refreshDatabaseList() {
   const seq = ++dbListSeq;
   const rawList = await listDatabases();
-  if (seq !== dbListSeq) return;
+  if (seq !== dbListSeq) return false;
   const parsed = rawList
     .map(parseRootRef)
     .filter((item) => item !== null)
     .sort((a, b) => a.rootPath.localeCompare(b.rootPath));
   state.databases = parsed;
+  return true;
 }
 
 /**
@@ -265,10 +267,10 @@ export async function selectDatabase(
   initialSegments = [],
   replaceHistory = false
 ) {
-  const myDbEpoch = ++dbEpoch;
-  const myNavEpoch = ++navEpoch;
   const dbChanged =
     state.activeProjectId !== projectId || state.activeDatabaseId !== databaseId;
+  const myDbEpoch = dbChanged ? ++dbEpoch : dbEpoch;
+  const myNavEpoch = ++navEpoch;
   state.activeProjectId = projectId;
   state.activeDatabaseId = databaseId;
   state.segments = [...initialSegments];
@@ -566,6 +568,11 @@ export async function handleSseBatch(events) {
     }
     if (ev.type === "database_cleared") {
       shouldRefreshDbList = true;
+      if (ev.database) {
+        state.databases = state.databases.filter(
+          (db) => db.rootPath !== ev.database
+        );
+      }
       if (ev.database && ev.database === activeRoot) {
         // Clear cached state WITHOUT calling /v1/projects/... so we never re-create the cleared database!
         myDbEpoch = ++dbEpoch;
@@ -602,10 +609,10 @@ export async function handleSseBatch(events) {
   }
 
   if (shouldRefreshDbList) {
-    await refreshDatabaseList();
+    const applied = await refreshDatabaseList();
     if (myDbEpoch !== dbEpoch) return;
     // If no active DB is selected and a DB now exists, auto-select the first one cleanly.
-    if (!state.activeProjectId && state.databases.length > 0) {
+    if (applied && !state.activeProjectId && state.databases.length > 0) {
       const first = state.databases[0];
       await selectDatabase(first.projectId, first.databaseId, [], true);
       return;
@@ -706,15 +713,11 @@ export async function saveDocumentFromInspector(docLevel) {
   renderApp();
 
   const myDbEpoch = dbEpoch;
-  docRequestSeq.set(
-    docLevel.docPath,
-    (docRequestSeq.get(docLevel.docPath) ?? 0) + 1
-  );
 
   try {
     const cleanFields = session.cleanDoc?.fields ?? {};
     const updateMask =
-      session.mode === "structured"
+      session.mode === "structured" && session.cleanDoc !== null
         ? computeChangedFieldMask(cleanFields, extracted.fields)
         : null;
 
@@ -732,6 +735,11 @@ export async function saveDocumentFromInspector(docLevel) {
       session.cleanDoc?.updateTime ?? null
     );
     if (myDbEpoch !== dbEpoch) return;
+    docRequestSeq.set(
+      docLevel.docPath,
+      (docRequestSeq.get(docLevel.docPath) ?? 0) + 1
+    );
+    docLevel.loading = false;
     docLevel.exists = true;
     syncSessionWithDocument(session, updated);
     pushToast(`Saved ${docLevel.docId}`, "success");
@@ -1605,8 +1613,12 @@ export function renderModal() {
     renderApp();
     try {
       await clearDatabase(m.projectId, m.databaseId);
-      dbEpoch++;
+      const myDbEpoch = ++dbEpoch;
       navEpoch++;
+      const clearedRoot = `projects/${m.projectId}/databases/${m.databaseId}/documents`;
+      state.databases = state.databases.filter(
+        (db) => db.rootPath !== clearedRoot
+      );
       state.modal = null;
       state.activeProjectId = null;
       state.activeDatabaseId = null;
@@ -1618,11 +1630,12 @@ export function renderModal() {
       colRequestSeq.clear();
       docRequestSeq.clear();
       state.queryState = createQueryRunnerState();
-      await refreshDatabaseList();
-      if (state.databases.length > 0) {
+      const applied = await refreshDatabaseList();
+      if (myDbEpoch !== dbEpoch) return;
+      if (applied && !state.activeProjectId && state.databases.length > 0) {
         const next = state.databases[0];
         await selectDatabase(next.projectId, next.databaseId, [], true);
-      } else {
+      } else if (!state.activeProjectId) {
         syncBrowserUrl(true);
       }
       pushToast(`Cleared database ${m.projectId}/${m.databaseId}`, "success");
@@ -1719,7 +1732,24 @@ export async function init() {
   window.addEventListener("popstate", () => {
     const route = parseBrowserRoute(window.location.pathname);
     if (route) {
-      void selectDatabase(route.projectId, route.databaseId, route.segments, true);
+      if (
+        route.projectId === state.activeProjectId &&
+        route.databaseId === state.activeDatabaseId
+      ) {
+        state.segments = [...route.segments];
+        navEpoch++;
+        renderApp();
+        if (state.segments.length > 0) {
+          void hydrateVisiblePath();
+        }
+      } else {
+        void selectDatabase(
+          route.projectId,
+          route.databaseId,
+          route.segments,
+          true
+        );
+      }
     } else {
       state.segments = [];
       navEpoch++;

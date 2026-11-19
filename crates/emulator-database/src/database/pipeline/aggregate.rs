@@ -1,8 +1,8 @@
 use std::collections::{BTreeMap, HashMap};
 
 use googleapis::google::firestore::v1::{Document, Value, pipeline::Stage, value::ValueType};
-use itertools::Itertools;
 
+use super::parse_projection_paths;
 use crate::{
     GenericDatabaseError,
     error::Result,
@@ -32,20 +32,30 @@ pub(super) fn execute(
         )
     })?;
 
-    let mut group_by_fields = match args.get(1) {
-        None => Vec::new(),
-        Some(v) => v
-            .as_map()
-            .ok_or_else(|| {
-                GenericDatabaseError::invalid_argument(
-                    "aggregate stage expects a MapValue argument as second argument",
-                )
-            })?
-            .iter()
-            .collect_vec(),
+    let group_by_map = match args.get(1) {
+        None => None,
+        Some(v) => Some(v.as_map().ok_or_else(|| {
+            GenericDatabaseError::invalid_argument(
+                "aggregate stage expects a MapValue argument as second argument",
+            )
+        })?),
     };
-    // Sort to ensure stable group key ordering
-    group_by_fields.sort_by(|a, b| a.0.cmp(b.0));
+
+    let sorted_aggs = parse_projection_paths(aggregations)?;
+    let group_by_fields = match group_by_map {
+        None => Vec::new(),
+        Some(map) => parse_projection_paths(map)?,
+    };
+
+    for (agg_path, _) in &sorted_aggs {
+        for (grp_path, _) in &group_by_fields {
+            if agg_path.starts_with(grp_path) || grp_path.starts_with(agg_path) {
+                return Err(GenericDatabaseError::invalid_argument(format!(
+                    "Conflicting field paths '{agg_path}' and '{grp_path}'"
+                )));
+            }
+        }
+    }
 
     let mut buckets: BTreeMap<Vec<Value>, Vec<Document>> = BTreeMap::new();
 
@@ -62,19 +72,16 @@ pub(super) fn execute(
         }
     }
 
-    let mut sorted_aggs = aggregations.iter().collect_vec();
-    sorted_aggs.sort_by(|a, b| a.0.cmp(b.0));
-
     let mut aggregated_docs = Vec::new();
 
     for (group_key, bucket_docs) in buckets {
         let mut result_fields = HashMap::new();
 
-        for (i, (alias, _)) in group_by_fields.iter().enumerate() {
-            result_fields.insert(alias.to_string(), group_key[i].clone());
+        for (i, (path, _)) in group_by_fields.iter().enumerate() {
+            path.set_value(&mut result_fields, group_key[i].clone());
         }
 
-        for &(alias, value) in &sorted_aggs {
+        for &(ref path, value) in &sorted_aggs {
             let func = match value.value_type.as_ref() {
                 Some(ValueType::FunctionValue(f)) => f,
                 _ => {
@@ -155,7 +162,7 @@ pub(super) fn execute(
                 }
             };
 
-            result_fields.insert(alias.clone(), result_val);
+            path.set_value(&mut result_fields, result_val);
         }
 
         aggregated_docs.push(Document {
@@ -179,4 +186,107 @@ fn collect_numeric_values(expr: &Value, docs: &[Document]) -> Result<Vec<Value>>
         }
     }
     Ok(values)
+}
+
+#[cfg(test)]
+mod tests {
+    use googleapis::google::firestore::v1::Function;
+
+    use super::*;
+
+    fn field_ref(path: &str) -> Value {
+        Value {
+            value_type: Some(ValueType::FieldReferenceValue(path.to_string())),
+        }
+    }
+
+    fn fn_val(name: &str, args: Vec<Value>) -> Value {
+        Value {
+            value_type: Some(ValueType::FunctionValue(Function {
+                name: name.to_string(),
+                args,
+                options: HashMap::new(),
+            })),
+        }
+    }
+
+    #[test]
+    fn aggregate_parses_field_path_aliases_and_rejects_reserved_or_conflicting_paths() {
+        let docs = vec![Document {
+            name: "projects/p/databases/(default)/documents/c/d1".to_string(),
+            fields: HashMap::from([
+                ("g".to_string(), Value::string("k")),
+                ("n".to_string(), Value::integer(5)),
+            ]),
+            create_time: None,
+            update_time: None,
+        }];
+
+        let out = execute(
+            Stage {
+                name:    "aggregate".to_string(),
+                args:    vec![
+                    Value::map(HashMap::from([
+                        ("`a.b`".to_string(), fn_val("count", vec![])),
+                        ("stats.sum".to_string(), fn_val("sum", vec![field_ref("n")])),
+                    ])),
+                    Value::map(HashMap::from([("grp.key".to_string(), field_ref("g"))])),
+                ],
+                options: HashMap::new(),
+            },
+            docs.clone(),
+        )
+        .unwrap();
+
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].fields.get("a.b"), Some(&Value::integer(1)));
+        assert_eq!(
+            out[0]
+                .fields
+                .get("stats")
+                .and_then(Value::as_map)
+                .and_then(|m| m.get("sum")),
+            Some(&Value::integer(5))
+        );
+        assert_eq!(
+            out[0]
+                .fields
+                .get("grp")
+                .and_then(Value::as_map)
+                .and_then(|m| m.get("key")),
+            Some(&Value::string("k"))
+        );
+
+        let reserved = execute(
+            Stage {
+                name:    "aggregate".to_string(),
+                args:    vec![Value::map(HashMap::from([(
+                    "__reserved__".to_string(),
+                    fn_val("count", vec![]),
+                )]))],
+                options: HashMap::new(),
+            },
+            docs.clone(),
+        );
+        assert!(matches!(
+            reserved,
+            Err(GenericDatabaseError::InvalidArgument(_))
+        ));
+
+        let conflicting = execute(
+            Stage {
+                name:    "aggregate".to_string(),
+                args:    vec![
+                    Value::map(HashMap::from([("a".to_string(), fn_val("count", vec![]))])),
+                    Value::map(HashMap::from([("a.b".to_string(), field_ref("g"))])),
+                ],
+                options: HashMap::new(),
+            },
+            docs,
+        );
+        assert!(matches!(
+            conflicting,
+            Err(GenericDatabaseError::InvalidArgument(_))
+        ));
+    }
 }

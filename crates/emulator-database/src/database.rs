@@ -619,19 +619,17 @@ impl FirestoreDatabase {
         writes: Vec<Write>,
         transaction: TransactionId,
     ) -> Result<(Timestamp, Vec<WriteResult>)> {
-        // Consume the transaction up front so concurrent commit/rollback calls cannot race and
-        // failed or cancelled commits immediately release any held read locks and free the ID.
-        let txn = self.transactions.remove(transaction).await?;
-        let rw_txn = txn.as_read_write();
+        // Reserve the transaction up front so concurrent commit/rollback/retry calls cannot race,
+        // while preserving read-only transactions when writes are rejected. Dropping `commit_guard`
+        // on completion, error, or cancellation releases held read locks before freeing the ID.
+        let commit_guard = self
+            .transactions
+            .begin_commit(transaction, !writes.is_empty())?;
+        let rw_txn = commit_guard.as_read_write();
 
         let mut target_docs = BTreeSet::new();
         for write in &writes {
             let name = get_doc_name_from_write(write)?;
-            if rw_txn.is_none() {
-                return Err(GenericDatabaseError::invalid_argument(
-                    "Cannot modify entities in a read-only transaction",
-                ));
-            }
             self.ensure_owns_doc(&name)?;
             validation::validate_write(write)?;
             target_docs.insert(name);
@@ -691,6 +689,7 @@ impl FirestoreDatabase {
         }
         drop(write_guard_cache);
         drop(_optimistic_guard);
+        drop(commit_guard);
 
         self.send_event(DatabaseEvent {
             database: Arc::downgrade(self),
@@ -815,9 +814,13 @@ impl FirestoreDatabase {
         Ok(id)
     }
 
-    pub async fn rollback(&self, transaction: TransactionId) -> Result<()> {
-        self.transactions.remove(transaction).await?;
+    pub fn rollback_sync(&self, transaction: TransactionId) -> Result<()> {
+        self.transactions.remove_sync(transaction)?;
         Ok(())
+    }
+
+    pub async fn rollback(&self, transaction: TransactionId) -> Result<()> {
+        self.rollback_sync(transaction)
     }
 
     pub fn send_event(&self, event: DatabaseEvent) {
@@ -888,6 +891,27 @@ impl FirestoreDatabase {
             != optimistic_concurrency
             && events.is_some()
         {
+            self.project
+                .send_project_event(ProjectEvent::DatabaseConfigChanged {
+                    database: self.name.clone(),
+                });
+        }
+    }
+
+    pub fn set_config(&self, enterprise_edition: bool, optimistic_concurrency: bool) {
+        let events = self
+            .events
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let enterprise_changed = self
+            .enterprise_edition
+            .swap(enterprise_edition, atomic::Ordering::Relaxed)
+            != enterprise_edition;
+        let optimistic_changed = self
+            .optimistic_concurrency
+            .swap(optimistic_concurrency, atomic::Ordering::Relaxed)
+            != optimistic_concurrency;
+        if (enterprise_changed || optimistic_changed) && events.is_some() {
             self.project
                 .send_project_event(ProjectEvent::DatabaseConfigChanged {
                     database: self.name.clone(),
@@ -978,6 +1002,14 @@ impl<'a> StagedDocument<'a> {
             commit_time,
         )?;
         if let Some(version) = version {
+            if let (Some(orig), Some(staged)) =
+                (self.guard.current_version(), version.stored_document())
+                && orig.create_time == staged.create_time
+                && Value::fields_storage_eq(&orig.fields, &staged.fields)
+            {
+                self.pending = None;
+                return Ok(orig.update_time);
+            }
             self.pending = Some(version);
         }
         Ok(update_time)
@@ -1208,5 +1240,180 @@ mod tests {
 
         h1.await.unwrap().expect("commit 1 should not deadlock");
         h2.await.unwrap().expect("commit 2 should not deadlock");
+    }
+
+    #[tokio::test]
+    async fn inflight_commit_rejects_concurrent_retry_transaction_with_same_id() {
+        let project: &'static FirestoreProject =
+            Box::leak(Box::new(FirestoreProject::new(FirestoreConfig::default())));
+        let root: RootRef = "projects/p/databases/(default)".parse().unwrap();
+        let db = project.database(&root).await;
+
+        let doc_a: DocumentRef = "projects/p/databases/(default)/documents/c/a"
+            .parse()
+            .unwrap();
+        db.update_doc(
+            &doc_a,
+            HashMap::from([("v".to_string(), Value::integer(0))]),
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let rw_opts = TransactionOptions {
+            mode: Some(transaction_options::Mode::ReadWrite(
+                transaction_options::ReadWrite::default(),
+            )),
+        };
+        let blocker_txn = db.new_txn(rw_opts.clone()).await.unwrap();
+        drop(
+            db.get_doc(&doc_a, ReadConsistency::Transaction(blocker_txn))
+                .await
+                .unwrap(),
+        );
+
+        let make_write = |doc: &DocumentRef, v: i64| Write {
+            operation: Some(write::Operation::Update(Document {
+                name: doc.to_string(),
+                fields: HashMap::from([("v".to_string(), Value::integer(v))]),
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+
+        let t1_id = db.new_txn(rw_opts).await.unwrap();
+        let mut commit_fut = Box::pin(db.commit(vec![make_write(&doc_a, 1)], t1_id));
+        assert!(futures::poll!(&mut commit_fut).is_pending());
+
+        let retry_res = db
+            .new_txn(TransactionOptions {
+                mode: Some(transaction_options::Mode::ReadWrite(
+                    transaction_options::ReadWrite {
+                        retry_transaction: Vec::from(t1_id),
+                    },
+                )),
+            })
+            .await;
+
+        db.rollback(blocker_txn).await.unwrap();
+        commit_fut.await.unwrap();
+
+        assert!(
+            matches!(retry_res, Err(GenericDatabaseError::FailedPrecondition(_))),
+            "in-flight commit must still reserve TransactionId against retry_transaction, got \
+             {retry_res:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn commit_writes_on_read_only_transaction_preserves_read_only_transaction() {
+        let project: &'static FirestoreProject =
+            Box::leak(Box::new(FirestoreProject::new(FirestoreConfig::default())));
+        let root: RootRef = "projects/p/databases/(default)".parse().unwrap();
+        let db = project.database(&root).await;
+
+        let doc_a: DocumentRef = "projects/p/databases/(default)/documents/c/a"
+            .parse()
+            .unwrap();
+        db.update_doc(
+            &doc_a,
+            HashMap::from([("v".to_string(), Value::integer(1))]),
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let ro_id = db
+            .new_txn(TransactionOptions {
+                mode: Some(transaction_options::Mode::ReadOnly(
+                    transaction_options::ReadOnly::default(),
+                )),
+            })
+            .await
+            .unwrap();
+
+        let write = Write {
+            operation: Some(write::Operation::Update(Document {
+                name: doc_a.to_string(),
+                fields: HashMap::from([("v".to_string(), Value::integer(2))]),
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+        let err = db.commit(vec![write], ro_id).await.unwrap_err();
+        assert!(matches!(err, GenericDatabaseError::InvalidArgument(_)));
+
+        assert!(
+            db.get_doc(&doc_a, ReadConsistency::Transaction(ro_id))
+                .await
+                .is_ok(),
+            "read-only transaction must remain readable after rejected write commit"
+        );
+        assert!(
+            db.rollback(ro_id).await.is_ok(),
+            "read-only transaction must still be rollback-able after rejected write commit"
+        );
+    }
+
+    #[tokio::test]
+    async fn multi_write_commit_cancelling_back_to_original_fields_is_noop() {
+        let project: &'static FirestoreProject =
+            Box::leak(Box::new(FirestoreProject::new(FirestoreConfig::default())));
+        let root: RootRef = "projects/p/databases/(default)".parse().unwrap();
+        let db = project.database(&root).await;
+
+        let col: CollectionRef = "projects/p/databases/(default)/documents/c"
+            .parse()
+            .unwrap();
+        let created = db
+            .create_doc(
+                &col,
+                "d1",
+                HashMap::from([("v".to_string(), Value::integer(1))]),
+                None,
+            )
+            .await
+            .unwrap();
+        let t0 = created.update_time.unwrap();
+
+        let d1: DocumentRef = "projects/p/databases/(default)/documents/c/d1"
+            .parse()
+            .unwrap();
+        let mut rx = db.subscribe();
+
+        let rw_opts = TransactionOptions {
+            mode: Some(transaction_options::Mode::ReadWrite(
+                transaction_options::ReadWrite::default(),
+            )),
+        };
+        let t_id = db.new_txn(rw_opts).await.unwrap();
+        let make_write = |v: i64| Write {
+            operation: Some(write::Operation::Update(Document {
+                name: d1.to_string(),
+                fields: HashMap::from([("v".to_string(), Value::integer(v))]),
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+        db.commit(vec![make_write(2), make_write(1)], t_id)
+            .await
+            .unwrap();
+
+        let after = db
+            .get_doc(&d1, ReadConsistency::Default)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(after.update_time, t0);
+        if let Ok(ev) = rx.try_recv() {
+            assert!(
+                !ev.updates.contains_key(&d1),
+                "noop multi-write commit must not emit update event for {d1}"
+            );
+        }
     }
 }

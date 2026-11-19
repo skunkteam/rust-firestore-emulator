@@ -4,7 +4,10 @@
 use std::{
     mem,
     pin::Pin,
-    sync::{Arc, Mutex, PoisonError},
+    sync::{
+        Arc, Mutex, PoisonError,
+        atomic::{AtomicBool, Ordering},
+    },
     task::{Context, Poll},
 };
 
@@ -37,11 +40,11 @@ mod utils;
 const MAX_MESSAGE_SIZE: usize = 50 * 1024 * 1024;
 const MAX_PIPELINE_RESPONSE_BYTES: usize = 1024 * 1024;
 
-async fn rollback_new_txn(database: &FirestoreDatabase, new_txn_bytes: &[u8]) {
+fn rollback_new_txn_sync(database: &FirestoreDatabase, new_txn_bytes: &[u8]) {
     if !new_txn_bytes.is_empty()
         && let Ok(id) = new_txn_bytes.to_vec().try_into()
     {
-        drop(database.rollback(id).await);
+        drop(database.rollback_sync(id));
     }
 }
 
@@ -62,23 +65,15 @@ impl NewTxnGuard {
         mem::take(&mut self.txn_bytes)
     }
 
-    async fn rollback(&mut self) {
+    fn rollback(&mut self) {
         let txn_bytes = mem::take(&mut self.txn_bytes);
-        rollback_new_txn(&self.database, &txn_bytes).await;
+        rollback_new_txn_sync(&self.database, &txn_bytes);
     }
 }
 
 impl Drop for NewTxnGuard {
     fn drop(&mut self) {
-        let txn_bytes = mem::take(&mut self.txn_bytes);
-        if !txn_bytes.is_empty()
-            && let Ok(handle) = tokio::runtime::Handle::try_current()
-        {
-            let database = Arc::clone(&self.database);
-            handle.spawn(async move {
-                rollback_new_txn(&database, &txn_bytes).await;
-            });
-        }
+        self.rollback();
     }
 }
 
@@ -87,8 +82,9 @@ fn take_guard(guard: &Mutex<Option<NewTxnGuard>>) -> Option<NewTxnGuard> {
 }
 
 struct BatchGetStream {
-    inner: ReceiverStream<Result<BatchGetDocumentsResponse>>,
-    guard: Arc<Mutex<Option<NewTxnGuard>>>,
+    inner:     ReceiverStream<Result<BatchGetDocumentsResponse>>,
+    guard:     Arc<Mutex<Option<NewTxnGuard>>>,
+    completed: Arc<AtomicBool>,
 }
 
 impl tokio_stream::Stream for BatchGetStream {
@@ -96,7 +92,8 @@ impl tokio_stream::Stream for BatchGetStream {
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let poll = Pin::new(&mut self.inner).poll_next(cx);
-        if let Poll::Ready(Some(Ok(_))) = &poll
+        if matches!(poll, Poll::Ready(None))
+            && self.completed.load(Ordering::Acquire)
             && let Some(mut guard) = take_guard(&self.guard)
         {
             drop(guard.take_bytes());
@@ -344,23 +341,46 @@ impl Firestore for FirestoreEmulator {
                 Ok(read_time) => read_time,
                 Err(err) => {
                     if let Some(mut guard) = take_guard(&shared_guard) {
-                        guard.rollback().await;
+                        guard.rollback();
                     }
                     return Err(err.into());
                 }
             };
 
             let worker_guard = Arc::clone(&shared_guard);
+            let completed = Arc::new(AtomicBool::new(false));
+            let worker_completed = Arc::clone(&completed);
             let (tx, rx) = mpsc::channel(16);
             tokio::spawn(
                 async move {
-                    let mut new_transaction = new_txn_bytes.clone();
-                    let mut any_queued = false;
+                    let mut new_transaction = new_txn_bytes;
+                    if documents.is_empty() {
+                        if !new_transaction.is_empty() {
+                            let msg = Ok(BatchGetDocumentsResponse {
+                                result:      None,
+                                read_time:   Some(read_time),
+                                transaction: mem::take(&mut new_transaction),
+                            });
+                            if tx.send(msg).await.is_err() {
+                                if let Some(mut guard) = take_guard(&worker_guard) {
+                                    guard.rollback();
+                                }
+                                return;
+                            }
+                        }
+                        worker_completed.store(true, Ordering::Release);
+                        return;
+                    }
                     for name in documents {
                         use batch_get_documents_response::Result::*;
                         let doc_result = tokio::select! {
                             biased;
-                            _ = tx.closed() => break,
+                            _ = tx.closed() => {
+                                if let Some(mut guard) = take_guard(&worker_guard) {
+                                    guard.rollback();
+                                }
+                                return;
+                            }
                             res = database.get_doc(&name, read_consistency) => res,
                         };
                         let msg = match doc_result {
@@ -374,30 +394,27 @@ impl Firestore for FirestoreEmulator {
                             }),
                             Err(err) => {
                                 if let Some(mut guard) = take_guard(&worker_guard) {
-                                    drop(guard.take_bytes());
+                                    guard.rollback();
                                 }
-                                rollback_new_txn(&database, &new_txn_bytes).await;
                                 drop(tx.send(Err(Status::from(err))).await);
                                 return;
                             }
                         };
                         if tx.send(msg).await.is_err() {
-                            break;
+                            if let Some(mut guard) = take_guard(&worker_guard) {
+                                guard.rollback();
+                            }
+                            return;
                         }
-                        any_queued = true;
                     }
-                    if !any_queued {
-                        if let Some(mut guard) = take_guard(&worker_guard) {
-                            drop(guard.take_bytes());
-                        }
-                        rollback_new_txn(&database, &new_txn_bytes).await;
-                    }
+                    worker_completed.store(true, Ordering::Release);
                 }
                 .instrument(debug_span!("worker")),
             );
             Ok(BatchGetStream {
                 inner: ReceiverStream::new(rx),
                 guard: shared_guard,
+                completed,
             })
         })
         .await
@@ -446,7 +463,7 @@ impl Firestore for FirestoreEmulator {
                 res
             }
             Err(err) => {
-                new_txn_guard.rollback().await;
+                new_txn_guard.rollback();
                 return Err(err.into());
             }
         };
@@ -667,7 +684,7 @@ impl Firestore for FirestoreEmulator {
             {
                 Ok(res) => res,
                 Err(err) => {
-                    new_txn_guard.rollback().await;
+                    new_txn_guard.rollback();
                     return Err(err.into());
                 }
             };
@@ -741,7 +758,7 @@ impl Firestore for FirestoreEmulator {
             {
                 Ok(res) => res,
                 Err(err) => {
-                    new_txn_guard.rollback().await;
+                    new_txn_guard.rollback();
                     return Err(err.into());
                 }
             };
@@ -819,7 +836,7 @@ impl Firestore for FirestoreEmulator {
             {
                 Ok(res) => res,
                 Err(err) => {
-                    new_txn_guard.rollback().await;
+                    new_txn_guard.rollback();
                     return Err(err.into());
                 }
             };
@@ -1104,20 +1121,43 @@ mod tests {
         let err = bad_stream.next().await.unwrap().unwrap_err();
         assert_eq!(err.code(), Code::InvalidArgument);
 
-        // NewTransaction with empty documents ends cleanly with zero items.
-        let mut new_txn_stream = emu
+        // Unpolled NewTransaction stream with empty documents cleans up the transaction on drop.
+        let db = project.database(&DB_ROOT.parse().unwrap()).await;
+        let t1 = db.new_txn(rw_opts()).await.unwrap();
+        let t1_bytes = Vec::from(t1);
+        db.rollback(t1).await.unwrap();
+
+        let new_txn_stream = emu
             .batch_get_documents(Request::new(BatchGetDocumentsRequest {
                 database: DB_ROOT.to_string(),
                 documents: Vec::new(),
                 mask: None,
                 consistency_selector: Some(
-                    batch_get_documents_request::ConsistencySelector::NewTransaction(rw_opts()),
+                    batch_get_documents_request::ConsistencySelector::NewTransaction(
+                        TransactionOptions {
+                            mode: Some(transaction_options::Mode::ReadWrite(ReadWrite {
+                                retry_transaction: t1_bytes.clone(),
+                            })),
+                        },
+                    ),
                 ),
             }))
             .await
             .unwrap()
             .into_inner();
-        assert!(new_txn_stream.next().await.is_none());
+        drop(new_txn_stream);
+
+        let retry = db
+            .new_txn(TransactionOptions {
+                mode: Some(transaction_options::Mode::ReadWrite(ReadWrite {
+                    retry_transaction: t1_bytes,
+                })),
+            })
+            .await;
+        assert!(
+            retry.is_ok(),
+            "unpolled empty-docs NewTransaction must roll back on drop"
+        );
     }
 
     #[tokio::test]
@@ -1514,5 +1554,212 @@ mod tests {
             .expect("unpolled dropped streams must rollback NewTransaction locks")
             .unwrap();
         }
+    }
+
+    #[tokio::test]
+    async fn batch_get_documents_mid_stream_drop_after_first_item_rolls_back_new_transaction() {
+        let project = leaked_project(false);
+        let db = project.database(&DB_ROOT.parse().unwrap()).await;
+        let emu = FirestoreEmulator { project };
+
+        let mut doc_names = Vec::new();
+        for i in 0..20 {
+            let name = format!("{DOCS_ROOT}/c/d{i:02}");
+            let doc_ref = name.parse().unwrap();
+            db.update_doc(&doc_ref, fields!({ "v": i as i64 }), None, None, None)
+                .await
+                .unwrap();
+            doc_names.push(name);
+        }
+
+        let mut stream = emu
+            .batch_get_documents(Request::new(BatchGetDocumentsRequest {
+                database: DB_ROOT.to_string(),
+                documents: doc_names,
+                mask: None,
+                consistency_selector: Some(
+                    batch_get_documents_request::ConsistencySelector::NewTransaction(rw_opts()),
+                ),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+
+        let first = stream
+            .next()
+            .await
+            .expect("expected first BatchGetDocumentsResponse")
+            .unwrap();
+        let txn_bytes = first.transaction;
+        assert!(!txn_bytes.is_empty());
+
+        drop(stream);
+        tokio::task::yield_now().await;
+
+        let retry = db
+            .new_txn(TransactionOptions {
+                mode: Some(transaction_options::Mode::ReadWrite(ReadWrite {
+                    retry_transaction: txn_bytes,
+                })),
+            })
+            .await;
+        assert!(
+            retry.is_ok(),
+            "mid-stream cancelled BatchGetDocuments must roll back NewTransaction, got {retry:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelled_new_transaction_allows_immediate_retry_without_yielding() {
+        let project = leaked_project(false);
+        let db = project.database(&DB_ROOT.parse().unwrap()).await;
+        let emu = FirestoreEmulator { project };
+
+        let d1 = format!("{DOCS_ROOT}/c/d1").parse().unwrap();
+        db.update_doc(&d1, fields!({ "v": 1i64 }), None, None, None)
+            .await
+            .unwrap();
+
+        let t1 = db.new_txn(rw_opts()).await.unwrap();
+        let t1_bytes = Vec::from(t1);
+        db.rollback(t1).await.unwrap();
+
+        let rq_stream = emu
+            .run_query(Request::new(RunQueryRequest {
+                parent: DOCS_ROOT.to_string(),
+                explain_options: None,
+                query_type: Some(run_query_request::QueryType::StructuredQuery(
+                    collection_query("c"),
+                )),
+                consistency_selector: Some(run_query_request::ConsistencySelector::NewTransaction(
+                    TransactionOptions {
+                        mode: Some(transaction_options::Mode::ReadWrite(ReadWrite {
+                            retry_transaction: t1_bytes.clone(),
+                        })),
+                    },
+                )),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        drop(rq_stream);
+
+        let retry = db
+            .new_txn(TransactionOptions {
+                mode: Some(transaction_options::Mode::ReadWrite(ReadWrite {
+                    retry_transaction: t1_bytes,
+                })),
+            })
+            .await;
+        assert!(
+            retry.is_ok(),
+            "dropping unpolled NewTransaction stream must synchronously free retry_transaction \
+             ID, got {retry:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn batch_get_documents_double_rollback_does_not_destroy_subsequent_retry_transaction() {
+        let project = leaked_project(false);
+        let db = project.database(&DB_ROOT.parse().unwrap()).await;
+        let emu = FirestoreEmulator { project };
+
+        let d1 = format!("{DOCS_ROOT}/c/d1").parse().unwrap();
+        db.update_doc(&d1, fields!({ "v": 1i64 }), None, None, None)
+            .await
+            .unwrap();
+
+        let t1 = db.new_txn(rw_opts()).await.unwrap();
+        let t1_bytes = Vec::from(t1);
+        db.rollback(t1).await.unwrap();
+
+        let stream = emu
+            .batch_get_documents(Request::new(BatchGetDocumentsRequest {
+                database: DB_ROOT.to_string(),
+                documents: vec![format!("{DOCS_ROOT}/c/d1")],
+                mask: None,
+                consistency_selector: Some(
+                    batch_get_documents_request::ConsistencySelector::NewTransaction(
+                        TransactionOptions {
+                            mode: Some(transaction_options::Mode::ReadWrite(ReadWrite {
+                                retry_transaction: t1_bytes.clone(),
+                            })),
+                        },
+                    ),
+                ),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+
+        let retry_handle = tokio::spawn({
+            let db = Arc::clone(&db);
+            let retry_bytes = t1_bytes.clone();
+            async move {
+                db.new_txn(TransactionOptions {
+                    mode: Some(transaction_options::Mode::ReadWrite(ReadWrite {
+                        retry_transaction: retry_bytes,
+                    })),
+                })
+                .await
+            }
+        });
+
+        drop(stream);
+
+        let retried_id = retry_handle
+            .await
+            .unwrap()
+            .expect("retry_transaction should succeed");
+        tokio::task::yield_now().await;
+
+        let commit_res = db.commit(Vec::new(), retried_id).await;
+        assert!(
+            commit_res.is_ok(),
+            "duplicate rollback from cancelled attempt 1 must not destroy active retry \
+             transaction, got {commit_res:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn batch_get_documents_empty_docs_with_new_transaction_emits_transaction_frame() {
+        let project = leaked_project(false);
+        let emu = FirestoreEmulator { project };
+
+        let mut stream = emu
+            .batch_get_documents(Request::new(BatchGetDocumentsRequest {
+                database: DB_ROOT.to_string(),
+                documents: Vec::new(),
+                mask: None,
+                consistency_selector: Some(
+                    batch_get_documents_request::ConsistencySelector::NewTransaction(rw_opts()),
+                ),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+
+        let frame = stream
+            .next()
+            .await
+            .expect("expected metadata frame carrying new_transaction")
+            .unwrap();
+        assert!(!frame.transaction.is_empty());
+        assert!(frame.result.is_none());
+        assert!(frame.read_time.is_some());
+        assert!(stream.next().await.is_none());
+
+        let commit_res = emu
+            .commit(Request::new(CommitRequest {
+                database:    DB_ROOT.to_string(),
+                writes:      Vec::new(),
+                transaction: frame.transaction,
+            }))
+            .await;
+        assert!(
+            commit_res.is_ok(),
+            "empty BatchGetDocuments NewTransaction must remain usable for Commit, got \
+             {commit_res:?}"
+        );
     }
 }

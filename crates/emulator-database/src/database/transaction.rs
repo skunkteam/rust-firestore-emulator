@@ -1,14 +1,15 @@
 use std::{
     collections::{BTreeMap, HashMap, HashSet, hash_map::Entry},
     fmt::Display,
+    mem,
     sync::{
-        Arc, LazyLock, Weak,
+        Arc, LazyLock, PoisonError, RwLock, Weak,
         atomic::{self, AtomicUsize},
     },
 };
 
 use googleapis::google::protobuf::Timestamp;
-use tokio::sync::{Mutex, MutexGuard, RwLock};
+use tokio::sync::{Mutex, MutexGuard};
 
 use super::{
     FirestoreDatabase,
@@ -24,9 +25,15 @@ use crate::{
 };
 
 #[derive(Debug)]
+enum TransactionSlot {
+    Active(Arc<Transaction>),
+    Committing,
+}
+
+#[derive(Debug)]
 pub(crate) struct RunningTransactions {
     database: Weak<FirestoreDatabase>,
-    txns:     RwLock<HashMap<TransactionId, Arc<Transaction>>>,
+    txns:     Arc<RwLock<HashMap<TransactionId, TransactionSlot>>>,
 }
 
 impl RunningTransactions {
@@ -38,9 +45,17 @@ impl RunningTransactions {
     }
 
     pub(crate) async fn get(&self, id: TransactionId) -> Result<Arc<Transaction>> {
-        self.txns.read().await.get(&id).cloned().ok_or_else(|| {
-            GenericDatabaseError::invalid_argument(format!("invalid transaction ID: {}", id.0))
-        })
+        match self
+            .txns
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(&id)
+        {
+            Some(TransactionSlot::Active(txn)) => Ok(Arc::clone(txn)),
+            Some(TransactionSlot::Committing) | None => Err(
+                GenericDatabaseError::invalid_argument(format!("invalid transaction ID: {}", id.0)),
+            ),
+        }
     }
 
     pub(crate) async fn start_read_write(&self, optimistic_concurrency: bool) -> TransactionId {
@@ -50,7 +65,10 @@ impl RunningTransactions {
             Weak::clone(&self.database),
             optimistic_concurrency,
         )));
-        self.txns.write().await.insert(id, txn);
+        self.txns
+            .write()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(id, TransactionSlot::Active(txn));
         id
     }
 
@@ -68,7 +86,10 @@ impl RunningTransactions {
             Weak::clone(&self.database),
             read_time,
         )));
-        self.txns.write().await.insert(id, txn);
+        self.txns
+            .write()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(id, TransactionSlot::Active(txn));
         Ok(id)
     }
 
@@ -78,7 +99,12 @@ impl RunningTransactions {
         optimistic_concurrency: bool,
     ) -> Result<()> {
         id.check()?;
-        match self.txns.write().await.entry(id) {
+        match self
+            .txns
+            .write()
+            .unwrap_or_else(PoisonError::into_inner)
+            .entry(id)
+        {
             Entry::Occupied(_) => Err(GenericDatabaseError::failed_precondition(
                 "transaction_id already/still in use",
             )),
@@ -88,16 +114,88 @@ impl RunningTransactions {
                     Weak::clone(&self.database),
                     optimistic_concurrency,
                 )));
-                e.insert(txn);
+                e.insert(TransactionSlot::Active(txn));
                 Ok(())
             }
         }
     }
 
-    pub(crate) async fn remove(&self, id: TransactionId) -> Result<Arc<Transaction>> {
-        self.txns.write().await.remove(&id).ok_or_else(|| {
-            GenericDatabaseError::invalid_argument(format!("invalid transaction ID: {}", id.0))
-        })
+    pub(crate) fn begin_commit(&self, id: TransactionId, has_writes: bool) -> Result<CommitGuard> {
+        let mut txns = self.txns.write().unwrap_or_else(PoisonError::into_inner);
+        match txns.entry(id) {
+            Entry::Occupied(mut entry) => match entry.get() {
+                TransactionSlot::Active(txn) => {
+                    if has_writes && txn.as_read_write().is_none() {
+                        return Err(GenericDatabaseError::invalid_argument(
+                            "Cannot modify entities in a read-only transaction",
+                        ));
+                    }
+                    let TransactionSlot::Active(txn) =
+                        mem::replace(entry.get_mut(), TransactionSlot::Committing)
+                    else {
+                        unreachable!();
+                    };
+                    Ok(CommitGuard {
+                        txn,
+                        _reservation: CommitReservation {
+                            txns: Arc::clone(&self.txns),
+                            id,
+                        },
+                    })
+                }
+                TransactionSlot::Committing => Err(GenericDatabaseError::invalid_argument(
+                    format!("invalid transaction ID: {}", id.0),
+                )),
+            },
+            Entry::Vacant(_) => Err(GenericDatabaseError::invalid_argument(format!(
+                "invalid transaction ID: {}",
+                id.0
+            ))),
+        }
+    }
+
+    pub(crate) fn remove_sync(&self, id: TransactionId) -> Result<Arc<Transaction>> {
+        let mut txns = self.txns.write().unwrap_or_else(PoisonError::into_inner);
+        match txns.entry(id) {
+            Entry::Occupied(entry) if matches!(entry.get(), TransactionSlot::Active(_)) => {
+                let TransactionSlot::Active(txn) = entry.remove() else {
+                    unreachable!();
+                };
+                Ok(txn)
+            }
+            Entry::Occupied(_) | Entry::Vacant(_) => Err(GenericDatabaseError::invalid_argument(
+                format!("invalid transaction ID: {}", id.0),
+            )),
+        }
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct CommitGuard {
+    // Field order is load-bearing: `txn` drops first (releasing any held read locks) before
+    // `_reservation` drops and frees the `TransactionId` for `retry_transaction`.
+    txn: Arc<Transaction>,
+    _reservation: CommitReservation,
+}
+
+impl CommitGuard {
+    pub(crate) fn as_read_write(&self) -> Option<&ReadWriteTransaction> {
+        self.txn.as_read_write()
+    }
+}
+
+#[derive(Debug)]
+struct CommitReservation {
+    txns: Arc<RwLock<HashMap<TransactionId, TransactionSlot>>>,
+    id:   TransactionId,
+}
+
+impl Drop for CommitReservation {
+    fn drop(&mut self) {
+        let mut txns = self.txns.write().unwrap_or_else(PoisonError::into_inner);
+        if matches!(txns.get(&self.id), Some(TransactionSlot::Committing)) {
+            txns.remove(&self.id);
+        }
     }
 }
 

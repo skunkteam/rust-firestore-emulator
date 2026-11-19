@@ -62,6 +62,21 @@ pub(crate) fn validate_writable_value(value: &Value, in_array: bool) -> Result<(
             )),
             VectorClassification::NotVectorMap => validate_writable_fields(&map.fields),
         },
+        Some(ValueType::GeoPointValue(geo)) => {
+            if !geo.latitude.is_finite() || !(-90.0..=90.0).contains(&geo.latitude) {
+                return Err(GenericDatabaseError::invalid_argument(format!(
+                    "latitude must be in the range [-90, 90], got {}",
+                    geo.latitude
+                )));
+            }
+            if !geo.longitude.is_finite() || !(-180.0..=180.0).contains(&geo.longitude) {
+                return Err(GenericDatabaseError::invalid_argument(format!(
+                    "longitude must be in the range [-180, 180], got {}",
+                    geo.longitude
+                )));
+            }
+            Ok(())
+        }
         Some(
             ValueType::NullValue(_)
             | ValueType::BooleanValue(_)
@@ -70,8 +85,7 @@ pub(crate) fn validate_writable_value(value: &Value, in_array: bool) -> Result<(
             | ValueType::TimestampValue(_)
             | ValueType::StringValue(_)
             | ValueType::BytesValue(_)
-            | ValueType::ReferenceValue(_)
-            | ValueType::GeoPointValue(_),
+            | ValueType::ReferenceValue(_),
         ) => Ok(()),
     }
 }
@@ -524,5 +538,31 @@ mod tests {
             }),
             ok(())
         );
+    }
+
+    #[gtest]
+    fn rejects_out_of_range_or_non_finite_geopoint_values() {
+        use googleapis::google::r#type::LatLng;
+
+        for (latitude, longitude) in [
+            (90.0001, 0.0),
+            (-90.0001, 0.0),
+            (0.0, 180.0001),
+            (0.0, -180.0001),
+            (f64::NAN, 0.0),
+            (0.0, f64::INFINITY),
+        ] {
+            let fields = HashMap::from([(
+                "loc".to_string(),
+                Value::from(LatLng {
+                    latitude,
+                    longitude,
+                }),
+            )]);
+            assert_that!(
+                validate_writable_fields(&fields),
+                err(matches_pattern!(GenericDatabaseError::InvalidArgument(_)))
+            );
+        }
     }
 }

@@ -1,7 +1,8 @@
 #![allow(unused_crate_dependencies)]
 
 use std::{
-    io::Write,
+    fs,
+    io::{BufRead, BufReader, Write},
     path::Path,
     process::{Command, Stdio},
 };
@@ -980,8 +981,8 @@ console.log("bug_web_ui_7 passed");
 #[test]
 fn bug_web_ui_8_miller_column_header_overflow_css() {
     let repo_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-    let css = std::fs::read_to_string(repo_root.join("ui/styles.css"))
-        .expect("failed to read ui/styles.css");
+    let css =
+        fs::read_to_string(repo_root.join("ui/styles.css")).expect("failed to read ui/styles.css");
 
     assert!(
         css.contains(".miller-col") && css.contains("overflow: hidden;"),
@@ -998,4 +999,582 @@ fn bug_web_ui_8_miller_column_header_overflow_css() {
         css.contains(".col-header-actions") && css.contains("flex-shrink: 0;"),
         "expected .col-header-actions to enforce flex-shrink: 0"
     );
+}
+
+#[test]
+fn regression_popstate_same_db_does_not_lock_saving_or_loading_states() {
+    let script = format!(
+        r#"{NODE_BOOTSTRAP}
+const app = await import("./ui/app.js");
+
+const colPath = "projects/p/databases/(default)/documents/orders";
+const parentPath = "projects/p/databases/(default)/documents";
+const docPath = "projects/p/databases/(default)/documents/orders/ord1";
+
+let patchDef = null;
+let colReloadDef = null;
+
+fetchImpl = async (url, init) => {{
+  if (url === "/emulator/v1") {{
+    return jsonResponse(["projects/p/databases/(default)/documents"]);
+  }}
+  if (url === "/v1/projects/p/databases/(default)") {{
+    return jsonResponse({{
+      name: "projects/p/databases/(default)",
+      uid: "u1",
+      type: "FIRESTORE_NATIVE",
+      databaseEdition: "STANDARD",
+      concurrencyMode: "PESSIMISTIC",
+    }});
+  }}
+  if (url === "/v1/projects/p/databases/(default)/documents:listCollectionIds") {{
+    return jsonResponse({{ collectionIds: ["orders"] }});
+  }}
+  if (url.startsWith("/v1/projects/p/databases/(default)/documents/orders?")) {{
+    if (colReloadDef) return colReloadDef.promise;
+    return jsonResponse({{
+      documents: [{{
+        name: docPath,
+        createTime: "2026-01-01T00:00:00Z",
+        updateTime: "2026-01-01T00:00:00Z",
+      }}],
+    }});
+  }}
+  if (url === "/v1/projects/p/databases/(default)/documents/orders/ord1" && (!init.method || init.method === "GET")) {{
+    return jsonResponse({{
+      name: docPath,
+      fields: {{ status: {{ stringValue: "open" }} }},
+      createTime: "2026-01-01T00:00:00Z",
+      updateTime: "2026-01-01T00:00:00Z",
+    }});
+  }}
+  if (url === "/v1/projects/p/databases/(default)/documents/orders/ord1:listCollectionIds") {{
+    return jsonResponse({{ collectionIds: [] }});
+  }}
+  if (url.startsWith("/v1/projects/p/databases/(default)/documents/orders/ord1") && init.method === "PATCH") {{
+    return patchDef.promise;
+  }}
+  throw new Error("unexpected url: " + (init.method ?? "GET") + " " + url);
+}};
+
+globalThis.window.location.pathname = "/projects/p/databases/(default)/documents/orders/ord1";
+await app.init();
+
+const level = app.state.documentLevels.get(docPath);
+const colState = app.state.collectionColumns.get(colPath);
+assert.ok(level?.editorSession);
+assert.ok(colState);
+
+// Mark ord1 dirty and start an in-flight Save + an in-flight collection reload.
+const valInput = findInputHandler(app.renderWorkspace(), "string value");
+assert.ok(valInput);
+valInput({{ target: {{ value: "closed" }} }});
+assert.equal(level.editorSession.isDirty, true);
+
+patchDef = deferred();
+colReloadDef = deferred();
+const savePromise = app.saveDocumentFromInspector(level);
+const colPromise = app.loadCollectionColumn(colPath, parentPath, "orders", false);
+assert.equal(level.editorSession.saving, true);
+assert.equal(colState.loading, true);
+
+// Browser Back/Forward within the SAME database ("p" / "(default)") to root documents view.
+globalThis.window.location.pathname = "/projects/p/databases/(default)/documents";
+for (const fn of popstateListeners) {{
+  fn();
+}}
+await new Promise((r) => setTimeout(r, 0));
+
+// Now settle the in-flight PATCH and collection GET.
+patchDef.resolve(jsonResponse({{
+  name: docPath,
+  fields: {{ status: {{ stringValue: "closed" }} }},
+  createTime: "2026-01-01T00:00:00Z",
+  updateTime: "2026-01-02T00:00:00Z",
+}}));
+colReloadDef.resolve(jsonResponse({{ documents: [] }}));
+await savePromise;
+await colPromise;
+
+assert.equal(
+  level.editorSession.saving,
+  false,
+  "same-DB popstate navigation must not leave cached editorSession.saving permanently stuck true"
+);
+assert.equal(
+  colState.loading,
+  false,
+  "same-DB popstate navigation must not leave cached colState.loading permanently stuck true"
+);
+"#
+    );
+
+    run_node_ui_test(&script);
+}
+
+#[test]
+fn regression_clear_database_modal_does_not_resurrect_cleared_db_on_concurrent_sse() {
+    let script = format!(
+        r#"{NODE_BOOTSTRAP}
+const app = await import("./ui/app.js");
+
+const listDef1 = deferred();
+const listDef2 = deferred();
+let listCalls = 0;
+const fetched = [];
+
+fetchImpl = async (url, init) => {{
+  fetched.push((init.method ?? "GET") + " " + url);
+  if (url === "/emulator/v1/projects/p/databases/(default)/documents" && init.method === "DELETE") {{
+    return jsonResponse({{}});
+  }}
+  if (url === "/emulator/v1") {{
+    listCalls++;
+    return listCalls === 1 ? listDef1.promise : listDef2.promise;
+  }}
+  if (url === "/v1/projects/p/databases/(default)") {{
+    return jsonResponse({{
+      name: "projects/p/databases/(default)",
+      uid: "u-resurrected",
+      type: "FIRESTORE_NATIVE",
+      databaseEdition: "STANDARD",
+      concurrencyMode: "PESSIMISTIC",
+    }});
+  }}
+  if (url === "/v1/projects/p/databases/(default)/documents:listCollectionIds") {{
+    return jsonResponse({{ collectionIds: [] }});
+  }}
+  throw new Error("unexpected url: " + (init.method ?? "GET") + " " + url);
+}};
+
+app.state.activeProjectId = "p";
+app.state.activeDatabaseId = "(default)";
+app.state.databases = [{{
+  projectId: "p",
+  databaseId: "(default)",
+  rootPath: "projects/p/databases/(default)/documents",
+}}];
+app.state.modal = {{
+  kind: "clear_db",
+  projectId: "p",
+  databaseId: "(default)",
+  busy: false,
+  error: null,
+}};
+
+const clearBtn = findClickHandler(app.renderModal(), "Clear Database");
+assert.ok(clearBtn, "expected Clear Database button handler");
+const clearPromise = clearBtn();
+
+// Wait a microtask so DELETE completes and confirmClearDb awaits GET /emulator/v1 (#1).
+await new Promise((r) => setTimeout(r, 0));
+assert.equal(listCalls, 1);
+
+// Concurrent SSE database_cleared arrives and starts GET /emulator/v1 (#2), bumping dbListSeq.
+const ssePromise = app.handleSseBatch([{{
+  type: "database_cleared",
+  database: "projects/p/databases/(default)/documents",
+}}]);
+assert.equal(listCalls, 2);
+
+// Resolve both GET /emulator/v1 calls with [] (no databases remain).
+listDef1.resolve(jsonResponse([]));
+await new Promise((r) => setTimeout(r, 0));
+listDef2.resolve(jsonResponse([]));
+await clearPromise;
+await ssePromise;
+
+assert.equal(
+  fetched.some((entry) => entry.includes(" /v1/projects/p/databases/(default)")),
+  false,
+  "confirmClearDb must not read stale state.databases and resurrect the cleared database: " + JSON.stringify(fetched)
+);
+assert.equal(app.state.activeProjectId, null);
+"#
+    );
+
+    run_node_ui_test(&script);
+}
+
+#[test]
+fn regression_deleted_externally_keep_empty_edits_and_save_recreates_document() {
+    let script = format!(
+        r#"{NODE_BOOTSTRAP}
+const app = await import("./ui/app.js");
+
+const docPath = "projects/p/databases/(default)/documents/users/alice";
+let docExists = true;
+let patchCount = 0;
+
+fetchImpl = async (url, init) => {{
+  if (url === "/v1/projects/p/databases/(default)") {{
+    return jsonResponse({{
+      name: "projects/p/databases/(default)",
+      uid: "u1",
+      type: "FIRESTORE_NATIVE",
+      databaseEdition: "STANDARD",
+      concurrencyMode: "PESSIMISTIC",
+    }});
+  }}
+  if (url === "/v1/projects/p/databases/(default)/documents:listCollectionIds") {{
+    return jsonResponse({{ collectionIds: ["users"] }});
+  }}
+  if (url === "/emulator/v1") {{
+    return jsonResponse(["projects/p/databases/(default)/documents"]);
+  }}
+  if (url.startsWith("/v1/projects/p/databases/(default)/documents/users?")) {{
+    return jsonResponse({{
+      documents: docExists
+        ? [{{ name: docPath, createTime: "2026-01-01T00:00:00Z", updateTime: "2026-01-01T00:00:00Z" }}]
+        : [],
+    }});
+  }}
+  if (url === "/v1/projects/p/databases/(default)/documents/users/alice" && (!init.method || init.method === "GET")) {{
+    return docExists
+      ? jsonResponse({{
+          name: docPath,
+          fields: {{ name: {{ stringValue: "Alice" }} }},
+          createTime: "2026-01-01T00:00:00Z",
+          updateTime: "2026-01-01T00:00:00Z",
+        }})
+      : jsonResponse({{ error: {{ code: 404, status: "NOT_FOUND", message: "not found" }} }}, 404);
+  }}
+  if (url === "/v1/projects/p/databases/(default)/documents/users/alice:listCollectionIds") {{
+    return jsonResponse({{ collectionIds: [] }});
+  }}
+  if (url.startsWith("/v1/projects/p/databases/(default)/documents/users/alice") && init.method === "PATCH") {{
+    patchCount++;
+    docExists = true;
+    return jsonResponse({{
+      name: docPath,
+      fields: {{}},
+      createTime: "2026-01-02T00:00:00Z",
+      updateTime: "2026-01-02T00:00:00Z",
+    }});
+  }}
+  throw new Error("unexpected url: " + (init.method ?? "GET") + " " + url);
+}};
+
+await app.selectDatabase("p", "(default)", ["users", "alice"], true);
+const level = app.state.documentLevels.get(docPath);
+assert.ok(level?.editorSession);
+
+// User deletes the only field so the edited document is an empty `{{}}` document (`isDirty === true`).
+const rawTab = findClickHandler(app.renderWorkspace(), "Raw ProtoJSON");
+assert.ok(rawTab);
+rawTab();
+level.editorSession.rawText = '{{"fields":{{}}}}';
+const structuredTab = findClickHandler(app.renderWorkspace(), "Structured Fields");
+assert.ok(structuredTab);
+structuredTab();
+assert.equal(level.editorSession.nodes.length, 0);
+assert.equal(level.editorSession.isDirty, true);
+
+// Document is deleted externally via SSE.
+docExists = false;
+await app.handleSseBatch([{{
+  type: "documents_changed",
+  database: "projects/p/databases/(default)/documents",
+  paths: [docPath],
+}}]);
+assert.equal(level.exists, false);
+assert.equal(level.editorSession.deletedExternally, true);
+
+// User clicks "Keep my edits" intending to keep and save the empty `{{}}` document.
+const keepBtn = findClickHandler(app.renderWorkspace(), "Keep my edits");
+assert.ok(keepBtn, "expected Keep my edits button");
+keepBtn();
+
+assert.equal(
+  level.editorSession.isDirty,
+  true,
+  "Keep my edits on an externally deleted document with empty fields must stay dirty so the user can recreate it"
+);
+assert.equal(
+  flattenText(app.renderWorkspace()).includes("Non-existent ancestor document"),
+  false,
+  "editor must remain visible instead of collapsing into Non-existent ancestor document card"
+);
+
+await app.saveDocumentFromInspector(level);
+assert.equal(patchCount, 1, "Save Changes must send PATCH to recreate the empty document");
+assert.equal(level.exists, true);
+"#
+    );
+
+    run_node_ui_test(&script);
+}
+
+#[test]
+fn regression_save_document_clears_loading_and_ignores_concurrent_inflight_sse_get() {
+    let script = format!(
+        r#"{NODE_BOOTSTRAP}
+const app = await import("./ui/app.js");
+
+const docPath = "projects/p/databases/(default)/documents/users/alice";
+let getHandler = async () => jsonResponse({{
+  name: docPath,
+  fields: {{ name: {{ stringValue: "Alice-v1" }} }},
+  createTime: "2026-01-01T00:00:00Z",
+  updateTime: "2026-01-01T00:00:00Z",
+}});
+let patchHandler = async () => jsonResponse({{
+  name: docPath,
+  fields: {{ name: {{ stringValue: "Alice-v2" }} }},
+  createTime: "2026-01-01T00:00:00Z",
+  updateTime: "2026-01-02T00:00:00Z",
+}});
+
+fetchImpl = async (url, init) => {{
+  if (url === "/v1/projects/p/databases/(default)") {{
+    return jsonResponse({{
+      name: "projects/p/databases/(default)",
+      uid: "u1",
+      type: "FIRESTORE_NATIVE",
+      databaseEdition: "STANDARD",
+      concurrencyMode: "PESSIMISTIC",
+    }});
+  }}
+  if (url === "/v1/projects/p/databases/(default)/documents:listCollectionIds") {{
+    return jsonResponse({{ collectionIds: ["users"] }});
+  }}
+  if (url === "/emulator/v1") {{
+    return jsonResponse(["projects/p/databases/(default)/documents"]);
+  }}
+  if (url.startsWith("/v1/projects/p/databases/(default)/documents/users?")) {{
+    return jsonResponse({{
+      documents: [{{ name: docPath, createTime: "2026-01-01T00:00:00Z", updateTime: "2026-01-01T00:00:00Z" }}],
+    }});
+  }}
+  if (url === "/v1/projects/p/databases/(default)/documents/users/alice" && (!init.method || init.method === "GET")) {{
+    return getHandler();
+  }}
+  if (url === "/v1/projects/p/databases/(default)/documents/users/alice:listCollectionIds") {{
+    return jsonResponse({{ collectionIds: [] }});
+  }}
+  if (url.startsWith("/v1/projects/p/databases/(default)/documents/users/alice") && init.method === "PATCH") {{
+    return patchHandler();
+  }}
+  throw new Error("unexpected url: " + (init.method ?? "GET") + " " + url);
+}};
+
+await app.selectDatabase("p", "(default)", ["users", "alice"], true);
+const level = app.state.documentLevels.get(docPath);
+assert.ok(level?.editorSession);
+
+// Part A: An SSE loadDocumentLevel starts (`level.loading = true`), then user saves before SSE GET settles.
+const sseDef1 = deferred();
+getHandler = () => sseDef1.promise;
+const sseP1 = app.loadDocumentLevel(docPath, "alice", true);
+assert.equal(level.loading, true);
+
+const input1 = findInputHandler(app.renderWorkspace(), "string value");
+assert.ok(input1);
+input1({{ target: {{ value: "Alice-v2" }} }});
+await app.saveDocumentFromInspector(level);
+
+sseDef1.resolve(jsonResponse({{
+  name: docPath,
+  fields: {{ name: {{ stringValue: "Alice-v1" }} }},
+  createTime: "2026-01-01T00:00:00Z",
+  updateTime: "2026-01-01T00:00:00Z",
+}}));
+await sseP1;
+assert.equal(
+  level.loading,
+  false,
+  "superseded loadDocumentLevel must not leave level.loading stuck true after saveDocumentFromInspector"
+);
+
+// Part B: User starts saveDocumentFromInspector (in-flight PATCH), SSE loadDocumentLevel starts BEFORE PATCH resolves,
+// then PATCH resolves with newer v3, then stale pre-PATCH SSE GET resolves with older v2.
+const patchDef = deferred();
+const sseDef2 = deferred();
+patchHandler = () => patchDef.promise;
+getHandler = () => sseDef2.promise;
+
+const input2 = findInputHandler(app.renderWorkspace(), "string value");
+assert.ok(input2);
+input2({{ target: {{ value: "Alice-v3" }} }});
+const saveP = app.saveDocumentFromInspector(level);
+
+// SSE GET begins while PATCH is still in flight on the wire.
+const sseP2 = app.loadDocumentLevel(docPath, "alice", true);
+
+patchDef.resolve(jsonResponse({{
+  name: docPath,
+  fields: {{ name: {{ stringValue: "Alice-v3" }} }},
+  createTime: "2026-01-01T00:00:00Z",
+  updateTime: "2026-01-03T00:00:00Z",
+}}));
+await saveP;
+assert.equal(level.editorSession.cleanDoc.updateTime, "2026-01-03T00:00:00Z");
+
+sseDef2.resolve(jsonResponse({{
+  name: docPath,
+  fields: {{ name: {{ stringValue: "Alice-v2" }} }},
+  createTime: "2026-01-01T00:00:00Z",
+  updateTime: "2026-01-02T00:00:00Z",
+}}));
+await sseP2;
+
+assert.equal(
+  level.editorSession.cleanDoc.updateTime,
+  "2026-01-03T00:00:00Z",
+  "concurrent SSE GET started while PATCH was in flight must not overwrite newer saved document"
+);
+"#
+    );
+
+    run_node_ui_test(&script);
+}
+
+#[test]
+fn regression_raw_protojson_overflow_float_is_rejected() {
+    let script = format!(
+        r#"{NODE_BOOTSTRAP}
+const values = await import("./ui/values.js");
+
+const res = values.validateRawProtoJsonFields('{{"fields":{{"d":{{"doubleValue":1e500}}}}}}');
+assert.equal(
+  res.valid,
+  false,
+  "JSON numeric literal 1e500 overflows IEEE-754 double to Infinity (which stringifyProtoJson turns into null) and must be rejected unless quoted as \"Infinity\""
+);
+"#
+    );
+
+    run_node_ui_test(&script);
+}
+
+#[test]
+fn regression_test_suite_script_sigterm_exit_code_and_eslint_flat_config_rules() {
+    // Part A: `test-suite/package.json` `test:rust-emulator` must exit non-zero on SIGTERM instead
+    // of swallowing TERM in `trap cleanup EXIT INT TERM`.
+    let repo_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let pkg_text = fs::read_to_string(repo_root.join("test-suite/package.json"))
+        .expect("failed to read test-suite/package.json");
+    let pkg_json: serde_json::Value =
+        serde_json::from_str(&pkg_text).expect("invalid test-suite/package.json");
+    let raw_script = pkg_json["scripts"]["test:rust-emulator"]
+        .as_str()
+        .expect("missing scripts.test:rust-emulator");
+
+    let node_poll_start = raw_script
+        .find("node -e ")
+        .expect("expected readiness poll in test:rust-emulator");
+    let node_poll_end = raw_script[node_poll_start..]
+        .find("|| return 1;")
+        .map(|idx| node_poll_start + idx + "|| return 1;".len())
+        .expect("expected `|| return 1;` at end of readiness poll");
+
+    let mut stubbed_script = String::new();
+    stubbed_script.push_str(&raw_script[..node_poll_start]);
+    stubbed_script.push_str(
+        "echo READY; sleep 2 & WAIT_PID=$!; wait \"$WAIT_PID\"; kill \"$WAIT_PID\" 2>/dev/null || \
+         true;",
+    );
+    stubbed_script.push_str(&raw_script[node_poll_end..]);
+    let stubbed_script = stubbed_script
+        .replace("../target/debug/firestore-emulator", "sleep 30")
+        .replace(
+            "RUST_EMULATOR=true NODE_OPTIONS='--experimental-vm-modules' jest \"$@\"",
+            "true",
+        );
+
+    let mut child = Command::new("/bin/bash")
+        .arg("-c")
+        .arg(&stubbed_script)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("failed to spawn bash for test:rust-emulator signal test");
+
+    let stdout = child.stdout.take().expect("stdout piped");
+    let mut reader = BufReader::new(stdout);
+    let mut line = String::new();
+    reader
+        .read_line(&mut line)
+        .expect("failed reading READY line");
+    assert_eq!(line.trim(), "READY", "unexpected startup output: {line:?}");
+
+    let kill_status = Command::new("kill")
+        .args(["-TERM", &child.id().to_string()])
+        .status()
+        .expect("failed to send SIGTERM via kill");
+    assert!(kill_status.success(), "kill -TERM failed");
+
+    let exit_status = child.wait().expect("failed waiting for bash child");
+    assert!(
+        !exit_status.success(),
+        "test:rust-emulator swallowed SIGTERM and exited with status 0 instead of non-zero"
+    );
+
+    // Part B: `test-suite/eslint.config.cjs` must preserve core `eslint:recommended` rules (e.g.
+    // `no-debugger`, `no-unreachable`, `no-constant-condition`).
+    let eslint_check = r#"
+import assert from "node:assert/strict";
+import Module from "node:module";
+import path from "node:path";
+
+const origLoad = Module._load;
+Module._load = function (request, parent, isMain) {
+  if (request === "@typescript-eslint/eslint-plugin") {
+    return {
+      configs: {
+        "flat/recommended-type-checked": [
+          { name: "typescript-eslint/base" },
+          {
+            name: "typescript-eslint/eslint-recommended",
+            rules: {
+              "no-var": "error",
+              "prefer-const": "error",
+            },
+          },
+          {
+            name: "typescript-eslint/recommended-type-checked",
+            rules: {
+              "@typescript-eslint/no-explicit-any": "error",
+            },
+          },
+        ],
+      },
+    };
+  }
+  if (request === "eslint-config-prettier/flat") {
+    return { name: "eslint-config-prettier", rules: {} };
+  }
+  if (request === "@eslint/js") {
+    return {
+      configs: {
+        recommended: {
+          rules: {
+            "no-debugger": "error",
+            "no-unreachable": "error",
+            "no-constant-condition": "error",
+          },
+        },
+      },
+    };
+  }
+  return origLoad.call(this, request, parent, isMain);
+};
+
+const requireCjs = Module.createRequire(path.resolve("./test-suite/eslint.config.cjs"));
+const flatConfig = requireCjs("./eslint.config.cjs");
+assert.ok(Array.isArray(flatConfig), "eslint.config.cjs must export a flat-config array");
+
+const mergedRules = Object.assign(
+  {},
+  ...flatConfig.filter((entry) => entry && entry.rules).map((entry) => entry.rules)
+);
+for (const coreRule of ["no-debugger", "no-unreachable", "no-constant-condition"]) {
+  assert.equal(
+    mergedRules[coreRule],
+    "error",
+    `eslint.config.cjs dropped eslint:recommended rule "${coreRule}" during flat-config migration`
+  );
+}
+"#;
+    run_node_ui_test(eslint_check);
 }

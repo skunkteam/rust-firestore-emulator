@@ -91,6 +91,10 @@ impl Display for FieldReference {
 pub struct FieldPath(Vec<String>);
 
 impl FieldPath {
+    pub(crate) fn segments(&self) -> &[String] {
+        &self.0
+    }
+
     pub(crate) fn starts_with(&self, prefix: &Self) -> bool {
         self.0.starts_with(&prefix.0)
     }

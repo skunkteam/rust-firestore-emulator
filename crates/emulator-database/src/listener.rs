@@ -27,7 +27,10 @@ use tracing::{Level, debug, instrument, warn};
 
 use crate::{
     FirestoreDatabase, FirestoreProject, GenericDatabaseError,
-    database::{read_consistency::ReadConsistency, reference::Ref},
+    database::{
+        read_consistency::{ReadConsistency, validate_read_time},
+        reference::Ref,
+    },
     document::DocumentVersion,
     error::Result,
     event::DatabaseEvent,
@@ -284,7 +287,7 @@ impl Listener {
                 target::ResumeType::ResumeToken(token) => {
                     Timestamp::from_token(token).map_err(GenericDatabaseError::invalid_argument)
                 }
-                target::ResumeType::ReadTime(time) => Ok(time),
+                target::ResumeType::ReadTime(time) => validate_read_time(time),
             })
             .transpose()?;
 
@@ -845,5 +848,57 @@ mod tests {
         };
         let (_, skipped) = target.process_event(&db, &stale_event).await.unwrap();
         assert!(skipped.is_empty());
+    }
+
+    #[tokio::test]
+    async fn document_listener_rejects_invalid_resume_read_time() {
+        use googleapis::google::protobuf::Timestamp;
+
+        let project = Box::leak(Box::new(FirestoreProject::new(FirestoreConfig::default())));
+        let root: RootRef = "projects/p/databases/(default)".parse().unwrap();
+        let (req_tx, req_rx) = mpsc::channel(4);
+
+        let mut resp_stream = project.listen(ReceiverStream::new(req_rx));
+        req_tx
+            .send(ListenRequest {
+                database: root.to_string(),
+                labels: Default::default(),
+                target_change: Some(listen_request::TargetChange::AddTarget(Target {
+                    target_id: 1,
+                    once: false,
+                    expected_count: None,
+                    target_type: Some(target::TargetType::Documents(DocumentsTarget {
+                        documents: vec![format!("{root}/col/doc1")],
+                    })),
+                    resume_type: Some(target::ResumeType::ReadTime(Timestamp {
+                        seconds: -1,
+                        nanos:   0,
+                    })),
+                })),
+            })
+            .await
+            .unwrap();
+
+        let mut saw_invalid_arg = false;
+        while let Some(frame) = resp_stream.next().await {
+            match frame {
+                Err(crate::GenericDatabaseError::InvalidArgument(_)) => {
+                    saw_invalid_arg = true;
+                    break;
+                }
+                Ok(resp) => {
+                    if let Some(ResponseType::TargetChange(tc)) = resp.response_type
+                        && tc.target_ids.is_empty()
+                    {
+                        break;
+                    }
+                }
+                Err(other) => panic!("unexpected listener error: {other:?}"),
+            }
+        }
+        assert!(
+            saw_invalid_arg,
+            "expected InvalidArgument for negative resume_type ReadTime"
+        );
     }
 }
