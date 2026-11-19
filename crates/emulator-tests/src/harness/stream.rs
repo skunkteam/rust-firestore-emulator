@@ -438,7 +438,7 @@ mod tests {
     async fn abort_on_drop_cancels_collector_task() {
         let (tx, mut rx) = mpsc::channel::<()>(1);
         let handle = tokio::spawn(async move {
-            futures::future::pending::<()>().await;
+            std::future::pending::<()>().await;
             drop(tx);
         });
         let guard = AbortOnDrop(Some(handle));

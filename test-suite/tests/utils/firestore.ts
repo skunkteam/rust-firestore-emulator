@@ -1,7 +1,7 @@
 import { DocumentData, DocumentReference, Firestore, Timestamp, WithFieldValue } from '@google-cloud/firestore';
 import assert from 'assert';
-import ms from 'ms';
 
+const ONE_HOUR_MS = 60 * 60 * 1_000;
 const projectId = 'firestore-test-406503';
 const standard = new Firestore({ projectId });
 const enterprise = new Firestore({ projectId, databaseId: 'enterprise' });
@@ -68,7 +68,7 @@ if (connection === 'RUST EMULATOR') {
 export function writeData<T = Record<string, unknown>>(data: WithFieldValue<T>): T;
 export function writeData(): Record<string, unknown>;
 export function writeData(data: Record<string, unknown> = {}) {
-    const ttl = Timestamp.fromMillis(Date.now() + ms('1h'));
+    const ttl = Timestamp.fromMillis(Date.now() + ONE_HOUR_MS);
     return { ...data, ttl };
 }
 export function readData<T = DocumentData>(data: DocumentData | undefined) {

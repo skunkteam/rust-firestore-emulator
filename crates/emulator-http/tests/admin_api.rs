@@ -3,17 +3,124 @@
 use std::time::Duration;
 
 use axum::{
-    body::{Body, Bytes},
-    http::{HeaderMap, Method, Request, StatusCode},
-    serve::ListenerExt,
+    Router,
+    body::{Body, BodyDataStream, Bytes, to_bytes},
+    http::{HeaderMap, Method, Request, StatusCode, header},
 };
 use emulator_database::{FirestoreProject, config::FirestoreConfig};
 use emulator_http::RouterBuilder;
 use googletest::prelude::*;
-use reqwest::Client;
+use serde::{Serialize, de::DeserializeOwned};
 use serde_json::json;
 use tokio_stream::StreamExt;
 use tower::ServiceExt;
+
+#[derive(Clone)]
+struct Client {
+    router: Router,
+}
+
+impl Client {
+    fn request(&self, method: Method, uri: impl Into<String>) -> TestRequestBuilder {
+        TestRequestBuilder {
+            router: self.router.clone(),
+            method,
+            uri: uri.into(),
+            content_type: None,
+            body: Vec::new(),
+        }
+    }
+
+    fn get(&self, uri: impl Into<String>) -> TestRequestBuilder {
+        self.request(Method::GET, uri)
+    }
+
+    fn post(&self, uri: impl Into<String>) -> TestRequestBuilder {
+        self.request(Method::POST, uri)
+    }
+
+    fn patch(&self, uri: impl Into<String>) -> TestRequestBuilder {
+        self.request(Method::PATCH, uri)
+    }
+
+    fn delete(&self, uri: impl Into<String>) -> TestRequestBuilder {
+        self.request(Method::DELETE, uri)
+    }
+}
+
+struct TestRequestBuilder {
+    router: Router,
+    method: Method,
+    uri: String,
+    content_type: Option<&'static str>,
+    body: Vec<u8>,
+}
+
+impl TestRequestBuilder {
+    fn json<T: Serialize + ?Sized>(mut self, value: &T) -> Self {
+        self.content_type = Some("application/json");
+        self.body = serde_json::to_vec(value).expect("serialize JSON request body");
+        self
+    }
+
+    async fn send(self) -> Result<TestResponse> {
+        let mut builder = Request::builder().method(self.method).uri(self.uri);
+        if let Some(ct) = self.content_type {
+            builder = builder.header(header::CONTENT_TYPE, ct);
+        }
+        let resp = self
+            .router
+            .oneshot(builder.body(Body::from(self.body))?)
+            .await?;
+        let status = resp.status();
+        let headers = resp.headers().clone();
+        Ok(TestResponse {
+            status,
+            headers,
+            body: Some(resp.into_body()),
+            stream: None,
+        })
+    }
+}
+
+struct TestResponse {
+    status:  StatusCode,
+    headers: HeaderMap,
+    body:    Option<Body>,
+    stream:  Option<BodyDataStream>,
+}
+
+impl TestResponse {
+    fn status(&self) -> StatusCode {
+        self.status
+    }
+
+    #[cfg_attr(not(feature = "ui"), allow(dead_code))]
+    fn headers(&self) -> &HeaderMap {
+        &self.headers
+    }
+
+    async fn bytes(mut self) -> Result<Bytes> {
+        let body = self.body.take().expect("response body already consumed");
+        Ok(to_bytes(body, usize::MAX).await?)
+    }
+
+    async fn text(self) -> Result<String> {
+        Ok(String::from_utf8(self.bytes().await?.to_vec())?)
+    }
+
+    async fn json<T: DeserializeOwned>(self) -> Result<T> {
+        Ok(serde_json::from_slice(&self.bytes().await?)?)
+    }
+
+    async fn chunk(&mut self) -> Result<Option<Bytes>> {
+        if self.stream.is_none() {
+            let body = self.body.take().expect("response body already consumed");
+            self.stream = Some(body.into_data_stream());
+        }
+        Ok(self.stream.as_mut().unwrap().next().await.transpose()?)
+    }
+}
 
 async fn spawn_server(
     default_enterprise: bool,
@@ -23,16 +130,7 @@ async fn spawn_server(
         ..Default::default()
     })));
     let router = RouterBuilder::new(project).build();
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
-    let port = listener.local_addr()?.port();
-    let base_url = format!("http://127.0.0.1:{port}");
-    let listener = listener.tap_io(|tcp_stream| {
-        tcp_stream.set_nodelay(true).unwrap();
-    });
-    tokio::spawn(async move {
-        axum::serve(listener, router).await.unwrap();
-    });
-    Ok((project, Client::builder().no_proxy().build()?, base_url))
+    Ok((project, Client { router }, String::new()))
 }
 
 #[gtest]
@@ -699,7 +797,7 @@ async fn test_rest_vector_passthrough_body_limit_and_run_query_find_nearest() ->
         )
         .await?;
     expect_eq!(unimpl_res.status(), StatusCode::NOT_IMPLEMENTED);
-    let unimpl_bytes = axum::body::to_bytes(unimpl_res.into_body(), usize::MAX).await?;
+    let unimpl_bytes = to_bytes(unimpl_res.into_body(), usize::MAX).await?;
     let unimpl_body: serde_json::Value = serde_json::from_slice(&unimpl_bytes)?;
     expect_eq!(unimpl_body["error"]["status"], "UNIMPLEMENTED");
 
@@ -719,7 +817,7 @@ async fn test_rest_vector_passthrough_body_limit_and_run_query_find_nearest() ->
         )
         .await?;
     expect_eq!(bad_fn_res.status(), StatusCode::BAD_REQUEST);
-    let bad_fn_bytes = axum::body::to_bytes(bad_fn_res.into_body(), usize::MAX).await?;
+    let bad_fn_bytes = to_bytes(bad_fn_res.into_body(), usize::MAX).await?;
     let bad_fn_body: serde_json::Value = serde_json::from_slice(&bad_fn_bytes)?;
     expect_eq!(bad_fn_body["error"]["status"], "INVALID_ARGUMENT");
 
@@ -755,7 +853,7 @@ async fn test_rest_vector_passthrough_body_limit_and_run_query_find_nearest() ->
         )
         .await?;
     expect_eq!(patch_res.status(), StatusCode::OK);
-    let patch_bytes = axum::body::to_bytes(patch_res.into_body(), usize::MAX).await?;
+    let patch_bytes = to_bytes(patch_res.into_body(), usize::MAX).await?;
     let patch_text = String::from_utf8(patch_bytes.to_vec())?;
     let type_pos = patch_text
         .find("\"__type__\"")
@@ -776,7 +874,7 @@ async fn test_rest_vector_passthrough_body_limit_and_run_query_find_nearest() ->
         )
         .await?;
     expect_eq!(get_res.status(), StatusCode::OK);
-    let get_bytes = axum::body::to_bytes(get_res.into_body(), usize::MAX).await?;
+    let get_bytes = to_bytes(get_res.into_body(), usize::MAX).await?;
     let get_text = String::from_utf8(get_bytes.to_vec())?;
     let get_type_pos = get_text
         .find("\"__type__\"")
@@ -809,7 +907,7 @@ async fn test_rest_vector_passthrough_body_limit_and_run_query_find_nearest() ->
         )
         .await?;
     expect_eq!(invalid_vec_res.status(), StatusCode::BAD_REQUEST);
-    let invalid_vec_bytes = axum::body::to_bytes(invalid_vec_res.into_body(), usize::MAX).await?;
+    let invalid_vec_bytes = to_bytes(invalid_vec_res.into_body(), usize::MAX).await?;
     let invalid_vec_body: serde_json::Value = serde_json::from_slice(&invalid_vec_bytes)?;
     expect_eq!(invalid_vec_body["error"]["status"], "INVALID_ARGUMENT");
 
@@ -848,7 +946,7 @@ async fn test_rest_vector_passthrough_body_limit_and_run_query_find_nearest() ->
 }
 
 async fn send_oneshot(
-    router: &axum::Router,
+    router: &Router,
     method: Method,
     uri: &str,
     json_body: Option<serde_json::Value>,
@@ -862,7 +960,7 @@ async fn send_oneshot(
     };
     let resp = router.clone().oneshot(builder.body(body)?).await?;
     let status = resp.status();
-    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await?;
+    let bytes = to_bytes(resp.into_body(), usize::MAX).await?;
     let parsed = if bytes.is_empty() {
         serde_json::Value::Null
     } else {
@@ -1406,7 +1504,7 @@ async fn test_rest_masks_read_time_consistency_and_create_document_slash_id() ->
 }
 
 async fn send_raw_oneshot(
-    router: &axum::Router,
+    router: &Router,
     method: Method,
     uri: &str,
     json_body: Option<serde_json::Value>,
@@ -1421,7 +1519,7 @@ async fn send_raw_oneshot(
     let resp = router.clone().oneshot(builder.body(body)?).await?;
     let status = resp.status();
     let headers = resp.headers().clone();
-    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await?;
+    let bytes = to_bytes(resp.into_body(), usize::MAX).await?;
     Ok((status, headers, bytes))
 }
 

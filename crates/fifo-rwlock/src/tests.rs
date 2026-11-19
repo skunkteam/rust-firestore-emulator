@@ -452,7 +452,7 @@ fn downgrade_visibility_and_fifo_barrier_via_public_guards() {
 fn miri_scoped_threads_read_write_upgrade_downgrade() {
     use std::sync::Barrier;
 
-    use futures::executor::block_on;
+    use futures_executor::block_on;
 
     let iterations = 16_u32;
     let rwlock = Arc::new(FifoRwLock::new(0_u32));
@@ -519,7 +519,6 @@ fn miri_scoped_threads_read_write_upgrade_downgrade() {
 #[cfg_attr(miri, ignore)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn multithreaded() {
-    use futures::stream::{self, StreamExt};
     use tokio::sync::Barrier;
 
     let num_iterations = 1000; // Number of operations per task
@@ -536,15 +535,10 @@ async fn multithreaded() {
         let barrier = barrier.clone();
         expected_sum += 2 * num_iterations;
         tokio::spawn(async move {
-            stream::iter(0..num_iterations)
-                .for_each(|_| {
-                    let rwlock = rwlock.clone();
-                    async move {
-                        let mut guard = rwlock.write_owned().await;
-                        *guard += 2;
-                    }
-                })
-                .await;
+            for _ in 0..num_iterations {
+                let mut guard = rwlock.write_owned().await;
+                *guard += 2;
+            }
             barrier.wait().await;
         });
     }
@@ -555,15 +549,10 @@ async fn multithreaded() {
         let barrier = barrier.clone();
         expected_sum += 3 * num_iterations;
         tokio::spawn(async move {
-            stream::iter(0..num_iterations)
-                .for_each(|_| {
-                    let rwlock = rwlock.clone();
-                    async move {
-                        let mut guard = rwlock.write_owned().await;
-                        *guard += 3;
-                    }
-                })
-                .await;
+            for _ in 0..num_iterations {
+                let mut guard = rwlock.write_owned().await;
+                *guard += 3;
+            }
             barrier.wait().await;
         });
     }
@@ -574,18 +563,13 @@ async fn multithreaded() {
         let barrier = barrier.clone();
         expected_sum += 5 * num_iterations;
         tokio::spawn(async move {
-            stream::iter(0..num_iterations)
-                .for_each(|_| {
-                    let rwlock = rwlock.clone();
-                    async move {
-                        let read_guard = rwlock.read_owned().await;
-                        // In a real scenario, might do some reading here.
-                        let _ = *read_guard;
-                        let mut write_guard = read_guard.upgrade().await;
-                        *write_guard += 5;
-                    }
-                })
-                .await;
+            for _ in 0..num_iterations {
+                let read_guard = rwlock.read_owned().await;
+                // In a real scenario, might do some reading here.
+                let _ = *read_guard;
+                let mut write_guard = read_guard.upgrade().await;
+                *write_guard += 5;
+            }
             barrier.wait().await;
         });
     }
@@ -595,16 +579,11 @@ async fn multithreaded() {
         let rwlock = rwlock.clone();
         let barrier = barrier.clone();
         tokio::spawn(async move {
-            stream::iter(0..num_iterations)
-                .for_each(|_| {
-                    let rwlock = rwlock.clone();
-                    async move {
-                        let guard = rwlock.read().await;
-                        let value = *guard; // Perform a read
-                        black_box(value);
-                    }
-                })
-                .await;
+            for _ in 0..num_iterations {
+                let guard = rwlock.read().await;
+                let value = *guard; // Perform a read
+                black_box(value);
+            }
             barrier.wait().await;
         });
     }

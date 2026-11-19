@@ -1,6 +1,6 @@
 use std::task::{Context, Poll};
 
-use futures::future::Either;
+use futures_util::future::Either;
 use tower::{Layer, Service, ServiceExt, util::Oneshot};
 
 /// Layer that routes to a different service whenever `when` returns `true`. Otherwise calls the
@@ -160,7 +160,7 @@ mod tests {
 
         // Routing to pending `base` awaits readiness instead of panicking.
         let mut pending_fut = svc.ready().await.unwrap().call(false);
-        assert!(futures::poll!(&mut pending_fut).is_pending());
+        assert!(futures_util::poll!(&mut pending_fut).is_pending());
         base_state.set_ready(true);
         assert_eq!(pending_fut.await, Ok("base"));
         assert_eq!(other_state.poll_count.load(Ordering::SeqCst), 1);

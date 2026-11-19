@@ -1285,7 +1285,7 @@ mod tests {
 
         let t1_id = db.new_txn(rw_opts).await.unwrap();
         let mut commit_fut = Box::pin(db.commit(vec![make_write(&doc_a, 1)], t1_id));
-        assert!(futures::poll!(&mut commit_fut).is_pending());
+        assert!(futures_util::poll!(&mut commit_fut).is_pending());
 
         let retry_res = db
             .new_txn(TransactionOptions {

@@ -4,7 +4,7 @@
 Rust crate that compiles the upstream Google Firestore v1 Protocol Buffers (`include/google/firestore/v1/firestore.proto`) into server-side (and optional `client`-gated) `tonic`/`prost` types at build time and layers Firestore-specific Rust domain extensions, `From<T> for Value` conversions, declarative `val!`/`fields!`/`doc!` macros, `serde` ProtoJSON attributes, and ordering/aggregation traits on top.
 
 ## Interface
-- `[Cargo.toml:googleapis]`: Rust library crate exporting compiled Google Firestore v1 and protobuf well-known types, declarative construction macros, and domain extension traits/methods. Defines optional Cargo feature `client = ["tonic/gzip"]` (`default = []`) to gate `FirestoreClient` generation for test/client consumers.
+- `[Cargo.toml:googleapis]`: Rust library crate exporting compiled Google Firestore v1 and protobuf well-known types, declarative construction macros, and domain extension traits/methods. Defines optional Cargo feature `client = ["tonic/channel", "tonic/gzip", "tonic-prost-build/transport"]` (`default = []`) to gate `FirestoreClient` generation for test/client consumers.
 - `[build.rs:main]`: Cargo build script invoking `tonic_prost_build` to compile `include/google/firestore/v1/firestore.proto` into `googleapis.rs`.
 - Subdirectories:
   - [`./src/README.md`](./src/README.md): Crate root module (`lib.rs`), declarative macros (`macros.rs`), and extension implementations (`ser.rs`, `timestamp_ext.rs`, `transaction_options_ext.rs`, `value_ext.rs`).

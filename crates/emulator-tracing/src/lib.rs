@@ -62,12 +62,7 @@ impl DefaultTracing {
                 reload::Layer::new(layers)
             };
 
-            let registry = tracing_subscriber::registry().with(layer);
-
-            #[cfg(feature = "console")]
-            let registry = registry.with(console_subscriber::spawn());
-
-            registry.init();
+            tracing_subscriber::registry().with(layer).init();
 
             Self {
                 reload_handle,
@@ -271,6 +266,16 @@ mod tests {
         let captured = String::from_utf8(sub.drain().to_vec()).unwrap();
         expect_that!(captured, contains_substring("hello dynamic capture"));
         expect_that!(captured, not(contains_substring("should be filtered out")));
+        // Verify OffsetTime formatted a HH:MM:SS.ffffff timestamp prefix (modulo ANSI codes).
+        let has_timestamp = captured.as_bytes().windows(15).any(|b| {
+            b[2] == b':'
+                && b[5] == b':'
+                && b[8] == b'.'
+                && b.iter()
+                    .enumerate()
+                    .all(|(i, ch)| matches!(i, 2 | 5 | 8) || ch.is_ascii_digit())
+        });
+        expect_true!(has_timestamp);
 
         // Subsequent drain without new matching events is empty.
         expect_true!(sub.drain().is_empty());

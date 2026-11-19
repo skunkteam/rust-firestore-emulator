@@ -9,7 +9,7 @@ doctest = false
 
 [features]
 default = []
-client = ["tonic/gzip"]
+client = ["tonic/channel", "tonic/gzip", "tonic-prost-build/transport"]
 
 [dependencies]
 base64 = { workspace = true }
@@ -20,7 +20,7 @@ serde = { workspace = true, features = ["serde_derive"] }
 thiserror = { workspace = true }
 tonic-prost = { workspace = true }
 time = { workspace = true, features = ["formatting", "macros", "parsing"] }
-tonic = { workspace = true }
+tonic = { workspace = true, features = ["codegen"] }
 
 [build-dependencies]
 tonic-prost-build = { workspace = true }

@@ -125,7 +125,6 @@ mod tests {
     use std::array;
 
     use googletest::prelude::*;
-    use itertools::Itertools;
     use rstest::rstest;
     use time::macros::datetime;
 
@@ -221,8 +220,8 @@ mod tests {
     #[gtest]
     fn now_monotonically_increasing() {
         let timestamps: [Timestamp; 100] = array::from_fn(|_| Timestamp::now());
-        for [a, b] in timestamps.into_iter().array_windows() {
-            expect_lt!(a, b, "a should be strictly less than b, always");
+        for pair in timestamps.windows(2) {
+            expect_lt!(pair[0], pair[1], "a should be strictly less than b, always");
         }
     }
 

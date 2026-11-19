@@ -18,7 +18,7 @@ use emulator_database::{
     read_consistency::ReadConsistency,
     reference::{CollectionRef, DocumentRef, Ref, RootRef},
 };
-use futures::{TryStreamExt, future::join_all, stream::BoxStream};
+use futures_util::{TryStreamExt, future::join_all, stream::BoxStream};
 use googleapis::google::{
     firestore::v1::{
         firestore_server::{Firestore, FirestoreServer},
@@ -139,7 +139,7 @@ where
 {
     let (err_tx, err_rx) = tokio::sync::oneshot::channel::<Status>();
     let mut err_tx = Some(err_tx);
-    let clean_requests = futures::stream::poll_fn(move |cx| {
+    let clean_requests = futures_util::stream::poll_fn(move |cx| {
         if err_tx.is_none() {
             return Poll::Ready(None);
         }
@@ -841,7 +841,7 @@ impl Firestore for FirestoreEmulator {
                 }
             };
 
-            Ok(futures::stream::once(async move {
+            Ok(futures_util::stream::once(async move {
                 let transaction = new_txn_guard.take_bytes();
                 Ok(RunAggregationQueryResponse {
                     result: Some(AggregationResult { aggregate_fields }),
@@ -889,7 +889,7 @@ impl Firestore for FirestoreEmulator {
         request: Request<tonic::Streaming<ListenRequest>>,
     ) -> Result<Response<Self::ListenStream>> {
         let (clean_requests, err_rx) = forward_listen_requests(request.into_inner());
-        let err_stream = futures::stream::once(err_rx).filter_map(|res| res.ok().map(Err));
+        let err_stream = futures_util::stream::once(err_rx).filter_map(|res| res.ok().map(Err));
         let stream = self
             .project
             .listen(clean_requests)
@@ -1233,7 +1233,7 @@ mod tests {
 
     #[tokio::test]
     async fn forward_listen_requests_stops_and_surfaces_stream_errors() {
-        let input = futures::stream::iter([
+        let input = futures_util::stream::iter([
             Ok(ListenRequest {
                 database: DB_ROOT.to_string(),
                 labels: HashMap::new(),
@@ -1290,7 +1290,7 @@ mod tests {
             .await
             .map(|_| ())
         });
-        assert!(futures::poll!(&mut blocker_fut).is_pending());
+        assert!(futures_util::poll!(&mut blocker_fut).is_pending());
         (d1, blocker_fut, Vec::from(hold_id))
     }
 
@@ -1330,7 +1330,7 @@ mod tests {
                             run_query_request::ConsistencySelector::NewTransaction(rw_opts()),
                         ),
                     })));
-                    assert!(futures::poll!(&mut fut).is_pending());
+                    assert!(futures_util::poll!(&mut fut).is_pending());
                     drop(fut);
                 }
                 "run_agg" => {
@@ -1362,7 +1362,7 @@ mod tests {
                             ),
                         },
                     )));
-                    assert!(futures::poll!(&mut fut).is_pending());
+                    assert!(futures_util::poll!(&mut fut).is_pending());
                     drop(fut);
                 }
                 "execute_pipeline" => {
@@ -1391,7 +1391,7 @@ mod tests {
                                 ),
                             ),
                         })));
-                    assert!(futures::poll!(&mut fut).is_pending());
+                    assert!(futures_util::poll!(&mut fut).is_pending());
                     drop(fut);
                 }
                 "commit" => {
@@ -1403,7 +1403,7 @@ mod tests {
                         ],
                         transaction: Vec::new(),
                     })));
-                    assert!(futures::poll!(&mut fut).is_pending());
+                    assert!(futures_util::poll!(&mut fut).is_pending());
                     drop(fut);
                 }
                 _ => unreachable!(),

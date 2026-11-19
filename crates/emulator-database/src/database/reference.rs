@@ -1,9 +1,52 @@
 use std::{cmp, fmt::Display, iter, str::FromStr};
 
-use serde_with::{DeserializeFromStr, SerializeDisplay};
 use string_cache::DefaultAtom;
 
 use crate::GenericDatabaseError;
+
+macro_rules! impl_serde_display_from_str {
+    ($($ty:ty),+ $(,)?) => {
+        $(
+            impl serde::Serialize for $ty {
+                fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+                where
+                    S: serde::Serializer,
+                {
+                    serializer.collect_str(self)
+                }
+            }
+
+            impl<'de> serde::Deserialize<'de> for $ty {
+                fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+                where
+                    D: serde::Deserializer<'de>,
+                {
+                    struct FromStrVisitor;
+
+                    impl serde::de::Visitor<'_> for FromStrVisitor {
+                        type Value = $ty;
+
+                        fn expecting(
+                            &self,
+                            formatter: &mut std::fmt::Formatter<'_>,
+                        ) -> std::fmt::Result {
+                            formatter.write_str("a Firestore resource reference string")
+                        }
+
+                        fn visit_str<E>(self, v: &str) -> Result<Self::Value, E>
+                        where
+                            E: serde::de::Error,
+                        {
+                            v.parse().map_err(E::custom)
+                        }
+                    }
+
+                    deserializer.deserialize_str(FromStrVisitor)
+                }
+            }
+        )+
+    };
+}
 
 pub(crate) fn is_reserved_name(s: &str) -> bool {
     s.starts_with("__") && s.ends_with("__") && s.len() >= 5
@@ -40,7 +83,7 @@ pub(crate) fn is_reserved_name(s: &str) -> bool {
 /// # Ok(())
 /// # }
 /// ```
-#[derive(Clone, Debug, PartialEq, Eq, DeserializeFromStr, SerializeDisplay)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Ref {
     Root(RootRef),
     Collection(CollectionRef),
@@ -225,9 +268,7 @@ impl From<CollectionRef> for Ref {
     }
 }
 
-#[derive(
-    Clone, Debug, Hash, PartialEq, Eq, PartialOrd, Ord, DeserializeFromStr, SerializeDisplay,
-)]
+#[derive(Clone, Debug, Hash, PartialEq, Eq, PartialOrd, Ord)]
 pub struct RootRef {
     pub project_id:  DefaultAtom,
     pub database_id: DefaultAtom,
@@ -263,9 +304,7 @@ impl RootRef {
     }
 }
 
-#[derive(
-    Clone, Debug, Hash, PartialEq, Eq, PartialOrd, Ord, DeserializeFromStr, SerializeDisplay,
-)]
+#[derive(Clone, Debug, Hash, PartialEq, Eq, PartialOrd, Ord)]
 pub struct CollectionRef {
     pub root_ref:      RootRef,
     pub collection_id: DefaultAtom,
@@ -420,9 +459,7 @@ impl CollectionRef {
     }
 }
 
-#[derive(
-    Clone, Debug, Hash, PartialEq, Eq, PartialOrd, Ord, DeserializeFromStr, SerializeDisplay,
-)]
+#[derive(Clone, Debug, Hash, PartialEq, Eq, PartialOrd, Ord)]
 pub struct DocumentRef {
     pub collection_ref: CollectionRef,
     pub document_id:    DefaultAtom,
@@ -471,6 +508,8 @@ impl DocumentRef {
             })
     }
 }
+
+impl_serde_display_from_str!(Ref, RootRef, CollectionRef, DocumentRef);
 
 #[cfg(test)]
 mod tests {
@@ -550,6 +589,68 @@ mod tests {
                 _,
                 _
             )))
+        );
+    }
+
+    #[gtest]
+    fn serde_roundtrip_and_rejection_for_all_ref_types() {
+        let root_str = "projects/p/databases/(default)/documents";
+        let col_str = "projects/p/databases/(default)/documents/users";
+        let doc_str = "projects/p/databases/(default)/documents/users/alice";
+
+        let root: RootRef = serde_json::from_str(&format!("{root_str:?}")).unwrap();
+        expect_eq!(
+            serde_json::to_string(&root).unwrap(),
+            format!("{root_str:?}")
+        );
+
+        let col: CollectionRef = serde_json::from_str(&format!("{col_str:?}")).unwrap();
+        expect_eq!(serde_json::to_string(&col).unwrap(), format!("{col_str:?}"));
+
+        let doc: DocumentRef = serde_json::from_str(&format!("{doc_str:?}")).unwrap();
+        expect_eq!(serde_json::to_string(&doc).unwrap(), format!("{doc_str:?}"));
+
+        // Escaped JSON string (exercises owned String path in Visitor::visit_str) and Ref Serialize
+        let escaped_doc: Ref =
+            serde_json::from_str("\"projects/p/databases/(default)/documents/users/al\\u0069ce\"")
+                .unwrap();
+        expect_eq!(escaped_doc, Ref::Document(doc));
+        expect_eq!(
+            serde_json::to_string(&escaped_doc).unwrap(),
+            format!("{doc_str:?}")
+        );
+        expect_eq!(
+            serde_json::to_string(&Ref::Root(root)).unwrap(),
+            format!("{root_str:?}")
+        );
+        expect_eq!(
+            serde_json::to_string(&Ref::Collection(col)).unwrap(),
+            format!("{col_str:?}")
+        );
+
+        // Invalid path, non-string types, and wrong-kind references fail deserialization cleanly
+        expect_that!(
+            serde_json::from_str::<Ref>("\"not-a-ref\""),
+            err(anything())
+        );
+        expect_that!(serde_json::from_str::<Ref>("123"), err(anything()));
+        expect_that!(serde_json::from_str::<RootRef>("123"), err(anything()));
+        expect_that!(
+            serde_json::from_str::<CollectionRef>("123"),
+            err(anything())
+        );
+        expect_that!(serde_json::from_str::<DocumentRef>("123"), err(anything()));
+        expect_that!(
+            serde_json::from_str::<DocumentRef>(&format!("{col_str:?}")),
+            err(anything())
+        );
+        expect_that!(
+            serde_json::from_str::<CollectionRef>(&format!("{doc_str:?}")),
+            err(anything())
+        );
+        expect_that!(
+            serde_json::from_str::<RootRef>(&format!("{col_str:?}")),
+            err(anything())
         );
     }
 

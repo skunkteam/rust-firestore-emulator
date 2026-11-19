@@ -707,11 +707,11 @@ mod tests {
             "/cola\0/docb",
             "/colb/doca",
         ];
-        for [a, b] in ordered_refs
+        for (a, b) in ordered_refs
             .into_iter()
             .map(str::to_string)
             .map(Value::reference)
-            .array_windows()
+            .tuple_windows()
         {
             expect_lt!(a, &b);
         }

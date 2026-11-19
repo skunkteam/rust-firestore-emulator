@@ -5,21 +5,22 @@ edition = "2024"
 
 [dependencies]
 fifo-rwlock = { workspace = true }
-futures = { workspace = true }
 googleapis = { workspace = true }
 itertools = { workspace = true }
-serde_with = { workspace = true }
+serde = { workspace = true }
 string_cache = { workspace = true }
 thiserror = { workspace = true }
-tokio = { workspace = true, features = ["macros"] }
+tokio = { workspace = true, features = ["macros", "rt", "sync", "time"] }
 tokio-stream = { workspace = true, features = ["sync"] }
 tonic = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]
+futures-util = { workspace = true }
 googletest = { workspace = true }
 proptest = { workspace = true }
 rstest = { workspace = true }
+serde_json = { workspace = true }
 tokio-test = { workspace = true }
 
 [lints]

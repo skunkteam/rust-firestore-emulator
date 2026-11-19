@@ -1,21 +1,7 @@
-use std::{str::FromStr, sync::LazyLock};
+use std::str::FromStr;
 
-use ctreg::regex;
-use itertools::Itertools;
 use thiserror::Error;
 use tracing::{Metadata, level_filters::LevelFilter};
-
-static DIRECTIVE_RE: LazyLock<DirectiveRe> = LazyLock::new(DirectiveRe::new);
-regex! {
-    DirectiveRe =
-        r"(?x)
-            # Either a single global level
-        ^(?<global_level>(?i:trace|debug|info|warn|error|off|[0-5]))$
-        |
-            # Or a target with an optional level (defaults to trace)
-        ^(?<target>[\w:-]+) (?: = (?<level>(?i:trace|debug|info|warn|error|off|[0-5])) )?$
-        "
-}
 
 #[derive(Debug, Error)]
 pub enum ParseError {
@@ -47,12 +33,12 @@ impl FromStr for Filter {
     type Err = ParseError;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let directives: Vec<_> = s
+        let directives = s
             .split(',')
-            .map(|s| s.trim())
+            .map(str::trim)
             .filter(|s| !s.is_empty())
             .map(Directive::from_str)
-            .try_collect()?;
+            .collect::<Result<Vec<_>, _>>()?;
         Ok(Self { directives })
     }
 }
@@ -63,36 +49,62 @@ struct Directive {
     level:  LevelFilter,
 }
 
+fn parse_level(s: &str) -> Option<LevelFilter> {
+    if s.eq_ignore_ascii_case("trace") || s == "5" {
+        Some(LevelFilter::TRACE)
+    } else if s.eq_ignore_ascii_case("debug") || s == "4" {
+        Some(LevelFilter::DEBUG)
+    } else if s.eq_ignore_ascii_case("info") || s == "3" {
+        Some(LevelFilter::INFO)
+    } else if s.eq_ignore_ascii_case("warn") || s == "2" {
+        Some(LevelFilter::WARN)
+    } else if s.eq_ignore_ascii_case("error") || s == "1" {
+        Some(LevelFilter::ERROR)
+    } else if s.eq_ignore_ascii_case("off") || s == "0" {
+        Some(LevelFilter::OFF)
+    } else {
+        None
+    }
+}
+
+fn is_valid_target(s: &str) -> bool {
+    !s.is_empty()
+        && s.chars()
+            .all(|c| c.is_alphanumeric() || matches!(c, '_' | ':' | '-'))
+}
+
 impl FromStr for Directive {
     type Err = ParseError;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let caps = DIRECTIVE_RE
-            .captures(s)
-            .ok_or_else(|| ParseError::InvalidDirective(s.to_owned()))?;
+        let invalid = || ParseError::InvalidDirective(s.to_owned());
 
-        if let Some(level) = caps.global_level {
-            return Ok(Directive {
-                target: None,
-                level:  level
-                    .content
-                    .parse()
-                    .expect("regex should have prevented a parse error"),
+        if let Some((target, level_str)) = s.split_once('=') {
+            if !is_valid_target(target) {
+                return Err(invalid());
+            }
+            let level = parse_level(level_str).ok_or_else(invalid)?;
+            return Ok(Self {
+                target: Some(target.to_owned()),
+                level,
             });
         }
 
-        let target = caps.target.map(|cap| cap.content.to_owned());
+        if let Some(level) = parse_level(s) {
+            return Ok(Self {
+                target: None,
+                level,
+            });
+        }
 
-        let level = caps
-            .level
-            .map(|cap| {
-                cap.content
-                    .parse()
-                    .expect("regex should have prevented a parse error")
-            })
-            .unwrap_or(LevelFilter::TRACE);
+        if is_valid_target(s) {
+            return Ok(Self {
+                target: Some(s.to_owned()),
+                level:  LevelFilter::TRACE,
+            });
+        }
 
-        Ok(Self { target, level })
+        Err(invalid())
     }
 }
 
@@ -145,33 +157,28 @@ mod tests {
 
     #[gtest]
     #[rstest]
-    #[case("off", false, false, false)]
-    #[case("0", false, false, false)]
-    #[case("error", true, false, false)]
-    #[case("WARN", true, false, false)]
-    #[case("info", true, true, false)]
-    #[case("debug", true, true, true)]
-    #[case("trace", true, true, true)]
-    #[case("5", true, true, true)]
-    fn global_level_directives(
-        #[case] directive: &str,
-        #[case] allows_error: bool,
-        #[case] allows_info: bool,
-        #[case] allows_debug: bool,
-    ) {
+    #[case("off", [false, false, false, false, false])]
+    #[case("0", [false, false, false, false, false])]
+    #[case("error", [true, false, false, false, false])]
+    #[case("1", [true, false, false, false, false])]
+    #[case("WARN", [true, true, false, false, false])]
+    #[case("2", [true, true, false, false, false])]
+    #[case("info", [true, true, true, false, false])]
+    #[case("3", [true, true, true, false, false])]
+    #[case("debug", [true, true, true, true, false])]
+    #[case("4", [true, true, true, true, false])]
+    #[case("trace", [true, true, true, true, true])]
+    #[case("5", [true, true, true, true, true])]
+    fn global_level_directives(#[case] directive: &str, #[case] expected: [bool; 5]) {
         let filter: Filter = directive.parse().unwrap();
-        expect_eq!(
+        let actual = [
             filter.allows(static_meta!("any::mod", Level::ERROR)),
-            allows_error
-        );
-        expect_eq!(
+            filter.allows(static_meta!("any::mod", Level::WARN)),
             filter.allows(static_meta!("any::mod", Level::INFO)),
-            allows_info
-        );
-        expect_eq!(
             filter.allows(static_meta!("any::mod", Level::DEBUG)),
-            allows_debug
-        );
+            filter.allows(static_meta!("any::mod", Level::TRACE)),
+        ];
+        expect_eq!(actual, expected);
     }
 
     #[gtest]
@@ -195,9 +202,17 @@ mod tests {
     #[gtest]
     #[rstest]
     #[case("tower_http=invalid_level")]
+    #[case("tower_http=")]
+    #[case("tower_http=6")]
+    #[case("tower_http=info=debug")]
     #[case("my_target[span_name]=debug")]
+    #[case("my_target[span_name]")]
     #[case("has spaces=info")]
+    #[case("has spaces")]
     #[case("=debug")]
+    #[case("=invalid=filter=")]
+    #[case("invalid/slash=info")]
+    #[case("invalid/slash")]
     fn invalid_directives_return_parse_error(#[case] bad: &str) {
         let err = bad.parse::<Filter>().unwrap_err();
         expect_that!(err, pat!(ParseError::InvalidDirective(_)));
