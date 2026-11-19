@@ -265,6 +265,7 @@ async fn structured_query_rejects_invalid_from_parent_operator_and_duplicate_arr
                 )),
                 consistency_selector: None,
                 explain_options: None,
+                request_options: None,
             })
             .await
             .unwrap()
@@ -289,6 +290,7 @@ async fn structured_query_rejects_invalid_from_parent_operator_and_duplicate_arr
                 )),
                 consistency_selector: None,
                 explain_options: None,
+                request_options: None,
             })
             .await
             .unwrap()
@@ -317,6 +319,7 @@ async fn structured_query_rejects_invalid_from_parent_operator_and_duplicate_arr
                 )),
                 consistency_selector: None,
                 explain_options: None,
+                request_options: None,
             })
             .await
             .unwrap()
@@ -364,6 +367,7 @@ async fn structured_query_rejects_invalid_from_parent_operator_and_duplicate_arr
                 )),
                 consistency_selector: None,
                 explain_options: None,
+                request_options: None,
             })
             .await
             .unwrap()
@@ -426,6 +430,7 @@ async fn run_query_rejects_malformed_filter_subfields_with_invalid_argument() {
                     )),
                     consistency_selector: None,
                     explain_options: None,
+                    request_options: None,
                 })
                 .await
                 .unwrap()

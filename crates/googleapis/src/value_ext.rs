@@ -205,6 +205,10 @@ impl Value {
             (Some(ValueType::FieldReferenceValue(a)), Some(ValueType::FieldReferenceValue(b))) => {
                 a == b
             }
+            (
+                Some(ValueType::VariableReferenceValue(a)),
+                Some(ValueType::VariableReferenceValue(b)),
+            ) => a == b,
             (Some(ValueType::FunctionValue(a)), Some(ValueType::FunctionValue(b))) => {
                 a.name == b.name
                     && a.args.len() == b.args.len()
@@ -255,7 +259,8 @@ fn classify_value_type_rank(vt: Option<&ValueType>) -> (u8, Option<&[Value]>) {
             VectorClassification::NotVectorMap | VectorClassification::Invalid(_) => (12, None),
         },
         // The following are not allowed to be used when writing documents.
-        Some(ValueType::FieldReferenceValue(_)) => (u8::MAX - 2, None),
+        Some(ValueType::FieldReferenceValue(_)) => (u8::MAX - 3, None),
+        Some(ValueType::VariableReferenceValue(_)) => (u8::MAX - 2, None),
         Some(ValueType::FunctionValue(_)) => (u8::MAX - 1, None),
         Some(ValueType::PipelineValue(_)) => (u8::MAX, None),
     }
@@ -366,6 +371,9 @@ fn cmp_value_type(a: &ValueType, b: &ValueType) -> cmp::Ordering {
                 _ => unreachable!("logic error in Ord implementation of Value"),
             },
             (ValueType::FieldReferenceValue(a), ValueType::FieldReferenceValue(b)) => a.cmp(b),
+            (ValueType::VariableReferenceValue(a), ValueType::VariableReferenceValue(b)) => {
+                a.cmp(b)
+            }
             (ValueType::FunctionValue(a), ValueType::FunctionValue(b)) => a.cmp(b),
             (ValueType::PipelineValue(a), ValueType::PipelineValue(b)) => a.cmp(b),
             // Only the above types should need to be compared here, because of the type
@@ -796,6 +804,12 @@ mod tests {
             vec![Value {
                 value_type: Some(ValueType::FieldReferenceValue("b".to_string())),
             }],
+            vec![Value {
+                value_type: Some(ValueType::VariableReferenceValue("a".to_string())),
+            }],
+            vec![Value {
+                value_type: Some(ValueType::VariableReferenceValue("b".to_string())),
+            }],
             vec![
                 Value {
                     value_type: Some(ValueType::FunctionValue(Function {
@@ -935,6 +949,19 @@ mod tests {
         let ref_empty = Value::reference("projects/p/databases/d/documents/c/".into());
         expect_that!(ref_sentinel == ref_empty, eq(true));
         expect_that!(ref_sentinel.storage_eq(&ref_empty), eq(false));
+
+        // VariableReferenceValue storage equality
+        let var_a1 = Value {
+            value_type: Some(ValueType::VariableReferenceValue("x".to_string())),
+        };
+        let var_a2 = Value {
+            value_type: Some(ValueType::VariableReferenceValue("x".to_string())),
+        };
+        let var_b = Value {
+            value_type: Some(ValueType::VariableReferenceValue("y".to_string())),
+        };
+        expect_that!(var_a1.storage_eq(&var_a2), eq(true));
+        expect_that!(var_a1.storage_eq(&var_b), eq(false));
     }
 
     #[gtest]

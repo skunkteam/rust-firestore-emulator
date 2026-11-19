@@ -38,6 +38,9 @@ pub(crate) fn validate_writable_value(value: &Value, in_array: bool) -> Result<(
         Some(ValueType::FieldReferenceValue(_)) => Err(GenericDatabaseError::invalid_argument(
             "fieldReferenceValue is not valid in stored documents",
         )),
+        Some(ValueType::VariableReferenceValue(_)) => Err(GenericDatabaseError::invalid_argument(
+            "variableReferenceValue is not valid in stored documents",
+        )),
         Some(ValueType::FunctionValue(_)) => Err(GenericDatabaseError::invalid_argument(
             "functionValue is not valid in stored documents",
         )),
@@ -333,6 +336,19 @@ mod tests {
             validate_writable_fields(&field_ref_val),
             err(eq(&GenericDatabaseError::invalid_argument(
                 "fieldReferenceValue is not valid in stored documents"
+            )))
+        );
+
+        let var_ref_val = HashMap::from([(
+            "a".to_string(),
+            Value {
+                value_type: Some(ValueType::VariableReferenceValue("x".to_string())),
+            },
+        )]);
+        assert_that!(
+            validate_writable_fields(&var_ref_val),
+            err(eq(&GenericDatabaseError::invalid_argument(
+                "variableReferenceValue is not valid in stored documents"
             )))
         );
 

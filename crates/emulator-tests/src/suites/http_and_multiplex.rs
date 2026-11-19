@@ -306,6 +306,7 @@ async fn loopback_tcp_multiplexer_serves_grpc_and_http_on_same_port_and_shuts_do
             update_mask: None,
             mask: None,
             current_document: None,
+            request_options: None,
         })
         .await
         .expect("gRPC UpdateDocument over multiplexed TCP");
@@ -342,6 +343,7 @@ async fn loopback_tcp_multiplexer_serves_grpc_and_http_on_same_port_and_shuts_do
             name: doc_path("mux/from-http"),
             mask: None,
             consistency_selector: None,
+            request_options: None,
         })
         .await
         .expect("gRPC GetDocument over multiplexed TCP")
@@ -443,6 +445,7 @@ async fn grpc_service_accepts_mixed_case_content_type_with_params() {
             update_mask: None,
             mask: None,
             current_document: None,
+            request_options: None,
         })
         .await
         .expect("Tonic FirestoreServer accepts mixed-case gRPC content-type")
@@ -524,6 +527,7 @@ async fn loopback_tcp_multiplexer_routes_case_insensitive_grpc_content_type_and_
             update_mask: None,
             mask: None,
             current_document: None,
+            request_options: None,
         })
         .await
         .expect("mixed-case gRPC Content-Type routes to Tonic over multiplexed TCP");
@@ -533,6 +537,7 @@ async fn loopback_tcp_multiplexer_routes_case_insensitive_grpc_content_type_and_
             name: doc_path("ct_mux/doc1"),
             mask: None,
             consistency_selector: None,
+            request_options: None,
         })
         .await
         .expect("GetDocument succeeds")

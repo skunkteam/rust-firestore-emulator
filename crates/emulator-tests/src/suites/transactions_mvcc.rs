@@ -380,6 +380,7 @@ async fn read_time_rejects_invalid_and_future_timestamps_and_allows_epoch() {
                 consistency_selector: Some(
                     batch_get_documents_request::ConsistencySelector::ReadTime(ts),
                 ),
+                request_options: None,
             })
             .await
             .unwrap()

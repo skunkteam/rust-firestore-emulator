@@ -359,6 +359,9 @@ impl Serialize for Value {
             ValueType::ArrayValue(a) => map.serialize_entry("arrayValue", a)?,
             ValueType::MapValue(m) => map.serialize_entry("mapValue", m)?,
             ValueType::FieldReferenceValue(f) => map.serialize_entry("fieldReferenceValue", f)?,
+            ValueType::VariableReferenceValue(v) => {
+                map.serialize_entry("variableReferenceValue", v)?
+            }
             ValueType::FunctionValue(_) => {
                 return Err(serde::ser::Error::custom(
                     "FunctionValue ProtoJSON serialization is not supported",
@@ -387,6 +390,7 @@ const VALUE_VARIANT_KEYS: &[&str] = &[
     "arrayValue",
     "mapValue",
     "fieldReferenceValue",
+    "variableReferenceValue",
 ];
 
 impl<'de> Deserialize<'de> for Value {
@@ -425,6 +429,9 @@ impl<'de> Deserialize<'de> for Value {
                     "mapValue" => ValueType::MapValue(map.next_value::<MapValue>()?),
                     "fieldReferenceValue" => {
                         ValueType::FieldReferenceValue(map.next_value::<String>()?)
+                    }
+                    "variableReferenceValue" => {
+                        ValueType::VariableReferenceValue(map.next_value::<String>()?)
                     }
                     other => return Err(de::Error::unknown_variant(other, VALUE_VARIANT_KEYS)),
                 };
@@ -1036,6 +1043,11 @@ impl Serialize for RunQueryRequest {
                 "RunQueryRequest.explainOptions ProtoJSON serialization is not supported",
             ));
         }
+        if self.request_options.is_some() {
+            return Err(serde::ser::Error::custom(
+                "RunQueryRequest.requestOptions ProtoJSON serialization is not supported",
+            ));
+        }
         if matches!(
             self.consistency_selector,
             Some(run_query_request::ConsistencySelector::NewTransaction(_))
@@ -1094,6 +1106,7 @@ impl<'de> Deserialize<'de> for RunQueryRequest {
                 .map(run_query_request::QueryType::StructuredQuery),
             consistency_selector,
             explain_options: None,
+            request_options: None,
         })
     }
 }
@@ -1149,6 +1162,11 @@ impl<'de> Deserialize<'de> for RunQueryResponse {
 
 impl Serialize for ListCollectionIdsRequest {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        if self.request_options.is_some() {
+            return Err(serde::ser::Error::custom(
+                "ListCollectionIdsRequest.requestOptions ProtoJSON serialization is not supported",
+            ));
+        }
         let mut map = serializer.serialize_map(None)?;
         if !self.parent.is_empty() {
             map.serialize_entry("parent", &self.parent)?;
@@ -1186,6 +1204,7 @@ impl<'de> Deserialize<'de> for ListCollectionIdsRequest {
             consistency_selector: helper
                 .read_time
                 .map(list_collection_ids_request::ConsistencySelector::ReadTime),
+            request_options: None,
         })
     }
 }
@@ -1699,7 +1718,7 @@ mod tests {
 
     #[gtest]
     fn run_query_request_serializes_transaction_and_rejects_unsupported_fields() {
-        use crate::google::firestore::v1::{ExplainOptions, TransactionOptions};
+        use crate::google::firestore::v1::{ExplainOptions, RequestOptions, TransactionOptions};
 
         let rq_json = json!({
             "parent": "projects/p/databases/(default)/documents",
@@ -1724,6 +1743,26 @@ mod tests {
             ..Default::default()
         };
         expect_that!(serde_json::to_string(&rq_explain), err(anything()));
+
+        let rq_req_opts = RunQueryRequest {
+            request_options: Some(RequestOptions::default()),
+            ..Default::default()
+        };
+        expect_that!(serde_json::to_string(&rq_req_opts), err(anything()));
+
+        let lci_req_opts = ListCollectionIdsRequest {
+            request_options: Some(RequestOptions::default()),
+            ..Default::default()
+        };
+        expect_that!(serde_json::to_string(&lci_req_opts), err(anything()));
+
+        let var_ref = Value {
+            value_type: Some(ValueType::VariableReferenceValue("v".to_string())),
+        };
+        let var_ref_json = serde_json::to_value(&var_ref).unwrap();
+        expect_eq!(var_ref_json, json!({ "variableReferenceValue": "v" }));
+        let var_ref_roundtrip: Value = serde_json::from_value(var_ref_json).unwrap();
+        expect_true!(var_ref.storage_eq(&var_ref_roundtrip));
     }
 
     mod proptests {

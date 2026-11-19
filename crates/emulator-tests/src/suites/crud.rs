@@ -133,6 +133,7 @@ async fn crud_rejects_malformed_paths_and_non_storable_values() {
             document_id: "bob".to_string(),
             document: Some(doc!("must-be-empty", { "a": 1i64 })),
             mask: None,
+            request_options: None,
         })
         .await;
     assert_status_code(res, Code::InvalidArgument);
@@ -146,6 +147,7 @@ async fn crud_rejects_malformed_paths_and_non_storable_values() {
             document_id: "p1".to_string(),
             document: Some(doc! { "a": 1i64 }),
             mask: None,
+            request_options: None,
         })
         .await;
     assert_status_code(res, Code::InvalidArgument);
@@ -159,6 +161,7 @@ async fn crud_rejects_malformed_paths_and_non_storable_values() {
             document_id: "p1".to_string(),
             document: Some(doc! { "a": 1i64 }),
             mask: None,
+            request_options: None,
         })
         .await;
     assert_status_code(res, Code::InvalidArgument);
@@ -170,6 +173,7 @@ async fn crud_rejects_malformed_paths_and_non_storable_values() {
             name: format!("{DOCUMENTS_ROOT}/users"),
             mask: None,
             consistency_selector: None,
+            request_options: None,
         })
         .await;
     assert_status_code(res, Code::InvalidArgument);
@@ -195,6 +199,7 @@ async fn crud_rejects_malformed_paths_and_non_storable_values() {
             update_mask: None,
             mask: None,
             current_document: None,
+            request_options: None,
         })
         .await;
     assert_status_code(res, Code::InvalidArgument);
@@ -226,6 +231,7 @@ async fn batch_get_and_batch_write_handle_missing_stream_errors_and_partial_fail
             documents: vec![format!("{DOCUMENTS_ROOT}/items")], // odd segments (collection)
             mask: None,
             consistency_selector: None,
+            request_options: None,
         })
         .await
         .expect("RPC envelope succeeds, error is delivered on first stream frame");
@@ -306,6 +312,7 @@ async fn create_document_rejects_slashes_in_document_id_and_foreign_database_roo
                 document_id: bad_doc_id.to_string(),
                 document: Some(doc! { "a": 1i64 }),
                 mask: None,
+                request_options: None,
             })
             .await;
         assert_status_code(res, Code::InvalidArgument);
@@ -335,6 +342,7 @@ async fn create_document_rejects_slashes_in_document_id_and_foreign_database_roo
             documents: vec![foreign_doc.to_string()],
             mask: None,
             consistency_selector: None,
+            request_options: None,
         })
         .await
         .expect("RPC envelope succeeds, error delivered in stream");

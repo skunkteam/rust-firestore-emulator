@@ -23,6 +23,8 @@ fn pipeline_type_name(v: &Value) -> &'static str {
         Some(ValueType::ArrayValue(_)) => "ARRAY",
         Some(ValueType::MapValue(_)) => "MAP",
         Some(ValueType::FieldReferenceValue(_)) => "FIELD_REFERENCE",
+        // TODO: verify exact Cloud Firestore type name once pipeline variables are supported.
+        Some(ValueType::VariableReferenceValue(_)) => "VARIABLE_REFERENCE",
         Some(ValueType::FunctionValue(_)) => "FUNCTION",
         Some(ValueType::PipelineValue(_)) => "PIPELINE",
     }

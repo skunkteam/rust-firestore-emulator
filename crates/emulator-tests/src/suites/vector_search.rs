@@ -1566,6 +1566,7 @@ async fn listen_find_nearest_updates_threshold_suppression_and_dynamic_nan_termi
                 })),
                 resume_type: None,
             })),
+            request_options: None,
         })
         .await
         .unwrap();
@@ -1720,6 +1721,7 @@ async fn listen_find_nearest_updates_threshold_suppression_and_dynamic_nan_termi
                 })),
                 resume_type: None,
             })),
+            request_options: None,
         })
         .await;
     let err = err_handle
@@ -1755,6 +1757,7 @@ async fn listen_find_nearest_updates_threshold_suppression_and_dynamic_nan_termi
                 })),
                 resume_type: None,
             })),
+            request_options: None,
         })
         .await;
     let ent_err = ent_err_handle
@@ -2113,6 +2116,8 @@ async fn enterprise_pipeline_vector_functions_find_nearest_and_chunked_streaming
                     mode: Some(transaction_options::Mode::ReadWrite(ReadWrite::default())),
                 }),
             ),
+            auto_commit_transaction: false,
+            request_options: None,
         })
         .await
         .unwrap()
@@ -2163,6 +2168,8 @@ async fn enterprise_pipeline_vector_functions_find_nearest_and_chunked_streaming
                 PipelineSpec::collection("oversize").into_structured(),
             )),
             consistency_selector: None,
+            auto_commit_transaction: false,
+            request_options: None,
         })
         .await
         .unwrap()
@@ -2185,6 +2192,8 @@ async fn enterprise_pipeline_vector_functions_find_nearest_and_chunked_streaming
                 PipelineSpec::collection("empty_col").into_structured(),
             )),
             consistency_selector: None,
+            auto_commit_transaction: false,
+            request_options: None,
         })
         .await
         .unwrap()
@@ -2240,6 +2249,7 @@ async fn new_transaction_errors_rollback_cleanly_across_all_five_rpcs() {
                         run_query_request::ConsistencySelector::NewTransaction(rw_opts()),
                     ),
                     explain_options: None,
+                    request_options: None,
                 })
                 .await
                 .unwrap()
@@ -2285,6 +2295,7 @@ async fn new_transaction_errors_rollback_cleanly_across_all_five_rpcs() {
                         ),
                     ),
                     explain_options: None,
+                    request_options: None,
                 })
                 .await
                 .unwrap()
@@ -2339,6 +2350,7 @@ async fn new_transaction_errors_rollback_cleanly_across_all_five_rpcs() {
                     },
                 ],
                 transaction: Vec::new(),
+                request_options: None,
             })
             .await;
         assert_status_code(commit_err, Code::NotFound);
@@ -2391,6 +2403,7 @@ async fn new_transaction_errors_rollback_cleanly_across_all_five_rpcs() {
                     consistency_selector: Some(
                         batch_get_documents_request::ConsistencySelector::NewTransaction(rw_opts()),
                     ),
+                    request_options: None,
                 })
                 .await?
                 .into_inner();

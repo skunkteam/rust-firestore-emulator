@@ -124,6 +124,12 @@ struct PatchDatabase {
     database_edition: Option<DatabaseEdition>,
     #[serde(alias = "concurrency_mode")]
     concurrency_mode: Option<ConcurrencyMode>,
+    #[serde(alias = "firestore_data_access_mode")]
+    firestore_data_access_mode: Option<serde_json::Value>,
+    #[serde(alias = "mongodb_compatible_data_access_mode")]
+    mongodb_compatible_data_access_mode: Option<serde_json::Value>,
+    #[serde(alias = "realtime_updates_mode")]
+    realtime_updates_mode: Option<serde_json::Value>,
 }
 
 async fn get_database(
@@ -149,6 +155,26 @@ async fn patch_database(
     let (project_id, database_id) = extract_raw_project_and_database(uri.path())?;
     let name = parse_root_ref(&project_id, &database_id)?;
     let update_mask = parse_patch_database_mask(uri.query())?;
+
+    if update_mask.is_none() {
+        for (name, val) in [
+            (
+                "firestore_data_access_mode",
+                &payload.firestore_data_access_mode,
+            ),
+            (
+                "mongodb_compatible_data_access_mode",
+                &payload.mongodb_compatible_data_access_mode,
+            ),
+            ("realtime_updates_mode", &payload.realtime_updates_mode),
+        ] {
+            if val.is_some() {
+                return Err(RestError::not_implemented(format!(
+                    "Database.{name} is not supported yet"
+                )));
+            }
+        }
+    }
 
     let db = project.database(&name).await;
 
@@ -695,6 +721,16 @@ fn parse_patch_database_mask(raw_query: Option<&str>) -> Result<Option<PatchData
                     }
                     "databaseEdition" | "database_edition" => mask.database_edition = true,
                     "concurrencyMode" | "concurrency_mode" => mask.concurrency_mode = true,
+                    "firestoreDataAccessMode"
+                    | "firestore_data_access_mode"
+                    | "mongodbCompatibleDataAccessMode"
+                    | "mongodb_compatible_data_access_mode"
+                    | "realtimeUpdatesMode"
+                    | "realtime_updates_mode" => {
+                        return Err(RestError::not_implemented(format!(
+                            "Database.{field} is not supported yet"
+                        )));
+                    }
                     other => {
                         return Err(RestError::bad_request(format!(
                             "Unsupported updateMask field for Database: {other}"
@@ -790,6 +826,14 @@ impl DocumentQueryParams {
                         return Err(RestError::bad_request("transaction cannot be empty"));
                     }
                     params.transaction = Some(val);
+                }
+                "requestOptions.requestTags"
+                | "requestOptions.request_tags"
+                | "request_options.requestTags"
+                | "request_options.request_tags" => {
+                    return Err(RestError::not_implemented(
+                        "request_options is not supported yet",
+                    ));
                 }
                 _ => {}
             }
