@@ -34,6 +34,13 @@ impl FieldReference {
         matches!(self, Self::DocumentName)
     }
 
+    pub(crate) fn validate_query_reference(&self) -> Result<()> {
+        match self {
+            Self::DocumentName => Ok(()),
+            Self::FieldPath(p) => p.validate_non_reserved(),
+        }
+    }
+
     pub(crate) fn into_non_reserved_field_path(
         self,
         context_err: &'static str,
@@ -60,9 +67,11 @@ impl FromStr for FieldReference {
     type Err = GenericDatabaseError;
 
     fn from_str(path: &str) -> Result<Self, Self::Err> {
-        match path {
-            DOC_NAME => Ok(Self::DocumentName),
-            path => Ok(Self::FieldPath((path.parse())?)),
+        let parsed: FieldPath = path.parse()?;
+        if parsed.0.len() == 1 && parsed.0[0] == DOC_NAME {
+            Ok(Self::DocumentName)
+        } else {
+            Ok(Self::FieldPath(parsed))
         }
     }
 }
@@ -87,14 +96,10 @@ impl Display for FieldReference {
 /// may contain any character. Some characters, including `` ` ``, must be
 /// escaped using a `\`. For example, `` `x&y` `` represents `x&y` and
 /// `` `bak\`tik` `` represents `` bak`tik ``.
-#[derive(Clone, Debug, Hash, PartialEq, Eq)]
+#[derive(Clone, Debug, Hash, PartialEq, Eq, PartialOrd, Ord)]
 pub struct FieldPath(Vec<String>);
 
 impl FieldPath {
-    pub(crate) fn segments(&self) -> &[String] {
-        &self.0
-    }
-
     pub(crate) fn starts_with(&self, prefix: &Self) -> bool {
         self.0.starts_with(&prefix.0)
     }
@@ -359,10 +364,11 @@ mod tests {
         );
 
         let quoted_doc_name: FieldReference = "`__name__`".parse().unwrap();
+        assert_eq!(quoted_doc_name, FieldReference::DocumentName);
         assert_that!(
             quoted_doc_name.into_non_reserved_field_path("cannot be __name__"),
             err(eq(&GenericDatabaseError::invalid_argument(
-                "the name __name__ is reserved"
+                "cannot be __name__"
             )))
         );
 
@@ -393,6 +399,40 @@ mod tests {
                 .unwrap()
                 .starts_with(&"a".parse::<FieldPath>().unwrap())
         );
+    }
+
+    #[gtest]
+    fn field_path_orders_by_segment_and_validate_query_reference_allows_doc_name() {
+        let a_z: FieldPath = "a.z".parse().unwrap();
+        let a_dash_b: FieldPath = "a-b".parse().unwrap();
+        assert!(a_z < a_dash_b);
+
+        let escaped_dot: FieldPath = "`a.b`".parse().unwrap();
+        let nested: FieldPath = "a.b".parse().unwrap();
+        assert!(nested < escaped_dot);
+
+        for ok in [DOC_NAME, "`__name__`", "____"] {
+            assert!(
+                ok.parse::<FieldReference>()
+                    .unwrap()
+                    .validate_query_reference()
+                    .is_ok()
+            );
+        }
+        for bad in [
+            "__custom__",
+            "__name__.a",
+            "a.__name__",
+            "a.__custom__",
+            "a..b",
+        ] {
+            assert_that!(
+                bad.parse::<FieldReference>()
+                    .unwrap()
+                    .validate_query_reference(),
+                err(matches_pattern!(GenericDatabaseError::InvalidArgument(_)))
+            );
+        }
     }
 
     #[gtest]
@@ -511,9 +551,10 @@ mod tests {
                 prop_assert!(doc_ref.is_document_name());
                 prop_assert_eq!(doc_ref.to_string(), DOC_NAME);
 
-                // Quoted `__name__` is a literal field path, not the document-name pseudo-field.
+                // Quoted `__name__` also resolves to the document-name pseudo-field in queries.
                 let quoted_doc_name: FieldReference = "`__name__`".parse().unwrap();
-                prop_assert!(!quoted_doc_name.is_document_name());
+                prop_assert!(quoted_doc_name.is_document_name());
+                prop_assert_eq!(quoted_doc_name.to_string(), DOC_NAME);
 
                 if seg != DOC_NAME {
                     let parsed: FieldReference = seg.parse().unwrap();

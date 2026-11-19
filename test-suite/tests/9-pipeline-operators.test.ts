@@ -1,6 +1,6 @@
 import { CollectionReference, DocumentData, FieldPath, FieldValue, GeoPoint, Timestamp } from '@google-cloud/firestore';
 import * as p from '@google-cloud/firestore/pipelines';
-import { callRawStreamRpc, editions, expectCloudLimitationCanary, notImplementedInRust, writeData } from './utils';
+import { callRawStreamRpc, editions, expectCloudLimitationCanary, expectRpcCode, notImplementedInRust, writeData } from './utils';
 
 const enterpriseDatabases = editions.filter(e => e.enterprise);
 const suite = enterpriseDatabases.length ? describe.each(enterpriseDatabases) : describe.skip.each(editions);
@@ -2222,20 +2222,19 @@ suite('$description', fs => {
                 ];
 
                 for (const item of badStages) {
-                    let code: number | undefined;
-                    try {
-                        await callRawStreamRpc(fs.firestore, 'executePipeline', {
-                            database,
-                            structuredPipeline: {
-                                pipeline: {
-                                    stages: [colStage, item.stage],
+                    await expectRpcCode(
+                        () =>
+                            callRawStreamRpc(fs.firestore, 'executePipeline', {
+                                database,
+                                structuredPipeline: {
+                                    pipeline: {
+                                        stages: [colStage, item.stage],
+                                    },
                                 },
-                            },
-                        });
-                    } catch (err: unknown) {
-                        code = typeof err === 'object' && err !== null ? Number((err as { code?: unknown }).code) : undefined;
-                    }
-                    expect({ label: item.label, code }).toEqual({ label: item.label, code: 3 });
+                            }),
+                        3,
+                        item.label,
+                    );
                 }
             });
 

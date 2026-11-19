@@ -6,6 +6,7 @@ import {
     DocumentReference,
     FieldPath,
     FieldValue,
+    Filter,
     GeoPoint,
     Query,
     QueryDocumentSnapshot,
@@ -377,6 +378,30 @@ describe.each(editions)('$description', fs => {
                               : "3 INVALID_ARGUMENT: A maximum of 1 'ARRAY_CONTAINS' filter is allowed per disjunction.",
                       );
             });
+
+            test('not-in, OR + inequality existence, and lexicographical multi-inequality orderBy', async () => {
+                expect(await getData(collection.where('type', 'not-in', ['string', 'bytes']))).toIncludeSameMembers(
+                    without(testData, ...strings, ...bytes),
+                );
+
+                expect(await getData(collection.where('ordered', 'not-in', [-500]).where('type', '==', 'number'))).toIncludeSameMembers(
+                    numbers.slice(1),
+                );
+
+                const notInAndGt = await getData(collection.where('type', 'not-in', ['none']).where('ordered', '>', 0));
+                const expectedNums = testData.filter(d => d.type === 'number' && (d.ordered as number) > 0);
+                fs.enterprise ? expect(notInAndGt).toIncludeSameMembers(expectedNums) : expect(notInAndGt).toStrictEqual(expectedNums);
+
+                const orWithIneq = await getData(
+                    collection.where(Filter.or(Filter.where('type', '==', 'none'), Filter.where('ordered', '>', 2))),
+                );
+                const orderedGtTwo = testData.filter(d => d.type === 'number' && (d.ordered as number) > 2);
+                expect(orWithIneq).toIncludeSameMembers(fs.enterprise ? [nothing, ...orderedGtTwo] : orderedGtTwo);
+
+                const typeFirst = await getData(collection.where('type', '>', 'A').where('ordered', '>', 0));
+                const orderedFirst = await getData(collection.where('ordered', '>', 0).where('type', '>', 'A'));
+                fs.enterprise ? expect(typeFirst).toIncludeSameMembers(orderedFirst) : expect(typeFirst).toStrictEqual(orderedFirst);
+            });
         });
 
         describe('paginating results', () => {
@@ -678,6 +703,29 @@ describe.each(editions)('$description', fs => {
             expect(await ids(subCol.where('geo', '!=', new GeoPoint(52.0907, 5.1214)))).toIncludeSameMembers(
                 fs.enterprise ? ['int-zero', 'neg-zero', 'int-one', 'double-one', 'nan'] : [],
             );
+
+            // not-in and array-contains-any across 0/-0, 1/1.0, NaN, and { nested: NaN }
+            expect(await ids(subCol.where('val', 'not-in', [-0, 1]))).toIncludeSameMembers(['nan', ...missingValIds]);
+            expect(await ids(subCol.where('val', 'not-in', [NaN]))).toIncludeSameMembers(
+                fs.enterprise
+                    ? ['int-zero', 'neg-zero', 'int-one', 'double-one', 'geo']
+                    : ['int-zero', 'neg-zero', 'int-one', 'double-one', 'nan'],
+            );
+            expect(await ids(subCol.where('arr', 'array-contains-any', [-0, 999]))).toIncludeSameMembers([
+                'int-zero',
+                'neg-zero',
+                'double-one',
+            ]);
+            expect(await ids(subCol.where('arr', 'array-contains-any', [0, 1]))).toIncludeSameMembers([
+                'int-zero',
+                'neg-zero',
+                'int-one',
+                'double-one',
+            ]);
+            expect(await ids(subCol.where('arr', 'array-contains-any', [NaN, { nested: NaN }]))).toIncludeSameMembers([
+                'double-one',
+                'nan',
+            ]);
         });
 
         test('exact 64-bit integer vs float64 precision above 2^53', async () => {

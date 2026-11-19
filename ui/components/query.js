@@ -3,7 +3,9 @@
 import { html, nothing } from "../lit-html.js";
 import {
   VALUE_TYPES,
+  findUnsafeUnquotedInteger,
   formatValuePreview,
+  normalizeProtoValue,
   normalizeReference,
   stringifyProtoJson,
   validateDouble,
@@ -19,8 +21,8 @@ import {
 /** @typedef {import('../lit-html.js').TemplateResult} TemplateResult */
 
 /**
- * Supported operators matching crates/emulator-database/src/database/query/filter.rs.
- * (Omits ARRAY_CONTAINS_ANY and NOT_IN which are unimplemented in filter.rs.)
+ * Supported StructuredQuery field and unary operators matching
+ * crates/emulator-database/src/database/query/filter.rs.
  */
 const FILTER_OPERATORS = [
   { op: "EQUAL", label: "== (EQUAL)", kind: "field" },
@@ -34,7 +36,9 @@ const FILTER_OPERATORS = [
     kind: "field",
   },
   { op: "ARRAY_CONTAINS", label: "array-contains", kind: "field" },
-  { op: "IN", label: "in (JSON array)", kind: "in" },
+  { op: "IN", label: "in (JSON array)", kind: "array" },
+  { op: "ARRAY_CONTAINS_ANY", label: "array-contains-any (JSON array)", kind: "array" },
+  { op: "NOT_IN", label: "not-in (JSON array)", kind: "array" },
   { op: "IS_NULL", label: "is null", kind: "unary" },
   { op: "IS_NOT_NULL", label: "is not null", kind: "unary" },
   { op: "IS_NAN", label: "is NaN", kind: "unary" },
@@ -159,7 +163,14 @@ export function buildStructuredQueryFromVisual(state, projectId, databaseId) {
           field: { fieldPath: fp },
         },
       });
-    } else if (opMeta.kind === "in") {
+    } else if (opMeta.kind === "array") {
+      const unsafeLiteral = findUnsafeUnquotedInteger(f.valueText);
+      if (unsafeLiteral) {
+        return {
+          valid: false,
+          error: `Unquoted 64-bit integer ${unsafeLiteral} in ${f.op} filter for "${fp}" loses precision in JSON.parse; wrap in quotes inside ProtoJSON integerValue`,
+        };
+      }
       /** @type {unknown} */
       let parsedArr;
       try {
@@ -167,34 +178,57 @@ export function buildStructuredQueryFromVisual(state, projectId, databaseId) {
       } catch {
         return {
           valid: false,
-          error: `Filter "${fp} IN": enter a JSON array of ProtoJSON values or primitives, e.g. ["alice", "bob"]`,
+          error: `Filter "${fp} ${f.op}": enter a JSON array of ProtoJSON values or primitives, e.g. ["alice", "bob"]`,
         };
       }
       if (!Array.isArray(parsedArr)) {
-        return { valid: false, error: `Filter "${fp} IN" requires a JSON array` };
+        return { valid: false, error: `Filter "${fp} ${f.op}" requires a JSON array` };
       }
       /** @type {FirestoreValue[]} */
       const values = [];
-      for (const item of parsedArr) {
+      for (let i = 0; i < parsedArr.length; i++) {
+        const item = parsedArr[i];
         if (item === null) values.push({ nullValue: null });
         else if (typeof item === "boolean") values.push({ booleanValue: item });
         else if (typeof item === "string") values.push({ stringValue: item });
         else if (typeof item === "number") {
-          if (Number.isInteger(item)) {
+          if (!Number.isFinite(item)) {
+            const infStr = item === Infinity ? "Infinity" : "-Infinity";
+            return {
+              valid: false,
+              error: `Numeric literal in ${f.op} filter for "${fp}" overflows IEEE-754 double; use {"doubleValue": "${infStr}"} instead`,
+            };
+          } else if (Number.isSafeInteger(item) && !Object.is(item, -0)) {
             values.push({ integerValue: String(item) });
           } else {
             values.push({ doubleValue: item });
           }
+        } else if (Array.isArray(item)) {
+          return {
+            valid: false,
+            error:
+              f.op === "ARRAY_CONTAINS_ANY"
+                ? `Nested arrays are not supported in ${f.op} filter for "${fp}"`
+                : `Array elements in ${f.op} filter for "${fp}" must use explicit ProtoJSON {"arrayValue": {"values": [...]}}`,
+          };
         } else if (item && typeof item === "object") {
-          values.push(/** @type {FirestoreValue} */ (item));
+          const res = normalizeProtoValue(
+            item,
+            `${fp}[${i}]`,
+            f.op === "ARRAY_CONTAINS_ANY"
+          );
+          if (!res.valid || !res.value) {
+            return { valid: false, error: res.error };
+          }
+          values.push(res.value);
         } else {
-          return { valid: false, error: `Invalid item in IN array for "${fp}"` };
+          return { valid: false, error: `Invalid item in ${f.op} array for "${fp}"` };
         }
       }
       builtFilters.push({
         fieldFilter: {
           field: { fieldPath: fp },
-          op: "IN",
+          op: f.op,
           value: { arrayValue: { values } },
         },
       });
@@ -694,7 +728,8 @@ function renderFilterRow(f, idx, state, onRerender) {
           .value=${f.op}
           @change=${(/** @type {Event} */ e) => {
             f.op = /** @type {HTMLSelectElement} */ (e.target).value;
-            if (f.op === "IN" && !f.valueText.trim().startsWith("[")) {
+            const nextMeta = FILTER_OPERATORS.find((o) => o.op === f.op);
+            if (nextMeta?.kind === "array" && !f.valueText.trim().startsWith("[")) {
               f.valueText = "[]";
             }
             onRerender();
@@ -721,7 +756,7 @@ function renderFilterRow(f, idx, state, onRerender) {
 
       ${kind === "unary"
         ? nothing
-        : kind === "in"
+        : kind === "array"
           ? html`
               <input
                 type="text"

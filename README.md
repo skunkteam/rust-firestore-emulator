@@ -18,7 +18,6 @@ Because the implementation is driven by consumed features, some advanced or edge
 
 - Some updates with Transforms (such as `Maximum` and `Minimum`)
 - Multiplexing listeners in a single stream (used by frontend Firestore SDKs; `Listener` enforces a single active target with `target_id == 1`)
-- Some field filters (such as `ArrayContainsAny` and `NotIn`)
 - Explain options
 - Additional unimplemented gRPC endpoints (`partition_query`, `write`) or request options guarded by `unimplemented!` macros across the codebase.
 

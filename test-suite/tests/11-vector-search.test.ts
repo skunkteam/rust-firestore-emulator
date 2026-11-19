@@ -11,42 +11,21 @@ import type { EventEmitter } from 'events';
 import { setTimeout as time } from 'timers/promises';
 import {
     ConcurrentTest,
+    RawDocument,
+    RawProtoValue,
+    RawRunQueryRequest,
+    RawRunQueryResponseChunk,
     callRawStreamRpc,
     callRawUnaryRpc,
-    connection,
     editions,
     expectCloudLimitationCanary,
+    expectRpcCode,
     notImplementedInJava,
+    rawRunQuery,
     readData,
+    toRunQueryProto,
     writeData,
 } from './utils';
-
-interface RawProtoValue {
-    nullValue?: 'NULL_VALUE' | null;
-    booleanValue?: boolean;
-    integerValue?: string;
-    doubleValue?: number;
-    stringValue?: string;
-    arrayValue?: { values?: RawProtoValue[] };
-    mapValue?: { fields?: Record<string, RawProtoValue> };
-}
-
-interface RawDocument {
-    name?: string;
-    fields?: Record<string, RawProtoValue>;
-}
-
-interface RawRunQueryRequest {
-    parent: string;
-    structuredQuery?: Record<string, unknown>;
-    transaction?: Uint8Array;
-    newTransaction?: { readWrite?: Record<string, never> };
-}
-
-interface RawRunQueryResponseChunk {
-    document?: RawDocument;
-    transaction?: Uint8Array;
-}
 
 interface RawAggregationResponseChunk {
     result?: {
@@ -73,17 +52,9 @@ interface RawListenResponse {
     documentRemove?: { document?: string };
 }
 
-interface InternalVectorQueryProtoCarrier {
-    toProto(transaction?: Uint8Array): RawRunQueryRequest;
-}
-
 interface InternalListenClient {
     initializeIfNeeded(tag: string): Promise<void>;
     requestStream(methodName: string, bidirectional: boolean, request: object, tag: string): Promise<NodeJS.ReadWriteStream & EventEmitter>;
-}
-
-function toRunQueryProto(vq: VectorQuery, transaction?: Uint8Array): RawRunQueryRequest {
-    return (vq as unknown as InternalVectorQueryProtoCarrier).toProto(transaction);
 }
 
 function docNameFromParent(parent: string, docRef: DocumentReference): string {
@@ -105,75 +76,6 @@ function createVectorMap(coords: number[]): RawProtoValue {
             },
         },
     };
-}
-
-async function expectRpcCode(fn: () => Promise<unknown>, expectedCode: number, label = 'rpc'): Promise<void> {
-    let resolvedValue: unknown;
-    try {
-        resolvedValue = await fn();
-    } catch (err: unknown) {
-        const code = typeof err === 'object' && err !== null ? (err as { code?: unknown }).code : undefined;
-        const msg = err instanceof Error ? err.message : String(err);
-        expect({ label, code, detail: code === expectedCode ? 'ok' : msg }).toEqual({
-            label,
-            code: expectedCode,
-            detail: 'ok',
-        });
-        return;
-    }
-    throw new Error(`[${label}] Expected gRPC status code ${expectedCode}, but call resolved with ${JSON.stringify(resolvedValue)}`);
-}
-
-async function expectRunQueryNewTxnError(
-    firestore: Firestore,
-    req: RawRunQueryRequest,
-    expectedCode: number,
-    database: string,
-    label: string,
-): Promise<void> {
-    const client = firestore as unknown as InternalListenClient;
-    let capturedTx: Uint8Array | undefined;
-    try {
-        await client.initializeIfNeeded(label);
-        const stream = await client.requestStream('runQuery', false, req, label);
-        await new Promise<void>((resolve, reject) => {
-            let settled = false;
-            const finish = (err?: unknown) => {
-                if (settled) return;
-                settled = true;
-                if (err !== undefined) {
-                    reject(err instanceof Error ? err : new Error(String(err)));
-                } else {
-                    resolve();
-                }
-            };
-            stream.on('data', (chunk: unknown) => {
-                const typed = chunk as RawRunQueryResponseChunk;
-                if (typed.transaction && typed.transaction.length > 0) {
-                    capturedTx = typed.transaction;
-                }
-            });
-            stream.on('error', err => finish(err));
-            stream.on('end', () => finish());
-            stream.resume();
-        });
-    } catch (err: unknown) {
-        const code = typeof err === 'object' && err !== null ? (err as { code?: unknown }).code : undefined;
-        const msg = err instanceof Error ? err.message : String(err);
-        expect({ label, code, detail: code === expectedCode ? 'ok' : msg }).toEqual({
-            label,
-            code: expectedCode,
-            detail: 'ok',
-        });
-        if (connection === 'CLOUD FIRESTORE' && capturedTx && capturedTx.length > 0) {
-            await callRawUnaryRpc(firestore, 'rollback', { database, transaction: capturedTx }).catch(() => undefined);
-        }
-        return;
-    }
-    if (connection === 'CLOUD FIRESTORE' && capturedTx && capturedTx.length > 0) {
-        await callRawUnaryRpc(firestore, 'rollback', { database, transaction: capturedTx }).catch(() => undefined);
-    }
-    throw new Error(`[${label}] Expected gRPC status code ${expectedCode}, but call resolved`);
 }
 
 interface ListenSnapshot {
@@ -778,6 +680,131 @@ describe.each(editions)('$description - vector search', fs => {
                 expect(descSnap.docs.map(d => d.id)).toEqual(['c', 'd', 'a', 'b']);
             }
         });
+
+        notImplementedInJava ||
+            test.concurrent('combines category == and tags array-contains-any pre-filters on 3D nested FieldPath', async () => {
+                const col = makeCol('composite-nested-aca');
+                await Promise.all([
+                    col.doc('match-ml').set(
+                        writeData({
+                            category: 'books',
+                            tags: ['ml', 'rust'],
+                            vectorQueryFields: { nested: FieldValue.vector([1, 1, 0]) },
+                        }),
+                    ),
+                    col.doc('match-go').set(
+                        writeData({
+                            category: 'books',
+                            tags: ['go'],
+                            vectorQueryFields: { nested: FieldValue.vector([4, 1, 0]) },
+                        }),
+                    ),
+                    col.doc('wrong-cat').set(
+                        writeData({
+                            category: 'music',
+                            tags: ['go'],
+                            vectorQueryFields: { nested: FieldValue.vector([1, 1, 0]) },
+                        }),
+                    ),
+                    col.doc('wrong-tag').set(
+                        writeData({
+                            category: 'books',
+                            tags: ['fiction'],
+                            vectorQueryFields: { nested: FieldValue.vector([1, 1, 0]) },
+                        }),
+                    ),
+                ]);
+
+                const snap = await col
+                    .where('category', '==', 'books')
+                    .where('tags', 'array-contains-any', ['ml', 'go'])
+                    .findNearest({
+                        vectorField: new FieldPath('vectorQueryFields', 'nested'),
+                        queryVector: [1, 1, 0],
+                        limit: 5,
+                        distanceMeasure: 'EUCLIDEAN',
+                        distanceResultField: 'dist',
+                    })
+                    .get();
+
+                expect(snap.docs.map(d => d.id)).toEqual(['match-ml', 'match-go']);
+            });
+
+        test.concurrent('tie-breaks equal distances with repeated single-field inequality before __name__', async () => {
+            const col = makeCol('repeated-ineq-tie');
+            await Promise.all([
+                col.doc('a').set(writeData({ price: 50, embedding: FieldValue.vector([1, 0]) })),
+                col.doc('b').set(writeData({ price: 10, embedding: FieldValue.vector([1, 0]) })),
+                col.doc('c').set(writeData({ price: 10, embedding: FieldValue.vector([1, 0]) })),
+                col.doc('too-low').set(writeData({ price: 5, embedding: FieldValue.vector([1, 0]) })),
+                col.doc('too-high').set(writeData({ price: 100, embedding: FieldValue.vector([1, 0]) })),
+            ]);
+
+            const snap = await col
+                .where('price', '<', 100)
+                .where('price', '>', 5)
+                .findNearest({
+                    vectorField: 'embedding',
+                    queryVector: [1, 0],
+                    limit: 5,
+                    distanceMeasure: 'EUCLIDEAN',
+                })
+                .get();
+
+            if (fs.enterprise) {
+                // Live Cloud Enterprise leaves equal-distance vector ties in unspecified order.
+                expect(snap.docs.map(d => d.id)).toIncludeSameMembers(['a', 'b', 'c']);
+            } else {
+                expect(snap.docs.map(d => d.id)).toEqual(['b', 'c', 'a']);
+            }
+        });
+
+        if (fs.enterprise) {
+            test.concurrent('enterprise pre-filters findNearest with not-in and tie-breaks unsorted multi-field inequalities', async () => {
+                const col = makeCol('ent-not-in-and-tie');
+                await Promise.all([
+                    col.doc('a').set(writeData({ tag: 'keep', a: 10, b: 1, embedding: FieldValue.vector([1, 0]) })),
+                    col.doc('b').set(writeData({ tag: 'keep', a: 2, b: 20, embedding: FieldValue.vector([1, 0]) })),
+                    col.doc('c').set(writeData({ tag: 'keep', a: 2, b: 5, embedding: FieldValue.vector([1, 0]) })),
+                    col.doc('missing-tag').set(writeData({ a: 1, b: 99, embedding: FieldValue.vector([1, 0]) })),
+                    col.doc('drop').set(writeData({ tag: 'skip', a: 0, b: 0, embedding: FieldValue.vector([1, 0]) })),
+                ]);
+
+                const notInSnap = await col
+                    .where('tag', 'not-in', ['skip'])
+                    .findNearest({
+                        vectorField: 'embedding',
+                        queryVector: [1, 0],
+                        limit: 10,
+                        distanceMeasure: 'EUCLIDEAN',
+                    })
+                    .get();
+                expect(notInSnap.docs.map(d => d.id)).toIncludeSameMembers(['missing-tag', 'a', 'b', 'c']);
+
+                const bFirstSnap = await col
+                    .where('b', '>', 0)
+                    .where('a', '>', 0)
+                    .findNearest({
+                        vectorField: 'embedding',
+                        queryVector: [1, 0],
+                        limit: 10,
+                        distanceMeasure: 'EUCLIDEAN',
+                    })
+                    .get();
+                const aFirstSnap = await col
+                    .where('a', '>', 0)
+                    .where('b', '>', 0)
+                    .findNearest({
+                        vectorField: 'embedding',
+                        queryVector: [1, 0],
+                        limit: 10,
+                        distanceMeasure: 'EUCLIDEAN',
+                    })
+                    .get();
+                expect(bFirstSnap.docs.map(d => d.id)).toIncludeSameMembers(['missing-tag', 'a', 'b', 'c']);
+                expect(aFirstSnap.docs.map(d => d.id)).toIncludeSameMembers(['missing-tag', 'a', 'b', 'c']);
+            });
+        }
     });
 
     describe('8. select() projection shadowing and RunAggregationQuery over findNearest', () => {
@@ -1180,15 +1207,17 @@ describe.each(editions)('$description - vector search', fs => {
                             distanceMeasure: 'COSINE',
                         }),
                     );
-                    const database = baseProto.parent.split('/documents')[0];
-                    await expectRunQueryNewTxnError(
-                        fs.firestore,
-                        {
-                            ...baseProto,
-                            newTransaction: { readWrite: {} },
-                        },
+                    await expectRpcCode(
+                        () =>
+                            rawRunQuery(
+                                fs.firestore,
+                                {
+                                    ...baseProto,
+                                    newTransaction: { readWrite: {} },
+                                },
+                                'newtxn-cosine-zero',
+                            ),
                         fs.enterprise ? 3 : 9,
-                        database,
                         'newtxn-cosine-zero',
                     );
 
@@ -1531,6 +1560,106 @@ describe.each(editions)('$description - vector search', fs => {
                         }
                     }
                     expect(outcomes).toEqual(invalidRunQueries.map(item => ({ label: item.label, code: item.expectedCode })));
+
+                    const ineqWithOrderByNameReq = {
+                        parent: sampleProto.parent,
+                        structuredQuery: {
+                            ...sampleProto.structuredQuery,
+                            where: {
+                                fieldFilter: {
+                                    field: { fieldPath: 'a' },
+                                    op: 'GREATER_THAN',
+                                    value: { integerValue: '0' },
+                                },
+                            },
+                            orderBy: [{ field: { fieldPath: '__name__' }, direction: 'ASCENDING' }],
+                        },
+                    };
+
+                    if (!fs.enterprise) {
+                        const vals6 = Array.from({ length: 6 }, (_, i) => ({ integerValue: String(i) }));
+                        await expectRpcCode(
+                            () =>
+                                rawRunQuery(
+                                    fs.firestore,
+                                    {
+                                        parent: sampleProto.parent,
+                                        structuredQuery: {
+                                            ...sampleProto.structuredQuery,
+                                            where: {
+                                                compositeFilter: {
+                                                    op: 'AND',
+                                                    filters: [
+                                                        {
+                                                            fieldFilter: {
+                                                                field: { fieldPath: 'a' },
+                                                                op: 'IN',
+                                                                value: { arrayValue: { values: vals6 } },
+                                                            },
+                                                        },
+                                                        {
+                                                            fieldFilter: {
+                                                                field: { fieldPath: 'b' },
+                                                                op: 'IN',
+                                                                value: { arrayValue: { values: vals6 } },
+                                                            },
+                                                        },
+                                                    ],
+                                                },
+                                            },
+                                        },
+                                    },
+                                    'std-find-nearest-dnf-36',
+                                ),
+                            3,
+                            'std-find-nearest-dnf-36',
+                        );
+                        await expectRpcCode(
+                            () =>
+                                rawRunQuery(
+                                    fs.firestore,
+                                    {
+                                        parent: sampleProto.parent,
+                                        structuredQuery: {
+                                            ...sampleProto.structuredQuery,
+                                            where: {
+                                                compositeFilter: {
+                                                    op: 'OR',
+                                                    filters: [
+                                                        {
+                                                            fieldFilter: {
+                                                                field: { fieldPath: 'a' },
+                                                                op: 'NOT_IN',
+                                                                value: { arrayValue: { values: [{ integerValue: '1' }] } },
+                                                            },
+                                                        },
+                                                        {
+                                                            fieldFilter: {
+                                                                field: { fieldPath: 'b' },
+                                                                op: 'EQUAL',
+                                                                value: { integerValue: '2' },
+                                                            },
+                                                        },
+                                                    ],
+                                                },
+                                            },
+                                        },
+                                    },
+                                    'std-find-nearest-not-in-or',
+                                ),
+                            3,
+                            'std-find-nearest-not-in-or',
+                        );
+                        await expectRpcCode(
+                            () => rawRunQuery(fs.firestore, ineqWithOrderByNameReq, 'std-find-nearest-ineq-orderby-name'),
+                            3,
+                            'std-find-nearest-ineq-orderby-name',
+                        );
+                    } else {
+                        await expect(
+                            rawRunQuery(fs.firestore, ineqWithOrderByNameReq, 'ent-find-nearest-ineq-orderby-name'),
+                        ).resolves.toBeDefined();
+                    }
                 },
                 30_000,
             );

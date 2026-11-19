@@ -14,7 +14,9 @@ Shared TypeScript harness utilities for the Cloud Firestore conformance test sui
 - `[concurrent.ts:ConcurrentTest]`: Deterministic concurrency coordinator exposing `log: string[]`, `lastEvent$`, `processName: AsyncLocalStorage<string>`, `event(what: string)`, `when(...what: string[]): Promise<void>`, and `run(...processes: Array<() => Promise<unknown>>): Promise<void>`.
 - `[common.ts:isDefined]` & `[common.ts:expectToBeOrdered]`: Non-nullish type guard (`inp != null`) and UTF-16 lexicographic sort-order assertion helper (`expect(inp).toEqual(inp.slice().sort())`).
 - `[common.ts:expectCloudLimitationCanary]`: Awaits `Promise.resolve().then(fn)` and asserts `err?.code === expectedCode` (default `3`), throwing a canary alert on `CLOUD FIRESTORE` if an expected cloud limitation unexpectedly succeeds.
-- `[common.ts:callRawUnaryRpc]` & `[common.ts:callRawStreamRpc]`: Typed wrappers around `@google-cloud/firestore`'s internal GAPIC `request` / `requestStream` transport (`initializeIfNeeded`, auth headers, and `x-goog-request-params` database routing) for testing wire-level protobuf payloads that the typed SDK rejects client-side.
+- `[common.ts:RawProtoValue]`, `[common.ts:RawDocument]`, `[common.ts:RawRunQueryRequest]`, `[common.ts:RawRunQueryResponseChunk]`: Structural raw protobuf payload types for GAPIC `RunQuery` requests/chunks (including `referenceValue` support).
+- `[common.ts:callRawUnaryRpc]` & `[common.ts:callRawStreamRpc]`: Typed wrappers around `@google-cloud/firestore`'s internal GAPIC `request` / `requestStream` transport (`initializeIfNeeded`, auth headers, and `x-goog-request-params` database routing) for testing wire-level protobuf payloads that the typed SDK rejects client-side; `callRawStreamRpc` also accepts an optional `onChunk?: (chunk: TChunk) => void` callback.
+- `[common.ts:toRunQueryProto]`, `[common.ts:rawRunQuery]`, `[common.ts:expectRpcCode]`: Extracts a typed `Query | VectorQuery` to a raw `RunQueryRequest`, streams raw `RunQuery` responses with automatic `CLOUD FIRESTORE` `newTransaction` rollback cleanup, and asserts expected gRPC error status codes with clear diagnostic labels.
 
 ## Invariants
 
@@ -27,7 +29,7 @@ Shared TypeScript harness utilities for the Cloud Firestore conformance test sui
 ## Side Effects
 
 - **Module-Load Client & Hook Registration (`[firestore.ts]`, `[index.ts]`)**: Importing `./utils` reads `process.env.FIRESTORE_EMULATOR_HOST` and `process.env.RUST_EMULATOR`, instantiates three `@google-cloud/firestore` clients targeting project `'firestore-test-406503'` (`(default)`, `'enterprise'`, `'enterprise-pessimistic'`), registers a conditional Jest `beforeAll` hook (`fetch` `PATCH` against `/v1/projects/.../databases/...` on the Rust emulator), and registers Jest `afterAll` hooks invoking `recursiveDelete` (skipping enterprise roots on `JAVA EMULATOR`) followed by `terminate()` on all three `Firestore` clients.
-- **Network & Clock I/O (`[firestore.ts:writeData]`, `[firestore.ts:readDataRef]`)**: Reads `Date.now()` when constructing fixtures and performs gRPC document reads via `ref.get()`.
+- **Network & Clock I/O (`[firestore.ts:writeData]`, `[firestore.ts:readDataRef]`, `[common.ts:rawRunQuery]`)**: Reads `Date.now()` when constructing fixtures, performs gRPC document reads via `ref.get()`, and on `CLOUD FIRESTORE` invokes a best-effort `rollback` unary RPC in `finally` whenever a `req.newTransaction` `rawRunQuery` stream yields a transaction token (deriving the database root via `req.parent.split('/documents')[0]`).
 - **Async Context & Reactive State (`[concurrent.ts:ConcurrentTest]`)**: Binds per-worker labels in `AsyncLocalStorage`, mutates `this.log` and `@skunkteam/sherlock` `lastEvent$` state, and schedules `timers/promises` timeouts.
 
 ## Verification

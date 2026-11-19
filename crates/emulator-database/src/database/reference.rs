@@ -52,6 +52,99 @@ pub(crate) fn is_reserved_name(s: &str) -> bool {
     s.starts_with("__") && s.ends_with("__") && s.len() >= 5
 }
 
+pub(crate) fn is_datastore_numeric_id(s: &str) -> bool {
+    s.strip_prefix("__id")
+        .and_then(|rest| rest.strip_suffix("__"))
+        .is_some_and(|n| {
+            (n == "0" || (!n.starts_with(['+', '0']) && !n.starts_with("-0")))
+                && n.parse::<i64>().is_ok()
+        })
+}
+
+fn parse_resource_path(
+    s: &str,
+    allow_datastore_id: bool,
+) -> Option<(&str, &str, &str, usize, bool)> {
+    // Fixed prefix "projects/"
+    let s = s.strip_prefix("projects/")?;
+    // Next is the project_id until the next "/"
+    let (project_id, s) = s.split_once('/')?;
+    if project_id.is_empty() {
+        return None;
+    }
+    // Fixed token "databases/".
+    let s = s.strip_prefix("databases/")?;
+    // Next is the database_id until the next "/" or the end of the string
+    let (database_id, s) = match s.split_once('/') {
+        Some((database_id, rest)) => (database_id, rest.strip_prefix("documents")?),
+        None => (s, ""),
+    };
+    if database_id.is_empty() {
+        return None;
+    }
+    if s.is_empty() {
+        return Some((project_id, database_id, "", 0, false));
+    }
+    let rel_path = s.strip_prefix('/')?;
+    let mut slash_count = 0;
+    let mut has_zero_datastore_id = false;
+    for (idx, seg) in rel_path.split('/').enumerate() {
+        if idx > 0 {
+            slash_count += 1;
+        }
+        if seg.is_empty() || seg == "." || seg == ".." || seg.len() > 1500 {
+            return None;
+        }
+        if is_reserved_name(seg) {
+            if idx % 2 == 0 || !(allow_datastore_id && is_datastore_numeric_id(seg)) {
+                return None;
+            }
+            if seg == "__id0__" {
+                has_zero_datastore_id = true;
+            }
+        }
+    }
+    Some((
+        project_id,
+        database_id,
+        rel_path,
+        slash_count,
+        has_zero_datastore_id,
+    ))
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct QueryRefMeta<'a> {
+    pub(crate) project_id: &'a str,
+    pub(crate) database_id: &'a str,
+    pub(crate) has_doc_path: bool,
+    pub(crate) has_zero_datastore_id: bool,
+}
+
+pub(crate) fn parse_query_ref_root(s: &str) -> crate::error::Result<QueryRefMeta<'_>> {
+    match parse_resource_path(s, true) {
+        Some((project_id, database_id, "", _, _)) => Ok(QueryRefMeta {
+            project_id,
+            database_id,
+            has_doc_path: false,
+            has_zero_datastore_id: false,
+        }),
+        Some((project_id, database_id, _, slash_count, has_zero_datastore_id))
+            if slash_count % 2 == 1 =>
+        {
+            Ok(QueryRefMeta {
+                project_id,
+                database_id,
+                has_doc_path: true,
+                has_zero_datastore_id,
+            })
+        }
+        _ => Err(GenericDatabaseError::invalid_argument(format!(
+            "Invalid document reference: {s}"
+        ))),
+    }
+}
+
 /// A reference to either the database root (including project name and database name), a single
 /// collection or a single document.
 ///
@@ -188,43 +281,16 @@ impl FromStr for Ref {
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         fn parse_ref(s: &str) -> Option<Ref> {
-            // Fixed prefix "projects/"
-            let s = s.strip_prefix("projects/")?;
-            // Next is the project_id until the next "/"
-            let (project_id, s) = s.split_once('/')?;
-            if project_id.is_empty() {
-                return None;
-            }
-            // Fixed token "databases/".
-            let s = s.strip_prefix("databases/")?;
-            // Next is the database_id until the next "/" or the end of the string
-            let (database_id, s) = match s.split_once('/') {
-                Some((database_id, rest)) => (database_id, rest.strip_prefix("documents")?),
-                None => (s, ""),
-            };
-            if database_id.is_empty() {
-                return None;
-            }
+            let (project_id, database_id, rel_path, slash_count, _) =
+                parse_resource_path(s, false)?;
             let root_ref = RootRef::new(project_id, database_id);
-            if s.is_empty() {
+            if rel_path.is_empty() {
                 return Some(Ref::Root(root_ref));
             }
-            // Next up is an alternating path of collection name and document name, we can
-            // determine whether this is a collection or a document by counting the slashes.
-            let s = s.strip_prefix('/')?;
-
-            let is_invalid_id = |id: &str| {
-                id.is_empty() || id == "." || id == ".." || is_reserved_name(id) || id.len() > 1500
-            };
-            if s.split('/').any(is_invalid_id) {
-                return None;
-            }
-
-            let slashes = s.chars().filter(|ch| *ch == '/').count();
-            if slashes % 2 == 0 {
-                Some(Ref::Collection(CollectionRef::new(root_ref, s)))
+            if slash_count.is_multiple_of(2) {
+                Some(Ref::Collection(CollectionRef::new(root_ref, rel_path)))
             } else {
-                let (collection_id, document_id) = s.rsplit_once('/')?;
+                let (collection_id, document_id) = rel_path.rsplit_once('/')?;
                 Some(Ref::Document(DocumentRef::new(
                     CollectionRef::new(root_ref, collection_id),
                     document_id,
@@ -652,6 +718,112 @@ mod tests {
             serde_json::from_str::<RootRef>(&format!("{col_str:?}")),
             err(anything())
         );
+    }
+
+    #[gtest]
+    fn parse_query_ref_root_validates_structure_and_datastore_ids() {
+        assert_eq!(
+            parse_query_ref_root("projects/p1/databases/d1").unwrap(),
+            QueryRefMeta {
+                project_id: "p1",
+                database_id: "d1",
+                has_doc_path: false,
+                has_zero_datastore_id: false,
+            }
+        );
+        assert_eq!(
+            parse_query_ref_root("projects/p1/databases/d1/documents").unwrap(),
+            QueryRefMeta {
+                project_id: "p1",
+                database_id: "d1",
+                has_doc_path: false,
+                has_zero_datastore_id: false,
+            }
+        );
+        for doc in [
+            "projects/p1/databases/d1/documents/col/doc",
+            "projects/p1/databases/d1/documents/c/d/sub/d2",
+            "projects/p1/databases/d1/documents/col/____",
+        ] {
+            assert_eq!(
+                parse_query_ref_root(doc).unwrap(),
+                QueryRefMeta {
+                    project_id: "p1",
+                    database_id: "d1",
+                    has_doc_path: true,
+                    has_zero_datastore_id: false,
+                }
+            );
+        }
+
+        // Datastore numeric IDs (`__id<i64>__`) are permitted in query document (odd) segments
+        // across both editions, while strict write `Ref` parsing rejects them. Zero IDs
+        // (`__id0__`) are tracked via `has_zero_datastore_id` for Standard `__name__` filters.
+        for (ds_doc, expected_zero) in [
+            (
+                "projects/p1/databases/(default)/documents/col/__id0__",
+                true,
+            ),
+            (
+                "projects/p1/databases/(default)/documents/col/__id0__/sub/d1",
+                true,
+            ),
+            (
+                "projects/p1/databases/(default)/documents/col/__id123__",
+                false,
+            ),
+            (
+                "projects/p1/databases/(default)/documents/col/__id-9223372036854775808__",
+                false,
+            ),
+            (
+                "projects/p1/databases/(default)/documents/col/__id123__/sub/__id-456__",
+                false,
+            ),
+        ] {
+            assert_eq!(
+                parse_query_ref_root(ds_doc).unwrap(),
+                QueryRefMeta {
+                    project_id: "p1",
+                    database_id: "(default)",
+                    has_doc_path: true,
+                    has_zero_datastore_id: expected_zero,
+                }
+            );
+            assert_that!(
+                ds_doc.parse::<Ref>(),
+                err(matches_pattern!(GenericDatabaseError::InvalidReference(
+                    _,
+                    _
+                )))
+            );
+        }
+
+        let too_long_seg = "a".repeat(1501);
+        let over_1500 = format!("projects/p1/databases/d1/documents/col/{too_long_seg}");
+        for bad in [
+            "projects/p1/databases/d1/documents/col",
+            "projects/p1/databases/d1/documents/col/doc/sub",
+            "projects/p1/databases/d1/documents/__id123__/doc",
+            "projects/p1/databases/d1/documents/col/__id-0__",
+            "projects/p1/databases/d1/documents/col/__id01__",
+            "projects/p1/databases/d1/documents/col/__id-01__",
+            "projects/p1/databases/d1/documents/col/__id00__",
+            "projects/p1/databases/d1/documents/col/__id+1__",
+            "projects/p1/databases/d1/documents/col/__id__",
+            "projects/p1/databases/d1/documents/col/__id9223372036854775808__",
+            "projects/p1/databases/d1/documents/col/__custom__",
+            "projects/p1/databases/d1/documents/__custom__/doc",
+            "projects/p1/databases/d1/documents/col/.",
+            "projects/p1/databases/d1/documents/col/..",
+            "projects/p1/databases/d1/documents/col/",
+            over_1500.as_str(),
+        ] {
+            assert_that!(
+                parse_query_ref_root(bad),
+                err(matches_pattern!(GenericDatabaseError::InvalidArgument(_)))
+            );
+        }
     }
 
     mod proptests {

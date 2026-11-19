@@ -567,7 +567,7 @@ impl QueryTarget {
                 let update_time = update.update_time();
                 match update.stored_document() {
                     Some(doc) => {
-                        if self.query.matches_prefilters(doc)? {
+                        if self.query.matches_prefilters(doc) {
                             if let Some(target) = self.doctargets_by_name.get_mut(name) {
                                 if target.last_read_time >= update_time {
                                     continue;
