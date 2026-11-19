@@ -38,7 +38,7 @@ brew install just node
 
 #### Building and Testing
 
-The full suite of checks (Rust unit/doc tests, Clippy + Web UI linting, and the `test-suite/` SDK conformance suite against a freshly built Rust emulator) can be executed using:
+The full suite of CI checks (`fmt-check`, `lint` [Clippy + `sdk-lint` + `ui-check`], `test` [default features + `--no-default-features` + doctests], and the `test-suite/` SDK conformance suite via `sdk-test` against a freshly built Rust emulator) can be executed using:
 
 ```shell
 just
@@ -130,12 +130,12 @@ FIRESTORE_EMULATOR_HOST=127.0.0.1:8080 firestore-emulator
 - **Conformance Suite Process & Cloud IO (`[test-suite/package.json:scripts]`, `[test-suite/tests/utils/firestore.ts]`)**: `test-suite` spawns local Rust (`127.0.0.1:8080`) or Firebase Java emulator processes—or connects directly to GCP project `firestore-test-406503` when `FIRESTORE_EMULATOR_HOST` is unset—performing live gRPC/HTTP database configurations, reads, writes, listeners, pipelines, and `recursiveDelete` teardowns.
 
 ## System Verification
-- **Full Workspace Check (Tests, Lints & Rust Emulator Conformance)**: `just`
-- **Workspace Rust Tests (Required for Cross-Crate Black-Box Suites)**: `just test` or `cargo nextest run --workspace --profile ci` (running `-p emulator-database` or `-p emulator-grpc` alone skips the wire-level black-box suites in `crates/emulator-tests`; also verify feature-matrix isolation via `cargo nextest run --workspace --exclude emulator-tests --no-default-features --profile ci` and shared-process execution via `cargo test --workspace`).
+- **Full CI Parity Check (Formatting, Lints/Type-Checks, Tests & Rust Emulator Conformance)**: `just` (runs `fmt-check`, `lint`, `test`, and `sdk-test` — matching `.github/workflows/rust.yml`, with automatic `test-suite/node_modules` syncing via `npm ci` when missing or stale).
+- **Workspace Rust Tests (Required for Cross-Crate Black-Box Suites)**: `just test` (runs `cargo nextest run --workspace`, `cargo nextest run --workspace --exclude emulator-tests --no-default-features`, and `cargo test --doc --workspace --exclude googleapis`; running `-p emulator-database` or `-p emulator-grpc` alone skips the wire-level black-box suites in `crates/emulator-tests`; also verify shared-process execution via `cargo test --workspace` and CI profile via `NEXTEST_PROFILE=ci PROPTEST_CASES=128 just test`).
 - **Line & Region Coverage**: `just cov` (`cargo llvm-cov nextest --workspace`, excluding generated Protobuf/UI files and `crates/emulator-tests/`).
 - **Scoped Mutation Testing**: `just mutants <crate> <file>` (runs `cargo-mutants` with the `mutants` nextest profile and writes scratch artifacts exclusively inside `./tmp/mutants`).
 - **Unsafe Aliasing Soundness (`fifo-rwlock`)**: `just miri` (`cargo +nightly miri test --package fifo-rwlock`).
-- **Static Checks & Web UI Verification**: `just fmt`, `just clippy`, and `just ui-check` (run `npm ci` inside `test-suite/` first so `tsc` is installed).
-- **Node.js SDK Conformance (Rust Emulator)**: `just sdk-test` (builds `--no-default-features` and runs `test-suite` against `127.0.0.1:8080`).
+- **Static Checks, Test-Suite Lint & Web UI Verification**: `just fmt` (auto-format), `just fmt-check`, `just clippy`, `just sdk-lint` (ESLint, Prettier, and `tsc` in `test-suite/`), `just ui-check` (Web UI JSDoc `tsc` check), or `just lint` (all of `clippy`, `sdk-lint`, and `ui-check`, automatically syncing `test-suite/node_modules` via `npm ci` when missing or stale).
+- **Node.js SDK Conformance (Rust Emulator)**: `just sdk-test` (automatically syncs `test-suite/node_modules` if needed, builds `--no-default-features`, and runs `test-suite` against `127.0.0.1:8080` with `--maxConcurrency=3` by default, overridable via `JEST_MAX_CONCURRENCY`, matching CI).
 - **Node.js SDK Conformance (Ground-Truth Google Cloud Firestore)**: `cd test-suite && npm test`
 - **Node.js SDK Conformance (Google's Java-based Firebase Emulator)**: `cd test-suite && npm run test:java-emulator`

@@ -6,7 +6,7 @@
     "scripts": {
         "test": "NODE_OPTIONS='--experimental-vm-modules' jest",
         "test:java-emulator": "f() { firebase emulators:exec --only firestore \"NODE_OPTIONS='--experimental-vm-modules' jest --maxConcurrency 1$(printf ' %q' \"$@\")\"; }; f",
-        "test:rust-emulator": "f() { export FIRESTORE_EMULATOR_HOST=127.0.0.1:8080; RUST_LOG=\"${RUST_LOG:=OFF}\" ../target/debug/firestore-emulator & PID=$!; cleanup() { kill -INT \"$PID\" 2>/dev/null || true; wait \"$PID\" 2>/dev/null || true; }; trap cleanup EXIT INT TERM; RUST_EMULATOR=true NODE_OPTIONS='--experimental-vm-modules' jest \"$@\"; }; f",
+        "test:rust-emulator": "f() { export FIRESTORE_EMULATOR_HOST=127.0.0.1:8080; RUST_LOG=\"${RUST_LOG:=OFF}\" ../target/debug/firestore-emulator & PID=$!; cleanup() { if kill -0 \"$PID\" 2>/dev/null; then kill -INT \"$PID\" 2>/dev/null || true; i=0; while [ \"$i\" -lt 50 ] && kill -0 \"$PID\" 2>/dev/null; do sleep 0.1; i=$((i + 1)); done; if kill -0 \"$PID\" 2>/dev/null; then kill -KILL \"$PID\" 2>/dev/null || true; fi; fi; wait \"$PID\" 2>/dev/null || true; }; trap cleanup EXIT; trap 'trap - EXIT; cleanup; exit 130' INT; trap 'trap - EXIT; cleanup; exit 143' TERM; node -e 'const pid = Number(process.argv[1]); const deadline = Date.now() + 10_000; (async () => { while (Date.now() < deadline) { try { process.kill(pid, 0); } catch { console.error(\"firestore-emulator exited before becoming ready\"); process.exit(1); } try { const r = await fetch(\"http://127.0.0.1:8080/emulator/v1\"); if (r.ok) { await new Promise(r => setTimeout(r, 50)); process.kill(pid, 0); process.exit(0); } } catch {} await new Promise(r => setTimeout(r, 25)); } console.error(\"Timed out waiting for firestore-emulator on 127.0.0.1:8080\"); process.exit(1); })();' \"$PID\" || return 1; RUST_EMULATOR=true NODE_OPTIONS='--experimental-vm-modules' jest \"$@\"; }; f",
         "build:rust": "cd .. && cargo build",
         "lint": "eslint tests && prettier -c tests"
     },
@@ -21,6 +21,7 @@
         "ms": "^2.1.3"
     },
     "devDependencies": {
+        "@eslint/js": "^10.0.1",
         "@types/jest": "^30.0.0",
         "@typescript-eslint/eslint-plugin": "^8.72.2",
         "@typescript-eslint/parser": "^8.72.2",

@@ -91,6 +91,10 @@ impl Display for FieldReference {
 pub struct FieldPath(Vec<String>);
 
 impl FieldPath {
+    pub(crate) fn segments(&self) -> &[String] {
+        &self.0
+    }
+
     pub(crate) fn starts_with(&self, prefix: &Self) -> bool {
         self.0.starts_with(&prefix.0)
     }
@@ -202,7 +206,7 @@ impl Display for FieldPath {
 }
 
 fn parse_field_path(path: &str) -> Result<Vec<String>> {
-    let mut iter = path.chars().enumerate().peekable();
+    let mut iter = path.char_indices().peekable();
     let mut segments = vec![];
     'next_segment: loop {
         // I'm not sure if empty segments are used like this, but this is what they would mean if
@@ -268,13 +272,14 @@ fn parse_field_path(path: &str) -> Result<Vec<String>> {
             }
 
             _ => {
-                let end_pos = iter
+                let end_byte = iter
                     .by_ref()
                     .peeking_take_while(|&(_, ch)| ch != '.')
-                    .map(|(pos, _)| pos)
                     .last()
-                    .unwrap_or(start_pos);
-                segments.push(path[start_pos..=end_pos].to_string());
+                    .map_or(start_pos + first_ch.len_utf8(), |(pos, ch)| {
+                        pos + ch.len_utf8()
+                    });
+                segments.push(path[start_pos..end_byte].to_string());
                 // Consume the next '.' or return if we got at the end.
                 if iter.next().is_none() {
                     return Ok(segments);
@@ -307,6 +312,13 @@ mod tests {
     #[case(r"`bak\`tik`.`x&y`",     &["bak`tik", "x&y"])]
     #[case(r"`bak.\`.tik`.`x&y`",   &["bak.`.tik", "x&y"])]
     #[case("a`b",           &["a`b"])] // Tricky case, should we allow this?
+    #[case("é",             &["é"])]
+    #[case("café",          &["café"])]
+    #[case("aéb",           &["aéb"])]
+    #[case("α.β",           &["α", "β"])]
+    #[case("`é`.foo",       &["é", "foo"])]
+    #[case("`café`.price",  &["café", "price"])]
+    #[case("🌃.é.αβ",       &["🌃", "é", "αβ"])]
     fn test_parse_field_path_success(#[case] input: &str, #[case] result: &[&str]) {
         assert_that!(parse_field_path(input), ok(eq(result)));
     }

@@ -205,16 +205,23 @@ describe.each(editions)('$description - query with allDescendants', fs => {
 
             test.concurrent('onSnapshot', async () => {
                 const { query, child, grandchild, sibling, nibling } = await prepareQuery();
-                const querySnap = new Promise<QuerySnapshot>((resolve, reject) => query.onSnapshot(resolve, reject));
-                if (connection === 'JAVA EMULATOR' || connection === 'RUST EMULATOR') {
-                    expectQuerySnap(await querySnap, [child, grandchild, ...(type === 'without' ? [sibling] : []), nibling]);
-                    return;
+                let unsubscribe: (() => void) | undefined;
+                const querySnap = new Promise<QuerySnapshot>((resolve, reject) => {
+                    unsubscribe = query.onSnapshot(resolve, reject);
+                });
+                try {
+                    if (connection === 'JAVA EMULATOR' || connection === 'RUST EMULATOR') {
+                        expectQuerySnap(await querySnap, [child, grandchild, ...(type === 'without' ? [sibling] : []), nibling]);
+                        return;
+                    }
+                    await expect(querySnap).rejects.toThrow(
+                        type === 'without'
+                            ? 'Error 3: All-collection queries are not supported by real-time queries.'
+                            : `Error 3: 'all_descendants' in CollectionSelector with document parent is not supported by real-time queries.`,
+                    );
+                } finally {
+                    unsubscribe?.();
                 }
-                await expect(querySnap).rejects.toThrow(
-                    type === 'without'
-                        ? 'Error 3: All-collection queries are not supported by real-time queries.'
-                        : `Error 3: 'all_descendants' in CollectionSelector with document parent is not supported by real-time queries.`,
-                );
             });
 
             test.concurrent('orderBy document name descending', async () => {

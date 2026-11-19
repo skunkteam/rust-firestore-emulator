@@ -313,3 +313,149 @@ async fn unimplemented_transform_variants_return_unimplemented(#[case] spec: Wri
     assert_status_code(db.commit_writes(spec).await, Code::Unimplemented);
     let _unused = doc_mask(["x"]);
 }
+
+#[gtest]
+#[tokio::test]
+async fn deleted_document_rejects_update_time_precondition_and_failed_commit_is_atomic() {
+    let mut db = TestEnv::new().build_db();
+
+    // 1. Create and delete `guards/repro`; passing the delete timestamp as `UpdateTime` must reject
+    //    with FailedPrecondition because the document does not exist.
+    db.put("guards/repro", fields!({ "v": 1i64 }))
+        .await
+        .unwrap();
+    let (delete_commit_ts, _) = db
+        .commit_writes(WriteBatchSpec::new().delete("guards/repro", None))
+        .await
+        .expect("delete commit succeeds");
+    let t_del = delete_commit_ts.expect("delete commit_time set");
+
+    assert_status_code(
+        db.update(
+            "guards/repro",
+            fields!({ "v": 2i64 }),
+            None,
+            Some(pre_update_time(t_del)),
+            None,
+        )
+        .await,
+        Code::FailedPrecondition,
+    );
+    assert_status_code(
+        db.delete("guards/repro", Some(pre_update_time(t_del)))
+            .await,
+        Code::FailedPrecondition,
+    );
+    assert_status_code(db.get("guards/repro").await, Code::NotFound);
+
+    // 2. Atomic Commit rollback: if a later write in Commit fails precondition or transform
+    //    evaluation, earlier writes in the same Commit must not persist.
+    assert_status_code(
+        db.commit_writes(
+            WriteBatchSpec::new()
+                .put("atomic/doc1", fields!({ "v": 1i64 }))
+                .update_with(
+                    "atomic/missing",
+                    fields!({ "v": 2i64 }),
+                    None,
+                    vec![],
+                    Some(pre_exists(true)),
+                ),
+        )
+        .await,
+        Code::NotFound,
+    );
+    assert_status_code(db.get("atomic/doc1").await, Code::NotFound);
+
+    assert_status_code(
+        db.commit_writes(
+            WriteBatchSpec::new()
+                .put("atomic/doc1", fields!({ "v": 1i64 }))
+                .update_with(
+                    "atomic/doc2",
+                    fields!({}),
+                    Some(vec![]),
+                    vec![tf_maximum("m", 5i64)],
+                    None,
+                ),
+        )
+        .await,
+        Code::Unimplemented,
+    );
+    assert_status_code(db.get("atomic/doc1").await, Code::NotFound);
+
+    assert_status_code(
+        db.commit_writes(
+            WriteBatchSpec::new()
+                .put("atomic/same", fields!({ "v": 1i64 }))
+                .update_with(
+                    "atomic/same",
+                    fields!({ "v": 2i64 }),
+                    None,
+                    vec![],
+                    Some(pre_exists(false)),
+                ),
+        )
+        .await,
+        Code::AlreadyExists,
+    );
+    assert_status_code(db.get("atomic/same").await, Code::NotFound);
+}
+
+#[gtest]
+#[tokio::test]
+async fn array_union_deduplicates_on_missing_or_non_array_and_increment_rejects_non_numeric() {
+    let mut db = TestEnv::new().build_db();
+
+    db.put("arrays/u1", fields!({ "scalar": "not-an-array" }))
+        .await
+        .unwrap();
+
+    db.commit_writes(WriteBatchSpec::new().update_with(
+        "arrays/u1",
+        fields!({}),
+        Some(vec![]),
+        vec![
+            tf_append_missing(
+                "missing",
+                vec![
+                    val!(1i64),
+                    val!(1i64),
+                    val!(0i64),
+                    val!(-0.0f64),
+                    val!(f64::NAN),
+                    val!(f64::NAN),
+                ],
+            ),
+            tf_append_missing("scalar", vec![val!("x"), val!("x"), val!("y")]),
+        ],
+        None,
+    ))
+    .await
+    .unwrap();
+
+    let doc = db.get("arrays/u1").await.unwrap();
+    assert_doc_wire_eq(
+        &doc,
+        "arrays/u1",
+        &fields!({
+            "missing": [1i64, 0i64, f64::NAN],
+            "scalar": ["x", "y"],
+        }),
+    );
+
+    // Non-numeric Increment operands must reject with InvalidArgument.
+    for bad in [val!("bad"), val!(true), Value::null()] {
+        assert_status_code(
+            db.commit_writes(WriteBatchSpec::new().update_with(
+                "arrays/u1",
+                fields!({}),
+                Some(vec![]),
+                vec![tf_increment("cnt", bad)],
+                None,
+            ))
+            .await,
+            Code::InvalidArgument,
+        );
+    }
+}

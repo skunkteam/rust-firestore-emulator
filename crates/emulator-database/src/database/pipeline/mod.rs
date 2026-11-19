@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
 
 use googleapis::google::firestore::v1::{Document, StructuredPipeline};
 
@@ -24,7 +24,7 @@ mod sort;
 use googleapis::google::firestore::v1::Value;
 use itertools::Itertools;
 
-use crate::database::field_path::FieldReference;
+use crate::database::field_path::{FieldPath, FieldReference};
 
 pub async fn execute(
     database: &Arc<FirestoreDatabase>,
@@ -79,7 +79,9 @@ pub async fn execute(
 /// capabilities directly into the stateless `Document` instances passed through pipeline arrays.
 fn get_document_value(field_ref: &FieldReference, doc: &Document) -> Option<Value> {
     match field_ref {
-        FieldReference::DocumentName => Some(Value::reference(doc.name.clone())),
+        FieldReference::DocumentName => {
+            (!doc.name.is_empty()).then(|| Value::reference(doc.name.clone()))
+        }
         FieldReference::FieldPath(path) => path.get_value(&doc.fields).cloned(),
     }
 }
@@ -91,4 +93,102 @@ fn get_exact_expr_args<'a, const N: usize>(
     args.iter().collect_array().ok_or_else(|| {
         GenericDatabaseError::invalid_argument(format!("{what} expects {N} arguments"))
     })
+}
+
+/// Parses and validates projection/add-fields target paths deterministically, rejecting
+/// overlapping ancestor/descendant or duplicate-representation paths in the same stage.
+pub(super) fn parse_projection_paths(
+    projection_map: &HashMap<String, Value>,
+) -> Result<Vec<(FieldPath, &Value)>> {
+    let mut entries: Vec<(&String, FieldPath, &Value)> = Vec::with_capacity(projection_map.len());
+    for (alias, expr) in projection_map {
+        let path: FieldPath = alias.parse()?;
+        path.validate_non_reserved()?;
+        entries.push((alias, path, expr));
+    }
+    entries.sort_by(|a, b| a.0.cmp(b.0));
+
+    for i in 0..entries.len() {
+        for j in (i + 1)..entries.len() {
+            if entries[i].1.starts_with(&entries[j].1) || entries[j].1.starts_with(&entries[i].1) {
+                return Err(GenericDatabaseError::invalid_argument(format!(
+                    "Conflicting field paths '{}' and '{}'",
+                    entries[i].0, entries[j].0
+                )));
+            }
+        }
+    }
+
+    Ok(entries
+        .into_iter()
+        .map(|(_, path, expr)| (path, expr))
+        .collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use googleapis::google::firestore::v1::{Function, pipeline::Stage, value::ValueType};
+
+    use super::*;
+
+    fn field_ref(path: &str) -> Value {
+        Value {
+            value_type: Some(ValueType::FieldReferenceValue(path.to_string())),
+        }
+    }
+
+    fn fn_val(name: &str, args: Vec<Value>) -> Value {
+        Value {
+            value_type: Some(ValueType::FunctionValue(Function {
+                name: name.to_string(),
+                args,
+                options: HashMap::new(),
+            })),
+        }
+    }
+
+    #[test]
+    fn remove_fields_document_name_treats_name_as_absent_in_subsequent_stages() {
+        let doc = Document {
+            name: "projects/p/databases/(default)/documents/c/d1".to_string(),
+            fields: HashMap::from([("x".to_string(), Value::integer(1))]),
+            create_time: None,
+            update_time: None,
+        };
+
+        let after_rm = remove_fields::execute(
+            Stage {
+                name:    "remove_fields".to_string(),
+                args:    vec![field_ref("__name__")],
+                options: HashMap::new(),
+            },
+            vec![doc],
+        )
+        .unwrap();
+
+        let selected = select::execute(
+            Stage {
+                name:    "select".to_string(),
+                args:    vec![Value::map(HashMap::from([
+                    (
+                        "name_absent".to_string(),
+                        fn_val("is_absent", vec![field_ref("__name__")]),
+                    ),
+                    (
+                        "eq_missing".to_string(),
+                        fn_val("equal", vec![field_ref("__name__"), field_ref("missing")]),
+                    ),
+                    ("projected_name".to_string(), field_ref("__name__")),
+                ]))],
+                options: HashMap::new(),
+            },
+            after_rm,
+        )
+        .unwrap();
+
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].fields["name_absent"], Value::boolean(true));
+        assert_eq!(selected[0].fields["eq_missing"], Value::boolean(true));
+        assert_eq!(selected[0].fields["projected_name"], Value::null());
+    }
 }

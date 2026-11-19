@@ -1,4 +1,4 @@
-use std::iter;
+use std::{cmp::Ordering, iter};
 
 use googleapis::google::firestore::v1::{Value, structured_query};
 use itertools::Itertools;
@@ -24,6 +24,24 @@ impl Filter {
             Filter::Field(f) => f.op.is_inequality().then_some(&f.field),
             Filter::Unary(f) => f.op.is_inequality().then_some(&f.field),
         })
+    }
+
+    pub(crate) fn sorted_non_name_inequality_fields(&self) -> Vec<FieldReference> {
+        let mut fields: Vec<FieldReference> = self
+            .get_inequality_fields()
+            .filter(|f| !f.is_document_name())
+            .cloned()
+            .unique()
+            .collect();
+        fields.sort_by(|a, b| match (a, b) {
+            (FieldReference::FieldPath(pa), FieldReference::FieldPath(pb)) => {
+                pa.segments().cmp(pb.segments())
+            }
+            (FieldReference::DocumentName, FieldReference::DocumentName) => Ordering::Equal,
+            (FieldReference::DocumentName, FieldReference::FieldPath(_)) => Ordering::Less,
+            (FieldReference::FieldPath(_), FieldReference::DocumentName) => Ordering::Greater,
+        });
+        fields
     }
 
     pub fn field_filters(&self) -> impl Iterator<Item = &FieldFilter> {
@@ -78,7 +96,10 @@ impl TryFrom<structured_query::Filter> for Filter {
 
     fn try_from(value: structured_query::Filter) -> Result<Self, Self::Error> {
         use structured_query::filter::FilterType::*;
-        match value.filter_type.expect("filter without filter_type") {
+        let filter_type = value.filter_type.ok_or_else(|| {
+            GenericDatabaseError::invalid_argument("missing filter_type in Filter")
+        })?;
+        match filter_type {
             CompositeFilter(f) => Ok(Self::Composite(f.try_into()?)),
             FieldFilter(f) => Ok(Self::Field(f.try_into()?)),
             UnaryFilter(f) => Ok(Self::Unary(f.try_into()?)),
@@ -195,15 +216,20 @@ impl TryFrom<structured_query::FieldFilter> for FieldFilter {
     type Error = GenericDatabaseError;
 
     fn try_from(value: structured_query::FieldFilter) -> Result<Self, Self::Error> {
+        let field = value
+            .field
+            .as_ref()
+            .ok_or_else(|| GenericDatabaseError::invalid_argument("missing field in FieldFilter"))?
+            .field_path
+            .parse()?;
+        let op = value.op().try_into()?;
+        let val = value.value.ok_or_else(|| {
+            GenericDatabaseError::invalid_argument("missing value in FieldFilter")
+        })?;
         Ok(Self {
-            field: value
-                .field
-                .as_ref()
-                .expect("missing field in FieldFilter")
-                .field_path
-                .parse()?,
-            op:    value.op().try_into()?,
-            value: value.value.expect("missing value in FieldFilter"),
+            field,
+            op,
+            value: val,
         })
     }
 }
@@ -361,10 +387,10 @@ impl TryFrom<structured_query::UnaryFilter> for UnaryFilter {
     type Error = GenericDatabaseError;
 
     fn try_from(value: structured_query::UnaryFilter) -> Result<Self, Self::Error> {
-        let structured_query::unary_filter::OperandType::Field(field) = value
-            .operand_type
-            .as_ref()
-            .expect("missing operand_type in UnaryFilter");
+        let structured_query::unary_filter::OperandType::Field(field) =
+            value.operand_type.as_ref().ok_or_else(|| {
+                GenericDatabaseError::invalid_argument("missing operand_type in UnaryFilter")
+            })?;
         Ok(Self {
             field: field.field_path.parse()?,
             op:    value.op().try_into()?,
@@ -495,5 +521,95 @@ mod tests {
         };
         expect_that!(nan_in_filter.eval(&nan_version, false), ok(eq(&false)));
         expect_that!(nan_in_filter.eval(&nan_version, true), ok(eq(&true)));
+    }
+
+    #[gtest]
+    fn try_from_missing_required_proto_fields_returns_invalid_argument() {
+        use googleapis::google::firestore::v1::structured_query;
+
+        use super::{Filter, GenericDatabaseError};
+
+        assert_that!(
+            Filter::try_from(structured_query::Filter { filter_type: None }),
+            err(eq(&GenericDatabaseError::invalid_argument(
+                "missing filter_type in Filter"
+            )))
+        );
+
+        assert_that!(
+            FieldFilter::try_from(structured_query::FieldFilter {
+                field: None,
+                op:    structured_query::field_filter::Operator::Equal as i32,
+                value: Some(Value::integer(1)),
+            }),
+            err(eq(&GenericDatabaseError::invalid_argument(
+                "missing field in FieldFilter"
+            )))
+        );
+
+        assert_that!(
+            FieldFilter::try_from(structured_query::FieldFilter {
+                field: Some(structured_query::FieldReference {
+                    field_path: "a".to_string(),
+                }),
+                op:    structured_query::field_filter::Operator::Equal as i32,
+                value: None,
+            }),
+            err(eq(&GenericDatabaseError::invalid_argument(
+                "missing value in FieldFilter"
+            )))
+        );
+
+        assert_that!(
+            super::UnaryFilter::try_from(structured_query::UnaryFilter {
+                op: structured_query::unary_filter::Operator::IsNull as i32,
+                operand_type: None,
+            }),
+            err(eq(&GenericDatabaseError::invalid_argument(
+                "missing operand_type in UnaryFilter"
+            )))
+        );
+    }
+
+    #[gtest]
+    fn sorted_non_name_inequality_fields_orders_escaped_dot_segments_by_parsed_segments() {
+        use super::{CompositeFilter, CompositeOperator, Filter};
+
+        let f_escaped = Filter::Field(FieldFilter {
+            field: "`a.b`".parse().unwrap(),
+            op:    FieldOperator::GreaterThan,
+            value: Value::integer(0),
+        });
+        let f_nested_c = Filter::Field(FieldFilter {
+            field: "a.c".parse().unwrap(),
+            op:    FieldOperator::GreaterThan,
+            value: Value::integer(0),
+        });
+        let f_nested_b = Filter::Field(FieldFilter {
+            field: "a.b".parse().unwrap(),
+            op:    FieldOperator::GreaterThan,
+            value: Value::integer(0),
+        });
+
+        let filter = Filter::Composite(CompositeFilter {
+            op:      CompositeOperator::And,
+            filters: vec![f_escaped.clone(), f_nested_c],
+        });
+        assert_eq!(
+            filter.sorted_non_name_inequality_fields(),
+            vec!["a.c".parse().unwrap(), "`a.b`".parse().unwrap()]
+        );
+
+        let order_1 = Filter::Composite(CompositeFilter {
+            op:      CompositeOperator::And,
+            filters: vec![f_escaped.clone(), f_nested_b.clone()],
+        });
+        let order_2 = Filter::Composite(CompositeFilter {
+            op:      CompositeOperator::And,
+            filters: vec![f_nested_b, f_escaped],
+        });
+        let expected = vec!["a.b".parse().unwrap(), "`a.b`".parse().unwrap()];
+        assert_eq!(order_1.sorted_non_name_inequality_fields(), expected);
+        assert_eq!(order_2.sorted_non_name_inequality_fields(), expected);
     }
 }

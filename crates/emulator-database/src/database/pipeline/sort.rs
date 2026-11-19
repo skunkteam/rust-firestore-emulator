@@ -2,11 +2,8 @@ use std::cmp::Ordering;
 
 use googleapis::google::firestore::v1::{Document, pipeline::Stage};
 
-use super::get_document_value;
-use crate::{
-    GenericDatabaseError, database::field_path::FieldReference, error::Result,
-    unimplemented_collection,
-};
+use super::expressions;
+use crate::{GenericDatabaseError, error::Result, unimplemented_collection};
 
 /// Executes the `sort` pipeline stage.
 ///
@@ -17,49 +14,56 @@ pub(super) fn execute(
         args,
         options,
     }: Stage,
-    mut docs: Vec<Document>,
+    docs: Vec<Document>,
 ) -> Result<Vec<Document>> {
     assert_eq!(name, "sort");
     unimplemented_collection!(options);
 
-    let mut criteria = Vec::new();
+    if args.is_empty() {
+        return Err(GenericDatabaseError::invalid_argument(
+            "sort stage expects at least 1 ordering argument",
+        ));
+    }
+
+    let mut criteria = Vec::with_capacity(args.len());
 
     for arg in &args {
         let map = arg.as_map().ok_or_else(|| {
             GenericDatabaseError::invalid_argument("sort arguments must be MapValues")
         })?;
-        let dir_val = map.get("direction").and_then(|v| v.as_string());
-        let field_ref: FieldReference = map
-            .get("expression")
-            .and_then(|v| v.as_field_reference())
-            .ok_or_else(|| {
-                GenericDatabaseError::invalid_argument(
-                    "sort expression must be a FieldReferenceValue",
-                )
-            })?
-            .parse()?;
-
-        let is_ascending = match dir_val {
-            Some("descending") => false,
-            Some("ascending") => true,
-            _ => true,
+        let is_ascending = match map.get("direction") {
+            None => true,
+            Some(v) => match v.as_string() {
+                Some("ascending") => true,
+                Some("descending") => false,
+                _ => {
+                    return Err(GenericDatabaseError::invalid_argument(
+                        "sort direction must be 'ascending' or 'descending'",
+                    ));
+                }
+            },
         };
+        let expr = map.get("expression").ok_or_else(|| {
+            GenericDatabaseError::invalid_argument("sort ordering must contain an 'expression'")
+        })?;
 
-        criteria.push((field_ref, is_ascending));
+        criteria.push((expr, is_ascending));
     }
 
-    docs.sort_by(|a, b| {
-        for (field_ref, is_ascending) in &criteria {
-            let val_a = get_document_value(field_ref, a);
-            let val_b = get_document_value(field_ref, b);
+    let mut keyed_docs = Vec::with_capacity(docs.len());
+    for doc in docs {
+        let mut keys = Vec::with_capacity(criteria.len());
+        for (expr, _) in &criteria {
+            keys.push(expressions::evaluate(expr, &doc)?);
+        }
+        keyed_docs.push((doc, keys));
+    }
 
-            let ord = match (val_a, val_b) {
-                (Some(ref a_val), Some(ref b_val)) => a_val.cmp(b_val),
-                (Some(_), None) => Ordering::Greater,
-                (None, Some(_)) => Ordering::Less,
-                (None, None) => Ordering::Equal,
-            };
-
+    keyed_docs.sort_by(|(_, keys_a), (_, keys_b)| {
+        for ((_, is_ascending), (val_a, val_b)) in
+            criteria.iter().zip(keys_a.iter().zip(keys_b.iter()))
+        {
+            let ord = val_a.cmp(val_b);
             if ord.is_ne() {
                 return if *is_ascending { ord } else { ord.reverse() };
             }
@@ -67,5 +71,5 @@ pub(super) fn execute(
         Ordering::Equal
     });
 
-    Ok(docs)
+    Ok(keyed_docs.into_iter().map(|(doc, _)| doc).collect())
 }

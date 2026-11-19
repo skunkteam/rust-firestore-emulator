@@ -31,10 +31,14 @@ pub(super) async fn execute(
         GenericDatabaseError::invalid_argument("collection stage expects a ReferenceValue argument")
     })?;
 
-    let collection_ref = CollectionRef::new(
-        root_ref.clone(),
-        collection_path.strip_prefix('/').unwrap_or(collection_path),
-    );
+    let rel_path = collection_path.strip_prefix('/').unwrap_or(collection_path);
+    if rel_path.is_empty() {
+        return Err(GenericDatabaseError::InvalidReference(
+            "collection",
+            collection_path.to_string(),
+        ));
+    }
+    let collection_ref: CollectionRef = format!("{root_ref}/{rel_path}").parse()?;
 
     // The enterprise edition check was successfully validated at the entrance of PipelineEngine.
     let mut query = QueryBuilder::from_collection(collection_ref)

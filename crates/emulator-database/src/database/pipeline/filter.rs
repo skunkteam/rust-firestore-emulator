@@ -1,9 +1,9 @@
-use googleapis::google::firestore::v1::{Document, Function, pipeline::Stage};
+use googleapis::google::firestore::v1::{Document, Value, pipeline::Stage};
 
 use crate::{
     GenericDatabaseError,
     error::Result,
-    pipeline::{function, get_exact_expr_args},
+    pipeline::{expressions, get_exact_expr_args},
     unimplemented_collection,
 };
 
@@ -20,13 +20,9 @@ pub(super) fn execute(
 
     let [arg] = get_exact_expr_args(&args, "where")?;
 
-    let func = arg.as_function_value().ok_or_else(|| {
-        GenericDatabaseError::invalid_argument("where stage expects a FunctionValue argument")
-    })?;
-
     let mut filtered_docs = Vec::new();
     for doc in docs {
-        if evaluate_condition(func, &doc)? {
+        if evaluate_condition(arg, &doc)? {
             filtered_docs.push(doc);
         }
     }
@@ -34,9 +30,14 @@ pub(super) fn execute(
     Ok(filtered_docs)
 }
 
-fn evaluate_condition(func: &Function, doc: &Document) -> Result<bool> {
-    let result = function::evaluate(func, doc)?;
-    let is_match = result.and_then(|v| v.as_boolean()).ok_or_else(|| {
+fn evaluate_condition(expr: &Value, doc: &Document) -> Result<bool> {
+    let Some(result) = expressions::maybe_evaluate(expr, doc)? else {
+        return Ok(false);
+    };
+    if result.is_null() {
+        return Ok(false);
+    }
+    let is_match = result.as_boolean().ok_or_else(|| {
         GenericDatabaseError::invalid_argument("where condition expects a boolean argument")
     })?;
 

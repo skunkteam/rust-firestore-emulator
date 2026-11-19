@@ -554,6 +554,12 @@ impl PartialOrd for Pipeline {
     }
 }
 
+impl PartialEq for LatLng {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other).is_eq()
+    }
+}
+
 impl Eq for LatLng {}
 
 impl Ord for LatLng {
@@ -861,6 +867,43 @@ mod tests {
         expect_eq!(a.cmp(&b), Ordering::Equal);
         expect_eq!(a.cmp(&c), Ordering::Less);
         expect_eq!(b.cmp(&c), Ordering::Less);
+
+        expect_eq!(a, a);
+        expect_eq!(a, b);
+        expect_ne!(a, c);
+        expect_eq!(a.partial_cmp(&b), Some(Ordering::Equal));
+
+        let neg_zero = LatLng {
+            latitude:  -0.0,
+            longitude: -0.0,
+        };
+        expect_eq!(neg_zero, c);
+        expect_eq!(neg_zero.cmp(&c), Ordering::Equal);
+
+        let samples = [
+            a,
+            b,
+            LatLng {
+                latitude:  0.0,
+                longitude: neg_nan,
+            },
+            LatLng {
+                latitude:  0.0,
+                longitude: pos_nan,
+            },
+            neg_zero,
+            c,
+            LatLng {
+                latitude:  52.37,
+                longitude: 4.89,
+            },
+        ];
+        for x in &samples {
+            for y in &samples {
+                expect_eq!(x == y, x.cmp(y) == Ordering::Equal);
+                expect_eq!(x.partial_cmp(y), Some(x.cmp(y)));
+            }
+        }
     }
 
     #[gtest]

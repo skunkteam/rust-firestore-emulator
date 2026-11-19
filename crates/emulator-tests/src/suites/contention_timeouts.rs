@@ -197,8 +197,8 @@ async fn fast_timeout_boundaries_enforce_2s_write_and_5s_read_across_1s_warning_
 
     // --- Part B: 5s read-lock timeout boundary ---
     // Hold read locks on `b1`, `b2`, `b3` in three transactions. A multi-doc commit writing
-    // `[target, b1, b2, b3]` immediately acquires `write_guard(target)` at t=0 and then awaits each
-    // blocker in sequence (< 2s each), keeping `target` write-locked past 5,000ms!
+    // `[a_target, b1, b2, b3]` immediately acquires `write_guard(a_target)` at t=0 and then awaits
+    // each blocker in sequence (< 2s each), keeping `a_target` write-locked past 5,000ms!
     let mut hold_b1 = db.begin_rw_txn().await.unwrap();
     let _unused = hold_b1.get("t/b1").await.unwrap();
     let mut hold_b2 = db.begin_rw_txn().await.unwrap();
@@ -211,7 +211,7 @@ async fn fast_timeout_boundaries_enforce_2s_write_and_5s_read_across_1s_warning_
         multi_writer
             .commit_writes(
                 WriteBatchSpec::new()
-                    .put("t/target", fields!({ "v": 9i64 }))
+                    .put("t/a_target", fields!({ "v": 9i64 }))
                     .put("t/b1", fields!({ "v": 9i64 }))
                     .put("t/b2", fields!({ "v": 9i64 }))
                     .put("t/b3", fields!({ "v": 9i64 })),
@@ -221,7 +221,7 @@ async fn fast_timeout_boundaries_enforce_2s_write_and_5s_read_across_1s_warning_
     hold_target_write.assert_pending().await;
 
     let mut reader_db = db.clone();
-    let mut read_op = ContentionProbe::spawn_op(async move { reader_db.get("t/target").await });
+    let mut read_op = ContentionProbe::spawn_op(async move { reader_db.get("t/a_target").await });
     read_op.assert_pending().await;
 
     // t = 1,800ms: release b1 so multi_writer advances to b2 (fresh 2s timer)
@@ -314,7 +314,7 @@ async fn cloud_timeout_boundaries_enforce_15s_write_and_16s_read() {
         multi_writer
             .commit_writes(
                 WriteBatchSpec::new()
-                    .put("c/target", fields!({ "v": 9i64 }))
+                    .put("c/a_target", fields!({ "v": 9i64 }))
                     .put("c/b1", fields!({ "v": 9i64 }))
                     .put("c/b2", fields!({ "v": 9i64 })),
             )
@@ -323,7 +323,7 @@ async fn cloud_timeout_boundaries_enforce_15s_write_and_16s_read() {
     hold_target_write.assert_pending().await;
 
     let mut reader_db = db.clone();
-    let mut read_op = ContentionProbe::spawn_op(async move { reader_db.get("c/target").await });
+    let mut read_op = ContentionProbe::spawn_op(async move { reader_db.get("c/a_target").await });
     read_op.assert_pending().await;
 
     // t = 14,000ms: release b1 so multi_writer holds `target` across t = 16,000ms

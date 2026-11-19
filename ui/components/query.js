@@ -5,6 +5,7 @@ import {
   VALUE_TYPES,
   formatValuePreview,
   normalizeReference,
+  stringifyProtoJson,
   validateDouble,
   validateGeoPoint,
   validateInteger64,
@@ -105,7 +106,7 @@ export function createQueryRunnerState(collectionId = "", parentSubpath = "") {
     filters: [],
     orders: [],
     limitText: "50",
-    rawQueryText: JSON.stringify(initialQuery, null, 2),
+    rawQueryText: stringifyProtoJson(initialQuery, 2),
     error: null,
     running: false,
     elapsedMs: null,
@@ -342,7 +343,7 @@ export function renderQueryRunner(props) {
     if (nextMode === "raw") {
       const built = buildStructuredQueryFromVisual(state, projectId, databaseId);
       if (built.valid && built.query) {
-        state.rawQueryText = JSON.stringify(built.query, null, 2);
+        state.rawQueryText = stringifyProtoJson(built.query, 2);
         state.error = null;
       }
     }

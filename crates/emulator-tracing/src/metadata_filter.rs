@@ -35,7 +35,11 @@ pub(crate) struct Filter {
 
 impl Filter {
     pub(crate) fn allows(&self, meta: &Metadata<'_>) -> bool {
-        self.directives.iter().any(|dir| dir.allows(meta))
+        self.directives
+            .iter()
+            .filter(|dir| dir.matches_target(meta))
+            .max_by_key(|dir| dir.target.as_deref().map_or(0, str::len))
+            .is_some_and(|dir| meta.level() <= &dir.level)
     }
 }
 
@@ -93,20 +97,11 @@ impl FromStr for Directive {
 }
 
 impl Directive {
-    fn allows(&self, meta: &Metadata<'_>) -> bool {
-        if meta.level() > &self.level {
-            return false;
+    fn matches_target(&self, meta: &Metadata<'_>) -> bool {
+        match &self.target {
+            Some(target) => meta.target().starts_with(target),
+            None => true,
         }
-
-        // Does this directive have a target filter, and does it match the
-        // metadata's target?
-        if let Some(ref target) = self.target
-            && !meta.target().starts_with(target)
-        {
-            return false;
-        }
-
-        true
     }
 }
 
@@ -207,5 +202,28 @@ mod tests {
         let err = bad.parse::<Filter>().unwrap_err();
         expect_that!(err, pat!(ParseError::InvalidDirective(_)));
         expect_that!(err.to_string(), contains_substring("invalid directive"));
+    }
+
+    #[gtest]
+    fn most_specific_and_later_directives_override_broader_rules() {
+        let off_override: Filter = "info,tower_http=off".parse().unwrap();
+        expect_true!(off_override.allows(static_meta!("emulator_grpc", Level::INFO)));
+        expect_false!(off_override.allows(static_meta!("tower_http::trace", Level::ERROR)));
+        expect_false!(off_override.allows(static_meta!("tower_http::trace", Level::INFO)));
+
+        let level_override: Filter = "debug,emulator_grpc=error".parse().unwrap();
+        expect_true!(level_override.allows(static_meta!("other", Level::DEBUG)));
+        expect_false!(level_override.allows(static_meta!("emulator_grpc::rpc", Level::WARN)));
+        expect_true!(level_override.allows(static_meta!("emulator_grpc::rpc", Level::ERROR)));
+
+        let subtarget_off: Filter = "tower_http=debug,tower_http::trace=off".parse().unwrap();
+        expect_true!(subtarget_off.allows(static_meta!("tower_http::other", Level::DEBUG)));
+        expect_false!(
+            subtarget_off.allows(static_meta!("tower_http::trace::on_req", Level::ERROR))
+        );
+
+        let global_last_wins: Filter = "debug,info".parse().unwrap();
+        expect_false!(global_last_wins.allows(static_meta!("any", Level::DEBUG)));
+        expect_true!(global_last_wins.allows(static_meta!("any", Level::INFO)));
     }
 }

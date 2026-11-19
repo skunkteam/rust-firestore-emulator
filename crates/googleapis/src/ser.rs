@@ -12,7 +12,7 @@ use serde::{
     de::{self, IgnoredAny, MapAccess, Visitor},
     ser::SerializeMap,
 };
-use time::{OffsetDateTime, UtcOffset, format_description::well_known::Iso8601};
+use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
 use crate::google::{
     firestore::v1::{
@@ -93,9 +93,8 @@ impl<'de> Deserialize<'de> for Timestamp {
             }
 
             fn visit_str<E: de::Error>(self, v: &str) -> Result<Self::Value, E> {
-                let dt = OffsetDateTime::parse(v, &Iso8601::DEFAULT)
-                    .map_err(|e| E::custom(format!("invalid RFC 3339 timestamp '{v}': {e}")))?
-                    .to_offset(UtcOffset::UTC);
+                let dt = OffsetDateTime::parse(v, &Rfc3339)
+                    .map_err(|e| E::custom(format!("invalid RFC 3339 timestamp '{v}': {e}")))?;
                 let ts = Timestamp::from(dt);
                 if !(MIN_TIMESTAMP_SECONDS..=MAX_TIMESTAMP_SECONDS).contains(&ts.seconds) {
                     return Err(E::custom(format!(
@@ -265,6 +264,11 @@ impl<'de> Deserialize<'de> for ProtoDouble {
                         let parsed = other.parse::<f64>().map_err(|e| {
                             E::custom(format!("invalid doubleValue '{other}': {e}"))
                         })?;
+                        if !parsed.is_finite() {
+                            return Err(E::custom(format!(
+                                "invalid or out-of-range doubleValue '{other}'"
+                            )));
+                        }
                         Ok(ProtoDouble(parsed))
                     }
                 }
@@ -272,6 +276,65 @@ impl<'de> Deserialize<'de> for ProtoDouble {
         }
 
         deserializer.deserialize_any(DoubleVisitor)
+    }
+}
+
+struct ProtoDoubleRef(f64);
+
+impl Serialize for ProtoDoubleRef {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        if self.0.is_nan() {
+            serializer.serialize_str("NaN")
+        } else if self.0 == f64::INFINITY {
+            serializer.serialize_str("Infinity")
+        } else if self.0 == f64::NEG_INFINITY {
+            serializer.serialize_str("-Infinity")
+        } else {
+            serializer.serialize_f64(self.0)
+        }
+    }
+}
+
+impl Serialize for LatLng {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        #[derive(Serialize)]
+        struct LatLngSer {
+            latitude:  ProtoDoubleRef,
+            longitude: ProtoDoubleRef,
+        }
+        LatLngSer {
+            latitude:  ProtoDoubleRef(self.latitude),
+            longitude: ProtoDoubleRef(self.longitude),
+        }
+        .serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for LatLng {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize, Default)]
+        #[serde(rename_all = "camelCase", default, deny_unknown_fields)]
+        struct LatLngDe {
+            latitude:  Option<ProtoDouble>,
+            longitude: Option<ProtoDouble>,
+        }
+        let helper = LatLngDe::deserialize(deserializer)?;
+        let latitude = helper.latitude.map_or(0.0, |v| v.0);
+        let longitude = helper.longitude.map_or(0.0, |v| v.0);
+        if !(-90.0..=90.0).contains(&latitude) {
+            return Err(de::Error::custom(format!(
+                "LatLng latitude {latitude} must be within [-90.0, 90.0]"
+            )));
+        }
+        if !(-180.0..=180.0).contains(&longitude) {
+            return Err(de::Error::custom(format!(
+                "LatLng longitude {longitude} must be within [-180.0, 180.0]"
+            )));
+        }
+        Ok(LatLng {
+            latitude,
+            longitude,
+        })
     }
 }
 
@@ -286,15 +349,7 @@ impl Serialize for Value {
             ValueType::BooleanValue(b) => map.serialize_entry("booleanValue", b)?,
             ValueType::IntegerValue(i) => map.serialize_entry("integerValue", &i.to_string())?,
             ValueType::DoubleValue(d) => {
-                if d.is_nan() {
-                    map.serialize_entry("doubleValue", "NaN")?;
-                } else if *d == f64::INFINITY {
-                    map.serialize_entry("doubleValue", "Infinity")?;
-                } else if *d == f64::NEG_INFINITY {
-                    map.serialize_entry("doubleValue", "-Infinity")?;
-                } else {
-                    map.serialize_entry("doubleValue", d)?;
-                }
+                map.serialize_entry("doubleValue", &ProtoDoubleRef(*d))?;
             }
             ValueType::TimestampValue(ts) => map.serialize_entry("timestampValue", ts)?,
             ValueType::StringValue(s) => map.serialize_entry("stringValue", s)?,
@@ -976,6 +1031,19 @@ impl<'de> Deserialize<'de> for StructuredQuery {
 
 impl Serialize for RunQueryRequest {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        if self.explain_options.is_some() {
+            return Err(serde::ser::Error::custom(
+                "RunQueryRequest.explainOptions ProtoJSON serialization is not supported",
+            ));
+        }
+        if matches!(
+            self.consistency_selector,
+            Some(run_query_request::ConsistencySelector::NewTransaction(_))
+        ) {
+            return Err(serde::ser::Error::custom(
+                "RunQueryRequest.newTransaction ProtoJSON serialization is not supported",
+            ));
+        }
         let mut map = serializer.serialize_map(None)?;
         if !self.parent.is_empty() {
             map.serialize_entry("parent", &self.parent)?;
@@ -983,10 +1051,14 @@ impl Serialize for RunQueryRequest {
         if let Some(run_query_request::QueryType::StructuredQuery(ref sq)) = self.query_type {
             map.serialize_entry("structuredQuery", sq)?;
         }
-        if let Some(run_query_request::ConsistencySelector::ReadTime(ref rt)) =
-            self.consistency_selector
-        {
-            map.serialize_entry("readTime", rt)?;
+        match &self.consistency_selector {
+            Some(run_query_request::ConsistencySelector::Transaction(tx)) => {
+                map.serialize_entry("transaction", &Base64Bytes(tx))?;
+            }
+            Some(run_query_request::ConsistencySelector::ReadTime(rt)) => {
+                map.serialize_entry("readTime", rt)?;
+            }
+            Some(run_query_request::ConsistencySelector::NewTransaction(_)) | None => {}
         }
         map.end()
     }
@@ -1472,6 +1544,186 @@ mod tests {
 
         let parsed_doc: Document = serde_json::from_str(&doc_json).unwrap();
         expect_true!(Value::fields_storage_eq(&doc.fields, &parsed_doc.fields));
+    }
+
+    #[gtest]
+    fn timestamp_offset_bounds_and_rfc3339_conformance() {
+        // Offset-shifted boundary timestamps crossing 0001..=9999 UTC must error without panicking.
+        for oob in [
+            "9999-12-31T23:59:59-01:00",
+            "9999-12-31T23:59:59.999999999-00:01",
+            "0001-01-01T00:00:00+01:00",
+            "0000-12-31T23:59:59Z",
+        ] {
+            expect_that!(
+                serde_json::from_str::<Timestamp>(&format!("\"{oob}\"")),
+                err(anything())
+            );
+            expect_that!(
+                serde_json::from_value::<Value>(json!({ "timestampValue": oob })),
+                err(anything())
+            );
+        }
+
+        let max_shifted: Timestamp =
+            serde_json::from_str(r#""9999-12-31T23:59:59+01:00""#).unwrap();
+        expect_eq!(max_shifted.seconds, MAX_TIMESTAMP_SECONDS - 3600);
+
+        let min_shifted: Timestamp =
+            serde_json::from_str(r#""0001-01-01T00:00:00-01:00""#).unwrap();
+        expect_eq!(min_shifted.seconds, MIN_TIMESTAMP_SECONDS + 3600);
+
+        // RFC 3339 allows lowercase 't' and 'z'.
+        let lower: Timestamp = serde_json::from_str(r#""2026-11-10t15:30:45z""#).unwrap();
+        let upper: Timestamp = serde_json::from_str(r#""2026-11-10T15:30:45Z""#).unwrap();
+        expect_eq!(lower, upper);
+
+        let lower_frac: Timestamp =
+            serde_json::from_str(r#""2026-11-10t15:30:45.125+02:00""#).unwrap();
+        expect_eq!(lower_frac.seconds, upper.seconds - 7200);
+        expect_eq!(lower_frac.nanos, 125_000_000);
+
+        // Non-RFC-3339 ISO 8601 forms must be rejected.
+        for non_rfc3339 in [
+            "2026-11-10T15:30Z",
+            "2026-11-10T15:30:45+0200",
+            "20261110T153045Z",
+            "2026-W46-2T15:30:45Z",
+            "2026-314T15:30:45Z",
+            "2026-11-10T15:30:45,5Z",
+        ] {
+            expect_that!(
+                serde_json::from_str::<Timestamp>(&format!("\"{non_rfc3339}\"")),
+                err(anything())
+            );
+        }
+    }
+
+    #[gtest]
+    fn double_string_validation_rejects_non_protojson_and_overflow() {
+        for bad in [
+            "inf",
+            "-inf",
+            "nan",
+            "NAN",
+            "-NaN",
+            "+NaN",
+            "+Infinity",
+            "infinity",
+            "-infinity",
+            "1e500",
+            "-1e500",
+            "1.8e308",
+        ] {
+            expect_that!(
+                serde_json::from_value::<Value>(json!({ "doubleValue": bad })),
+                err(anything())
+            );
+        }
+
+        let neg_zero_str: Value = serde_json::from_value(json!({ "doubleValue": "-0.0" })).unwrap();
+        expect_true!(neg_zero_str.storage_eq(&Value::double(-0.0)));
+
+        let neg_zero_short: Value = serde_json::from_value(json!({ "doubleValue": "-0" })).unwrap();
+        expect_true!(neg_zero_short.storage_eq(&Value::double(-0.0)));
+
+        let max_finite: Value =
+            serde_json::from_value(json!({ "doubleValue": "1.7976931348623157e308" })).unwrap();
+        expect_true!(max_finite.storage_eq(&Value::double(f64::MAX)));
+    }
+
+    #[gtest]
+    fn lat_lng_protojson_bounds_strings_and_non_finite_serialization() {
+        let empty: LatLng = serde_json::from_str("{}").unwrap();
+        expect_eq!(
+            empty,
+            LatLng {
+                latitude:  0.0,
+                longitude: 0.0,
+            }
+        );
+
+        let nulls: LatLng = serde_json::from_str(r#"{"latitude":null,"longitude":null}"#).unwrap();
+        expect_eq!(nulls, empty);
+
+        let bounds: LatLng =
+            serde_json::from_str(r#"{"latitude":-90.0,"longitude":180.0}"#).unwrap();
+        expect_eq!(bounds.latitude, -90.0);
+        expect_eq!(bounds.longitude, 180.0);
+
+        let from_strings: LatLng =
+            serde_json::from_str(r#"{"latitude":"52.3676","longitude":"-4.9041"}"#).unwrap();
+        expect_eq!(from_strings.latitude, 52.3676);
+        expect_eq!(from_strings.longitude, -4.9041);
+
+        let neg_zero: LatLng =
+            serde_json::from_str(r#"{"latitude":"-0.0","longitude":-0.0}"#).unwrap();
+        expect_eq!(neg_zero.latitude.to_bits(), (-0.0_f64).to_bits());
+        expect_eq!(neg_zero.longitude.to_bits(), (-0.0_f64).to_bits());
+
+        for bad in [
+            json!({ "latitude": 90.0001, "longitude": 0.0 }),
+            json!({ "latitude": -90.0001, "longitude": 0.0 }),
+            json!({ "latitude": 0.0, "longitude": 180.0001 }),
+            json!({ "latitude": 0.0, "longitude": -180.0001 }),
+            json!({ "latitude": "NaN", "longitude": 0.0 }),
+            json!({ "latitude": 0.0, "longitude": "Infinity" }),
+            json!({ "latitude": "-Infinity", "longitude": 0.0 }),
+            json!({ "latitude": "1e500", "longitude": 0.0 }),
+            json!({ "latitude": 10.0, "extra": 20.0 }),
+        ] {
+            expect_that!(
+                serde_json::from_value::<LatLng>(bad.clone()),
+                err(anything())
+            );
+            expect_that!(
+                serde_json::from_value::<Value>(json!({ "geoPointValue": bad })),
+                err(anything())
+            );
+        }
+
+        let non_finite = Value::from(LatLng {
+            latitude:  f64::NAN,
+            longitude: f64::NEG_INFINITY,
+        });
+        expect_eq!(
+            serde_json::to_value(&non_finite).unwrap(),
+            json!({
+                "geoPointValue": {
+                    "latitude": "NaN",
+                    "longitude": "-Infinity"
+                }
+            })
+        );
+    }
+
+    #[gtest]
+    fn run_query_request_serializes_transaction_and_rejects_unsupported_fields() {
+        use crate::google::firestore::v1::{ExplainOptions, TransactionOptions};
+
+        let rq_json = json!({
+            "parent": "projects/p/databases/(default)/documents",
+            "structuredQuery": {
+                "from": [{ "collectionId": "users", "allDescendants": false }]
+            },
+            "transaction": "AAEC"
+        });
+        let rq: RunQueryRequest = serde_json::from_value(rq_json.clone()).unwrap();
+        expect_eq!(serde_json::to_value(&rq).unwrap(), rq_json);
+
+        let rq_new_txn = RunQueryRequest {
+            consistency_selector: Some(run_query_request::ConsistencySelector::NewTransaction(
+                TransactionOptions::READ_WRITE,
+            )),
+            ..Default::default()
+        };
+        expect_that!(serde_json::to_string(&rq_new_txn), err(anything()));
+
+        let rq_explain = RunQueryRequest {
+            explain_options: Some(ExplainOptions::default()),
+            ..Default::default()
+        };
+        expect_that!(serde_json::to_string(&rq_explain), err(anything()));
     }
 
     mod proptests {

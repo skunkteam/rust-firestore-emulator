@@ -1,4 +1,7 @@
-use std::time::Duration;
+use std::{
+    task::{Context, Poll},
+    time::Duration,
+};
 
 use emulator_tracing::DefaultTracing;
 use futures::StreamExt;
@@ -9,9 +12,10 @@ use googleapis::{
     },
 };
 use googletest::prelude::*;
-use http::{Method, StatusCode};
+use http::{HeaderValue, Method, StatusCode, Uri, header::CONTENT_TYPE};
 use serde_json::json;
 use tokio::{net::TcpListener, sync::oneshot};
+use tower::Service;
 
 use crate::harness::{
     builders::{QuerySpec, doc_path},
@@ -300,4 +304,200 @@ async fn loopback_tcp_multiplexer_serves_grpc_and_http_on_same_port_and_shuts_do
         run_result.is_ok(),
         "firestore_emulator::run returned error: {run_result:?}"
     );
+}
+
+#[derive(Clone)]
+struct OverrideContentType<S> {
+    inner: S,
+    content_type: HeaderValue,
+}
+
+impl<S, B> Service<http::Request<B>> for OverrideContentType<S>
+where
+    S: Service<http::Request<B>>,
+{
+    type Response = S::Response;
+    type Error = S::Error;
+    type Future = S::Future;
+
+    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        self.inner.poll_ready(cx)
+    }
+
+    fn call(&mut self, mut req: http::Request<B>) -> Self::Future {
+        req.headers_mut()
+            .insert(CONTENT_TYPE, self.content_type.clone());
+        self.inner.call(req)
+    }
+}
+
+#[derive(Clone)]
+struct InjectRawBody<S> {
+    inner: S,
+    raw:   Vec<u8>,
+}
+
+impl<S> Service<http::Request<tonic::body::Body>> for InjectRawBody<S>
+where
+    S: Service<http::Request<tonic::body::Body>>,
+{
+    type Response = S::Response;
+    type Error = S::Error;
+    type Future = S::Future;
+
+    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        self.inner.poll_ready(cx)
+    }
+
+    fn call(&mut self, req: http::Request<tonic::body::Body>) -> Self::Future {
+        let (parts, _body) = req.into_parts();
+        let body = tonic::body::Body::new(axum::body::Body::from(self.raw.clone()));
+        self.inner.call(http::Request::from_parts(parts, body))
+    }
+}
+
+#[gtest]
+#[tokio::test]
+async fn grpc_service_accepts_mixed_case_content_type_with_params() {
+    let db = TestEnv::new().build_db();
+    let project = db.project();
+
+    let svc = OverrideContentType {
+        inner: emulator_grpc::service(project),
+        content_type: HeaderValue::from_static("Application/Grpc+proto; charset=utf-8"),
+    };
+    let mut client = FirestoreClient::with_origin(svc, Uri::from_static("http://localhost"));
+    let created = client
+        .update_document(UpdateDocumentRequest {
+            document: Some(Document {
+                name: doc_path("ct/d1"),
+                fields: fields!({ "ok": true }),
+                create_time: None,
+                update_time: None,
+            }),
+            update_mask: None,
+            mask: None,
+            current_document: None,
+        })
+        .await
+        .expect("Tonic FirestoreServer accepts mixed-case gRPC content-type")
+        .into_inner();
+    assert_doc_wire_eq(&created, "ct/d1", &fields!({ "ok": true }));
+}
+
+#[gtest]
+#[tokio::test]
+async fn listen_surfaces_malformed_protobuf_frame_as_grpc_error() {
+    let db = TestEnv::new().build_db();
+    let project = db.project();
+
+    // Valid 5-byte gRPC frame header (len = 3) followed by truncated protobuf varint `0xFF 0xFF
+    // 0xFF`.
+    let svc = InjectRawBody {
+        inner: emulator_grpc::service(project),
+        raw:   vec![0, 0, 0, 0, 3, 0xFF, 0xFF, 0xFF],
+    };
+    let mut client = FirestoreClient::with_origin(svc, Uri::from_static("http://localhost"));
+    let mut stream = client
+        .listen(futures::stream::empty())
+        .await
+        .expect("Listen RPC stream opens")
+        .into_inner();
+    let err = stream
+        .next()
+        .await
+        .expect("malformed request frame must yield an error item, not clean EOF")
+        .expect_err("malformed request frame must fail with gRPC Status");
+    assert_ne!(err.code(), tonic::Code::Ok);
+}
+
+#[gtest]
+#[tokio::test]
+async fn loopback_tcp_multiplexer_routes_case_insensitive_grpc_content_type_and_rejects_grpc_web() {
+    let db = TestEnv::new().build_db();
+    let project = db.project();
+
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind ephemeral loopback port");
+    let addr = listener.local_addr().expect("listener local_addr");
+    let base_url = format!("http://{addr}");
+
+    let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+    let server_task = tokio::spawn(async move {
+        firestore_emulator::run(
+            project,
+            listener,
+            async move {
+                let _unused = shutdown_rx.await;
+            },
+            DefaultTracing::start(),
+        )
+        .await
+    });
+
+    let channel = tonic::transport::Endpoint::from_shared(base_url.clone())
+        .expect("valid endpoint URI")
+        .tcp_nodelay(true)
+        .connect()
+        .await
+        .expect("connect Tonic channel");
+
+    let wrapped = OverrideContentType {
+        inner: channel.clone(),
+        content_type: HeaderValue::from_static("Application/Grpc+proto; charset=utf-8"),
+    };
+    let mut grpc_client = FirestoreClient::new(wrapped);
+    grpc_client
+        .update_document(UpdateDocumentRequest {
+            document: Some(Document {
+                name: doc_path("ct_mux/doc1"),
+                fields: fields!({ "via": "Application/Grpc" }),
+                create_time: None,
+                update_time: None,
+            }),
+            update_mask: None,
+            mask: None,
+            current_document: None,
+        })
+        .await
+        .expect("mixed-case gRPC Content-Type routes to Tonic over multiplexed TCP");
+
+    let got = grpc_client
+        .get_document(GetDocumentRequest {
+            name: doc_path("ct_mux/doc1"),
+            mask: None,
+            consistency_selector: None,
+        })
+        .await
+        .expect("GetDocument succeeds")
+        .into_inner();
+    assert_doc_wire_eq(&got, "ct_mux/doc1", &fields!({ "via": "Application/Grpc" }));
+
+    // `application/grpc-web` must NOT match gRPC routing and instead hits Axum 404 JSON.
+    let http_client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("build no-proxy reqwest client");
+    let non_grpc_resp = http_client
+        .post(format!(
+            "{base_url}/google.firestore.v1.Firestore/GetDocument"
+        ))
+        .header(CONTENT_TYPE, "application/grpc-web")
+        .body(Vec::<u8>::new())
+        .send()
+        .await
+        .expect("send non-gRPC request");
+    expect_eq!(non_grpc_resp.status(), StatusCode::NOT_FOUND);
+
+    // Drop clients before shutdown.
+    drop(grpc_client);
+    drop(channel);
+    drop(http_client);
+    shutdown_tx.send(()).expect("send shutdown signal");
+    tokio::time::timeout(Duration::from_secs(5), server_task)
+        .await
+        .expect("server exited within 5s")
+        .expect("server task did not panic")
+        .expect("server exited cleanly");
 }

@@ -349,3 +349,144 @@ async fn query_builder_find_nearest_validates_and_executes() -> Result<()> {
 
     Ok(())
 }
+
+#[gtest]
+#[tokio::test]
+async fn implicit_order_by_matches_firestore_semantics() -> Result<()> {
+    use crate::query::filter::{CompositeFilter, CompositeOperator};
+
+    let database = fresh_database()?;
+    let col = "implicit-order";
+    // Insert documents with ties and distinct fields:
+    // document-1: { a: 10, b: 30, tie: 5 }
+    // document-2: { a: 10, b: 10, tie: 5 }
+    // document-3: { a: 20, b: 5,  tie: 5 }
+    for (id, a, b) in [(1, 10, 30), (2, 10, 10), (3, 20, 5)] {
+        insert_docs(&database, col, [id], |_| {
+            [
+                ("a", Value::integer(a)),
+                ("b", Value::integer(b)),
+                ("tie", Value::integer(5)),
+            ]
+        })?;
+    }
+
+    let col_ref = CollectionRef::new(database.name.clone(), col);
+    let ids_of = |mut q: Query| -> Result<Vec<String>> {
+        let (_, matches) = assert_ready_ok!(spawn(q.once(&database)).poll_until_idle());
+        Ok(matches
+            .into_iter()
+            .map(|m| m.version.name.document_id.to_string())
+            .collect())
+    };
+
+    // 1. `orderBy('tie', 'desc')` on Standard Edition appends `__name__ DESC`: document-3, -2, -1
+    let q_desc = QueryBuilder::from_collection(col_ref.clone())
+        .order_by("tie".parse()?, Direction::Descending)
+        .build()?;
+    assert_eq!(
+        ids_of(q_desc)?,
+        vec!["document-3", "document-2", "document-1"]
+    );
+
+    // 2. Enterprise Edition `all_descendants` with `orderBy('tie', 'desc')` appends `__name__ DESC`
+    let q_ent_desc = QueryBuilder::from(
+        database.name.clone().into(),
+        vec![CollectionSelector {
+            collection_id:   col.to_string(),
+            all_descendants: true,
+        }],
+    )
+    .enterprise_edition(true)
+    .order_by("tie".parse()?, Direction::Descending)
+    .build()?;
+    assert_eq!(
+        ids_of(q_ent_desc)?,
+        vec!["document-3", "document-2", "document-1"]
+    );
+
+    // 3. `WHERE __name__ > ... AND a > 0` orders by `a ASC, __name__ ASC`, not `__name__` first
+    let doc1_ref = format!("{}/{col}/document-1", database.name);
+    let q_name_and_field = QueryBuilder::from_collection(col_ref.clone())
+        .filter(Filter::Composite(CompositeFilter {
+            op:      CompositeOperator::And,
+            filters: vec![
+                Filter::Field(FieldFilter {
+                    field: "__name__".parse()?,
+                    op:    FieldOperator::GreaterThan,
+                    value: Value::reference(doc1_ref.clone()),
+                }),
+                Filter::Field(FieldFilter {
+                    field: "a".parse()?,
+                    op:    FieldOperator::GreaterThan,
+                    value: Value::integer(0),
+                }),
+            ],
+        }))
+        .build()?;
+    assert_eq!(ids_of(q_name_and_field)?, vec!["document-2", "document-3"]);
+
+    // 4. `WHERE b > 0 AND a > 0` orders lexicographically (`a ASC, b ASC, __name__ ASC`)
+    let q_lex = QueryBuilder::from_collection(col_ref.clone())
+        .filter(Filter::Composite(CompositeFilter {
+            op:      CompositeOperator::And,
+            filters: vec![
+                Filter::Field(FieldFilter {
+                    field: "b".parse()?,
+                    op:    FieldOperator::GreaterThan,
+                    value: Value::integer(0),
+                }),
+                Filter::Field(FieldFilter {
+                    field: "a".parse()?,
+                    op:    FieldOperator::GreaterThan,
+                    value: Value::integer(0),
+                }),
+            ],
+        }))
+        .build()?;
+    assert_eq!(
+        ids_of(q_lex)?,
+        vec!["document-2", "document-1", "document-3"]
+    );
+
+    // 5. Duplicate inequality on same field (`a > 0 AND a < 30`) deduplicates `a` so 2-value cursor
+    //    `[10, document-1]` matches `[a, __name__]` cleanly
+    let q_dup_cursor = QueryBuilder::from_collection(col_ref.clone())
+        .filter(Filter::Composite(CompositeFilter {
+            op:      CompositeOperator::And,
+            filters: vec![
+                Filter::Field(FieldFilter {
+                    field: "a".parse()?,
+                    op:    FieldOperator::GreaterThan,
+                    value: Value::integer(0),
+                }),
+                Filter::Field(FieldFilter {
+                    field: "a".parse()?,
+                    op:    FieldOperator::LessThan,
+                    value: Value::integer(30),
+                }),
+            ],
+        }))
+        .start_at(Cursor {
+            before: false, // startAfter (10, document-1) -> document-2, document-3
+            values: vec![Value::integer(10), Value::reference(doc1_ref)],
+        })
+        .build()?;
+    assert_eq!(ids_of(q_dup_cursor)?, vec!["document-2", "document-3"]);
+
+    // 6. Explicit `orderBy('a', 'desc')` + inequality `b > 0` appends `b DESC, __name__ DESC`
+    let q_partial = QueryBuilder::from_collection(col_ref)
+        .filter(Filter::Field(FieldFilter {
+            field: "b".parse()?,
+            op:    FieldOperator::GreaterThan,
+            value: Value::integer(0),
+        }))
+        .order_by("a".parse()?, Direction::Descending)
+        .build()?;
+    assert_eq!(
+        ids_of(q_partial)?,
+        vec!["document-3", "document-1", "document-2"]
+    );
+
+    Ok(())
+}

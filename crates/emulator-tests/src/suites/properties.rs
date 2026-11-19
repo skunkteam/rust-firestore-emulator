@@ -1,6 +1,9 @@
 use std::{cell::RefCell, collections::BTreeMap};
 
-use googleapis::google::{firestore::v1::Document, protobuf::Timestamp};
+use googleapis::google::{
+    firestore::v1::{Document, Value},
+    protobuf::Timestamp,
+};
 use http::{Method, StatusCode};
 use proptest::prelude::*;
 
@@ -85,7 +88,16 @@ proptest! {
                 }
 
                 let after_mutations = db.query_at_time(QuerySpec::collection("m"), snap_time).await.unwrap();
-                prop_assert_eq!(after_mutations.documents, baseline.documents);
+                prop_assert_eq!(&after_mutations.documents, &baseline.documents);
+                for (after_doc, base_doc) in after_mutations.documents.iter().zip(&baseline.documents) {
+                    prop_assert!(
+                        Value::fields_storage_eq(&after_doc.fields, &base_doc.fields),
+                        "MVCC storage mismatch on {}:\n  after: {:?}\n  base:  {:?}",
+                        after_doc.name,
+                        after_doc.fields,
+                        base_doc.fields
+                    );
+                }
                 Ok(())
             })
         })?;
@@ -111,7 +123,12 @@ proptest! {
                 prop_assert_eq!(&http_doc.name, &written.name);
                 prop_assert_eq!(&http_doc.create_time, &written.create_time);
                 prop_assert_eq!(&http_doc.update_time, &written.update_time);
-                prop_assert_eq!(&http_doc.fields, &written.fields);
+                prop_assert!(
+                    Value::fields_storage_eq(&http_doc.fields, &written.fields),
+                    "wire-exact field mismatch between gRPC write and HTTP REST read:\n  http: {:?}\n  grpc: {:?}",
+                    http_doc.fields,
+                    written.fields
+                );
                 Ok(())
             })
         })?;
@@ -208,4 +225,15 @@ proptest! {
             })
         })?;
     }
+}
+
+#[test]
+fn storage_eq_rejects_semantic_only_numeric_representation_drift() {
+    use googleapis::fields;
+
+    let int_fields = fields!({ "n": 1i64, "z": 0.0f64 });
+    let float_fields = fields!({ "n": 1.0f64, "z": -0.0f64 });
+
+    assert_eq!(int_fields, float_fields);
+    assert!(!Value::fields_storage_eq(&int_fields, &float_fields));
 }

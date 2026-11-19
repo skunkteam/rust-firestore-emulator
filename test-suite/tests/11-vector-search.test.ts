@@ -109,10 +109,8 @@ function createVectorMap(coords: number[]): RawProtoValue {
 
 async function expectRpcCode(fn: () => Promise<unknown>, expectedCode: number, label = 'rpc'): Promise<void> {
     let resolvedValue: unknown;
-    let didResolve = false;
     try {
         resolvedValue = await fn();
-        didResolve = true;
     } catch (err: unknown) {
         const code = typeof err === 'object' && err !== null ? (err as { code?: unknown }).code : undefined;
         const msg = err instanceof Error ? err.message : String(err);
@@ -123,9 +121,7 @@ async function expectRpcCode(fn: () => Promise<unknown>, expectedCode: number, l
         });
         return;
     }
-    if (didResolve) {
-        throw new Error(`[${label}] Expected gRPC status code ${expectedCode}, but call resolved with ${JSON.stringify(resolvedValue)}`);
-    }
+    throw new Error(`[${label}] Expected gRPC status code ${expectedCode}, but call resolved with ${JSON.stringify(resolvedValue)}`);
 }
 
 async function expectRunQueryNewTxnError(

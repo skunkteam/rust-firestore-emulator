@@ -18,7 +18,7 @@ import {
   runQuery,
   updateDocument,
 } from "./api.js";
-import { generateAutoId } from "./values.js";
+import { generateAutoId, stringifyProtoJson } from "./values.js";
 import {
   computeChangedFieldMask,
   createEditorSession,
@@ -50,27 +50,21 @@ import {
  * } ActiveModal
  */
 
-/** @type {HTMLElement} */
-const topbarEl = /** @type {HTMLElement} */ (document.getElementById("topbar"));
-/** @type {HTMLElement} */
-const workspaceEl = /** @type {HTMLElement} */ (
-  document.getElementById("workspace")
-);
-/** @type {HTMLElement} */
-const modalRootEl = /** @type {HTMLElement} */ (
-  document.getElementById("modal-root")
-);
-/** @type {HTMLElement} */
-const toastRootEl = /** @type {HTMLElement} */ (
-  document.getElementById("toast-root")
-);
+/** @type {HTMLElement | null} */
+const topbarEl = document.getElementById("topbar");
+/** @type {HTMLElement | null} */
+const workspaceEl = document.getElementById("workspace");
+/** @type {HTMLElement | null} */
+const modalRootEl = document.getElementById("modal-root");
+/** @type {HTMLElement | null} */
+const toastRootEl = document.getElementById("toast-root");
 
 const emulatorVersion = String(
   /** @type {Record<string, unknown>} */ (/** @type {unknown} */ (window))
     .EMULATOR_VERSION ?? "dev"
 );
 
-const state = {
+export const state = {
   /** @type {Array<{ projectId: string, databaseId: string, rootPath: string }>} */
   databases: [],
   /** @type {string | null} */
@@ -108,6 +102,70 @@ const state = {
 };
 
 let nextToastId = 1;
+let dbEpoch = 0;
+let navEpoch = 0;
+let dbListSeq = 0;
+/** @type {Map<string, number>} */
+const colRequestSeq = new Map();
+/** @type {Map<string, number>} */
+const docRequestSeq = new Map();
+/** @type {Promise<void>} */
+let sseQueue = Promise.resolve();
+
+/**
+ * @returns {string | null}
+ */
+function getActiveRootPath() {
+  return state.activeProjectId && state.activeDatabaseId
+    ? `projects/${state.activeProjectId}/databases/${state.activeDatabaseId}/documents`
+    : null;
+}
+
+/**
+ * @param {string} seg
+ * @returns {boolean}
+ */
+function isValidPathSegment(seg) {
+  return Boolean(seg) && seg !== "." && seg !== ".." && !seg.includes("/");
+}
+
+/**
+ * @param {string} rootPath
+ * @param {string} resourcePath
+ * @returns {string[] | null}
+ */
+function relativeSegments(rootPath, resourcePath) {
+  if (!resourcePath.startsWith(`${rootPath}/`)) return null;
+  return resourcePath.slice(rootPath.length + 1).split("/");
+}
+
+/**
+ * @param {string[]} full
+ * @param {string[]} prefix
+ * @returns {boolean}
+ */
+function startsWithSegments(full, prefix) {
+  return prefix.length <= full.length && prefix.every((s, idx) => full[idx] === s);
+}
+
+/**
+ * @param {string} prefix
+ */
+function pruneCachesWithPrefix(prefix) {
+  const slashPrefix = `${prefix}/`;
+  for (const key of state.collectionColumns.keys()) {
+    if (key === prefix || key.startsWith(slashPrefix)) {
+      state.collectionColumns.delete(key);
+      colRequestSeq.delete(key);
+    }
+  }
+  for (const key of state.documentLevels.keys()) {
+    if (key === prefix || key.startsWith(slashPrefix)) {
+      state.documentLevels.delete(key);
+      docRequestSeq.delete(key);
+    }
+  }
+}
 
 /**
  * @param {string} text
@@ -125,10 +183,11 @@ function pushToast(text, tone = "info") {
 
 /**
  * Parses `/projects/{p}/databases/{d}/documents[/...]` from a browser pathname.
+ * Returns `null` for non-matching routes, malformed percent-encoding, or invalid segments.
  * @param {string} pathname
  * @returns {{ projectId: string, databaseId: string, segments: string[] } | null}
  */
-function parseBrowserRoute(pathname) {
+export function parseBrowserRoute(pathname) {
   const stripped = pathname.replace(/\/+$/, "");
   if (!stripped) return null;
   const m =
@@ -136,10 +195,27 @@ function parseBrowserRoute(pathname) {
       stripped
     );
   if (!m) return null;
-  const projectId = decodeURIComponent(m[1]);
-  const databaseId = decodeURIComponent(m[2]);
-  const tail = m[3] ? m[3].split("/").map((s) => decodeURIComponent(s)) : [];
-  return { projectId, databaseId, segments: tail };
+  try {
+    const projectId = decodeURIComponent(m[1]);
+    const databaseId = decodeURIComponent(m[2]);
+    if (!isValidPathSegment(projectId) || !isValidPathSegment(databaseId)) {
+      return null;
+    }
+    /** @type {string[]} */
+    const tail = [];
+    if (m[3] !== undefined) {
+      for (const rawSeg of m[3].split("/")) {
+        const seg = decodeURIComponent(rawSeg);
+        if (!isValidPathSegment(seg)) {
+          return null;
+        }
+        tail.push(seg);
+      }
+    }
+    return { projectId, databaseId, segments: tail };
+  } catch {
+    return null;
+  }
 }
 
 /**
@@ -164,14 +240,18 @@ function syncBrowserUrl(replace = false) {
 
 /**
  * Refreshes the list of active databases from `GET /emulator/v1` without creating any database.
+ * @returns {Promise<boolean>} True if this request applied its result (not superseded by a newer call).
  */
 async function refreshDatabaseList() {
+  const seq = ++dbListSeq;
   const rawList = await listDatabases();
+  if (seq !== dbListSeq) return false;
   const parsed = rawList
     .map(parseRootRef)
     .filter((item) => item !== null)
     .sort((a, b) => a.rootPath.localeCompare(b.rootPath));
   state.databases = parsed;
+  return true;
 }
 
 /**
@@ -181,7 +261,7 @@ async function refreshDatabaseList() {
  * @param {string[]} [initialSegments]
  * @param {boolean} [replaceHistory]
  */
-async function selectDatabase(
+export async function selectDatabase(
   projectId,
   databaseId,
   initialSegments = [],
@@ -189,14 +269,19 @@ async function selectDatabase(
 ) {
   const dbChanged =
     state.activeProjectId !== projectId || state.activeDatabaseId !== databaseId;
+  const myDbEpoch = dbChanged ? ++dbEpoch : dbEpoch;
+  const myNavEpoch = ++navEpoch;
   state.activeProjectId = projectId;
   state.activeDatabaseId = databaseId;
-  state.segments = initialSegments;
+  state.segments = [...initialSegments];
 
   if (dbChanged) {
+    state.activeDbMeta = null;
     state.rootCollections = [];
     state.collectionColumns.clear();
     state.documentLevels.clear();
+    colRequestSeq.clear();
+    docRequestSeq.clear();
     state.queryState = createQueryRunnerState();
   }
 
@@ -212,47 +297,70 @@ async function selectDatabase(
         `projects/${projectId}/databases/${databaseId}/documents`
       ),
     ]);
+    if (myDbEpoch !== dbEpoch) return;
     state.activeDbMeta = meta;
     state.rootCollections = cols;
     await refreshDatabaseList();
   } catch (err) {
+    if (myDbEpoch !== dbEpoch) return;
     pushToast(
       `Failed to load database: ${err instanceof Error ? err.message : String(err)}`,
       "error"
     );
   } finally {
-    state.rootLoading = false;
-    renderApp();
+    if (myDbEpoch === dbEpoch) {
+      state.rootLoading = false;
+      renderApp();
+    }
   }
 
-  if (initialSegments.length > 0) {
-    await hydrateVisiblePath();
+  if (
+    myDbEpoch === dbEpoch &&
+    myNavEpoch === navEpoch &&
+    initialSegments.length > 0
+  ) {
+    await hydrateVisiblePath(myDbEpoch, myNavEpoch, initialSegments);
   }
 }
 
 /**
- * Loads all collection columns and document levels along `state.segments`.
+ * Loads all collection columns and document levels along `segmentsSnapshot`.
+ * @param {number} [expectedDbEpoch]
+ * @param {number} [expectedNavEpoch]
+ * @param {string[]} [segmentsSnapshot]
  */
-async function hydrateVisiblePath() {
+export async function hydrateVisiblePath(
+  expectedDbEpoch = dbEpoch,
+  expectedNavEpoch = navEpoch,
+  segmentsSnapshot = [...state.segments]
+) {
   if (!state.activeProjectId || !state.activeDatabaseId) return;
   const rootPath = `projects/${state.activeProjectId}/databases/${state.activeDatabaseId}/documents`;
 
-  for (let i = 0; i < state.segments.length; i += 2) {
-    const colId = state.segments[i];
-    const parentSegments = state.segments.slice(0, i);
-    const colSegments = state.segments.slice(0, i + 1);
+  for (let i = 0; i < segmentsSnapshot.length; i += 2) {
+    if (expectedDbEpoch !== dbEpoch || expectedNavEpoch !== navEpoch) return;
+    const colId = segmentsSnapshot[i];
+    const parentSegments = segmentsSnapshot.slice(0, i);
+    const colSegments = segmentsSnapshot.slice(0, i + 1);
     const parentPath =
       parentSegments.length === 0
         ? rootPath
         : `${rootPath}/${parentSegments.join("/")}`;
     const colPath = `${rootPath}/${colSegments.join("/")}`;
 
-    await loadCollectionColumn(colPath, parentPath, colId, false);
+    await loadCollectionColumn(
+      colPath,
+      parentPath,
+      colId,
+      false,
+      expectedDbEpoch
+    );
+    if (expectedDbEpoch !== dbEpoch || expectedNavEpoch !== navEpoch) return;
 
-    if (state.segments.length > i + 1) {
-      const docId = state.segments[i + 1];
+    if (segmentsSnapshot.length > i + 1) {
+      const docId = segmentsSnapshot[i + 1];
       const docPath = `${colPath}/${docId}`;
-      await loadDocumentLevel(docPath, docId, false);
+      await loadDocumentLevel(docPath, docId, true, expectedDbEpoch);
     }
   }
 }
@@ -262,8 +370,19 @@ async function hydrateVisiblePath() {
  * @param {string} parentPath
  * @param {string} colId
  * @param {boolean} appendPage
+ * @param {number} [expectedDbEpoch]
  */
-async function loadCollectionColumn(colPath, parentPath, colId, appendPage) {
+export async function loadCollectionColumn(
+  colPath,
+  parentPath,
+  colId,
+  appendPage,
+  expectedDbEpoch = dbEpoch
+) {
+  if (expectedDbEpoch !== dbEpoch) return;
+  const seq = (colRequestSeq.get(colPath) ?? 0) + 1;
+  colRequestSeq.set(colPath, seq);
+
   let colState = state.collectionColumns.get(colPath);
   if (!colState) {
     colState = {
@@ -288,6 +407,9 @@ async function loadCollectionColumn(colPath, parentPath, colId, appendPage) {
       pageSize: 200,
       pageToken: appendPage ? colState.nextPageToken : undefined,
     });
+    if (expectedDbEpoch !== dbEpoch || colRequestSeq.get(colPath) !== seq) {
+      return;
+    }
     const mapped = res.documents.map((doc) => {
       const fullName = doc.name ?? "";
       const id = fullName.slice(fullName.lastIndexOf("/") + 1);
@@ -299,13 +421,18 @@ async function loadCollectionColumn(colPath, parentPath, colId, appendPage) {
       : mapped;
     colState.nextPageToken = res.nextPageToken;
   } catch (err) {
+    if (expectedDbEpoch !== dbEpoch || colRequestSeq.get(colPath) !== seq) {
+      return;
+    }
     pushToast(
       `Failed to list ${colId}: ${err instanceof Error ? err.message : String(err)}`,
       "error"
     );
   } finally {
-    colState.loading = false;
-    renderApp();
+    if (expectedDbEpoch === dbEpoch && colRequestSeq.get(colPath) === seq) {
+      colState.loading = false;
+      renderApp();
+    }
   }
 }
 
@@ -314,11 +441,20 @@ async function loadCollectionColumn(colPath, parentPath, colId, appendPage) {
  * @param {string} docPath
  * @param {string} docId
  * @param {boolean} preserveDirty
+ * @param {number} [expectedDbEpoch]
  */
-async function loadDocumentLevel(docPath, docId, preserveDirty) {
+export async function loadDocumentLevel(
+  docPath,
+  docId,
+  preserveDirty,
+  expectedDbEpoch = dbEpoch
+) {
+  if (expectedDbEpoch !== dbEpoch) return;
   if (!state.activeProjectId || !state.activeDatabaseId) return;
   const projectId = state.activeProjectId;
   const databaseId = state.activeDatabaseId;
+  const seq = (docRequestSeq.get(docPath) ?? 0) + 1;
+  docRequestSeq.set(docPath, seq);
 
   let level = state.documentLevels.get(docPath);
   if (!level) {
@@ -349,6 +485,9 @@ async function loadDocumentLevel(docPath, docId, preserveDirty) {
       ),
       listCollectionIds(docPath),
     ]);
+    if (expectedDbEpoch !== dbEpoch || docRequestSeq.get(docPath) !== seq) {
+      return;
+    }
 
     level.subcollections = subcols;
     level.exists = docOutcome.exists;
@@ -359,6 +498,7 @@ async function loadDocumentLevel(docPath, docId, preserveDirty) {
         level.editorSession &&
         level.editorSession.isDirty
       ) {
+        level.editorSession.deletedExternally = false;
         if (
           level.editorSession.cleanDoc?.updateTime !==
           docOutcome.doc.updateTime
@@ -376,18 +516,26 @@ async function loadDocumentLevel(docPath, docId, preserveDirty) {
         );
       }
     } else {
-      if (!preserveDirty || !level.editorSession?.isDirty) {
+      if (preserveDirty && level.editorSession?.isDirty) {
+        level.editorSession.deletedExternally = true;
+        level.editorSession.externalDoc = null;
+      } else {
         level.editorSession = null;
       }
     }
   } catch (err) {
+    if (expectedDbEpoch !== dbEpoch || docRequestSeq.get(docPath) !== seq) {
+      return;
+    }
     pushToast(
       `Failed to load document ${docId}: ${err instanceof Error ? err.message : String(err)}`,
       "error"
     );
   } finally {
-    level.loading = false;
-    renderApp();
+    if (expectedDbEpoch === dbEpoch && docRequestSeq.get(docPath) === seq) {
+      level.loading = false;
+      renderApp();
+    }
   }
 }
 
@@ -395,19 +543,18 @@ async function loadDocumentLevel(docPath, docId, preserveDirty) {
  * Handles debounced SSE invalidation batches without clobbering dirty edits or resurrecting cleared databases.
  * @param {EmulatorSseEvent[]} events
  */
-async function handleSseBatch(events) {
+export async function handleSseBatch(events) {
   if (state.ssePaused) return;
 
   let shouldRefreshDbList = false;
   let shouldRefreshMeta = false;
   let fullResyncActiveDb = false;
+  let clearedActiveDb = false;
   /** @type {Set<string>} */
   const changedPaths = new Set();
 
-  const activeRoot =
-    state.activeProjectId && state.activeDatabaseId
-      ? `projects/${state.activeProjectId}/databases/${state.activeDatabaseId}/documents`
-      : null;
+  let myDbEpoch = dbEpoch;
+  const activeRoot = getActiveRootPath();
 
   for (const ev of events) {
     if (ev.type === "resync") {
@@ -421,8 +568,16 @@ async function handleSseBatch(events) {
     }
     if (ev.type === "database_cleared") {
       shouldRefreshDbList = true;
+      if (ev.database) {
+        state.databases = state.databases.filter(
+          (db) => db.rootPath !== ev.database
+        );
+      }
       if (ev.database && ev.database === activeRoot) {
         // Clear cached state WITHOUT calling /v1/projects/... so we never re-create the cleared database!
+        myDbEpoch = ++dbEpoch;
+        navEpoch++;
+        clearedActiveDb = true;
         state.activeProjectId = null;
         state.activeDatabaseId = null;
         state.activeDbMeta = null;
@@ -430,6 +585,9 @@ async function handleSseBatch(events) {
         state.segments = [];
         state.collectionColumns.clear();
         state.documentLevels.clear();
+        colRequestSeq.clear();
+        docRequestSeq.clear();
+        state.queryState = createQueryRunnerState();
         syncBrowserUrl(true);
         pushToast(`Database ${ev.database} was cleared`, "info");
       }
@@ -451,9 +609,10 @@ async function handleSseBatch(events) {
   }
 
   if (shouldRefreshDbList) {
-    await refreshDatabaseList();
+    const applied = await refreshDatabaseList();
+    if (myDbEpoch !== dbEpoch) return;
     // If no active DB is selected and a DB now exists, auto-select the first one cleanly.
-    if (!state.activeProjectId && state.databases.length > 0) {
+    if (applied && !state.activeProjectId && state.databases.length > 0) {
       const first = state.databases[0];
       await selectDatabase(first.projectId, first.databaseId, [], true);
       return;
@@ -461,16 +620,25 @@ async function handleSseBatch(events) {
     renderApp();
   }
 
-  if (!state.activeProjectId || !state.activeDatabaseId || !activeRoot) {
+  if (
+    clearedActiveDb ||
+    myDbEpoch !== dbEpoch ||
+    !state.activeProjectId ||
+    !state.activeDatabaseId ||
+    !activeRoot ||
+    getActiveRootPath() !== activeRoot
+  ) {
     return;
   }
 
   if (shouldRefreshMeta || fullResyncActiveDb) {
     try {
-      state.activeDbMeta = await getDatabase(
+      const meta = await getDatabase(
         state.activeProjectId,
         state.activeDatabaseId
       );
+      if (myDbEpoch !== dbEpoch || getActiveRootPath() !== activeRoot) return;
+      state.activeDbMeta = meta;
     } catch {
       // Ignore transient error
     }
@@ -478,15 +646,20 @@ async function handleSseBatch(events) {
 
   if (fullResyncActiveDb || changedPaths.size > 0) {
     try {
-      state.rootCollections = await listCollectionIds(activeRoot);
+      const cols = await listCollectionIds(activeRoot);
+      if (myDbEpoch !== dbEpoch || getActiveRootPath() !== activeRoot) return;
+      state.rootCollections = cols;
     } catch {
       // Ignore
     }
 
-    for (let i = 0; i < state.segments.length; i += 2) {
-      const colId = state.segments[i];
-      const parentSegments = state.segments.slice(0, i);
-      const colSegments = state.segments.slice(0, i + 1);
+    const myNavEpoch = navEpoch;
+    const segmentsSnapshot = [...state.segments];
+    for (let i = 0; i < segmentsSnapshot.length; i += 2) {
+      if (myDbEpoch !== dbEpoch || myNavEpoch !== navEpoch) return;
+      const colId = segmentsSnapshot[i];
+      const parentSegments = segmentsSnapshot.slice(0, i);
+      const colSegments = segmentsSnapshot.slice(0, i + 1);
       const parentPath =
         parentSegments.length === 0
           ? activeRoot
@@ -498,22 +671,25 @@ async function handleSseBatch(events) {
         Array.from(changedPaths).some((p) => p.startsWith(`${colPath}/`));
 
       if (affectsCollection) {
-        await loadCollectionColumn(colPath, parentPath, colId, false);
+        await loadCollectionColumn(colPath, parentPath, colId, false, myDbEpoch);
       }
+      if (myDbEpoch !== dbEpoch || myNavEpoch !== navEpoch) return;
 
-      if (state.segments.length > i + 1) {
-        const docId = state.segments[i + 1];
+      if (segmentsSnapshot.length > i + 1) {
+        const docId = segmentsSnapshot[i + 1];
         const docPath = `${colPath}/${docId}`;
         const affectsDoc =
           fullResyncActiveDb ||
           changedPaths.has(docPath) ||
           Array.from(changedPaths).some((p) => p.startsWith(`${docPath}/`));
         if (affectsDoc) {
-          await loadDocumentLevel(docPath, docId, true);
+          await loadDocumentLevel(docPath, docId, true, myDbEpoch);
         }
       }
     }
-    renderApp();
+    if (myDbEpoch === dbEpoch) {
+      renderApp();
+    }
   }
 }
 
@@ -521,7 +697,7 @@ async function handleSseBatch(events) {
  * Saves an edited document from its EditorSession.
  * @param {DocumentLevelState} docLevel
  */
-async function saveDocumentFromInspector(docLevel) {
+export async function saveDocumentFromInspector(docLevel) {
   const session = docLevel.editorSession;
   if (!session) return;
 
@@ -536,10 +712,12 @@ async function saveDocumentFromInspector(docLevel) {
   session.saveError = null;
   renderApp();
 
+  const myDbEpoch = dbEpoch;
+
   try {
     const cleanFields = session.cleanDoc?.fields ?? {};
     const updateMask =
-      session.mode === "structured"
+      session.mode === "structured" && session.cleanDoc !== null
         ? computeChangedFieldMask(cleanFields, extracted.fields)
         : null;
 
@@ -556,9 +734,17 @@ async function saveDocumentFromInspector(docLevel) {
       updateMask,
       session.cleanDoc?.updateTime ?? null
     );
+    if (myDbEpoch !== dbEpoch) return;
+    docRequestSeq.set(
+      docLevel.docPath,
+      (docRequestSeq.get(docLevel.docPath) ?? 0) + 1
+    );
+    docLevel.loading = false;
+    docLevel.exists = true;
     syncSessionWithDocument(session, updated);
     pushToast(`Saved ${docLevel.docId}`, "success");
   } catch (err) {
+    if (myDbEpoch !== dbEpoch) return;
     session.saving = false;
     session.saveError = err instanceof Error ? err.message : String(err);
   }
@@ -587,7 +773,7 @@ async function executeCurrentQuery() {
       return;
     }
     structuredQuery = built.query;
-    qState.rawQueryText = JSON.stringify(structuredQuery, null, 2);
+    qState.rawQueryText = stringifyProtoJson(structuredQuery, 2);
   } else {
     try {
       const parsed = JSON.parse(qState.rawQueryText);
@@ -629,10 +815,13 @@ async function executeCurrentQuery() {
  * Toggles database edition or concurrency mode via PATCH /v1/projects/{p}/databases/{d}.
  * @param {'edition' | 'concurrency'} which
  */
-async function toggleDatabaseSetting(which) {
+export async function toggleDatabaseSetting(which) {
   if (!state.activeProjectId || !state.activeDatabaseId || !state.activeDbMeta) {
     return;
   }
+  const targetProject = state.activeProjectId;
+  const targetDb = state.activeDatabaseId;
+  const myDbEpoch = dbEpoch;
   try {
     const patch =
       which === "edition"
@@ -650,13 +839,18 @@ async function toggleDatabaseSetting(which) {
                 : "OPTIMISTIC"
             ),
           };
-    state.activeDbMeta = await patchDatabase(
-      state.activeProjectId,
-      state.activeDatabaseId,
-      patch
-    );
+    const updatedMeta = await patchDatabase(targetProject, targetDb, patch);
+    if (
+      myDbEpoch !== dbEpoch ||
+      state.activeProjectId !== targetProject ||
+      state.activeDatabaseId !== targetDb
+    ) {
+      return;
+    }
+    state.activeDbMeta = updatedMeta;
     renderApp();
   } catch (err) {
+    if (myDbEpoch !== dbEpoch) return;
     pushToast(
       `Failed to update database config: ${err instanceof Error ? err.message : String(err)}`,
       "error"
@@ -681,7 +875,7 @@ function openDatabaseModal() {
  * @param {string} [collectionId]
  * @param {string} [fixedDocId]
  */
-function openCreateDocumentModal(
+export function openCreateDocumentModal(
   parentPath,
   collectionId = "",
   fixedDocId = ""
@@ -735,6 +929,7 @@ function renderTopbar() {
             if (state.activeProjectId && state.activeDatabaseId) {
               state.view = "explorer";
               state.segments = [];
+              navEpoch++;
               syncBrowserUrl();
               renderApp();
             }
@@ -871,7 +1066,7 @@ function renderTopbar() {
   `;
 }
 
-function renderWorkspace() {
+export function renderWorkspace() {
   if (!state.activeProjectId || !state.activeDatabaseId) {
     return html`
       <div class="empty-hero">
@@ -905,6 +1100,7 @@ function renderWorkspace() {
         if (m) {
           state.view = "explorer";
           state.segments = m[1].split("/");
+          navEpoch++;
           syncBrowserUrl();
           renderApp();
           void hydrateVisiblePath();
@@ -923,6 +1119,7 @@ function renderWorkspace() {
     documentLevels: state.documentLevels,
     onSelectSegments: (nextSegments) => {
       state.segments = nextSegments;
+      navEpoch++;
       syncBrowserUrl();
       renderApp();
       void hydrateVisiblePath();
@@ -983,7 +1180,7 @@ function renderWorkspace() {
   });
 }
 
-function renderModal() {
+export function renderModal() {
   const m = state.modal;
   if (!m) return nothing;
 
@@ -997,8 +1194,9 @@ function renderModal() {
     const submit = async () => {
       const p = m.projectId.trim();
       const d = m.databaseId.trim();
-      if (!p || !d || p.includes("/") || d.includes("/")) {
-        m.error = "Enter valid non-empty Project ID and Database ID (no slashes)";
+      if (!isValidPathSegment(p) || !isValidPathSegment(d)) {
+        m.error =
+          "Enter valid non-empty Project ID and Database ID (no '/', '.', or '..')";
         renderApp();
         return;
       }
@@ -1091,13 +1289,14 @@ function renderModal() {
     const submit = async () => {
       const colId = m.collectionId.trim();
       const docId = m.docId.trim() || generateAutoId();
-      if (!colId || colId.includes("/")) {
-        m.error = "Collection ID must be a single non-empty segment";
+      if (!isValidPathSegment(colId)) {
+        m.error =
+          "Collection ID must be a valid non-empty segment (no '/', '.', or '..')";
         renderApp();
         return;
       }
-      if (docId.includes("/")) {
-        m.error = "Document ID cannot contain '/'";
+      if (!isValidPathSegment(docId)) {
+        m.error = "Document ID cannot contain '/' or be '.' / '..'";
         renderApp();
         return;
       }
@@ -1112,6 +1311,7 @@ function renderModal() {
       m.error = null;
       renderApp();
 
+      const myDbEpoch = dbEpoch;
       try {
         const created = await createDocument(
           m.parentPath,
@@ -1119,17 +1319,25 @@ function renderModal() {
           docId,
           extracted.fields
         );
+        if (myDbEpoch !== dbEpoch) {
+          state.modal = null;
+          renderApp();
+          return;
+        }
         state.modal = null;
         const fullName = created.name ?? "";
         const match =
           /^projects\/[^/]+\/databases\/[^/]+\/documents\/(.+)$/.exec(fullName);
         if (match && state.activeProjectId && state.activeDatabaseId) {
-          state.rootCollections = await listCollectionIds(
+          const cols = await listCollectionIds(
             `projects/${state.activeProjectId}/databases/${state.activeDatabaseId}/documents`
           );
+          if (myDbEpoch !== dbEpoch) return;
+          state.rootCollections = cols;
           state.segments = match[1].split("/");
+          const myNavEpoch = ++navEpoch;
           syncBrowserUrl();
-          await hydrateVisiblePath();
+          await hydrateVisiblePath(myDbEpoch, myNavEpoch);
         }
         pushToast(`Created ${colId}/${docId}`, "success");
       } catch (err) {
@@ -1237,18 +1445,36 @@ function renderModal() {
       m.busy = true;
       m.error = null;
       renderApp();
+      const myDbEpoch = dbEpoch;
       try {
         await deleteDocument(m.docPath, m.recursive);
+        if (myDbEpoch !== dbEpoch) {
+          state.modal = null;
+          renderApp();
+          return;
+        }
         state.documentLevels.delete(m.docPath);
+        docRequestSeq.delete(m.docPath);
+        if (m.recursive) {
+          pruneCachesWithPrefix(m.docPath);
+        }
         state.modal = null;
         if (state.activeProjectId && state.activeDatabaseId) {
           const rootPath = `projects/${state.activeProjectId}/databases/${state.activeDatabaseId}/documents`;
-          if (m.recursive || !m.hasSubcollections) {
-            state.segments = state.segments.slice(0, -1);
+          const docSegs = relativeSegments(rootPath, m.docPath);
+          if (
+            (m.recursive || !m.hasSubcollections) &&
+            docSegs &&
+            startsWithSegments(state.segments, docSegs)
+          ) {
+            state.segments = state.segments.slice(0, docSegs.length - 1);
           }
-          state.rootCollections = await listCollectionIds(rootPath);
+          const myNavEpoch = ++navEpoch;
+          const cols = await listCollectionIds(rootPath);
+          if (myDbEpoch !== dbEpoch) return;
+          state.rootCollections = cols;
           syncBrowserUrl();
-          await hydrateVisiblePath();
+          await hydrateVisiblePath(myDbEpoch, myNavEpoch);
         }
         pushToast("Document deleted", "success");
       } catch (err) {
@@ -1312,19 +1538,28 @@ function renderModal() {
       m.busy = true;
       m.error = null;
       renderApp();
+      const myDbEpoch = dbEpoch;
       try {
         await deleteCollection(m.colPath);
-        state.collectionColumns.delete(m.colPath);
+        if (myDbEpoch !== dbEpoch) {
+          state.modal = null;
+          renderApp();
+          return;
+        }
+        pruneCachesWithPrefix(m.colPath);
         state.modal = null;
         if (state.activeProjectId && state.activeDatabaseId) {
           const rootPath = `projects/${state.activeProjectId}/databases/${state.activeDatabaseId}/documents`;
-          const colIdx = state.segments.indexOf(m.colId);
-          if (colIdx >= 0) {
-            state.segments = state.segments.slice(0, colIdx);
+          const colSegs = relativeSegments(rootPath, m.colPath);
+          if (colSegs && startsWithSegments(state.segments, colSegs)) {
+            state.segments = state.segments.slice(0, colSegs.length - 1);
           }
-          state.rootCollections = await listCollectionIds(rootPath);
+          const myNavEpoch = ++navEpoch;
+          const cols = await listCollectionIds(rootPath);
+          if (myDbEpoch !== dbEpoch) return;
+          state.rootCollections = cols;
           syncBrowserUrl();
-          await hydrateVisiblePath();
+          await hydrateVisiblePath(myDbEpoch, myNavEpoch);
         }
         pushToast(`Deleted collection ${m.colId}`, "success");
       } catch (err) {
@@ -1378,6 +1613,12 @@ function renderModal() {
     renderApp();
     try {
       await clearDatabase(m.projectId, m.databaseId);
+      const myDbEpoch = ++dbEpoch;
+      navEpoch++;
+      const clearedRoot = `projects/${m.projectId}/databases/${m.databaseId}/documents`;
+      state.databases = state.databases.filter(
+        (db) => db.rootPath !== clearedRoot
+      );
       state.modal = null;
       state.activeProjectId = null;
       state.activeDatabaseId = null;
@@ -1386,11 +1627,15 @@ function renderModal() {
       state.segments = [];
       state.collectionColumns.clear();
       state.documentLevels.clear();
-      await refreshDatabaseList();
-      if (state.databases.length > 0) {
+      colRequestSeq.clear();
+      docRequestSeq.clear();
+      state.queryState = createQueryRunnerState();
+      const applied = await refreshDatabaseList();
+      if (myDbEpoch !== dbEpoch) return;
+      if (applied && !state.activeProjectId && state.databases.length > 0) {
         const next = state.databases[0];
         await selectDatabase(next.projectId, next.databaseId, [], true);
-      } else {
+      } else if (!state.activeProjectId) {
         syncBrowserUrl(true);
       }
       pushToast(`Cleared database ${m.projectId}/${m.databaseId}`, "success");
@@ -1463,18 +1708,20 @@ function renderToasts() {
 }
 
 function renderApp() {
-  render(renderTopbar(), topbarEl);
-  render(renderWorkspace(), workspaceEl);
-  render(renderModal(), modalRootEl);
-  render(renderToasts(), toastRootEl);
+  if (topbarEl) render(renderTopbar(), topbarEl);
+  if (workspaceEl) render(renderWorkspace(), workspaceEl);
+  if (modalRootEl) render(renderModal(), modalRootEl);
+  if (toastRootEl) render(renderToasts(), toastRootEl);
 }
 
-async function init() {
+export async function init() {
   renderApp();
 
   connectEventStream(
     (batch) => {
-      void handleSseBatch(batch);
+      sseQueue = sseQueue
+        .then(() => handleSseBatch(batch))
+        .catch(() => {});
     },
     (status) => {
       state.sseStatus = status;
@@ -1485,9 +1732,27 @@ async function init() {
   window.addEventListener("popstate", () => {
     const route = parseBrowserRoute(window.location.pathname);
     if (route) {
-      void selectDatabase(route.projectId, route.databaseId, route.segments, true);
+      if (
+        route.projectId === state.activeProjectId &&
+        route.databaseId === state.activeDatabaseId
+      ) {
+        state.segments = [...route.segments];
+        navEpoch++;
+        renderApp();
+        if (state.segments.length > 0) {
+          void hydrateVisiblePath();
+        }
+      } else {
+        void selectDatabase(
+          route.projectId,
+          route.databaseId,
+          route.segments,
+          true
+        );
+      }
     } else {
       state.segments = [];
+      navEpoch++;
       renderApp();
     }
   });
@@ -1513,7 +1778,10 @@ async function init() {
       `Failed to initialize UI: ${err instanceof Error ? err.message : String(err)}`,
       "error"
     );
+    renderApp();
   }
 }
 
-void init();
+if (topbarEl && workspaceEl && modalRootEl && toastRootEl) {
+  void init();
+}

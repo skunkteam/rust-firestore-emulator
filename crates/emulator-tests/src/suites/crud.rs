@@ -289,3 +289,55 @@ async fn batch_get_and_batch_write_handle_missing_stream_errors_and_partial_fail
     assert_status_code(db.get("items/c").await, Code::NotFound);
     let _unused = Value::null();
 }
+
+#[gtest]
+#[tokio::test]
+async fn create_document_rejects_slashes_in_document_id_and_foreign_database_roots() {
+    let mut db = TestEnv::new().build_db();
+
+    // CreateDocument: slash-containing `document_id` (even when total segment count is even) ->
+    // InvalidArgument
+    for bad_doc_id in ["alice/posts", "alice/posts/p1"] {
+        let res = db
+            .raw_grpc()
+            .create_document(CreateDocumentRequest {
+                parent: DOCUMENTS_ROOT.to_string(),
+                collection_id: "users".to_string(),
+                document_id: bad_doc_id.to_string(),
+                document: Some(doc! { "a": 1i64 }),
+                mask: None,
+            })
+            .await;
+        assert_status_code(res, Code::InvalidArgument);
+    }
+    assert_status_code(db.get("users/alice/posts/p1").await, Code::NotFound);
+
+    // Mismatched `database` vs document root in Commit, BatchWrite, and BatchGetDocuments ->
+    // InvalidArgument (no panic / no cross-database leakage)
+    let foreign_doc = "projects/other-project/databases/(default)/documents/c/d";
+    assert_status_code(
+        db.commit_writes(WriteBatchSpec::new().put(foreign_doc, fields!({ "x": 1i64 })))
+            .await,
+        Code::InvalidArgument,
+    );
+
+    let bw = db
+        .batch_write(WriteBatchSpec::new().put(foreign_doc, fields!({ "x": 1i64 })))
+        .await
+        .expect("BatchWrite returns per-entry status");
+    expect_eq!(bw.status.len(), 1);
+    expect_eq!(bw.status[0].code, Code::InvalidArgument as i32);
+
+    let bg_stream = db
+        .raw_grpc()
+        .batch_get_documents(BatchGetDocumentsRequest {
+            database: DATABASE_ROOT.to_string(),
+            documents: vec![foreign_doc.to_string()],
+            mask: None,
+            consistency_selector: None,
+        })
+        .await
+        .expect("RPC envelope succeeds, error delivered in stream");
+    let bg_err = crate::harness::stream::collect_batch_get(bg_stream.into_inner()).await;
+    assert_status_code(bg_err, Code::InvalidArgument);
+}

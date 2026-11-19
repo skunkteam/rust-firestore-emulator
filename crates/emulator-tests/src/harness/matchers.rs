@@ -4,7 +4,6 @@ use googleapis::google::{
     firestore::v1::{Document, Value},
     protobuf::Timestamp,
 };
-use googletest::prelude::*;
 use prost::Message;
 use tonic::{Code, Status};
 
@@ -62,7 +61,7 @@ pub(crate) fn assert_doc_wire_eq(
     expected_fields: &HashMap<String, Value>,
 ) {
     let expected_name = doc_path(expected_rel_or_full_name);
-    expect_eq!(actual.name, expected_name);
+    assert_eq!(actual.name, expected_name);
     assert!(
         Value::fields_storage_eq(&actual.fields, expected_fields),
         "wire-exact field mismatch on {}:\n  actual:   {:?}\n  expected: {:?}",
@@ -70,8 +69,10 @@ pub(crate) fn assert_doc_wire_eq(
         actual.fields,
         expected_fields
     );
-    if let (Some(ct), Some(ut)) = (actual.create_time, actual.update_time) {
-        assert_monotonic_timestamps(&[ct, ut], false);
+    match (actual.create_time, actual.update_time) {
+        (Some(ct), Some(ut)) => assert_monotonic_timestamps(&[ct, ut], false),
+        (Some(ts), None) | (None, Some(ts)) => assert_monotonic_timestamps(&[ts], false),
+        (None, None) => {}
     }
     // Verify Prost binary wire roundtrip preserves storage representation.
     let encoded = actual.encode_to_vec();
@@ -87,8 +88,8 @@ pub(crate) fn assert_doc_semantic_eq(
     expected_fields: &HashMap<String, Value>,
 ) {
     let expected_name = doc_path(expected_rel_or_full_name);
-    expect_eq!(actual.name, expected_name);
-    expect_eq!(&actual.fields, expected_fields);
+    assert_eq!(actual.name, expected_name);
+    assert_eq!(&actual.fields, expected_fields);
 }
 
 pub(crate) fn doc_names(docs: &[Document]) -> Vec<String> {
@@ -99,4 +100,80 @@ pub(crate) fn short_ids(docs: &[Document]) -> Vec<&str> {
     docs.iter()
         .map(|d| d.name.rsplit('/').next().unwrap_or(d.name.as_str()))
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use googleapis::fields;
+
+    use super::*;
+
+    #[test]
+    fn assert_doc_wire_and_semantic_work_without_gtest_context() {
+        let doc = Document {
+            name: doc_path("col/d1"),
+            fields: fields!({ "n": 1i64, "z": -0.0f64 }),
+            create_time: Some(Timestamp {
+                seconds: 10,
+                nanos:   0,
+            }),
+            update_time: Some(Timestamp {
+                seconds: 10,
+                nanos:   5,
+            }),
+        };
+        assert_doc_wire_eq(&doc, "col/d1", &fields!({ "n": 1i64, "z": -0.0f64 }));
+        assert_doc_semantic_eq(&doc, "col/d1", &fields!({ "n": 1.0f64, "z": 0.0f64 }));
+    }
+
+    #[test]
+    #[should_panic]
+    fn assert_doc_wire_eq_panics_on_name_mismatch_without_gtest() {
+        let doc = Document {
+            name: doc_path("col/wrong"),
+            fields: fields!({ "n": 1i64 }),
+            create_time: None,
+            update_time: None,
+        };
+        assert_doc_wire_eq(&doc, "col/expected", &fields!({ "n": 1i64 }));
+    }
+
+    #[test]
+    #[should_panic(expected = "timestamp nanos out of valid range")]
+    fn assert_doc_wire_eq_validates_single_present_timestamp() {
+        let doc = Document {
+            name: doc_path("col/d1"),
+            fields: fields!({}),
+            create_time: Some(Timestamp {
+                seconds: 10,
+                nanos:   1_000_000_000,
+            }),
+            update_time: None,
+        };
+        assert_doc_wire_eq(&doc, "col/d1", &fields!({}));
+    }
+
+    #[test]
+    #[should_panic]
+    fn assert_doc_semantic_eq_panics_on_field_mismatch_without_gtest() {
+        let doc = Document {
+            name: doc_path("col/d1"),
+            fields: fields!({ "n": 1i64 }),
+            create_time: None,
+            update_time: None,
+        };
+        assert_doc_semantic_eq(&doc, "col/d1", &fields!({ "n": 2i64 }));
+    }
+
+    #[test]
+    #[should_panic]
+    fn assert_doc_semantic_eq_panics_on_name_mismatch_without_gtest() {
+        let doc = Document {
+            name: doc_path("col/wrong"),
+            fields: fields!({ "n": 1i64 }),
+            create_time: None,
+            update_time: None,
+        };
+        assert_doc_semantic_eq(&doc, "col/expected", &fields!({ "n": 1i64 }));
+    }
 }

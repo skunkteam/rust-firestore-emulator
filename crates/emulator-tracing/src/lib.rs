@@ -1,9 +1,11 @@
 use std::{
+    collections::VecDeque,
     fmt::Debug,
-    sync::{Arc, Mutex, OnceLock},
+    io, mem,
+    sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError},
 };
 
-use bytes::{BufMut, Bytes, BytesMut, buf::Writer};
+use bytes::Bytes;
 use metadata_filter::Filter;
 use thiserror::Error;
 use time::{
@@ -12,7 +14,7 @@ use time::{
 };
 use tracing_subscriber::{
     EnvFilter, Layer, Registry,
-    fmt::{MakeWriter, format::FmtSpan, time::OffsetTime, writer::MutexGuardWriter},
+    fmt::{MakeWriter, format::FmtSpan, time::OffsetTime},
     prelude::*,
     reload,
 };
@@ -151,27 +153,91 @@ impl Drop for DefaultDynamicSubscriber<'_> {
     }
 }
 
+const DEFAULT_MAX_BUFFER_BYTES: usize = 16 * 1024 * 1024;
+
+const fn is_utf8_cont_byte(b: u8) -> bool {
+    (b & 0b1100_0000) == 0b1000_0000
+}
+
 #[derive(Clone)]
 struct SharedBuffer {
-    buffer: Arc<Mutex<Writer<BytesMut>>>,
+    buffer:    Arc<Mutex<VecDeque<u8>>>,
+    max_bytes: usize,
 }
 
 impl SharedBuffer {
     fn new() -> Self {
+        Self::with_max_bytes(DEFAULT_MAX_BUFFER_BYTES)
+    }
+
+    fn with_max_bytes(max_bytes: usize) -> Self {
         Self {
-            buffer: Arc::new(Mutex::new(BytesMut::new().writer())),
+            buffer: Arc::new(Mutex::new(VecDeque::new())),
+            max_bytes,
         }
     }
 
     fn drain(&self) -> Bytes {
-        self.buffer.lock().unwrap().get_mut().split().freeze()
+        let mut guard = self.buffer.lock().unwrap_or_else(PoisonError::into_inner);
+        if guard.is_empty() {
+            return Bytes::new();
+        }
+        Bytes::from(Vec::from(mem::take(&mut *guard)))
     }
 }
+
+struct SharedBufferWriter<'a> {
+    guard:     MutexGuard<'a, VecDeque<u8>>,
+    max_bytes: usize,
+}
+
+impl io::Write for SharedBufferWriter<'_> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        if self.max_bytes == 0 || buf.is_empty() {
+            return Ok(buf.len());
+        }
+        if buf.len() >= self.max_bytes {
+            let truncated = !self.guard.is_empty() || buf.len() > self.max_bytes;
+            self.guard.clear();
+            let mut start = buf.len() - self.max_bytes;
+            if truncated {
+                while start < buf.len() && is_utf8_cont_byte(buf[start]) {
+                    start += 1;
+                }
+            }
+            self.guard.extend(&buf[start..]);
+        } else {
+            let overflow = self
+                .guard
+                .len()
+                .saturating_add(buf.len())
+                .saturating_sub(self.max_bytes);
+            if overflow > 0 {
+                self.guard.drain(..overflow);
+            }
+            self.guard.extend(buf);
+            if overflow > 0 {
+                while self.guard.front().is_some_and(|&b| is_utf8_cont_byte(b)) {
+                    self.guard.pop_front();
+                }
+            }
+        }
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
 impl<'a> MakeWriter<'a> for SharedBuffer {
-    type Writer = MutexGuardWriter<'a, Writer<BytesMut>>;
+    type Writer = SharedBufferWriter<'a>;
 
     fn make_writer(&'a self) -> Self::Writer {
-        self.buffer.make_writer()
+        SharedBufferWriter {
+            guard:     self.buffer.lock().unwrap_or_else(PoisonError::into_inner),
+            max_bytes: self.max_bytes,
+        }
     }
 }
 
@@ -188,7 +254,7 @@ mod tests {
 
     use googletest::prelude::*;
 
-    use super::{DefaultTracing, DynamicSubscriber, SetLogLevelsError, Tracing};
+    use super::{DefaultTracing, DynamicSubscriber, SetLogLevelsError, SharedBuffer, Tracing};
 
     #[gtest]
     fn start_is_idempotent_and_captures_filtered_events() {
@@ -228,5 +294,100 @@ mod tests {
         drop(entered);
         drop(active_span);
         drop(mid_span_sub);
+    }
+
+    #[gtest]
+    fn shared_buffer_caps_retained_bytes_and_recovers_from_poison() {
+        use std::io::Write;
+
+        use tracing_subscriber::fmt::MakeWriter;
+
+        let buf = SharedBuffer::with_max_bytes(10);
+        {
+            let mut w = buf.make_writer();
+            w.write_all(b"123456").unwrap();
+            w.write_all(b"7890abcd").unwrap();
+        }
+        expect_eq!(buf.drain().as_ref(), b"567890abcd");
+
+        // Single write exceeding max_bytes keeps the newest tail.
+        {
+            let mut w = buf.make_writer();
+            w.write_all(b"0123456789XYZ").unwrap();
+        }
+        expect_eq!(buf.drain().as_ref(), b"3456789XYZ");
+
+        // Poisoning the inner mutex does not panic subsequent make_writer or drain calls.
+        let poisoned = buf.clone();
+        let panic_res = std::thread::spawn(move || {
+            let _guard = poisoned.make_writer();
+            panic!("intentional writer panic");
+        })
+        .join();
+        expect_true!(panic_res.is_err());
+        {
+            let mut w = buf.make_writer();
+            w.write_all(b"ok").unwrap();
+        }
+        expect_eq!(buf.drain().as_ref(), b"ok");
+    }
+
+    #[gtest]
+    fn shared_buffer_truncation_preserves_valid_utf8_boundaries() {
+        use std::io::Write;
+
+        use tracing_subscriber::fmt::MakeWriter;
+
+        let buf = SharedBuffer::with_max_bytes(10);
+        {
+            let mut w = buf.make_writer();
+            w.write_all("éééé".as_bytes()).unwrap();
+            w.write_all(b"ab").unwrap();
+            w.write_all(b"z").unwrap();
+        }
+        let drained = buf.drain();
+        assert!(
+            std::str::from_utf8(&drained).is_ok(),
+            "overflow truncation must preserve UTF-8 boundaries: {drained:?}"
+        );
+
+        let single_buf = SharedBuffer::with_max_bytes(10);
+        {
+            let mut w = single_buf.make_writer();
+            w.write_all("ab🌃12345678".as_bytes()).unwrap();
+        }
+        let single_drained = single_buf.drain();
+        assert!(
+            std::str::from_utf8(&single_drained).is_ok(),
+            "single-write tail truncation must preserve UTF-8 boundaries: {single_drained:?}"
+        );
+    }
+
+    #[gtest]
+    fn shared_buffer_sustained_writes_at_capacity_avoid_quadratic_memmove() {
+        use std::{
+            io::Write,
+            time::{Duration, Instant},
+        };
+
+        use tracing_subscriber::fmt::MakeWriter;
+
+        let buf = SharedBuffer::new();
+        {
+            let mut w = buf.make_writer();
+            w.write_all(&vec![b'x'; 16 * 1024 * 1024]).unwrap();
+        }
+
+        let line = [b'a'; 64];
+        let start = Instant::now();
+        for _ in 0..1_500 {
+            let mut w = buf.make_writer();
+            w.write_all(&line).unwrap();
+        }
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < Duration::from_millis(250),
+            "1500 small writes at capacity took {elapsed:?} due to quadratic memmove"
+        );
     }
 }

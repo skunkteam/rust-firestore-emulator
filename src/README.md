@@ -14,8 +14,8 @@ Root binary and library entry point for the `firestore-emulator` crate. Initiali
 
 ## Invariants
 - `[src/lib.rs:run]` & `[src/main.rs:main]`: Both `FirestoreProject` and the `Tracing` implementation must satisfy `'static` lifetimes (`main` enforces this via `Box::leak` on the allocated `FirestoreProject`).
-- `[src/lib.rs:is_not_a_grpc_request]`: Requests are routed to the Tonic gRPC service if and only if the `http::header::CONTENT_TYPE` header is present and starts with `b"application/grpc"`; all other requests are routed via `MultiplexLayer` to the Axum REST router.
-- `[src/multiplex.rs:MultiplexService::poll_ready]`: Both wrapped services (`self.base` and `self.other`) must be immediately ready when polled (`assert!(self.base.poll_ready(cx).is_ready())` and `assert!(self.other.poll_ready(cx).is_ready())`); `poll_ready` panics if either service is not immediately ready.
+- `[src/lib.rs:is_not_a_grpc_request]`: Requests are routed to the Tonic gRPC service if and only if the `http::header::CONTENT_TYPE` header's media type (before optional `;` parameters, trimmed of ASCII whitespace) matches `application/grpc` or `application/grpc+<suffix>` ASCII case-insensitively; all other requests are routed via `MultiplexLayer` to the Axum REST router.
+- `[src/multiplex.rs:MultiplexService]`: Routes requests via `tower::ServiceExt::oneshot` on a clone of the selected branch (`base` or `other`), so `poll_ready` is invoked exclusively on the chosen service and `Poll::Pending` / readiness errors propagate without panicking or holding unused readiness slots on the unchosen service.
 
 ## Side Effects
 - `[src/main.rs:GLOBAL_ALLOC]`: Sets `tikv_jemallocator::Jemalloc` as the process-wide `#[global_allocator]`.

@@ -1,12 +1,15 @@
 use googleapis::google::firestore::v1::{Document, pipeline::Stage};
 use itertools::Itertools;
 
-use crate::{GenericDatabaseError, error::Result, unimplemented_collection};
+use crate::{
+    GenericDatabaseError, database::field_path::FieldReference, error::Result,
+    unimplemented_collection,
+};
 
 /// Executes the `remove_fields` pipeline stage.
 ///
-/// Iterates across string argument targets dynamically stripping the nodes destructively out of the
-/// maps.
+/// Iterates across field reference targets stripping matching paths (or `__name__`) from each
+/// document.
 pub(super) fn execute(
     Stage {
         name,
@@ -18,21 +21,30 @@ pub(super) fn execute(
     assert_eq!(name, "remove_fields");
     unimplemented_collection!(options);
 
-    let targets: Vec<_> = args
+    let targets: Vec<FieldReference> = args
         .iter()
         .map(|arg| {
-            arg.as_field_reference().ok_or_else(|| {
+            let raw = arg.as_field_reference().ok_or_else(|| {
                 GenericDatabaseError::invalid_argument(
                     "remove_fields stage arguments must be field references",
                 )
-            })
+            })?;
+            let field_ref: FieldReference = raw.parse()?;
+            if let FieldReference::FieldPath(ref path) = field_ref {
+                path.validate_non_reserved()?;
+            }
+            Ok(field_ref)
         })
         .try_collect()?;
 
-    // Strip keys inline natively
     for doc in &mut docs {
         for target in &targets {
-            doc.fields.remove(*target);
+            match target {
+                FieldReference::DocumentName => doc.name.clear(),
+                FieldReference::FieldPath(path) => {
+                    path.delete_value(&mut doc.fields);
+                }
+            }
         }
     }
 

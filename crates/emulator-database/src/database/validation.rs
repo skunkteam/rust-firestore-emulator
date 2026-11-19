@@ -62,6 +62,21 @@ pub(crate) fn validate_writable_value(value: &Value, in_array: bool) -> Result<(
             )),
             VectorClassification::NotVectorMap => validate_writable_fields(&map.fields),
         },
+        Some(ValueType::GeoPointValue(geo)) => {
+            if !geo.latitude.is_finite() || !(-90.0..=90.0).contains(&geo.latitude) {
+                return Err(GenericDatabaseError::invalid_argument(format!(
+                    "latitude must be in the range [-90, 90], got {}",
+                    geo.latitude
+                )));
+            }
+            if !geo.longitude.is_finite() || !(-180.0..=180.0).contains(&geo.longitude) {
+                return Err(GenericDatabaseError::invalid_argument(format!(
+                    "longitude must be in the range [-180, 180], got {}",
+                    geo.longitude
+                )));
+            }
+            Ok(())
+        }
         Some(
             ValueType::NullValue(_)
             | ValueType::BooleanValue(_)
@@ -70,8 +85,7 @@ pub(crate) fn validate_writable_value(value: &Value, in_array: bool) -> Result<(
             | ValueType::TimestampValue(_)
             | ValueType::StringValue(_)
             | ValueType::BytesValue(_)
-            | ValueType::ReferenceValue(_)
-            | ValueType::GeoPointValue(_),
+            | ValueType::ReferenceValue(_),
         ) => Ok(()),
     }
 }
@@ -100,7 +114,15 @@ pub(crate) fn validate_field_transforms(transforms: &[FieldTransform]) -> Result
                     validate_writable_value(item, true)?;
                 }
             }
-            TransformType::Increment(v) | TransformType::Maximum(v) | TransformType::Minimum(v) => {
+            TransformType::Increment(v) => {
+                validate_writable_value(v, false)?;
+                if !v.is_number() {
+                    return Err(GenericDatabaseError::invalid_argument(
+                        "increment value must be an integer or double",
+                    ));
+                }
+            }
+            TransformType::Maximum(v) | TransformType::Minimum(v) => {
                 validate_writable_value(v, false)?;
             }
         }
@@ -417,6 +439,41 @@ mod tests {
             ]),
             ok(())
         );
+
+        // Non-numeric Increment operands are rejected with InvalidArgument.
+        for non_numeric in [
+            Value::string("abc"),
+            Value::boolean(true),
+            Value::null(),
+            Value::array(vec![Value::integer(1)]),
+            Value::map(HashMap::from([("k".to_string(), Value::integer(1))])),
+        ] {
+            assert_that!(
+                validate_field_transforms(&[FieldTransform {
+                    field_path:     "cnt".to_string(),
+                    transform_type: Some(TransformType::Increment(non_numeric)),
+                }]),
+                err(eq(&GenericDatabaseError::invalid_argument(
+                    "increment value must be an integer or double"
+                )))
+            );
+        }
+
+        // Integer and double (including NaN/Infinity) Increment operands remain valid.
+        for numeric in [
+            Value::integer(1),
+            Value::double(1.5),
+            Value::double(f64::NAN),
+            Value::double(f64::INFINITY),
+        ] {
+            assert_that!(
+                validate_field_transforms(&[FieldTransform {
+                    field_path:     "cnt".to_string(),
+                    transform_type: Some(TransformType::Increment(numeric)),
+                }]),
+                ok(())
+            );
+        }
     }
 
     #[gtest]
@@ -481,5 +538,31 @@ mod tests {
             }),
             ok(())
         );
+    }
+
+    #[gtest]
+    fn rejects_out_of_range_or_non_finite_geopoint_values() {
+        use googleapis::google::r#type::LatLng;
+
+        for (latitude, longitude) in [
+            (90.0001, 0.0),
+            (-90.0001, 0.0),
+            (0.0, 180.0001),
+            (0.0, -180.0001),
+            (f64::NAN, 0.0),
+            (0.0, f64::INFINITY),
+        ] {
+            let fields = HashMap::from([(
+                "loc".to_string(),
+                Value::from(LatLng {
+                    latitude,
+                    longitude,
+                }),
+            )]);
+            assert_that!(
+                validate_writable_fields(&fields),
+                err(matches_pattern!(GenericDatabaseError::InvalidArgument(_)))
+            );
+        }
     }
 }

@@ -17,7 +17,9 @@ export async function expectCloudLimitationCanary(description: string, fn: () =>
         const rpcErr = typeof err === 'object' && err !== null ? (err as { code?: unknown }) : undefined;
         if (rpcErr?.code !== expectedCode) {
             const detail = err instanceof Error ? err.message : String(err);
-            throw new Error(`Expected gRPC code ${expectedCode} for ${description}, got ${String(rpcErr?.code)}: ${detail}`);
+            throw new Error(`Expected gRPC code ${expectedCode} for ${description}, got ${String(rpcErr?.code)}: ${detail}`, {
+                cause: err,
+            });
         }
         return;
     }

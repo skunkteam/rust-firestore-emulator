@@ -14,6 +14,9 @@ console = ["emulator-tracing/console"]
 # Enable the web interface on the same host:port as the other emulator endpoints
 ui = ["emulator-http/ui"]
 
+[lints]
+workspace = true
+
 [workspace]
 members = ["crates/*"]
 exclude = ["tmp"]
