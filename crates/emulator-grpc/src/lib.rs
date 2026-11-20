@@ -42,7 +42,7 @@ const MAX_PIPELINE_RESPONSE_BYTES: usize = 1024 * 1024;
 
 fn rollback_new_txn_sync(database: &FirestoreDatabase, new_txn_bytes: &[u8]) {
     if !new_txn_bytes.is_empty()
-        && let Ok(id) = new_txn_bytes.to_vec().try_into()
+        && let Ok(id) = new_txn_bytes.try_into()
     {
         drop(database.rollback_sync(id));
     }

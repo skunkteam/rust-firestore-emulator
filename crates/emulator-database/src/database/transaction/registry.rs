@@ -2,8 +2,8 @@ use std::{
     collections::{HashMap, VecDeque},
     fmt::Display,
     sync::{
-        Arc, Mutex, PoisonError, Weak,
-        atomic::{self, AtomicU64},
+        Arc, PoisonError, RwLock, Weak,
+        atomic::{self, AtomicU32, AtomicU64},
     },
 };
 
@@ -22,13 +22,14 @@ use crate::{
 pub(crate) const MAX_RETRY_TOMBSTONES: usize = 4_096;
 pub(crate) const MAX_CLOSED_TXNS: usize = 4_096;
 
-static NEXT_LINEAGE_ID: AtomicU64 = AtomicU64::new(1);
+static NEXT_INSTANCE_ID: AtomicU32 = AtomicU32::new(1);
 
 /// 16-byte rotated transaction wire token encoding `(lineage_id, attempt_gen)`.
 ///
-/// Every fresh `BeginTransaction` allocates a unique non-zero `lineage_id` with `attempt_gen == 1`.
-/// Each `BeginTransaction(retry_transaction)` on that lineage increments `attempt_gen`, rotating
-/// the wire bytes while preserving the underlying lineage priority inside [`RunningTransactions`].
+/// Every fresh `BeginTransaction` allocates a unique non-zero `lineage_id` packing
+/// `(instance_id << 32) | local_seq` with `attempt_gen == 1`. Each
+/// `BeginTransaction(retry_transaction)` on that lineage increments `attempt_gen`, rotating the
+/// wire bytes while preserving the underlying lineage priority inside [`RunningTransactions`].
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct TransactionId {
     lineage_id:  u64,
@@ -36,12 +37,23 @@ pub struct TransactionId {
 }
 
 impl TransactionId {
-    pub(crate) fn new_lineage() -> Self {
-        let lineage_id = NEXT_LINEAGE_ID.fetch_add(1, atomic::Ordering::Relaxed);
+    const LOCAL_SEQ_MASK: u64 = 0xFFFF_FFFF;
+
+    fn from_instance_seq(instance_id: u32, local_seq: u32) -> Self {
+        debug_assert!(instance_id != 0);
+        debug_assert!(local_seq != 0);
         Self {
-            lineage_id,
+            lineage_id:  (u64::from(instance_id) << 32) | u64::from(local_seq),
             attempt_gen: 1,
         }
+    }
+
+    fn instance_id(self) -> u32 {
+        (self.lineage_id >> 32) as u32
+    }
+
+    fn local_seq(self) -> u64 {
+        self.lineage_id & Self::LOCAL_SEQ_MASK
     }
 
     pub(crate) fn with_attempt(self, attempt_gen: u64) -> Self {
@@ -70,11 +82,31 @@ impl TransactionId {
     }
 
     /// Check if the given [`TransactionId`] could have been issued by the currently running
-    /// instance. This doesn't guarantee that the given id is active, only that its lineage and
-    /// generation are syntactically in-bounds for this process.
+    /// process. This validates non-zero lineage/attempt fields and `instance_id` / `local_seq`
+    /// bounds without binding to a specific database instance.
     pub(crate) fn check(self) -> Result<()> {
-        if (1..NEXT_LINEAGE_ID.load(atomic::Ordering::Acquire)).contains(&self.lineage_id)
+        let instance_id = self.instance_id();
+        let local_seq = self.local_seq();
+        if self.lineage_id != 0
             && self.attempt_gen >= 1
+            && (1..NEXT_INSTANCE_ID.load(atomic::Ordering::Acquire)).contains(&instance_id)
+            && local_seq >= 1
+        {
+            Ok(())
+        } else {
+            Err(GenericDatabaseError::InvalidArgument(format!(
+                "Invalid transaction ID, {self} has not been issued by this instance"
+            )))
+        }
+    }
+
+    /// Check if the given [`TransactionId`] belongs to `instance_id` and has a `local_seq`
+    /// already issued by that registry instance (`1..next_local_seq`).
+    pub(crate) fn check_for_instance(self, instance_id: u32, next_local_seq: u64) -> Result<()> {
+        self.check()?;
+        if instance_id != 0
+            && self.instance_id() == instance_id
+            && (1..next_local_seq).contains(&self.local_seq())
         {
             Ok(())
         } else {
@@ -91,11 +123,11 @@ impl Display for TransactionId {
     }
 }
 
-impl TryFrom<Vec<u8>> for TransactionId {
+impl TryFrom<&[u8]> for TransactionId {
     type Error = GenericDatabaseError;
 
-    fn try_from(value: Vec<u8>) -> Result<Self, Self::Error> {
-        let bytes: [u8; 16] = value.try_into().map_err(|value: Vec<u8>| {
+    fn try_from(value: &[u8]) -> Result<Self, Self::Error> {
+        let bytes: [u8; 16] = value.try_into().map_err(|_| {
             GenericDatabaseError::invalid_argument(format!("invalid transaction ID: {value:?}"))
         })?;
         let lineage_id = u64::from_le_bytes(bytes[..8].try_into().expect("8-byte slice"));
@@ -109,6 +141,14 @@ impl TryFrom<Vec<u8>> for TransactionId {
             lineage_id,
             attempt_gen,
         })
+    }
+}
+
+impl TryFrom<Vec<u8>> for TransactionId {
+    type Error = GenericDatabaseError;
+
+    fn try_from(value: Vec<u8>) -> Result<Self, Self::Error> {
+        Self::try_from(value.as_slice())
     }
 }
 
@@ -325,18 +365,16 @@ pub(crate) enum CommitTake {
 pub(crate) struct CommitSlotGuard {
     database: Weak<FirestoreDatabase>,
     locks: Arc<LockManager>,
-    state: Arc<Mutex<RunningTxnMap>>,
+    state: Arc<RwLock<RunningTxnMap>>,
     id: TransactionId,
     session: Arc<LockSession>,
     armed: bool,
 }
 
 impl CommitSlotGuard {
-    pub(crate) fn finish_committed(mut self) {
-        self.armed = false;
-        let cleared = is_cleared(&self.database, &self.locks);
+    fn finalize_slot(&self, cleared: bool, next_slot: impl FnOnce() -> TxnSlot) {
         let dropped = {
-            let mut map = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+            let mut map = self.state.write().unwrap_or_else(PoisonError::into_inner);
             if matches!(
                 map.slots.get(&self.id.lineage_id),
                 Some(LineageEntry {
@@ -347,21 +385,23 @@ impl CommitSlotGuard {
                 if cleared {
                     map.remove_slot(self.id.lineage_id)
                 } else {
-                    map.set_slot(
-                        self.id.lineage_id,
-                        self.id.attempt_gen,
-                        TxnSlot::Closed {
-                            outcome:   ClosedOutcome::Committed,
-                            read_only: false,
-                            ring_gen:  0,
-                        },
-                    )
+                    map.set_slot(self.id.lineage_id, self.id.attempt_gen, next_slot())
                 }
             } else {
                 None
             }
         };
         drop(dropped);
+    }
+
+    pub(crate) fn finish_committed(mut self) {
+        self.armed = false;
+        let cleared = is_cleared(&self.database, &self.locks);
+        self.finalize_slot(cleared, || TxnSlot::Closed {
+            outcome:   ClosedOutcome::Committed,
+            read_only: false,
+            ring_gen:  0,
+        });
     }
 
     pub(crate) fn abort_commit(mut self, abort_reason: Option<AbortReason>) {
@@ -374,49 +414,30 @@ impl CommitSlotGuard {
                 abort_reason,
                 Some(AbortReason::DatabaseCleared | AbortReason::DatabaseDropped)
             );
-        let dropped = {
-            let mut map = self.state.lock().unwrap_or_else(PoisonError::into_inner);
-            if matches!(
-                map.slots.get(&self.id.lineage_id),
-                Some(LineageEntry {
-                    current_attempt,
-                    slot: TxnSlot::Committing,
-                }) if *current_attempt == self.id.attempt_gen
-            ) {
-                if cleared {
-                    map.remove_slot(self.id.lineage_id)
-                } else {
-                    let next_slot = match abort_reason {
-                        Some(reason @ AbortReason::Wounded { .. }) => TxnSlot::Wounded {
-                            root_seq,
-                            reason,
-                            ring_gen: 0,
-                        },
-                        Some(
-                            AbortReason::UpgradeContention
-                            | AbortReason::OptimisticWriteSkew
-                            | AbortReason::WriteTimeout
-                            | AbortReason::ReadTimeout,
-                        ) => TxnSlot::AbortedLineage {
-                            root_seq,
-                            ring_gen: 0,
-                        },
-                        Some(AbortReason::DatabaseCleared | AbortReason::DatabaseDropped) => {
-                            unreachable!("handled above")
-                        }
-                        None => TxnSlot::Closed {
-                            outcome:   ClosedOutcome::AbortedOrRolledBack,
-                            read_only: false,
-                            ring_gen:  0,
-                        },
-                    };
-                    map.set_slot(self.id.lineage_id, self.id.attempt_gen, next_slot)
-                }
-            } else {
-                None
+        self.finalize_slot(cleared, || match abort_reason {
+            Some(reason @ AbortReason::Wounded { .. }) => TxnSlot::Wounded {
+                root_seq,
+                reason,
+                ring_gen: 0,
+            },
+            Some(
+                AbortReason::UpgradeContention
+                | AbortReason::OptimisticWriteSkew
+                | AbortReason::WriteTimeout
+                | AbortReason::ReadTimeout,
+            ) => TxnSlot::AbortedLineage {
+                root_seq,
+                ring_gen: 0,
+            },
+            Some(AbortReason::DatabaseCleared | AbortReason::DatabaseDropped) => {
+                unreachable!("handled above")
             }
-        };
-        drop(dropped);
+            None => TxnSlot::Closed {
+                outcome:   ClosedOutcome::AbortedOrRolledBack,
+                read_only: false,
+                ring_gen:  0,
+            },
+        });
     }
 }
 
@@ -427,56 +448,59 @@ impl Drop for CommitSlotGuard {
         }
         self.session.close();
         let cleared = is_cleared(&self.database, &self.locks);
-        let dropped = {
-            let mut map = self.state.lock().unwrap_or_else(PoisonError::into_inner);
-            if matches!(
-                map.slots.get(&self.id.lineage_id),
-                Some(LineageEntry {
-                    current_attempt,
-                    slot: TxnSlot::Committing,
-                }) if *current_attempt == self.id.attempt_gen
-            ) {
-                if cleared {
-                    map.remove_slot(self.id.lineage_id)
-                } else {
-                    map.set_slot(
-                        self.id.lineage_id,
-                        self.id.attempt_gen,
-                        TxnSlot::Closed {
-                            outcome:   ClosedOutcome::AbortedOrRolledBack,
-                            read_only: false,
-                            ring_gen:  0,
-                        },
-                    )
-                }
-            } else {
-                None
-            }
-        };
-        drop(dropped);
+        self.finalize_slot(cleared, || TxnSlot::Closed {
+            outcome:   ClosedOutcome::AbortedOrRolledBack,
+            read_only: false,
+            ring_gen:  0,
+        });
     }
 }
 
 #[derive(Debug)]
 pub(crate) struct RunningTransactions {
+    instance_id: u32,
+    next_local_seq: AtomicU64,
     database: Weak<FirestoreDatabase>,
-    locks:    Arc<LockManager>,
-    state:    Arc<Mutex<RunningTxnMap>>,
+    locks: Arc<LockManager>,
+    state: Arc<RwLock<RunningTxnMap>>,
 }
 
 impl RunningTransactions {
     pub(crate) fn new(database: Weak<FirestoreDatabase>, locks: Arc<LockManager>) -> Self {
+        let instance_id = NEXT_INSTANCE_ID
+            .fetch_update(atomic::Ordering::AcqRel, atomic::Ordering::Acquire, |cur| {
+                cur.checked_add(1)
+            })
+            .expect("transaction registry instance_id exhausted");
         Self {
+            instance_id,
+            next_local_seq: AtomicU64::new(1),
             database,
             locks,
             state: Default::default(),
         }
     }
 
+    fn new_lineage_id(&self) -> TransactionId {
+        let local_seq = self.next_local_seq.fetch_add(1, atomic::Ordering::AcqRel);
+        assert!(
+            local_seq <= u64::from(u32::MAX),
+            "transaction lineage local sequence exhausted"
+        );
+        TransactionId::from_instance_seq(self.instance_id, local_seq as u32)
+    }
+
+    fn check_id(&self, id: TransactionId) -> Result<()> {
+        id.check_for_instance(
+            self.instance_id,
+            self.next_local_seq.load(atomic::Ordering::Acquire),
+        )
+    }
+
     pub(crate) fn clear_all(&self) {
         let txns = self
             .state
-            .lock()
+            .write()
             .unwrap_or_else(PoisonError::into_inner)
             .clear_all();
         drop(txns);
@@ -486,7 +510,7 @@ impl RunningTransactions {
         if is_cleared(&self.database, &self.locks) {
             return Err(AbortReason::DatabaseCleared.into());
         }
-        let id = TransactionId::new_lineage();
+        let id = self.new_lineage_id();
         let txn = Arc::new(Transaction::ReadWrite(Arc::new(ReadWriteTransaction::new(
             id,
             Weak::clone(&self.database),
@@ -494,7 +518,12 @@ impl RunningTransactions {
             LockPriority::Lazy,
             optimistic_concurrency,
         ))));
-        let mut map = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut map = self.state.write().unwrap_or_else(PoisonError::into_inner);
+        if is_cleared(&self.database, &self.locks) {
+            drop(map);
+            drop(txn);
+            return Err(AbortReason::DatabaseCleared.into());
+        }
         let dropped = map.set_slot(id.lineage_id, id.attempt_gen, TxnSlot::Active(txn));
         drop(map);
         drop(dropped);
@@ -509,13 +538,18 @@ impl RunningTransactions {
             Some(time) => validate_read_time(time)?,
             None => Timestamp::now(),
         };
-        let id = TransactionId::new_lineage();
+        let id = self.new_lineage_id();
         let txn = Arc::new(Transaction::ReadOnly(Arc::new(ReadOnlyTransaction::new(
             id,
             Weak::clone(&self.database),
             read_time,
         ))));
-        let mut map = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut map = self.state.write().unwrap_or_else(PoisonError::into_inner);
+        if is_cleared(&self.database, &self.locks) {
+            drop(map);
+            drop(txn);
+            return Err(AbortReason::DatabaseCleared.into());
+        }
         let dropped = map.set_slot(id.lineage_id, id.attempt_gen, TxnSlot::Active(txn));
         drop(map);
         drop(dropped);
@@ -523,11 +557,92 @@ impl RunningTransactions {
     }
 
     pub(crate) fn get_active(&self, id: TransactionId) -> Result<Arc<Transaction>> {
-        id.check()?;
+        self.check_id(id)?;
         if is_cleared(&self.database, &self.locks) {
             let dropped = self
                 .state
-                .lock()
+                .write()
+                .unwrap_or_else(PoisonError::into_inner)
+                .remove_slot(id.lineage_id);
+            drop(dropped);
+            return Err(AbortReason::DatabaseCleared.into());
+        }
+
+        // Read-lock fast path for un-wounded active transactions; only upgrade to `.write()` when
+        // an active `LockSession` needs lazy abort-state promotion into `RunningTxnMap`.
+        {
+            let map = self.state.read().unwrap_or_else(PoisonError::into_inner);
+            match map.slots.get(&id.lineage_id) {
+                Some(entry) if entry.current_attempt == id.attempt_gen => match &entry.slot {
+                    TxnSlot::Active(txn) => {
+                        if active_abort_promotion(txn).is_none() {
+                            return Ok(Arc::clone(txn));
+                        }
+                    }
+                    TxnSlot::Wounded { reason, .. } => return Err((*reason).into()),
+                    TxnSlot::Committing
+                    | TxnSlot::AbortedLineage { .. }
+                    | TxnSlot::Closed { .. } => {
+                        return Err(GenericDatabaseError::invalid_argument(format!(
+                            "invalid transaction ID: {id}"
+                        )));
+                    }
+                },
+                _ => {
+                    if is_cleared(&self.database, &self.locks) {
+                        return Err(AbortReason::DatabaseCleared.into());
+                    }
+                    return Err(GenericDatabaseError::invalid_argument(format!(
+                        "invalid transaction ID: {id}"
+                    )));
+                }
+            }
+        }
+
+        let mut dropped_txn = None;
+        let result = {
+            let mut map = self.state.write().unwrap_or_else(PoisonError::into_inner);
+            if is_cleared(&self.database, &self.locks) {
+                dropped_txn = map.remove_slot(id.lineage_id);
+                Err(AbortReason::DatabaseCleared.into())
+            } else {
+                match map.slots.get(&id.lineage_id) {
+                    Some(entry) if entry.current_attempt == id.attempt_gen => match &entry.slot {
+                        TxnSlot::Active(txn) => match active_abort_promotion(txn) {
+                            None => Ok(Arc::clone(txn)),
+                            Some(promoted) => {
+                                let (dropped, err) = promote_active_slot(&mut map, id, promoted);
+                                dropped_txn = dropped;
+                                Err(err)
+                            }
+                        },
+                        TxnSlot::Wounded { reason, .. } => Err((*reason).into()),
+                        TxnSlot::Committing
+                        | TxnSlot::AbortedLineage { .. }
+                        | TxnSlot::Closed { .. } => Err(GenericDatabaseError::invalid_argument(
+                            format!("invalid transaction ID: {id}"),
+                        )),
+                    },
+                    _ => Err(GenericDatabaseError::invalid_argument(format!(
+                        "invalid transaction ID: {id}"
+                    ))),
+                }
+            }
+        };
+        drop(dropped_txn);
+        result
+    }
+
+    pub(crate) fn take_for_commit(
+        &self,
+        id: TransactionId,
+        has_writes: bool,
+    ) -> Result<CommitTake> {
+        self.check_id(id)?;
+        if is_cleared(&self.database, &self.locks) {
+            let dropped = self
+                .state
+                .write()
                 .unwrap_or_else(PoisonError::into_inner)
                 .remove_slot(id.lineage_id);
             drop(dropped);
@@ -536,13 +651,127 @@ impl RunningTransactions {
 
         let mut dropped_txn = None;
         let result = {
-            let mut map = self.state.lock().unwrap_or_else(PoisonError::into_inner);
-            match map.slots.get(&id.lineage_id) {
-                Some(entry) if entry.current_attempt == id.attempt_gen => match &entry.slot {
-                    TxnSlot::Active(txn) => {
-                        let promoted = active_abort_promotion(txn);
-                        match promoted {
-                            None => Ok(Arc::clone(txn)),
+            let mut map = self.state.write().unwrap_or_else(PoisonError::into_inner);
+            if is_cleared(&self.database, &self.locks) {
+                dropped_txn = map.remove_slot(id.lineage_id);
+                Err(AbortReason::DatabaseCleared.into())
+            } else {
+                match map.slots.get(&id.lineage_id) {
+                    Some(entry) if entry.current_attempt == id.attempt_gen => match &entry.slot {
+                        TxnSlot::Active(txn) => match txn.as_ref() {
+                            Transaction::ReadOnly(ro) => {
+                                let ro = Arc::clone(ro);
+                                if has_writes {
+                                    dropped_txn = map.set_slot(
+                                        id.lineage_id,
+                                        id.attempt_gen,
+                                        TxnSlot::Closed {
+                                            outcome:   ClosedOutcome::AbortedOrRolledBack,
+                                            read_only: true,
+                                            ring_gen:  0,
+                                        },
+                                    );
+                                    Err(GenericDatabaseError::invalid_argument(
+                                        "Cannot modify entities in a read-only transaction",
+                                    ))
+                                } else {
+                                    dropped_txn = map.set_slot(
+                                        id.lineage_id,
+                                        id.attempt_gen,
+                                        TxnSlot::Closed {
+                                            outcome:   ClosedOutcome::Committed,
+                                            read_only: true,
+                                            ring_gen:  0,
+                                        },
+                                    );
+                                    Ok(CommitTake::ReadOnly(ro))
+                                }
+                            }
+                            Transaction::ReadWrite(rw) => {
+                                let rw = Arc::clone(rw);
+                                match active_abort_promotion(txn) {
+                                    Some(promoted) => {
+                                        let (dropped, err) =
+                                            promote_active_slot(&mut map, id, promoted);
+                                        dropped_txn = dropped;
+                                        Err(err)
+                                    }
+                                    None => {
+                                        let session = Arc::clone(rw.session());
+                                        // Disallow new reads on this session immediately while
+                                        // keeping `STATE_ACTIVE` and `woundable = true` until
+                                        // `seal_for_commit`.
+                                        session.mark_commit_started();
+                                        dropped_txn = map.set_slot(
+                                            id.lineage_id,
+                                            id.attempt_gen,
+                                            TxnSlot::Committing,
+                                        );
+                                        let guard = CommitSlotGuard {
+                                            database: Weak::clone(&self.database),
+                                            locks: Arc::clone(&self.locks),
+                                            state: Arc::clone(&self.state),
+                                            id,
+                                            session,
+                                            armed: true,
+                                        };
+                                        Ok(CommitTake::ReadWrite((rw, guard)))
+                                    }
+                                }
+                            }
+                        },
+                        TxnSlot::Wounded { reason, .. } => Err((*reason).into()),
+                        TxnSlot::Committing
+                        | TxnSlot::AbortedLineage { .. }
+                        | TxnSlot::Closed { .. } => Err(GenericDatabaseError::invalid_argument(
+                            format!("invalid transaction ID: {id}"),
+                        )),
+                    },
+                    _ => Err(GenericDatabaseError::invalid_argument(format!(
+                        "invalid transaction ID: {id}"
+                    ))),
+                }
+            }
+        };
+        drop(dropped_txn);
+        result
+    }
+
+    pub(crate) fn rollback(&self, id: TransactionId) -> Result<()> {
+        self.check_id(id)?;
+        if is_cleared(&self.database, &self.locks) {
+            let dropped = self
+                .state
+                .write()
+                .unwrap_or_else(PoisonError::into_inner)
+                .remove_slot(id.lineage_id);
+            drop(dropped);
+            return Err(AbortReason::DatabaseCleared.into());
+        }
+
+        let mut close_session: Option<Arc<LockSession>> = None;
+        let mut dropped_txn: Option<Arc<Transaction>> = None;
+        let result = {
+            let mut map = self.state.write().unwrap_or_else(PoisonError::into_inner);
+            if is_cleared(&self.database, &self.locks) {
+                dropped_txn = map.remove_slot(id.lineage_id);
+                Err(AbortReason::DatabaseCleared.into())
+            } else {
+                match map.slots.get(&id.lineage_id) {
+                    None => Err(GenericDatabaseError::invalid_argument(format!(
+                        "invalid transaction ID: {id}"
+                    ))),
+                    Some(entry) if id.attempt_gen > entry.current_attempt => {
+                        Err(GenericDatabaseError::invalid_argument(format!(
+                            "invalid transaction ID: {id}"
+                        )))
+                    }
+                    // Stale generation (`id.attempt_gen < current_attempt`): return idempotent
+                    // Ok(()) immediately without inspecting or mutating the active/committed newer
+                    // attempt.
+                    Some(entry) if id.attempt_gen < entry.current_attempt => Ok(()),
+                    Some(entry) => match &entry.slot {
+                        TxnSlot::Active(txn) => match active_abort_promotion(txn) {
                             Some(Promotion::Clear) => {
                                 dropped_txn = map.remove_slot(id.lineage_id);
                                 Err(AbortReason::DatabaseCleared.into())
@@ -557,7 +786,7 @@ impl RunningTransactions {
                                         ring_gen: 0,
                                     },
                                 );
-                                Err(reason.into())
+                                Ok(())
                             }
                             Some(Promotion::AbortedLineage { root_seq }) => {
                                 dropped_txn = map.set_slot(
@@ -568,263 +797,43 @@ impl RunningTransactions {
                                         ring_gen: 0,
                                     },
                                 );
-                                Err(GenericDatabaseError::invalid_argument(format!(
-                                    "invalid transaction ID: {id}"
-                                )))
+                                Ok(())
                             }
-                            Some(Promotion::Closed) => {
+                            None | Some(Promotion::Closed) => {
+                                let read_only = match txn.as_ref() {
+                                    Transaction::ReadWrite(rw) => {
+                                        close_session = Some(Arc::clone(rw.session()));
+                                        false
+                                    }
+                                    Transaction::ReadOnly(_) => true,
+                                };
                                 dropped_txn = map.set_slot(
                                     id.lineage_id,
                                     id.attempt_gen,
                                     TxnSlot::Closed {
-                                        outcome:   ClosedOutcome::AbortedOrRolledBack,
-                                        read_only: false,
-                                        ring_gen:  0,
+                                        outcome: ClosedOutcome::AbortedOrRolledBack,
+                                        read_only,
+                                        ring_gen: 0,
                                     },
                                 );
-                                Err(GenericDatabaseError::invalid_argument(format!(
-                                    "invalid transaction ID: {id}"
-                                )))
+                                Ok(())
                             }
-                        }
-                    }
-                    TxnSlot::Wounded { reason, .. } => Err((*reason).into()),
-                    TxnSlot::Committing
-                    | TxnSlot::AbortedLineage { .. }
-                    | TxnSlot::Closed { .. } => Err(GenericDatabaseError::invalid_argument(
-                        format!("invalid transaction ID: {id}"),
-                    )),
-                },
-                _ => Err(GenericDatabaseError::invalid_argument(format!(
-                    "invalid transaction ID: {id}"
-                ))),
-            }
-        };
-        drop(dropped_txn);
-        result
-    }
-
-    pub(crate) fn take_for_commit(
-        &self,
-        id: TransactionId,
-        has_writes: bool,
-    ) -> Result<CommitTake> {
-        id.check()?;
-        if is_cleared(&self.database, &self.locks) {
-            let dropped = self
-                .state
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .remove_slot(id.lineage_id);
-            drop(dropped);
-            return Err(AbortReason::DatabaseCleared.into());
-        }
-
-        let mut dropped_txn = None;
-        let result = {
-            let mut map = self.state.lock().unwrap_or_else(PoisonError::into_inner);
-            match map.slots.get(&id.lineage_id) {
-                Some(entry) if entry.current_attempt == id.attempt_gen => match &entry.slot {
-                    TxnSlot::Active(txn) => match txn.as_ref() {
-                        Transaction::ReadOnly(ro) => {
-                            let ro = Arc::clone(ro);
-                            if has_writes {
-                                dropped_txn = map.set_slot(
-                                    id.lineage_id,
-                                    id.attempt_gen,
-                                    TxnSlot::Closed {
-                                        outcome:   ClosedOutcome::AbortedOrRolledBack,
-                                        read_only: true,
-                                        ring_gen:  0,
-                                    },
-                                );
-                                Err(GenericDatabaseError::invalid_argument(
-                                    "Cannot modify entities in a read-only transaction",
-                                ))
-                            } else {
-                                dropped_txn = map.set_slot(
-                                    id.lineage_id,
-                                    id.attempt_gen,
-                                    TxnSlot::Closed {
-                                        outcome:   ClosedOutcome::Committed,
-                                        read_only: true,
-                                        ring_gen:  0,
-                                    },
-                                );
-                                Ok(CommitTake::ReadOnly(ro))
-                            }
-                        }
-                        Transaction::ReadWrite(rw) => {
-                            let rw = Arc::clone(rw);
-                            match active_abort_promotion(txn) {
-                                Some(Promotion::Clear) => {
-                                    dropped_txn = map.remove_slot(id.lineage_id);
-                                    Err(AbortReason::DatabaseCleared.into())
-                                }
-                                Some(Promotion::Wounded { root_seq, reason }) => {
-                                    dropped_txn = map.set_slot(
-                                        id.lineage_id,
-                                        id.attempt_gen,
-                                        TxnSlot::Wounded {
-                                            root_seq,
-                                            reason,
-                                            ring_gen: 0,
-                                        },
-                                    );
-                                    Err(reason.into())
-                                }
-                                Some(Promotion::AbortedLineage { root_seq }) => {
-                                    dropped_txn = map.set_slot(
-                                        id.lineage_id,
-                                        id.attempt_gen,
-                                        TxnSlot::AbortedLineage {
-                                            root_seq,
-                                            ring_gen: 0,
-                                        },
-                                    );
-                                    Err(GenericDatabaseError::invalid_argument(format!(
-                                        "invalid transaction ID: {id}"
-                                    )))
-                                }
-                                Some(Promotion::Closed) => {
-                                    dropped_txn = map.set_slot(
-                                        id.lineage_id,
-                                        id.attempt_gen,
-                                        TxnSlot::Closed {
-                                            outcome:   ClosedOutcome::AbortedOrRolledBack,
-                                            read_only: false,
-                                            ring_gen:  0,
-                                        },
-                                    );
-                                    Err(GenericDatabaseError::invalid_argument(format!(
-                                        "invalid transaction ID: {id}"
-                                    )))
-                                }
-                                None => {
-                                    let session = Arc::clone(rw.session());
-                                    dropped_txn = map.set_slot(
-                                        id.lineage_id,
-                                        id.attempt_gen,
-                                        TxnSlot::Committing,
-                                    );
-                                    let guard = CommitSlotGuard {
-                                        database: Weak::clone(&self.database),
-                                        locks: Arc::clone(&self.locks),
-                                        state: Arc::clone(&self.state),
-                                        id,
-                                        session,
-                                        armed: true,
-                                    };
-                                    Ok(CommitTake::ReadWrite((rw, guard)))
-                                }
-                            }
-                        }
+                        },
+                        TxnSlot::Committing
+                        | TxnSlot::Wounded { .. }
+                        | TxnSlot::AbortedLineage { .. }
+                        | TxnSlot::Closed {
+                            outcome: ClosedOutcome::AbortedOrRolledBack,
+                            ..
+                        } => Ok(()),
+                        TxnSlot::Closed {
+                            outcome: ClosedOutcome::Committed,
+                            ..
+                        } => Err(GenericDatabaseError::aborted(
+                            "The referenced transaction has expired or is no longer valid.",
+                        )),
                     },
-                    TxnSlot::Wounded { reason, .. } => Err((*reason).into()),
-                    TxnSlot::Committing
-                    | TxnSlot::AbortedLineage { .. }
-                    | TxnSlot::Closed { .. } => Err(GenericDatabaseError::invalid_argument(
-                        format!("invalid transaction ID: {id}"),
-                    )),
-                },
-                _ => Err(GenericDatabaseError::invalid_argument(format!(
-                    "invalid transaction ID: {id}"
-                ))),
-            }
-        };
-        drop(dropped_txn);
-        result
-    }
-
-    pub(crate) fn rollback(&self, id: TransactionId) -> Result<()> {
-        id.check()?;
-        if is_cleared(&self.database, &self.locks) {
-            let dropped = self
-                .state
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .remove_slot(id.lineage_id);
-            drop(dropped);
-            return Err(AbortReason::DatabaseCleared.into());
-        }
-
-        let mut close_session: Option<Arc<LockSession>> = None;
-        let mut dropped_txn: Option<Arc<Transaction>> = None;
-        let result = {
-            let mut map = self.state.lock().unwrap_or_else(PoisonError::into_inner);
-            match map.slots.get(&id.lineage_id) {
-                None => Err(GenericDatabaseError::invalid_argument(format!(
-                    "invalid transaction ID: {id}"
-                ))),
-                Some(entry) if id.attempt_gen > entry.current_attempt => Err(
-                    GenericDatabaseError::invalid_argument(format!("invalid transaction ID: {id}")),
-                ),
-                // Stale generation (`id.attempt_gen < current_attempt`): return idempotent Ok(())
-                // immediately without inspecting or mutating the active/committed newer attempt.
-                Some(entry) if id.attempt_gen < entry.current_attempt => Ok(()),
-                Some(entry) => match &entry.slot {
-                    TxnSlot::Active(txn) => match active_abort_promotion(txn) {
-                        Some(Promotion::Clear) => {
-                            dropped_txn = map.remove_slot(id.lineage_id);
-                            Err(AbortReason::DatabaseCleared.into())
-                        }
-                        Some(Promotion::Wounded { root_seq, reason }) => {
-                            dropped_txn = map.set_slot(
-                                id.lineage_id,
-                                id.attempt_gen,
-                                TxnSlot::Wounded {
-                                    root_seq,
-                                    reason,
-                                    ring_gen: 0,
-                                },
-                            );
-                            Ok(())
-                        }
-                        Some(Promotion::AbortedLineage { root_seq }) => {
-                            dropped_txn = map.set_slot(
-                                id.lineage_id,
-                                id.attempt_gen,
-                                TxnSlot::AbortedLineage {
-                                    root_seq,
-                                    ring_gen: 0,
-                                },
-                            );
-                            Ok(())
-                        }
-                        None | Some(Promotion::Closed) => {
-                            let read_only = match txn.as_ref() {
-                                Transaction::ReadWrite(rw) => {
-                                    close_session = Some(Arc::clone(rw.session()));
-                                    false
-                                }
-                                Transaction::ReadOnly(_) => true,
-                            };
-                            dropped_txn = map.set_slot(
-                                id.lineage_id,
-                                id.attempt_gen,
-                                TxnSlot::Closed {
-                                    outcome: ClosedOutcome::AbortedOrRolledBack,
-                                    read_only,
-                                    ring_gen: 0,
-                                },
-                            );
-                            Ok(())
-                        }
-                    },
-                    TxnSlot::Committing
-                    | TxnSlot::Wounded { .. }
-                    | TxnSlot::AbortedLineage { .. }
-                    | TxnSlot::Closed {
-                        outcome: ClosedOutcome::AbortedOrRolledBack,
-                        ..
-                    } => Ok(()),
-                    TxnSlot::Closed {
-                        outcome: ClosedOutcome::Committed,
-                        ..
-                    } => Err(GenericDatabaseError::aborted(
-                        "The referenced transaction has expired or is no longer valid.",
-                    )),
-                },
+                }
             }
         };
         if let Some(session) = close_session {
@@ -839,11 +848,11 @@ impl RunningTransactions {
         id: TransactionId,
         optimistic_concurrency: bool,
     ) -> Result<TransactionId> {
-        id.check()?;
+        self.check_id(id)?;
         if is_cleared(&self.database, &self.locks) {
             let dropped = self
                 .state
-                .lock()
+                .write()
                 .unwrap_or_else(PoisonError::into_inner)
                 .remove_slot(id.lineage_id);
             drop(dropped);
@@ -851,7 +860,14 @@ impl RunningTransactions {
         }
 
         let (dropped_txn, result) = {
-            let mut map = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+            let mut map = self.state.write().unwrap_or_else(PoisonError::into_inner);
+            if is_cleared(&self.database, &self.locks) {
+                let cleared_txn = map.remove_slot(id.lineage_id);
+                drop(map);
+                drop(cleared_txn);
+                return Err(AbortReason::DatabaseCleared.into());
+            }
+
             let (next_attempt, priority) = match map.slots.get(&id.lineage_id) {
                 Some(entry) if id.attempt_gen > entry.current_attempt => {
                     return Err(GenericDatabaseError::invalid_argument(format!(
@@ -878,10 +894,12 @@ impl RunningTransactions {
                                     Promotion::Wounded { root_seq, .. }
                                     | Promotion::AbortedLineage { root_seq },
                                 ) => (
-                                    cur + 1,
+                                    next_attempt_gen(cur, id)?,
                                     root_seq.map_or(LockPriority::Lazy, LockPriority::Assigned),
                                 ),
-                                Some(Promotion::Closed) => (cur + 1, LockPriority::Lazy),
+                                Some(Promotion::Closed) => {
+                                    (next_attempt_gen(cur, id)?, LockPriority::Lazy)
+                                }
                                 None => {
                                     return Err(GenericDatabaseError::failed_precondition(
                                         "transaction_id already/still in use",
@@ -903,15 +921,15 @@ impl RunningTransactions {
                         }
                         TxnSlot::Wounded { root_seq, .. }
                         | TxnSlot::AbortedLineage { root_seq, .. } => (
-                            cur + 1,
+                            next_attempt_gen(cur, id)?,
                             root_seq.map_or(LockPriority::Lazy, LockPriority::Assigned),
                         ),
                         TxnSlot::Closed {
                             read_only: false, ..
-                        } => (cur + 1, LockPriority::Lazy),
+                        } => (next_attempt_gen(cur, id)?, LockPriority::Lazy),
                     }
                 }
-                None => (id.attempt_gen + 1, LockPriority::Lazy),
+                None => (next_attempt_gen(id.attempt_gen, id)?, LockPriority::Lazy),
             };
 
             let new_id = id.with_attempt(next_attempt);
@@ -927,6 +945,60 @@ impl RunningTransactions {
         };
         drop(dropped_txn);
         result
+    }
+}
+
+fn next_attempt_gen(attempt_gen: u64, id: TransactionId) -> Result<u64> {
+    attempt_gen.checked_add(1).ok_or_else(|| {
+        GenericDatabaseError::invalid_argument(format!("invalid transaction ID: {id}"))
+    })
+}
+
+fn promote_active_slot(
+    map: &mut RunningTxnMap,
+    id: TransactionId,
+    promoted: Promotion,
+) -> (Option<Arc<Transaction>>, GenericDatabaseError) {
+    match promoted {
+        Promotion::Clear => (
+            map.remove_slot(id.lineage_id),
+            AbortReason::DatabaseCleared.into(),
+        ),
+        Promotion::Wounded { root_seq, reason } => (
+            map.set_slot(
+                id.lineage_id,
+                id.attempt_gen,
+                TxnSlot::Wounded {
+                    root_seq,
+                    reason,
+                    ring_gen: 0,
+                },
+            ),
+            reason.into(),
+        ),
+        Promotion::AbortedLineage { root_seq } => (
+            map.set_slot(
+                id.lineage_id,
+                id.attempt_gen,
+                TxnSlot::AbortedLineage {
+                    root_seq,
+                    ring_gen: 0,
+                },
+            ),
+            GenericDatabaseError::invalid_argument(format!("invalid transaction ID: {id}")),
+        ),
+        Promotion::Closed => (
+            map.set_slot(
+                id.lineage_id,
+                id.attempt_gen,
+                TxnSlot::Closed {
+                    outcome:   ClosedOutcome::AbortedOrRolledBack,
+                    read_only: false,
+                    ring_gen:  0,
+                },
+            ),
+            GenericDatabaseError::invalid_argument(format!("invalid transaction ID: {id}")),
+        ),
     }
 }
 
@@ -977,18 +1049,30 @@ mod tests {
 
     #[test]
     fn transaction_id_wire_encoding_and_check_validate_lineage_and_attempt() {
-        // 16-byte round-trip
-        let issued = TransactionId::new_lineage();
+        let txns = RunningTransactions::new(Weak::new(), test_locks());
+
+        // 16-byte round-trip (`Vec<u8>` and `&[u8]`)
+        let issued = txns.start_read_write(false).unwrap();
         assert!(issued.check().is_ok());
+        assert!(txns.check_id(issued).is_ok());
         assert_eq!(issued.attempt_gen(), 1);
         let wire: Vec<u8> = issued.into();
         assert_eq!(wire.len(), 16);
+        assert_eq!(TransactionId::try_from(wire.as_slice()).unwrap(), issued);
         let decoded = TransactionId::try_from(wire).unwrap();
         assert_eq!(decoded, issued);
 
-        // Zero lineage / zero attempt / wrong lengths are rejected.
+        // Zero lineage / zero instance / zero local_seq / zero attempt / wrong lengths rejected.
         assert!(matches!(
             TransactionId::from_parts(0, 1).check(),
+            Err(GenericDatabaseError::InvalidArgument(_))
+        ));
+        assert!(matches!(
+            TransactionId::from_parts(1, 1).check(),
+            Err(GenericDatabaseError::InvalidArgument(_))
+        ));
+        assert!(matches!(
+            TransactionId::from_parts(u64::from(issued.instance_id()) << 32, 1).check(),
             Err(GenericDatabaseError::InvalidArgument(_))
         ));
         assert!(matches!(
@@ -1000,15 +1084,26 @@ mod tests {
             Err(GenericDatabaseError::InvalidArgument(_))
         ));
         assert!(matches!(
+            TransactionId::try_from([0u8; 8].as_slice()),
+            Err(GenericDatabaseError::InvalidArgument(_))
+        ));
+        assert!(matches!(
             TransactionId::try_from(vec![0u8; 16]),
             Err(GenericDatabaseError::InvalidArgument(_))
         ));
 
-        // Future lineage ID rejected.
-        let unissued =
-            TransactionId::from_parts(NEXT_LINEAGE_ID.load(atomic::Ordering::Acquire) + 100, 1);
+        // Future instance ID and unissued local_seq rejected.
+        let future_instance = TransactionId::from_instance_seq(
+            NEXT_INSTANCE_ID.load(atomic::Ordering::Acquire) + 100,
+            1,
+        );
         assert!(matches!(
-            unissued.check(),
+            future_instance.check(),
+            Err(GenericDatabaseError::InvalidArgument(_))
+        ));
+        let unissued_local = TransactionId::from_instance_seq(txns.instance_id, 999);
+        assert!(matches!(
+            txns.check_id(unissued_local),
             Err(GenericDatabaseError::InvalidArgument(_))
         ));
     }
@@ -1266,6 +1361,167 @@ mod tests {
             db.transactions.rollback(closed_id),
             Err(GenericDatabaseError::Aborted(_))
         ));
-        assert!(db.transactions.state.lock().unwrap().slots.is_empty());
+        assert!(db.transactions.state.read().unwrap().slots.is_empty());
+    }
+
+    #[test]
+    fn retry_rejects_attempt_gen_u64_max_without_overflow_while_preserving_evicted_retry() {
+        let txns = RunningTransactions::new(Weak::new(), test_locks());
+
+        // Active / Closed slots with `u64::MAX` attempt_gen return `InvalidArgument`.
+        let active = txns.start_read_write(false).unwrap();
+        let active_max = active.with_attempt(u64::MAX);
+        assert!(matches!(
+            txns.start_read_write_with_id(active_max, false),
+            Err(GenericDatabaseError::InvalidArgument(_))
+        ));
+        txns.rollback(active).unwrap();
+        assert!(matches!(
+            txns.start_read_write_with_id(active_max, false),
+            Err(GenericDatabaseError::InvalidArgument(_))
+        ));
+
+        // Direct `current_attempt == u64::MAX` in `Closed` and `Wounded` slots rejects `cur + 1`.
+        let closed_sat = txns.start_read_write(false).unwrap();
+        let closed_sat_max = closed_sat.with_attempt(u64::MAX);
+        let dropped = txns.state.write().unwrap().set_slot(
+            closed_sat.lineage_id(),
+            u64::MAX,
+            TxnSlot::Closed {
+                outcome:   ClosedOutcome::AbortedOrRolledBack,
+                read_only: false,
+                ring_gen:  0,
+            },
+        );
+        drop(dropped);
+        assert!(matches!(
+            txns.start_read_write_with_id(closed_sat_max, false),
+            Err(GenericDatabaseError::InvalidArgument(_))
+        ));
+
+        let wounded_sat = txns.start_read_write(false).unwrap();
+        let wounded_sat_max = wounded_sat.with_attempt(u64::MAX);
+        let dropped = txns.state.write().unwrap().set_slot(
+            wounded_sat.lineage_id(),
+            u64::MAX,
+            TxnSlot::Wounded {
+                root_seq: Some(1),
+                reason:   AbortReason::Wounded {
+                    wounder_txn_id: None,
+                    wounder_seq:    1,
+                },
+                ring_gen: 0,
+            },
+        );
+        drop(dropped);
+        assert!(matches!(
+            txns.start_read_write_with_id(wounded_sat_max, false),
+            Err(GenericDatabaseError::InvalidArgument(_))
+        ));
+
+        // Evicted (`Entry::Vacant`) `u64::MAX` also returns `InvalidArgument` cleanly.
+        let evicted_rw = txns.start_read_write(false).unwrap();
+        txns.rollback(evicted_rw).unwrap();
+        for _ in 0..(MAX_CLOSED_TXNS + 32) {
+            let churn = txns.start_read_write(false).unwrap();
+            txns.rollback(churn).unwrap();
+        }
+        assert!(matches!(
+            txns.rollback(evicted_rw),
+            Err(GenericDatabaseError::InvalidArgument(_))
+        ));
+        assert!(matches!(
+            txns.start_read_write_with_id(evicted_rw.with_attempt(u64::MAX), false),
+            Err(GenericDatabaseError::InvalidArgument(_))
+        ));
+
+        // Same-DB evicted valid RW token still retries cleanly with rotated `attempt_gen = 2`.
+        let rotated = txns.start_read_write_with_id(evicted_rw, false).unwrap();
+        assert_eq!(rotated.lineage_id(), evicted_rw.lineage_id());
+        assert_eq!(rotated.attempt_gen(), 2);
+        txns.rollback(rotated).unwrap();
+    }
+
+    #[tokio::test]
+    async fn retry_rejects_cross_db_and_post_clear_tokens_and_start_fails_closed_when_cleared() {
+        let project: &'static FirestoreProject =
+            Box::leak(Box::new(FirestoreProject::new(FirestoreConfig::default())));
+        let root_a: RootRef = "projects/p/databases/db-a".parse().unwrap();
+        let root_b: RootRef = "projects/p/databases/db-b".parse().unwrap();
+        let db_a = project.database(&root_a).await;
+        let db_b = project.database(&root_b).await;
+
+        let rw_active_a = db_a.transactions.start_read_write(false).unwrap();
+        let rw_closed_a = db_a.transactions.start_read_write(false).unwrap();
+        db_a.transactions.rollback(rw_closed_a).unwrap();
+        let ro_a = db_a.transactions.start_read_only(None).unwrap();
+
+        for cross_id in [rw_active_a, rw_closed_a, ro_a] {
+            assert!(matches!(
+                db_b.transactions.start_read_write_with_id(cross_id, false),
+                Err(GenericDatabaseError::InvalidArgument(_))
+            ));
+            assert!(matches!(
+                db_b.transactions.get_active(cross_id),
+                Err(GenericDatabaseError::InvalidArgument(_))
+            ));
+            assert!(matches!(
+                db_b.transactions.take_for_commit(cross_id, false),
+                Err(GenericDatabaseError::InvalidArgument(_))
+            ));
+            assert!(matches!(
+                db_b.transactions.rollback(cross_id),
+                Err(GenericDatabaseError::InvalidArgument(_))
+            ));
+        }
+
+        // Clearing db_a makes `start_*` fail closed on cleared `db_a` without inserting slots, and
+        // makes recreated `db_a_recreated` reject pre-clear tokens as `InvalidArgument`.
+        project.clear_database(&root_a).await;
+        assert!(matches!(
+            db_a.transactions.start_read_write(false),
+            Err(GenericDatabaseError::Aborted(_))
+        ));
+        assert!(matches!(
+            db_a.transactions.start_read_only(None),
+            Err(GenericDatabaseError::Aborted(_))
+        ));
+        assert!(matches!(
+            db_a.transactions
+                .start_read_write_with_id(rw_closed_a, false),
+            Err(GenericDatabaseError::Aborted(_))
+        ));
+        assert!(db_a.transactions.state.read().unwrap().slots.is_empty());
+
+        let db_a_recreated = project.database(&root_a).await;
+        for pre_clear_id in [rw_active_a, rw_closed_a, ro_a] {
+            assert!(matches!(
+                db_a_recreated
+                    .transactions
+                    .start_read_write_with_id(pre_clear_id, false),
+                Err(GenericDatabaseError::InvalidArgument(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn take_for_commit_marks_commit_started_before_sealing() {
+        use crate::error::CommitError;
+
+        let locks = test_locks();
+        let txns = RunningTransactions::new(Weak::new(), locks);
+        let id = txns.start_read_write(false).unwrap();
+
+        let CommitTake::ReadWrite((rw, guard)) = txns.take_for_commit(id, true).unwrap() else {
+            panic!("expected ReadWrite");
+        };
+        assert!(matches!(
+            rw.session().check_read_active(),
+            Err(CommitError::Other(GenericDatabaseError::InvalidArgument(_)))
+        ));
+        assert!(rw.session().check_active().is_ok());
+        assert_eq!(rw.session().abort_state(), SessionAbortState::Active);
+
+        drop(guard);
     }
 }

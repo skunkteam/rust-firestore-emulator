@@ -26,7 +26,7 @@ use self::{
     collection::Collection,
     document::{DocumentContents, DocumentMeta, StoredDocumentVersion},
     event::{DatabaseEvent, ProjectEvent},
-    lock::{LockManager, LockPriority, SessionAbortState},
+    lock::{LockManager, LockPriority},
     projection::{Project, Projection},
     query::{Direction, Query, QueryBuilder},
     read_consistency::{ReadConsistency, validate_read_time},
@@ -120,7 +120,7 @@ impl FirestoreDatabase {
         Ok(())
     }
 
-    fn ensure_owns_doc(&self, doc_ref: &DocumentRef) -> Result<()> {
+    pub(crate) fn ensure_owns_doc(&self, doc_ref: &DocumentRef) -> Result<()> {
         self.ensure_owns_root(&doc_ref.collection_ref.root_ref)
     }
 
@@ -131,6 +131,7 @@ impl FirestoreDatabase {
         consistency: ReadConsistency,
     ) -> Result<Option<Arc<StoredDocumentVersion>>> {
         debug!(%name);
+        self.ensure_owns_doc(name)?;
         let version = match consistency {
             ReadConsistency::Default => {
                 if self.is_cleared() {
@@ -143,11 +144,6 @@ impl FirestoreDatabase {
                 match self.peek_doc_meta(name).await? {
                     Some(meta) => meta.read_with(&lease, |c| c.current_version().cloned())?,
                     None => {
-                        if matches!(lease.abort_state(), SessionAbortState::Closed) {
-                            return Err(GenericDatabaseError::invalid_argument(
-                                "transaction closed",
-                            ));
-                        }
                         lease.check_active()?;
                         None
                     }
@@ -216,6 +212,9 @@ impl FirestoreDatabase {
     #[instrument(level = Level::DEBUG, skip_all)]
     pub async fn get_collection_ids(&self, parent: &Ref) -> Result<BTreeSet<String>> {
         self.ensure_owns_root(parent.root())?;
+        if self.is_cleared() {
+            return Err(AbortReason::DatabaseCleared.into());
+        }
         // Cannot use `filter_map` because of the `await`.
         let mut result = BTreeSet::new();
         if matches!(parent, Ref::Collection(_)) {
@@ -242,11 +241,22 @@ impl FirestoreDatabase {
     #[instrument(level = Level::DEBUG, skip_all)]
     pub async fn get_document_ids(&self, parent: &CollectionRef) -> Result<BTreeSet<String>> {
         self.ensure_owns_root(&parent.root_ref)?;
+        if self.is_cleared() {
+            return Err(AbortReason::DatabaseCleared.into());
+        }
         // Cannot use `filter_map` because of the `await`.
         let mut result = BTreeSet::new();
-        for doc in self.get_collection(parent).await.docs().await {
-            if doc.read_latest_uncontended(DocumentContents::exists) {
-                result.insert(doc.name.document_id.to_string());
+        let col = self
+            .collections
+            .read()
+            .await
+            .get(&parent.collection_id)
+            .cloned();
+        if let Some(col) = col {
+            for doc in col.docs().await {
+                if doc.read_latest_uncontended(DocumentContents::exists) {
+                    result.insert(doc.name.document_id.to_string());
+                }
             }
         }
         for col in self.get_all_collections().await {
@@ -505,6 +515,9 @@ impl FirestoreDatabase {
     #[instrument(level = Level::DEBUG, skip_all, err)]
     pub async fn delete_prefix(self: &Arc<Self>, prefix: &Ref) -> Result<usize> {
         self.ensure_owns_root(prefix.root())?;
+        if self.is_cleared() {
+            return Err(AbortReason::DatabaseCleared.into());
+        }
         let mut to_delete = BTreeSet::new();
         if let Ref::Document(doc_ref) = prefix
             && let Some(meta) = self.peek_doc_meta(doc_ref).await?
@@ -621,12 +634,22 @@ impl FirestoreDatabase {
 
     pub async fn get_read_time(&self, consistency: ReadConsistency) -> Result<Timestamp> {
         match consistency {
-            ReadConsistency::Default => Ok(Timestamp::now()),
+            ReadConsistency::Default => {
+                if self.is_cleared() {
+                    return Err(AbortReason::DatabaseCleared.into());
+                }
+                Ok(Timestamp::now())
+            }
             ReadConsistency::Transaction(id) => {
                 let txn = self.transactions.get_active(id)?;
                 Ok(txn.read_time().unwrap_or_else(Timestamp::now))
             }
-            ReadConsistency::ReadTime(time) => validate_read_time(time),
+            ReadConsistency::ReadTime(time) => {
+                if self.is_cleared() {
+                    return Err(AbortReason::DatabaseCleared.into());
+                }
+                validate_read_time(time)
+            }
         }
     }
 

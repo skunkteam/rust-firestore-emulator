@@ -14,7 +14,7 @@ pub(crate) use self::registry::{CommitTake, RunningTransactions, TransactionId};
 use super::{
     FirestoreDatabase,
     document::{DocumentContents, StoredDocumentVersion},
-    lock::{LockManager, LockPriority, LockSession, SessionAbortState, WriteLease},
+    lock::{LockManager, LockPriority, LockSession, WriteLease},
     reference::DocumentRef,
 };
 use crate::{
@@ -80,6 +80,7 @@ impl PessimisticState {
         if db.is_cleared() {
             return Err(AbortReason::DatabaseCleared.into());
         }
+        db.ensure_owns_doc(name)?;
         let lease = self.session.acquire_read(name).await?;
         let meta = db.peek_doc_meta(name).await?;
         let (version, observed_update_time) = match meta {
@@ -87,9 +88,6 @@ impl PessimisticState {
                 meta.read_with(&lease, |c| (c.current_version().cloned(), c.last_updated()))?
             }
             None => {
-                if matches!(lease.abort_state(), SessionAbortState::Closed) {
-                    return Err(GenericDatabaseError::invalid_argument("transaction closed"));
-                }
                 lease.check_active()?;
                 (None, None)
             }
@@ -133,10 +131,12 @@ impl OptimisticState {
         if db.is_cleared() {
             return Err(AbortReason::DatabaseCleared.into());
         }
+        db.ensure_owns_doc(name)?;
+        let rt = *self.read_time;
         let version = db
             .peek_doc_meta(name)
             .await?
-            .and_then(|meta| meta.read_mvcc_at(*self.read_time));
+            .and_then(|meta| meta.read_mvcc_at(rt));
         self.observed_docs.lock().await.insert(name.clone());
         Ok(version)
     }
@@ -186,8 +186,16 @@ impl OptimisticState {
             for ExecutedQuery { query, snapshot } in executed_queries.iter_mut() {
                 let query_res = query.once_for_validation(&db, held_write_leases).await;
                 self.session.check_active()?;
-                let (_, result_docs) = query_res
-                    .map_err(|_| CommitError::Aborted(AbortReason::OptimisticWriteSkew))?;
+                let (_, result_docs) = match query_res {
+                    Ok(res) => res,
+                    Err(CommitError::Aborted(reason)) => return Err(CommitError::Aborted(reason)),
+                    Err(CommitError::Other(err @ GenericDatabaseError::Internal(_))) => {
+                        return Err(CommitError::Other(err));
+                    }
+                    Err(CommitError::Other(_)) => {
+                        return Err(CommitError::Aborted(AbortReason::OptimisticWriteSkew));
+                    }
+                };
                 if result_docs.len() != snapshot.len()
                     || result_docs
                         .iter()

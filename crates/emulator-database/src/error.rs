@@ -55,7 +55,7 @@ impl From<AbortReason> for GenericDatabaseError {
     }
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum CommitError {
     Aborted(AbortReason),
     Other(GenericDatabaseError),

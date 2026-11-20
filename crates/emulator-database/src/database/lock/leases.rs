@@ -2,8 +2,8 @@ use std::{collections::BTreeMap, sync::Arc};
 
 use googleapis::google::protobuf::Timestamp;
 
-use super::{LockSession, SessionAbortState};
-use crate::{database::reference::DocumentRef, error::AbortReason};
+use super::LockSession;
+use crate::{database::reference::DocumentRef, error::CommitError};
 
 /// RAII shared read lock capability on a single [`DocumentRef`].
 ///
@@ -29,12 +29,8 @@ impl ReadLease {
         &self.doc_ref
     }
 
-    pub(crate) fn check_active(&self) -> Result<(), AbortReason> {
-        self.session.check_active()
-    }
-
-    pub(crate) fn abort_state(&self) -> SessionAbortState {
-        self.session.abort_state()
+    pub(crate) fn check_active(&self) -> Result<(), CommitError> {
+        self.session.check_read_active()
     }
 
     #[cfg(test)]
@@ -46,9 +42,8 @@ impl ReadLease {
         &self.session
     }
 
-    pub(super) fn disarm(mut self) -> DocumentRef {
+    pub(super) fn disarm(mut self) {
         self.armed = false;
-        self.doc_ref.clone()
     }
 }
 
@@ -91,7 +86,7 @@ impl WriteLease {
         self.acquire_time
     }
 
-    pub(crate) fn check_active(&self) -> Result<(), AbortReason> {
+    pub(crate) fn check_active(&self) -> Result<(), CommitError> {
         self.session.check_active()
     }
 
@@ -153,7 +148,7 @@ impl CommitSeal {
         self.writes.keys()
     }
 
-    pub(crate) fn check_committing_active(&self) -> Result<(), AbortReason> {
+    pub(crate) fn check_committing_active(&self) -> Result<(), CommitError> {
         self.session.check_committing_active()
     }
 }

@@ -609,8 +609,8 @@ describe.each(editions.filter(e => e.concurrencyMode === 'pessimistic'))('$descr
                 ]);
                 // Regular updates suffer from contention (in the current version of the SDK), so
                 // they need to be retried and then the order cannot be guaranteed anymore.
-                // These last two (or three on Java emulator) might come back in different order...
-                if (connection === 'JAVA EMULATOR') {
+                // These last two (or three on non-Cloud emulators) might come back in different order...
+                if (connection !== 'CLOUD FIRESTORE') {
                     expect(test.log.slice(-3)).toIncludeSameMembers([
                         '       | <<2>> | EVENT: end txn A',
                         ' <<1>> | EVENT: finished first update outside txn',
@@ -1219,7 +1219,10 @@ describe.each(editions.filter(e => e.concurrencyMode === 'pessimistic'))('$descr
                                 await rawReadDoc(docA, txnLate);
                                 lateReadDocA.resolve();
 
-                                earlySettledWhileLateOpen = await waitOrTimeout(earlySettled.promise, 1_500);
+                                earlySettledWhileLateOpen = await waitOrTimeout(
+                                    earlySettled.promise,
+                                    connection === 'RUST EMULATOR' ? 750 : 1_500,
+                                );
                                 lateCommitOutcome = await captureRpcOutcome(() =>
                                     rawCommit([rawUpdateWrite(docA, { value: { stringValue: 'from late' } }, ['value'])], txnLate),
                                 );
@@ -1900,7 +1903,10 @@ describe.each(editions.filter(e => e.concurrencyMode === 'pessimistic'))('$descr
                             await rawReadDoc(doc1, txnBlocker);
                             blockerRead.resolve();
                             await youngerReadStarted.promise;
-                            youngerReadDoc2WhileBlockerOpen = await waitOrTimeout(youngerReadFinished.promise, 1_500);
+                            youngerReadDoc2WhileBlockerOpen = await waitOrTimeout(
+                                youngerReadFinished.promise,
+                                connection === 'RUST EMULATOR' ? 750 : 1_500,
+                            );
                             const blockerCommit = await captureRpcOutcome(() => rawCommit([], txnBlocker));
                             blockerCommitted = blockerCommit.ok;
                             blockerReleased.resolve();

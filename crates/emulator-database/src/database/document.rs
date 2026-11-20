@@ -10,7 +10,7 @@ use googleapis::google::{
 };
 
 use super::{
-    lock::{CommitSeal, ReadLease, SessionAbortState, WriteLease},
+    lock::{CommitSeal, ReadLease, WriteLease},
     reference::DocumentRef,
 };
 use crate::{
@@ -77,9 +77,6 @@ impl DocumentMeta {
                 lease.doc_ref(),
                 self.name
             )));
-        }
-        if matches!(lease.abort_state(), SessionAbortState::Closed) {
-            return Err(GenericDatabaseError::invalid_argument("transaction closed"));
         }
         let contents = self.contents.read();
         lease.check_active()?;
@@ -201,10 +198,11 @@ impl DocumentContents {
         &self,
         read_time: Timestamp,
     ) -> Option<&Arc<StoredDocumentVersion>> {
-        self.versions
-            .iter()
-            .rfind(|version| (version.update_time()) <= (read_time))
-            .and_then(DocumentVersion::stored_document)
+        let idx = self
+            .versions
+            .partition_point(|version| version.update_time() <= read_time);
+        idx.checked_sub(1)
+            .and_then(|i| self.versions[i].stored_document())
     }
 
     pub(crate) fn exists(&self) -> bool {
@@ -563,6 +561,114 @@ mod tests {
             meta.read_with(&r, |c| c.current_version().unwrap().fields["v"]
                 .as_integer()),
             ok(some(eq(&7)))
+        );
+    }
+
+    #[gtest]
+    fn version_at_time_binary_search_handles_edge_cases() {
+        use super::{DeletedDocumentVersion, DocumentVersion};
+
+        let name: DocumentRef = "projects/p/databases/d/documents/col/mvcc".parse().unwrap();
+        let mut contents = DocumentContents::new();
+
+        let ts = |seconds, nanos| Timestamp { seconds, nanos };
+
+        // Empty history returns `None` for any read_time.
+        expect_that!(contents.version_at_time(ts(100, 0)), none());
+
+        // Single version at `t1`: `< t1` -> `None`, `== t1` -> `v1`, `> t1` -> `v1`.
+        let t1 = ts(100, 10);
+        contents
+            .maybe_update(
+                &name,
+                HashMap::from([("v".to_string(), Value::integer(1))]),
+                t1,
+            )
+            .unwrap();
+        expect_that!(contents.version_at_time(ts(100, 9)), none());
+        expect_eq!(
+            contents
+                .version_at_time(t1)
+                .map(|v| (v.create_time, v.fields["v"].as_integer())),
+            Some((t1, Some(1)))
+        );
+        expect_eq!(
+            contents
+                .version_at_time(ts(100, 11))
+                .map(|v| v.fields["v"].as_integer()),
+            Some(Some(1))
+        );
+
+        // Update at `t2`, then overwrite at exact same timestamp `t2`.
+        let t2 = ts(100, 20);
+        contents
+            .maybe_update(
+                &name,
+                HashMap::from([("v".to_string(), Value::integer(2))]),
+                t2,
+            )
+            .unwrap();
+        contents
+            .maybe_update(
+                &name,
+                HashMap::from([("v".to_string(), Value::integer(22))]),
+                t2,
+            )
+            .unwrap();
+
+        // Delete at `t3`, then recreate at `t4`.
+        let t3 = ts(101, 0);
+        contents
+            .maybe_add_version(&DocumentVersion::Deleted(Arc::new(
+                DeletedDocumentVersion {
+                    name: name.clone(),
+                    delete_time: t3,
+                },
+            )))
+            .unwrap();
+
+        let t4 = ts(102, 5);
+        contents
+            .maybe_update(
+                &name,
+                HashMap::from([("v".to_string(), Value::integer(4))]),
+                t4,
+            )
+            .unwrap();
+
+        // Probe every boundary across `t1`, `t2`, `t3`, `t4`.
+        expect_that!(contents.version_at_time(ts(100, 9)), none());
+        expect_eq!(
+            contents
+                .version_at_time(ts(100, 19))
+                .map(|v| v.fields["v"].as_integer()),
+            Some(Some(1))
+        );
+        expect_eq!(
+            contents
+                .version_at_time(t2)
+                .map(|v| (v.create_time, v.fields["v"].as_integer())),
+            Some((t1, Some(22)))
+        );
+        expect_eq!(
+            contents
+                .version_at_time(ts(100, 999_999_999))
+                .map(|v| v.fields["v"].as_integer()),
+            Some(Some(22))
+        );
+        expect_that!(contents.version_at_time(t3), none());
+        expect_that!(contents.version_at_time(ts(102, 4)), none());
+        expect_eq!(
+            contents
+                .version_at_time(t4)
+                .map(|v| (v.create_time, v.fields["v"].as_integer())),
+            Some((t4, Some(4)))
+        );
+        expect_eq!(
+            contents
+                .version_at_time(ts(999, 0))
+                .map(|v| (v.create_time, v.fields["v"].as_integer())),
+            Some((t4, Some(4)))
         );
     }
 }

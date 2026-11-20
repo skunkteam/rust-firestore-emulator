@@ -1,6 +1,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
     sync::Arc,
+    time::Duration,
 };
 
 use googleapis::google::{
@@ -33,6 +34,11 @@ use crate::{
     unimplemented, unimplemented_collection, unimplemented_option,
 };
 
+struct ValidatedCommitWrites {
+    target_docs: BTreeSet<DocumentRef>,
+    writes:      Vec<(DocumentRef, Write)>,
+}
+
 impl FirestoreDatabase {
     #[instrument(level = Level::DEBUG, skip_all, fields(
         count = writes.len(),
@@ -48,18 +54,21 @@ impl FirestoreDatabase {
         };
 
         Span::current().record("txn_id", display(transaction_id));
-        let target_docs = self.validate_commit_writes(&writes)?;
+        let validated = self.validate_commit_writes(writes)?;
 
         match self
             .transactions
-            .take_for_commit(transaction_id, !writes.is_empty())?
+            .take_for_commit(transaction_id, !validated.writes.is_empty())?
         {
             CommitTake::ReadOnly(ro) => {
                 debug!(txn_id = %ro.id, "committing empty read-only transaction");
                 Ok((Timestamp::now(), Vec::new()))
             }
             CommitTake::ReadWrite((rw, commit_guard)) => {
-                match self.commit_read_write(&rw, target_docs, writes).await {
+                match self
+                    .commit_read_write(&rw, validated.target_docs, validated.writes)
+                    .await
+                {
                     Ok(res) => {
                         commit_guard.finish_committed();
                         Ok(res)
@@ -88,27 +97,51 @@ impl FirestoreDatabase {
             return Err(AbortReason::DatabaseCleared.into());
         }
 
-        let session = self
-            .locks
-            .new_session(None, LockPriority::NextSeq, false, false);
-        let lease = session.acquire_write(&name).await?;
-        let seal = session.seal_for_commit(BTreeMap::from([(name, lease)]))?;
-        let (_, mut results, stored) = self.apply_sealed_commit_writes(seal, vec![write]).await?;
+        let (_, mut results, stored) = self
+            .apply_single_non_transactional(name.clone(), vec![(name, write)])
+            .await?;
         let result = results
             .pop()
             .ok_or_else(|| GenericDatabaseError::internal("missing single write result"))?;
         Ok((result, stored))
     }
 
-    fn validate_commit_writes(&self, writes: &[Write]) -> Result<BTreeSet<DocumentRef>> {
+    fn validate_commit_writes(&self, writes: Vec<Write>) -> Result<ValidatedCommitWrites> {
         let mut target_docs = BTreeSet::new();
+        let mut parsed_writes = Vec::with_capacity(writes.len());
         for write in writes {
-            let name = get_doc_name_from_write(write)?;
+            let name = get_doc_name_from_write(&write)?;
             self.ensure_owns_doc(&name)?;
-            validation::validate_write(write)?;
-            target_docs.insert(name);
+            validation::validate_write(&write)?;
+            target_docs.insert(name.clone());
+            parsed_writes.push((name, write));
         }
-        Ok(target_docs)
+        Ok(ValidatedCommitWrites {
+            target_docs,
+            writes: parsed_writes,
+        })
+    }
+
+    async fn apply_single_non_transactional(
+        self: &Arc<Self>,
+        doc_ref: DocumentRef,
+        writes: Vec<(DocumentRef, Write)>,
+    ) -> Result<(
+        Timestamp,
+        Vec<WriteResult>,
+        Option<Arc<StoredDocumentVersion>>,
+    )> {
+        let session = self
+            .locks
+            .new_session(None, LockPriority::NextSeq, false, false);
+        let lease = session.acquire_write(&doc_ref).await?;
+        if self.is_cleared() {
+            return Err(AbortReason::DatabaseCleared.into());
+        }
+        let seal = session.seal_for_commit(BTreeMap::from([(doc_ref, lease)]))?;
+        self.apply_sealed_commit_writes(seal, writes)
+            .await
+            .map_err(Into::into)
     }
 
     async fn commit_non_transactional(
@@ -118,38 +151,41 @@ impl FirestoreDatabase {
         if self.is_cleared() {
             return Err(AbortReason::DatabaseCleared.into());
         }
-        let target_docs = self.validate_commit_writes(&writes)?;
+        let validated = self.validate_commit_writes(writes)?;
+        if validated.target_docs.is_empty() {
+            return Ok((Timestamp::now(), Vec::new()));
+        }
 
-        if target_docs.len() <= 1 {
-            let session = self
-                .locks
-                .new_session(None, LockPriority::NextSeq, false, false);
-            let mut write_leases = BTreeMap::new();
-            if let Some(doc_ref) = target_docs.into_iter().next() {
-                write_leases.insert(doc_ref.clone(), session.acquire_write(&doc_ref).await?);
-            }
-            if self.is_cleared() {
-                return Err(AbortReason::DatabaseCleared.into());
-            }
-            let seal = session.seal_for_commit(write_leases)?;
-            let (time, results, _) = self.apply_sealed_commit_writes(seal, writes).await?;
+        if validated.target_docs.len() == 1 {
+            let doc_ref = validated
+                .target_docs
+                .into_iter()
+                .next()
+                .expect("single target doc");
+            let (time, results, _) = self
+                .apply_single_non_transactional(doc_ref, validated.writes)
+                .await?;
             return Ok((time, results));
         }
 
         let deadline = Instant::now() + self.project.timeouts.write;
         let mut priority = LockPriority::NextSeq;
+        let mut wound_retries: u32 = 0;
 
         loop {
             let session = self.locks.new_session(None, priority, true, true);
-            let sealed = match session.acquire_writes_all(&target_docs, deadline).await {
-                Ok(write_leases) => session
-                    .seal_for_commit(write_leases)
-                    .map_err(CommitError::from),
+            let sealed = match session
+                .acquire_writes_all(&validated.target_docs, deadline)
+                .await
+            {
+                Ok(write_leases) => Arc::clone(&session).seal_for_commit(write_leases),
                 Err(err) => Err(err),
             };
             match sealed {
                 Ok(seal) => {
-                    let (time, results, _) = self.apply_sealed_commit_writes(seal, writes).await?;
+                    let (time, results, _) = self
+                        .apply_sealed_commit_writes(seal, validated.writes)
+                        .await?;
                     return Ok((time, results));
                 }
                 Err(CommitError::Aborted(AbortReason::Wounded { .. })) => {
@@ -163,7 +199,20 @@ impl FirestoreDatabase {
                     if Instant::now() >= deadline {
                         return Err(AbortReason::WriteTimeout.into());
                     }
-                    tokio::task::yield_now().await;
+                    if wound_retries == 0 {
+                        tokio::task::yield_now().await;
+                    } else {
+                        let backoff =
+                            Duration::from_millis((1u64 << (wound_retries - 1).min(4)).min(25));
+                        tokio::time::sleep_until((Instant::now() + backoff).min(deadline)).await;
+                    }
+                    wound_retries = wound_retries.saturating_add(1);
+                    if self.is_cleared() {
+                        return Err(AbortReason::DatabaseCleared.into());
+                    }
+                    if Instant::now() >= deadline {
+                        return Err(AbortReason::WriteTimeout.into());
+                    }
                 }
                 Err(other) => return Err(other.into()),
             }
@@ -174,7 +223,7 @@ impl FirestoreDatabase {
         self: &Arc<Self>,
         rw: &ReadWriteTransaction,
         target_docs: BTreeSet<DocumentRef>,
-        writes: Vec<Write>,
+        writes: Vec<(DocumentRef, Write)>,
     ) -> std::result::Result<(Timestamp, Vec<WriteResult>), CommitError> {
         // Serialize optimistic validation-through-commit critical sections so concurrent
         // optimistic transactions cannot pass validation against each other's pre-commit state.
@@ -230,7 +279,7 @@ impl FirestoreDatabase {
     async fn apply_sealed_commit_writes(
         self: &Arc<Self>,
         seal: CommitSeal,
-        writes: Vec<Write>,
+        writes: Vec<(DocumentRef, Write)>,
     ) -> std::result::Result<
         (
             Timestamp,
@@ -256,8 +305,7 @@ impl FirestoreDatabase {
                 .collect();
             let mut write_results = Vec::with_capacity(writes.len());
 
-            for write in writes {
-                let name = get_doc_name_from_write(&write)?;
+            for (name, write) in writes {
                 let staged = staged_docs.get_mut(&name).ok_or_else(|| {
                     GenericDatabaseError::internal(format!("missing staged document for {name}"))
                 })?;

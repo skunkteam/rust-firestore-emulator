@@ -1,5 +1,8 @@
 use std::{
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
     time::Duration,
 };
 
@@ -7,16 +10,18 @@ use googleapis::{
     fields,
     google::firestore::v1::{
         TransactionOptions,
+        structured_query::{CollectionSelector, field_filter::Operator},
         transaction_options::{self, ReadOnly},
     },
     val,
 };
 use googletest::prelude::*;
 use http::{Method, StatusCode};
+use tokio::sync::Barrier;
 use tonic::Code;
 
 use crate::harness::{
-    builders::{QuerySpec, WriteBatchSpec},
+    builders::{QuerySpec, WriteBatchSpec, field_filter},
     contention::ContentionProbe,
     env::TestEnv,
     matchers::{assert_doc_wire_eq, assert_status_code, short_ids},
@@ -806,4 +811,559 @@ async fn lock_debug_logging_emits_emulator_database_lock_events_via_http() {
         contains_substring("waiting more than 1 second")
     );
     expect_that!(captured.as_ref(), contains_substring("doc_name"));
+}
+
+#[gtest]
+#[tokio::test(start_paused = true)]
+async fn clear_database_aborts_queue_free_queries_and_get_read_time() {
+    use emulator_database::{
+        GenericDatabaseError, query::QueryBuilder, read_consistency::ReadConsistency,
+        reference::Ref,
+    };
+
+    let mut db = TestEnv::new().build_db();
+    let seeded = db.put("clr_q/a", fields!({ "v": 1i64 })).await.unwrap();
+    let t_before = seeded.update_time.expect("update_time");
+
+    let cleared_db = db.project().database(&TestEnv::root_ref()).await;
+    db.clear_default_db().await;
+
+    // On `cleared_db`, queue-free `Query::once` (`Default`/`ReadTime`) and `get_read_time`
+    // (`Default`/`ReadTime`) must return `Err(GenericDatabaseError::Aborted(_))`.
+    let selector = CollectionSelector {
+        collection_id:   "clr_q".to_string(),
+        all_descendants: false,
+    };
+    let mut default_query =
+        QueryBuilder::from(Ref::Root(TestEnv::root_ref()), vec![selector.clone()])
+            .consistency(ReadConsistency::Default)
+            .build()
+            .unwrap();
+    assert!(matches!(
+        default_query.once(&cleared_db).await,
+        Err(GenericDatabaseError::Aborted(_))
+    ));
+
+    let mut read_time_query = QueryBuilder::from(Ref::Root(TestEnv::root_ref()), vec![selector])
+        .consistency(ReadConsistency::ReadTime(t_before))
+        .build()
+        .unwrap();
+    assert!(matches!(
+        read_time_query.once(&cleared_db).await,
+        Err(GenericDatabaseError::Aborted(_))
+    ));
+
+    assert!(matches!(
+        cleared_db.get_read_time(ReadConsistency::Default).await,
+        Err(GenericDatabaseError::Aborted(_))
+    ));
+    assert!(matches!(
+        cleared_db
+            .get_read_time(ReadConsistency::ReadTime(t_before))
+            .await,
+        Err(GenericDatabaseError::Aborted(_))
+    ));
+}
+
+#[gtest]
+#[tokio::test(start_paused = true)]
+async fn clear_database_while_txn_committing_aborts_cleanly_and_releases_partial_leases() {
+    use emulator_database::{
+        GenericDatabaseError, read_consistency::ReadConsistency, reference::DocumentRef,
+    };
+
+    let mut db = TestEnv::new().build_db();
+    db.put("clr_c/a", fields!({ "v": 0i64 })).await.unwrap();
+    db.put("clr_c/b", fields!({ "v": 0i64 })).await.unwrap();
+
+    // Put a ReadWrite transaction into `TxnSlot::Committing` (holding a partial `WriteLease` on
+    // `clr_c/b` while blocked acquiring `clr_c/a` behind `blocker`).
+    let mut blocker = db.begin_rw_txn().await.unwrap();
+    let _unused = blocker.get("clr_c/a").await.unwrap();
+
+    let committer = db.begin_rw_txn().await.unwrap();
+    let committer_id = committer.id().to_vec();
+    let committer_txn_id = committer_id.clone().try_into().unwrap();
+    let mut commit_client = db.clone();
+    let commit_id_clone = committer_id.clone();
+    let mut commit_op = ContentionProbe::spawn_op(async move {
+        commit_client
+            .commit_raw(
+                &commit_id_clone,
+                WriteBatchSpec::new()
+                    .put("clr_c/a", fields!({ "v": 2i64 }))
+                    .put("clr_c/b", fields!({ "v": 2i64 }))
+                    .into_writes(),
+            )
+            .await
+    });
+    commit_op.assert_pending().await;
+    assert_status_code(
+        db.begin_retry_rw_txn(&committer_id).await,
+        Code::FailedPrecondition,
+    );
+
+    let cleared_db = db.project().database(&TestEnv::root_ref()).await;
+    db.clear_default_db().await;
+
+    // In-flight `Committing` future must abort immediately.
+    commit_op.expect_aborted().await;
+
+    let doc_a_ref: DocumentRef = "projects/test-project/databases/(default)/documents/clr_c/a"
+        .parse()
+        .unwrap();
+    assert!(matches!(
+        cleared_db
+            .get_doc(&doc_a_ref, ReadConsistency::Transaction(committer_txn_id))
+            .await,
+        Err(GenericDatabaseError::Aborted(_))
+    ));
+    assert!(matches!(
+        cleared_db.commit(vec![], Some(committer_txn_id)).await,
+        Err(GenericDatabaseError::Aborted(_))
+    ));
+    assert!(matches!(
+        cleared_db.rollback(committer_txn_id).await,
+        Err(GenericDatabaseError::Aborted(_))
+    ));
+
+    // Over gRPC, the recreated database starts clean with no leaked locks or slots.
+    assert_status_code(
+        db.get_in_txn("clr_c/a", &committer_id).await,
+        Code::InvalidArgument,
+    );
+    assert_status_code(db.rollback_raw(&committer_id).await, Code::InvalidArgument);
+    db.put("clr_c/a", fields!({ "v": 10i64 })).await.unwrap();
+    db.put("clr_c/b", fields!({ "v": 10i64 })).await.unwrap();
+}
+
+#[gtest]
+#[tokio::test(start_paused = true)]
+async fn foreign_db_get_doc_rejects_without_pinning_lazy_root_seq() {
+    use emulator_database::{
+        GenericDatabaseError, read_consistency::ReadConsistency, reference::DocumentRef,
+    };
+
+    let mut db = TestEnv::new().build_db();
+    db.put("m3/target", fields!({ "v": 0i64 })).await.unwrap();
+
+    let raw_db = db.project().database(&TestEnv::root_ref()).await;
+    let foreign_doc: DocumentRef = "projects/test-project/databases/foreign-db/documents/m3/target"
+        .parse()
+        .unwrap();
+
+    // Direct `get_doc` (`Default`) with foreign-DB `DocumentRef` rejects with `InvalidArgument`.
+    assert!(matches!(
+        raw_db.get_doc(&foreign_doc, ReadConsistency::Default).await,
+        Err(GenericDatabaseError::InvalidArgument(_))
+    ));
+
+    // Start `txn_a` first (`Lazy`), then `txn_b` (`Lazy`). Calling `get_doc` /
+    // `PessimisticState::read_doc` on `txn_a` with a foreign `DocumentRef` must fail with
+    // `InvalidArgument` WITHOUT pinning `txn_a`'s `root_seq`.
+    let mut txn_a = db.begin_rw_txn().await.unwrap();
+    let txn_a_id = txn_a.id().to_vec().try_into().unwrap();
+    let mut txn_b = db.begin_rw_txn().await.unwrap();
+
+    assert!(matches!(
+        raw_db
+            .get_doc(&foreign_doc, ReadConsistency::Transaction(txn_a_id))
+            .await,
+        Err(GenericDatabaseError::InvalidArgument(_))
+    ));
+
+    // `txn_b` reads a real document first and therefore must receive an OLDER `root_seq` than
+    // `txn_a`.
+    let _unused = txn_b.get("m3/target").await.unwrap();
+
+    // When `txn_a` now tries to write `m3/target`, it is younger than `txn_b` and must block
+    // rather than wounding `txn_b`!
+    txn_a.put("m3/target", fields!({ "v": 1i64 }));
+    let mut commit_a = ContentionProbe::spawn_op(txn_a.commit());
+    commit_a.assert_pending().await;
+
+    assert_doc_wire_eq(
+        &txn_b.get("m3/target").await.unwrap(),
+        "m3/target",
+        &fields!({ "v": 0i64 }),
+    );
+    txn_b.rollback().await.unwrap();
+
+    commit_a.expect_ready().await.unwrap();
+    assert_doc_wire_eq(
+        &db.get("m3/target").await.unwrap(),
+        "m3/target",
+        &fields!({ "v": 1i64 }),
+    );
+}
+
+#[gtest]
+#[tokio::test(start_paused = true)]
+async fn run_query_filter_out_preserves_prior_retained_read_hold() {
+    let mut db = TestEnv::new().build_db();
+    db.put("rq_keep/d1", fields!({ "tag": "keep" }))
+        .await
+        .unwrap();
+    db.put("rq_keep/d4", fields!({ "tag": "drop" }))
+        .await
+        .unwrap();
+
+    let mut tx = db.begin_rw_txn().await.unwrap();
+    assert_doc_wire_eq(
+        &tx.get("rq_keep/d4").await.unwrap(),
+        "rq_keep/d4",
+        &fields!({ "tag": "drop" }),
+    );
+
+    // Query scans `rq_keep` (acquiring and dropping an unmatched temporary `ReadLease` on `d4`).
+    // Dropping that temporary lease must preserve `d4`'s prior `retained = true` read lock!
+    let out = tx
+        .query(QuerySpec::collection("rq_keep").where_filter(field_filter(
+            "tag",
+            Operator::Equal,
+            "keep",
+        )))
+        .await
+        .unwrap();
+    expect_eq!(short_ids(&out.documents), vec!["d1"]);
+
+    let mut writer_db = db.clone();
+    let mut blocked_d4 = ContentionProbe::spawn_op(async move {
+        writer_db
+            .put("rq_keep/d4", fields!({ "tag": "mutated" }))
+            .await
+    });
+    blocked_d4.assert_pending().await;
+
+    tx.rollback().await.unwrap();
+    let updated = blocked_d4.expect_ready().await.unwrap();
+    assert_doc_wire_eq(&updated, "rq_keep/d4", &fields!({ "tag": "mutated" }));
+}
+
+#[gtest]
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn stress_multithreaded_concurrent_wounds_commits_rollbacks_reads_and_clear() {
+    // Phase A: 8 worker threads hammering overlapping docs (wounds, multi-doc commits,
+    // non-tx WriteBatch retries, and concurrent reads/commits/rollbacks on shared `txn_id`s)
+    // without `clear_database` -> must NEVER return `Code::Internal` or `"database was cleared"`.
+    {
+        let mut db = TestEnv::new().build_db();
+        let docs = ["stress/d0", "stress/d1", "stress/d2", "stress/d3"];
+        for d in docs {
+            db.put(d, fields!({ "v": 0i64 })).await.unwrap();
+        }
+
+        let start = Arc::new(Barrier::new(8));
+        let mut handles = Vec::with_capacity(8);
+        for worker in 0..8usize {
+            let mut wdb = db.clone();
+            let barrier = Arc::clone(&start);
+            handles.push(tokio::spawn(async move {
+                barrier.wait().await;
+                for round in 0..25usize {
+                    let a = docs[(worker + round) % docs.len()];
+                    let b = docs[(worker + round + 1) % docs.len()];
+                    let val = (worker * 100 + round) as i64;
+
+                    let assert_clean = |ctx: &str, status: &tonic::Status| {
+                        assert_ne!(
+                            status.code(),
+                            Code::Internal,
+                            "worker {worker} round {round} {ctx} returned Code::Internal: \
+                             {status:?}"
+                        );
+                        assert!(
+                            !status.message().contains("database was cleared"),
+                            "worker {worker} round {round} {ctx} returned database was cleared: \
+                             {status:?}"
+                        );
+                    };
+
+                    match (worker + round) % 4 {
+                        0 => {
+                            // RW txn read + multi-doc commit competing with other workers (wounds).
+                            if let Ok(mut tx) = wdb.begin_rw_txn().await {
+                                if let Err(e) = tx.get(a).await {
+                                    assert_clean("tx.get", &e);
+                                    let _unused = tx.rollback().await;
+                                    continue;
+                                }
+                                tx.put(a, fields!({ "v": val }))
+                                    .put(b, fields!({ "v": val }));
+                                if let Err(e) = tx.commit().await {
+                                    assert_clean("tx.commit", &e);
+                                }
+                            }
+                        }
+                        1 => {
+                            // Race `get_in_txn` and `query_in_txn` against `commit_raw` on same id.
+                            if let Ok(tx) = wdb.begin_rw_txn().await {
+                                let id = tx.id().to_vec();
+                                let mut gdb = wdb.clone();
+                                let gid = id.clone();
+                                let mut qdb = wdb.clone();
+                                let qid = id.clone();
+                                let mut cdb = wdb.clone();
+                                let cid = id;
+                                let (gr, qr, cr) = tokio::join!(
+                                    gdb.get_in_txn(a, &gid),
+                                    qdb.query_in_txn(QuerySpec::collection("stress"), &qid),
+                                    cdb.commit_raw(
+                                        &cid,
+                                        WriteBatchSpec::new()
+                                            .put(a, fields!({ "v": val }))
+                                            .put(b, fields!({ "v": val }))
+                                            .into_writes(),
+                                    ),
+                                );
+                                if let Err(e) = gr {
+                                    assert_clean("race get", &e);
+                                }
+                                if let Err(e) = qr {
+                                    assert_clean("race query", &e);
+                                }
+                                if let Err(e) = cr {
+                                    assert_clean("race commit", &e);
+                                }
+                            }
+                        }
+                        2 => {
+                            // Race `get_in_txn` against `rollback_raw` on same id.
+                            if let Ok(tx) = wdb.begin_rw_txn().await {
+                                let id = tx.id().to_vec();
+                                let mut gdb = wdb.clone();
+                                let gid = id.clone();
+                                let mut rdb = wdb.clone();
+                                let rid = id;
+                                let (gr, rr) =
+                                    tokio::join!(gdb.get_in_txn(a, &gid), rdb.rollback_raw(&rid),);
+                                if let Err(e) = gr {
+                                    assert_clean("rb-race get", &e);
+                                }
+                                if let Err(e) = rr {
+                                    assert_clean("rb-race rollback", &e);
+                                }
+                            }
+                        }
+                        _ => {
+                            // Non-tx multi-doc WriteBatch colliding with RW txns.
+                            if let Err(e) = wdb
+                                .commit_writes(
+                                    WriteBatchSpec::new()
+                                        .put(a, fields!({ "v": val }))
+                                        .put(b, fields!({ "v": val })),
+                                )
+                                .await
+                            {
+                                assert_clean("commit_writes", &e);
+                            }
+                        }
+                    }
+                }
+            }));
+        }
+
+        for h in handles {
+            h.await.unwrap();
+        }
+    }
+
+    // Phase B: 8 worker threads hammering wounds, reads, commits, rollbacks, and implicit drops
+    // while `clear_default_db()` runs repeatedly -> no deadlocks, panics, or `Code::Internal`.
+    {
+        let mut db = TestEnv::new().build_db();
+        let done = Arc::new(AtomicBool::new(false));
+        let start = Arc::new(Barrier::new(9));
+
+        let project = db.project();
+        let clear_done = Arc::clone(&done);
+        let clear_start = Arc::clone(&start);
+        let clear_task = tokio::spawn(async move {
+            clear_start.wait().await;
+            for _ in 0..8 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+                project.clear_database(&TestEnv::root_ref()).await;
+            }
+            clear_done.store(true, Ordering::Release);
+        });
+
+        let mut handles = Vec::with_capacity(8);
+        for worker in 0..8usize {
+            let mut wdb = db.clone();
+            let worker_done = Arc::clone(&done);
+            let worker_start = Arc::clone(&start);
+            handles.push(tokio::spawn(async move {
+                worker_start.wait().await;
+                let docs = ["sc/d0", "sc/d1", "sc/d2"];
+                let mut iter = 0usize;
+                while !worker_done.load(Ordering::Acquire) && iter < 80 {
+                    iter += 1;
+                    let a = docs[(worker + iter) % docs.len()];
+                    let b = docs[(worker + iter + 1) % docs.len()];
+                    let val = (worker * 1000 + iter) as i64;
+                    if let Ok(mut tx) = wdb.begin_rw_txn().await {
+                        if let Err(e) = tx.get(a).await {
+                            assert_ne!(e.code(), Code::Internal, "Phase B get Internal: {e:?}");
+                        }
+                        if iter.is_multiple_of(5) {
+                            // Drop active transaction holding read lock right across clear/wounds.
+                            drop(tx);
+                            continue;
+                        }
+                        tx.put(a, fields!({ "v": val }))
+                            .put(b, fields!({ "v": val }));
+                        if let Err(e) = tx.commit().await {
+                            assert_ne!(e.code(), Code::Internal, "Phase B commit Internal: {e:?}");
+                        }
+                    }
+                    if let Err(e) = wdb
+                        .commit_writes(WriteBatchSpec::new().put(a, fields!({ "v": val })))
+                        .await
+                    {
+                        assert_ne!(
+                            e.code(),
+                            Code::Internal,
+                            "Phase B commit_writes Internal: {e:?}"
+                        );
+                    }
+                }
+            }));
+        }
+
+        clear_task.await.unwrap();
+        for h in handles {
+            h.await.unwrap();
+        }
+
+        // Database remains usable after all concurrent clear + wound stress finishes.
+        db.put("sc/final", fields!({ "ok": true })).await.unwrap();
+        assert_doc_wire_eq(
+            &db.get("sc/final").await.unwrap(),
+            "sc/final",
+            &fields!({ "ok": true }),
+        );
+    }
+}
+
+#[gtest]
+#[tokio::test(start_paused = true)]
+async fn write_batch_repeated_wounds_back_off_and_expire_at_2s_write_timeout() {
+    let mut db = TestEnv::new().build_db(); // Timeouts::FAST: write = 2s
+    for doc in ["wb_wound/seed", "wb_wound/m1", "wb_wound/m2"] {
+        db.put(doc, fields!({ "v": 0i64 })).await.unwrap();
+    }
+
+    // Acquire `root_seq`s for `blocker` (`m1`) and five older transactions (`older_1..older_5`)
+    // before launching the multi-doc `WriteBatch`.
+    let mut blocker = db.begin_rw_txn().await.unwrap();
+    let _unused = blocker.get("wb_wound/m1").await.unwrap();
+
+    let mut older = Vec::with_capacity(5);
+    for _ in 0..5 {
+        let mut tx = db.begin_rw_txn().await.unwrap();
+        let _unused = tx.get("wb_wound/seed").await.unwrap();
+        older.push(tx);
+    }
+
+    let mut batch_db = db.clone();
+    let mut batch_op = ContentionProbe::spawn_op(async move {
+        batch_db
+            .commit_writes(
+                WriteBatchSpec::new()
+                    .put("wb_wound/m1", fields!({ "v": 1i64 }))
+                    .put("wb_wound/m2", fields!({ "v": 1i64 })),
+            )
+            .await
+    });
+    batch_op.assert_pending().await;
+
+    // Wound #1 (`wound_retries = 0 -> 1`): 0ms `yield_now()` retry still pending on `m1`.
+    let mut o1 = older.remove(0);
+    let _unused = o1
+        .get("wb_wound/m2")
+        .await
+        .expect("older_1 wounds WriteBatch attempt 0");
+    o1.rollback().await.unwrap();
+    batch_op.assert_pending().await;
+
+    // Wound #2 (`wound_retries = 1 -> 2`): 1ms backoff -> advance 5ms (`t = 5ms`).
+    let mut o2 = older.remove(0);
+    let _unused = o2
+        .get("wb_wound/m2")
+        .await
+        .expect("older_2 wounds WriteBatch attempt 1");
+    o2.rollback().await.unwrap();
+    ContentionProbe::advance_and_poll::<_, std::future::Pending<()>>(
+        Duration::from_millis(5),
+        &mut batch_op,
+        None,
+    )
+    .await;
+    batch_op.assert_pending().await;
+
+    // Wound #3 (`wound_retries = 2 -> 3`): 2ms backoff -> advance 10ms (`t = 15ms`).
+    let mut o3 = older.remove(0);
+    let _unused = o3
+        .get("wb_wound/m2")
+        .await
+        .expect("older_3 wounds WriteBatch attempt 2");
+    o3.rollback().await.unwrap();
+    ContentionProbe::advance_and_poll::<_, std::future::Pending<()>>(
+        Duration::from_millis(10),
+        &mut batch_op,
+        None,
+    )
+    .await;
+    batch_op.assert_pending().await;
+
+    // Wound #4 (`wound_retries = 3 -> 4`): 4ms backoff -> advance 1,980ms (`t = 1,995ms`).
+    let mut o4 = older.remove(0);
+    let _unused = o4
+        .get("wb_wound/m2")
+        .await
+        .expect("older_4 wounds WriteBatch attempt 3");
+    o4.rollback().await.unwrap();
+    ContentionProbe::advance_and_poll::<_, std::future::Pending<()>>(
+        Duration::from_millis(1_980),
+        &mut batch_op,
+        None,
+    )
+    .await;
+    batch_op.assert_pending().await;
+
+    // Wound #5 at `t = 1,995ms` (`wound_retries = 4 -> 5`, 8ms backoff clamped to 2,000ms
+    // deadline): still pending at `t = 1,999ms`, then aborts cleanly at `t = 2,000ms`.
+    let mut o5 = older.remove(0);
+    let _unused = o5
+        .get("wb_wound/m2")
+        .await
+        .expect("older_5 wounds WriteBatch attempt 4");
+    o5.rollback().await.unwrap();
+    ContentionProbe::advance_and_poll::<_, std::future::Pending<()>>(
+        Duration::from_millis(4),
+        &mut batch_op,
+        None,
+    )
+    .await;
+    batch_op.assert_pending().await;
+
+    ContentionProbe::advance_and_poll::<_, std::future::Pending<()>>(
+        Duration::from_millis(1),
+        &mut batch_op,
+        None,
+    )
+    .await;
+    batch_op.expect_aborted().await;
+
+    blocker.rollback().await.unwrap();
+    assert_doc_wire_eq(
+        &db.get("wb_wound/m1").await.unwrap(),
+        "wb_wound/m1",
+        &fields!({ "v": 0i64 }),
+    );
+    assert_doc_wire_eq(
+        &db.get("wb_wound/m2").await.unwrap(),
+        "wb_wound/m2",
+        &fields!({ "v": 0i64 }),
+    );
 }
