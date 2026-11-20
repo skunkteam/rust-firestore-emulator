@@ -59,6 +59,10 @@ impl RestError {
     pub(crate) fn not_implemented(message: impl Into<String>) -> Self {
         Self::new(StatusCode::NOT_IMPLEMENTED, "UNIMPLEMENTED", message)
     }
+
+    pub(crate) fn internal(message: impl Into<String>) -> Self {
+        Self::new(StatusCode::INTERNAL_SERVER_ERROR, "INTERNAL", message)
+    }
 }
 
 impl From<GenericDatabaseError> for RestError {
