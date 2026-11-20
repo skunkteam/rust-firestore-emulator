@@ -277,7 +277,7 @@ checksum = "0e9c71c2167ca323c882b99918929403426e2373ea17242ff5653e0d5e1058be"
 
 [[package]]
 name = "emulator-database"
-version = "0.3.0-beta.2"
+version = "0.4.0"
 dependencies = [
  "futures-util",
  "googleapis",
@@ -298,7 +298,7 @@ dependencies = [
 
 [[package]]
 name = "emulator-grpc"
-version = "0.3.0-beta.2"
+version = "0.4.0"
 dependencies = [
  "emulator-database",
  "futures-util",
@@ -313,7 +313,7 @@ dependencies = [
 
 [[package]]
 name = "emulator-http"
-version = "0.3.0-beta.2"
+version = "0.4.0"
 dependencies = [
  "axum",
  "emulator-database",
@@ -331,7 +331,7 @@ dependencies = [
 
 [[package]]
 name = "emulator-tests"
-version = "0.3.0-beta.2"
+version = "0.4.0"
 dependencies = [
  "axum",
  "bytes",
@@ -359,7 +359,7 @@ dependencies = [
 
 [[package]]
 name = "emulator-tracing"
-version = "0.3.0-beta.2"
+version = "0.4.0"
 dependencies = [
  "bytes",
  "googletest",
@@ -400,7 +400,7 @@ checksum = "1c66915cc5391097de7a2b0b972e8505aa33c0df401fd3a6811dbdb32881ba48"
 
 [[package]]
 name = "firestore-emulator"
-version = "0.3.0-beta.2"
+version = "0.4.0"
 dependencies = [
  "clap",
  "emulator-database",
@@ -504,7 +504,7 @@ checksum = "e4eba85ea1d0a966a983acd07deee566e67395d2d96b6fb39e62b5a833f1eb0b"
 
 [[package]]
 name = "googleapis"
-version = "0.3.0-beta.2"
+version = "0.4.0"
 dependencies = [
  "base64",
  "bytes",
