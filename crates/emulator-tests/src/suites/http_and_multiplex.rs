@@ -108,9 +108,10 @@ async fn dynamic_logging_capture_poll_filter_update_and_delete_against_idempoten
 #[gtest]
 #[tokio::test]
 async fn dynamic_logging_caps_active_handles_with_lru_eviction() {
+    const DEFAULT_MAX_HANDLES: usize = 64;
     let db = TestEnv::new().build_db();
 
-    for i in 0..=64 {
+    for i in 0..DEFAULT_MAX_HANDLES {
         let uri = format!("/emulator/v1/logging/cap-{i}");
         let (status, body) = db
             .http_raw_body(Method::POST, &uri, Some("text/plain"), "error")
@@ -119,21 +120,34 @@ async fn dynamic_logging_caps_active_handles_with_lru_eviction() {
         expect_eq!(body.as_ref(), b"");
     }
 
-    // Handle 0 (LRU) was evicted when handle 64 was opened.
-    let (evicted_poll, _) = db
+    // Refresh `cap-0` via `:poll` so it moves to MRU and `cap-1` becomes LRU.
+    let (refresh_status, _) = db
         .http_raw_body(Method::POST, "/emulator/v1/logging/cap-0:poll", None, "")
+        .await;
+    expect_eq!(refresh_status, StatusCode::OK);
+
+    // Opening one more handle at capacity evicts `cap-1` (LRU) while keeping `cap-0`.
+    let overflow_uri = format!("/emulator/v1/logging/cap-{DEFAULT_MAX_HANDLES}");
+    let (overflow_status, overflow_body) = db
+        .http_raw_body(Method::POST, &overflow_uri, Some("text/plain"), "error")
+        .await;
+    expect_eq!(overflow_status, StatusCode::OK);
+    expect_eq!(overflow_body.as_ref(), b"");
+
+    let (evicted_poll, _) = db
+        .http_raw_body(Method::POST, "/emulator/v1/logging/cap-1:poll", None, "")
         .await;
     expect_eq!(evicted_poll, StatusCode::NOT_FOUND);
 
-    // Handles 1..=64 remain active and poll cleanly.
-    for i in 1..=64 {
+    // `cap-0` and `cap-2..=cap-64` remain active and poll cleanly.
+    for i in std::iter::once(0).chain(2..=DEFAULT_MAX_HANDLES) {
         let poll_uri = format!("/emulator/v1/logging/cap-{i}:poll");
         let (poll_status, _) = db.http_raw_body(Method::POST, &poll_uri, None, "").await;
         expect_eq!(poll_status, StatusCode::OK);
     }
 
     // Cleanly delete all remaining handles so shared-process test runs leave no dynamic layers.
-    for i in 1..=64 {
+    for i in std::iter::once(0).chain(2..=DEFAULT_MAX_HANDLES) {
         let uri = format!("/emulator/v1/logging/cap-{i}");
         let (del_status, _) = db.http_oneshot(Method::DELETE, &uri, None).await;
         expect_eq!(del_status, StatusCode::OK);

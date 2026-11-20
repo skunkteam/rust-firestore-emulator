@@ -101,11 +101,7 @@ impl From<SetLogLevelsError> for RestError {
                 "INVALID_ARGUMENT",
                 parse_error.to_string(),
             ),
-            SetLogLevelsError::ReloadError(error) => Self::new(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "INTERNAL",
-                error.to_string(),
-            ),
+            SetLogLevelsError::ReloadError(error) => Self::internal(error.to_string()),
         }
     }
 }

@@ -1,6 +1,9 @@
 use std::{
     collections::{HashMap, VecDeque},
-    sync::{Arc, Mutex, MutexGuard, PoisonError},
+    sync::{
+        Arc, Mutex, MutexGuard, PoisonError,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 
 use axum::{
@@ -15,6 +18,15 @@ use crate::error::{RestError, Result};
 
 const DEFAULT_MAX_HANDLES: usize = 64;
 
+// Lock hierarchy and blocking boundaries:
+// - `TracingState.subscribers` (`SubscriberStore`) is strictly a leaf lock: held only for map and
+//   recency bookkeeping and never across `subscribe`, `drain`, `drop`, or `.await`.
+// - `SubscriberHandle.subscriber` decouples `:poll` (`drain`, which acquires only the subscriber's
+//   inner buffer lock) from store indexing and allows one-shot `take()` so `Drop` teardown (which
+//   calls `reload_handle.modify`) runs outside all locks on `tokio::task::spawn_blocking`.
+// - All mutexes recover via `PoisonError::into_inner` to prevent panic cascades across requests.
+// - Final `Router` / `TracingState` drop tears down remaining entries synchronously on process
+//   exit.
 struct SubscriberHandle {
     subscriber: Mutex<Option<Box<dyn DynamicSubscriber>>>,
 }
@@ -40,6 +52,21 @@ impl SubscriberHandle {
             .unwrap_or_else(PoisonError::into_inner)
             .take()
     }
+
+    /// Extracts and drains the subscriber while ensuring the per-handle mutex is released before
+    /// `drain()` and `Drop` run.
+    fn take_and_drain(&self) -> Option<Bytes> {
+        let mut subscriber = self.take()?;
+        let logs = subscriber.drain();
+        drop(subscriber);
+        Some(logs)
+    }
+}
+
+enum InsertCleanup {
+    None,
+    Replaced(Arc<SubscriberHandle>),
+    Evicted(Arc<SubscriberHandle>),
 }
 
 struct SubscriberEntry {
@@ -47,6 +74,8 @@ struct SubscriberEntry {
     generation: u64,
 }
 
+/// Bounded LRU index tracking active handles via generation-tagged `VecDeque` tombstones so
+/// `get_and_touch` remains O(1) amortized and `recency` stays bounded at `<= 2 * max_handles`.
 struct SubscriberStore {
     entries: HashMap<String, SubscriberEntry>,
     recency: VecDeque<(String, u64)>,
@@ -60,66 +89,67 @@ impl SubscriberStore {
             entries: HashMap::new(),
             recency: VecDeque::new(),
             next_generation: 0,
+            // Zero capacity would immediately self-evict every inserted handle.
             max_handles: max_handles.max(1),
         }
     }
 
     fn next_gen(&mut self) -> u64 {
+        // Wrapping is safe because `compact_recency` removes stale tombstones whenever `recency`
+        // exceeds `2 * max_handles`, keeping every entry in `recency` bound to its live key.
         self.next_generation = self.next_generation.wrapping_add(1);
         self.next_generation
     }
 
-    fn insert(
-        &mut self,
-        name: String,
-        handle: Arc<SubscriberHandle>,
-    ) -> (Option<Arc<SubscriberHandle>>, Vec<Arc<SubscriberHandle>>) {
+    fn insert(&mut self, name: String, handle: Arc<SubscriberHandle>) -> InsertCleanup {
         let generation = self.next_gen();
         self.recency.push_back((name.clone(), generation));
-        let replaced = self
+        if let Some(replaced) = self
             .entries
             .insert(name, SubscriberEntry { handle, generation })
-            .map(|entry| entry.handle);
-
-        let mut evicted = Vec::new();
-        while self.entries.len() > self.max_handles
-            && let Some((oldest_name, oldest_gen)) = self.recency.pop_front()
         {
-            if self
-                .entries
-                .get(&oldest_name)
-                .is_some_and(|entry| entry.generation == oldest_gen)
-                && let Some(entry) = self.entries.remove(&oldest_name)
-            {
-                evicted.push(entry.handle);
+            self.compact_recency();
+            return InsertCleanup::Replaced(replaced.handle);
+        }
+
+        let mut evicted = None;
+        if self.entries.len() > self.max_handles {
+            while let Some((oldest_name, oldest_gen)) = self.recency.pop_front() {
+                if self
+                    .entries
+                    .get(&oldest_name)
+                    .is_some_and(|entry| entry.generation == oldest_gen)
+                    && let Some(entry) = self.entries.remove(&oldest_name)
+                {
+                    evicted = Some(entry.handle);
+                    break;
+                }
             }
         }
         self.compact_recency();
-        (replaced, evicted)
+        evicted.map_or(InsertCleanup::None, InsertCleanup::Evicted)
     }
 
     fn get_and_touch(&mut self, name: &str) -> Option<Arc<SubscriberHandle>> {
-        {
-            let entry = self.entries.get(name)?;
-            if self.recency.back().is_some_and(|(back_name, back_gen)| {
-                back_name == name && *back_gen == entry.generation
-            }) {
-                return Some(Arc::clone(&entry.handle));
-            }
-        }
-        let generation = self.next_gen();
         let entry = self.entries.get_mut(name)?;
-        entry.generation = generation;
         let handle = Arc::clone(&entry.handle);
+        if self
+            .recency
+            .back()
+            .is_some_and(|(back_name, back_gen)| back_name == name && *back_gen == entry.generation)
+        {
+            return Some(handle);
+        }
+        self.next_generation = self.next_generation.wrapping_add(1);
+        let generation = self.next_generation;
+        entry.generation = generation;
         self.recency.push_back((name.to_owned(), generation));
         self.compact_recency();
         Some(handle)
     }
 
     fn remove(&mut self, name: &str) -> Option<Arc<SubscriberHandle>> {
-        let removed = self.entries.remove(name)?;
-        self.compact_recency();
-        Some(removed.handle)
+        self.entries.remove(name).map(|removed| removed.handle)
     }
 
     fn compact_recency(&mut self) {
@@ -154,11 +184,7 @@ impl<S: Tracing + 'static> TracingState<S> {
             .unwrap_or_else(PoisonError::into_inner)
     }
 
-    fn insert_handle(
-        &self,
-        name: String,
-        handle: Arc<SubscriberHandle>,
-    ) -> (Option<Arc<SubscriberHandle>>, Vec<Arc<SubscriberHandle>>) {
+    fn insert_handle(&self, name: String, handle: Arc<SubscriberHandle>) -> InsertCleanup {
         self.lock_store().insert(name, handle)
     }
 
@@ -168,6 +194,36 @@ impl<S: Tracing + 'static> TracingState<S> {
 
     fn remove_handle(&self, name: &str) -> Option<Arc<SubscriberHandle>> {
         self.lock_store().remove(name)
+    }
+}
+
+struct CancelOnDrop {
+    cancelled: Arc<AtomicBool>,
+    armed:     bool,
+}
+
+impl CancelOnDrop {
+    fn arm() -> (Self, Arc<AtomicBool>) {
+        let cancelled = Arc::new(AtomicBool::new(false));
+        (
+            Self {
+                cancelled: Arc::clone(&cancelled),
+                armed:     true,
+            },
+            cancelled,
+        )
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for CancelOnDrop {
+    fn drop(&mut self) {
+        if self.armed {
+            self.cancelled.store(true, Ordering::Release);
+        }
     }
 }
 
@@ -196,44 +252,39 @@ async fn start_capture_or_poll_logs<S: Tracing + 'static>(
         return poll_logs(tracing, name);
     }
 
-    let tracing_backend = tracing.tracing;
-    let subscriber = tokio::task::spawn_blocking(move || {
-        tracing_backend
-            .subscribe(&body)
-            .map(|subscriber| Box::new(subscriber) as Box<dyn DynamicSubscriber>)
-    })
-    .await
-    .map_err(|err| RestError::internal(format!("Failed to start log capture: {err}")))??;
-
-    let (replaced, evicted) =
-        tracing.insert_handle(name, Arc::new(SubscriberHandle::new(subscriber)));
-    drain_and_drop_handles(replaced, evicted).await
-}
-
-async fn drain_and_drop_handles(
-    replaced: Option<Arc<SubscriberHandle>>,
-    evicted: Vec<Arc<SubscriberHandle>>,
-) -> Result<Bytes> {
-    if replaced.is_none() && evicted.is_empty() {
-        return Ok(Bytes::new());
-    }
-    tokio::task::spawn_blocking(move || {
-        for handle in evicted {
-            drop(handle.take());
+    // Run `subscribe`, `insert_handle`, and replaced/evicted teardown inside one `spawn_blocking`
+    // task returning only `Bytes` so cancelling the HTTP future can never drop a live
+    // `Box<dyn DynamicSubscriber>` on a Tokio async worker thread, and `CancelOnDrop` aborts
+    // insertion/eviction if the client disconnects mid-`subscribe`.
+    let (mut cancel_guard, cancelled) = CancelOnDrop::arm();
+    let result = tokio::task::spawn_blocking(move || -> Result<Bytes> {
+        if cancelled.load(Ordering::Acquire) {
+            return Ok(Bytes::new());
         }
-        if let Some(handle) = replaced
-            && let Some(mut subscriber) = handle.take()
-        {
-            let logs = subscriber.drain();
+        let subscriber: Box<dyn DynamicSubscriber> = Box::new(tracing.tracing.subscribe(&body)?);
+        if cancelled.load(Ordering::Acquire) {
             drop(subscriber);
-            return logs;
+            return Ok(Bytes::new());
         }
-        Bytes::new()
+        match tracing.insert_handle(name, Arc::new(SubscriberHandle::new(subscriber))) {
+            InsertCleanup::None => Ok(Bytes::new()),
+            InsertCleanup::Evicted(handle) => {
+                // Evicted logs are discarded without draining; drop runs outside all locks here.
+                let subscriber = handle.take();
+                drop(subscriber);
+                Ok(Bytes::new())
+            }
+            InsertCleanup::Replaced(handle) => Ok(handle.take_and_drain().unwrap_or_default()),
+        }
     })
     .await
-    .map_err(|err| RestError::internal(format!("Failed to clean up log subscriber: {err}")))
+    .map_err(|err| RestError::internal(format!("Failed to start log capture: {err}")))?;
+    cancel_guard.disarm();
+    result
 }
 
+// Synchronous on the async worker because `DefaultTracing::drain` only drains an in-memory buffer
+// without touching `reload_handle`.
 fn poll_logs<S: Tracing + 'static>(tracing: TracingState<S>, name: &str) -> Result<Bytes> {
     let Some(handle) = tracing.get_handle(name) else {
         return Err(RestError::not_found());
@@ -249,6 +300,8 @@ fn poll_or_retry_replacement<S: Tracing + 'static>(
     if let Some(logs) = handle.drain() {
         return Ok(logs);
     }
+    // Retry once if a concurrent replacement took the old subscriber between `get_handle` and
+    // `handle.drain()`; `!Arc::ptr_eq` avoids retrying against the same emptied slot.
     if let Some(replacement) = tracing.get_handle(name)
         && !Arc::ptr_eq(handle, &replacement)
         && let Some(logs) = replacement.drain()
@@ -265,22 +318,18 @@ async fn stop_capture<S: Tracing + 'static>(
     let Some(handle) = tracing.remove_handle(&name) else {
         return Err(RestError::not_found());
     };
-    tokio::task::spawn_blocking(move || {
-        let Some(mut subscriber) = handle.take() else {
-            return Err(RestError::not_found());
-        };
-        let logs = subscriber.drain();
-        drop(subscriber);
-        Ok(logs)
-    })
-    .await
-    .map_err(|err| RestError::internal(format!("Failed to stop log capture: {err}")))?
+    // No `.await` between `remove_handle` and `spawn_blocking` ensures the removed handle is
+    // always scheduled for teardown even if the request future is cancelled immediately after.
+    tokio::task::spawn_blocking(move || handle.take_and_drain().ok_or_else(RestError::not_found))
+        .await
+        .map_err(|err| RestError::internal(format!("Failed to stop log capture: {err}")))?
 }
 
 #[cfg(test)]
 mod tests {
     use std::{
         collections::{HashMap, VecDeque},
+        pin::pin,
         sync::{
             Arc, Condvar, Mutex, PoisonError,
             atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -300,7 +349,7 @@ mod tests {
     use tower::ServiceExt;
 
     use super::{
-        SubscriberHandle, SubscriberStore, TracingState, poll_or_retry_replacement,
+        InsertCleanup, SubscriberHandle, SubscriberStore, TracingState, poll_or_retry_replacement,
         router_with_max_handles,
     };
     use crate::RouterBuilder;
@@ -388,6 +437,8 @@ mod tests {
         Ok(())
     }
 
+    // Synchronization gate with a 5-second safety timeout and RAII `GateGuard` release so
+    // `spawn_blocking` threads never hang Tokio runtime shutdown if a test fails early.
     #[derive(Default)]
     struct GateState {
         entered:   bool,
@@ -407,7 +458,7 @@ mod tests {
 
     impl GateGuard {
         fn release(self) {
-            self.gate.release();
+            drop(self);
         }
     }
 
@@ -445,7 +496,8 @@ mod tests {
 
         async fn wait_entered(&self) {
             loop {
-                let notified = self.entered_notify.notified();
+                let mut notified = pin!(self.entered_notify.notified());
+                notified.as_mut().enable();
                 if self
                     .state
                     .lock()
@@ -527,6 +579,7 @@ mod tests {
         live_count:   Arc<AtomicUsize>,
         dropped_ids:  Arc<Mutex<Vec<usize>>>,
         dropped_dirs: Arc<Mutex<Vec<String>>>,
+        drop_notify:  Arc<Notify>,
         next_id:      AtomicUsize,
         behaviors:    Mutex<HashMap<String, MockBehavior>>,
     }
@@ -537,6 +590,7 @@ mod tests {
                 live_count:   Arc::new(AtomicUsize::new(0)),
                 dropped_ids:  Arc::new(Mutex::new(Vec::new())),
                 dropped_dirs: Arc::new(Mutex::new(Vec::new())),
+                drop_notify:  Arc::new(Notify::new()),
                 next_id:      AtomicUsize::new(1),
                 behaviors:    Mutex::new(HashMap::new()),
             }
@@ -566,6 +620,23 @@ mod tests {
                 .unwrap_or_else(PoisonError::into_inner)
                 .clone()
         }
+
+        async fn wait_for_dropped_dir(&self, dir: &str) {
+            loop {
+                let mut notified = pin!(self.drop_notify.notified());
+                notified.as_mut().enable();
+                if self
+                    .dropped_dirs
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .iter()
+                    .any(|d| d == dir)
+                {
+                    return;
+                }
+                notified.await;
+            }
+        }
     }
 
     struct MockSubscriber {
@@ -578,6 +649,7 @@ mod tests {
         live_count: Arc<AtomicUsize>,
         dropped_ids: Arc<Mutex<Vec<usize>>>,
         dropped_dirs: Arc<Mutex<Vec<String>>>,
+        drop_notify: Arc<Notify>,
     }
 
     impl DynamicSubscriber for MockSubscriber {
@@ -605,12 +677,15 @@ mod tests {
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
                 .push(self.dir.clone());
+            self.drop_notify.notify_waiters();
             if self.panic_on_drop {
                 panic!("intentional mock drop panic");
             }
         }
     }
 
+    // `metadata_filter::ParseError` is crate-private inside `emulator_tracing`, so obtain a real
+    // `SetLogLevelsError::InvalidDirectives` value from `DefaultTracing::start().subscribe`.
     fn invalid_directives_error() -> SetLogLevelsError {
         match DefaultTracing::start().subscribe("=invalid=") {
             Err(err) => err,
@@ -653,6 +728,7 @@ mod tests {
                 live_count: Arc::clone(&self.live_count),
                 dropped_ids: Arc::clone(&self.dropped_ids),
                 dropped_dirs: Arc::clone(&self.dropped_dirs),
+                drop_notify: Arc::clone(&self.drop_notify),
             })
         }
     }
@@ -973,8 +1049,8 @@ mod tests {
             (StatusCode::OK, "a2".to_owned())
         );
 
-        // At capacity (`[c, a]`, with `a` MRU, wait: polling `a` made `a` MRU and `c` LRU;
-        // let's poll `c` first so `a` is LRU and `c` is MRU, then replace `a`!).
+        // At capacity, `a` is MRU and `c` is LRU. Poll `c` first so `a` becomes LRU before
+        // replacing `a`.
         expect_eq!(
             send_request(&router, Method::POST, "/c:poll", "").await?,
             (StatusCode::OK, "c1".to_owned())
@@ -1055,19 +1131,28 @@ mod tests {
         let mut store = SubscriberStore::new(0);
         assert_eq!(store.max_handles, 1);
 
-        let (rep, ev) = store.insert("only".to_owned(), make_handle("d1"));
-        assert!(rep.is_none());
-        assert!(ev.is_empty());
-        let (rep, ev) = store.insert("second".to_owned(), make_handle("d2"));
-        assert!(rep.is_none());
-        assert_eq!(ev.len(), 1);
+        assert!(matches!(
+            store.insert("only".to_owned(), make_handle("d1")),
+            InsertCleanup::None
+        ));
+        match store.insert("second".to_owned(), make_handle("d2")) {
+            InsertCleanup::Evicted(evicted) => drop(evicted),
+            InsertCleanup::None | InsertCleanup::Replaced(_) => {
+                panic!("expected evicted handle when exceeding max_handles")
+            }
+        }
         assert_eq!(store.entries.len(), 1);
-        drop(ev);
 
         // Repeated alternating touches compact `recency` to `<= max_handles * 2`.
         let mut two_store = SubscriberStore::new(2);
-        drop(two_store.insert("a".to_owned(), make_handle("a")));
-        drop(two_store.insert("b".to_owned(), make_handle("b")));
+        assert!(matches!(
+            two_store.insert("a".to_owned(), make_handle("a")),
+            InsertCleanup::None
+        ));
+        assert!(matches!(
+            two_store.insert("b".to_owned(), make_handle("b")),
+            InsertCleanup::None
+        ));
         for _ in 0..20 {
             assert!(two_store.get_and_touch("a").is_some());
             assert!(two_store.get_and_touch("b").is_some());
@@ -1206,6 +1291,106 @@ mod tests {
             StatusCode::OK
         );
 
+        // 5. `drop` panic during LRU eviction returns 500, keeps the inserted handle, and cleanly
+        //    frees capacity.
+        let one_slot_router = router_with_max_handles(mock, 1);
+        expect_eq!(
+            send_request(
+                &one_slot_router,
+                Method::POST,
+                "/evict-victim",
+                "panic-drop"
+            )
+            .await?
+            .0,
+            StatusCode::OK
+        );
+        let (evict_panic_status, _) =
+            send_request(&one_slot_router, Method::POST, "/evict-winner", "ok").await?;
+        expect_eq!(evict_panic_status, StatusCode::INTERNAL_SERVER_ERROR);
+        expect_eq!(
+            send_request(&one_slot_router, Method::POST, "/evict-victim:poll", "")
+                .await?
+                .0,
+            StatusCode::NOT_FOUND
+        );
+        expect_eq!(
+            send_request(&one_slot_router, Method::POST, "/evict-winner:poll", "").await?,
+            (StatusCode::OK, "ok-logs".to_owned())
+        );
+        expect_eq!(
+            send_request(&one_slot_router, Method::DELETE, "/evict-winner", "")
+                .await?
+                .0,
+            StatusCode::OK
+        );
+        drop(one_slot_router);
+
+        drop(router);
+        expect_eq!(mock.live_count(), 0);
+        Ok(())
+    }
+
+    #[gtest]
+    #[tokio::test]
+    async fn cancelled_subscribe_drops_on_blocking_thread_without_inserting_or_evicting()
+    -> Result<()> {
+        let mock = Box::leak(Box::new(MockTracing::new()));
+        let (gate, guard) = BlockingGate::armed();
+        mock.configure("ok", MockBehavior::default().with_logs(&["kept-logs"]));
+        mock.configure(
+            "slow-cancel",
+            MockBehavior::default().with_subscribe_gate(Arc::clone(&gate)),
+        );
+
+        let router = router_with_max_handles(mock, 1);
+        expect_eq!(
+            send_request(&router, Method::POST, "/existing", "ok")
+                .await?
+                .0,
+            StatusCode::OK
+        );
+
+        let router_clone = router.clone();
+        let cancelled_task = tokio::spawn(async move {
+            send_request(&router_clone, Method::POST, "/cancelled", "slow-cancel").await
+        });
+
+        tokio::time::timeout(Duration::from_secs(5), gate.wait_entered())
+            .await
+            .expect("subscribe entered blocking gate");
+
+        // Abort the HTTP future while `subscribe` is in flight; `CancelOnDrop` must prevent
+        // insertion/eviction and drop the subscriber on the blocking thread instead of leaking or
+        // dropping on an async worker.
+        cancelled_task.abort();
+        let join_err = cancelled_task
+            .await
+            .expect_err("aborted task should return JoinError");
+        assert!(join_err.is_cancelled());
+
+        guard.release();
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            mock.wait_for_dropped_dir("slow-cancel"),
+        )
+        .await
+        .expect("cancelled subscriber dropped on blocking thread");
+        expect_false!(gate.timed_out());
+
+        // Cancelled handle was never inserted and `/existing` was never evicted.
+        expect_eq!(
+            send_request(&router, Method::POST, "/cancelled:poll", "")
+                .await?
+                .0,
+            StatusCode::NOT_FOUND
+        );
+        expect_eq!(
+            send_request(&router, Method::POST, "/existing:poll", "").await?,
+            (StatusCode::OK, "kept-logs".to_owned())
+        );
+        expect_eq!(mock.live_count(), 1);
+
         drop(router);
         expect_eq!(mock.live_count(), 0);
         Ok(())
@@ -1228,16 +1413,21 @@ mod tests {
 
         let old_sub = Box::new(mock.subscribe("d1")?);
         let old_handle = Arc::new(SubscriberHandle::new(old_sub));
-        let (replaced, evicted) = state.insert_handle("h".to_owned(), Arc::clone(&old_handle));
-        assert!(replaced.is_none());
-        assert!(evicted.is_empty());
+        assert!(matches!(
+            state.insert_handle("h".to_owned(), Arc::clone(&old_handle)),
+            InsertCleanup::None
+        ));
 
         // Simulate concurrent replacement where old handle's box was already taken before `poll`
         // called `drain()`, falling back to `state.get_handle("h")` for the replacement.
         let new_sub = Box::new(mock.subscribe("d2")?);
         let new_handle = Arc::new(SubscriberHandle::new(new_sub));
-        let (replaced, _) = state.insert_handle("h".to_owned(), Arc::clone(&new_handle));
-        drop(replaced.expect("old handle returned").take());
+        match state.insert_handle("h".to_owned(), Arc::clone(&new_handle)) {
+            InsertCleanup::Replaced(replaced) => drop(replaced.take()),
+            InsertCleanup::None | InsertCleanup::Evicted(_) => {
+                panic!("expected replaced handle")
+            }
+        }
 
         let logs =
             poll_or_retry_replacement(&state, "h", &old_handle).expect("replacement poll succeeds");
