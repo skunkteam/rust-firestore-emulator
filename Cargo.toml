@@ -31,8 +31,6 @@ emulator-database = { path = "crates/emulator-database" }
 emulator-grpc = { path = "crates/emulator-grpc" }
 emulator-http = { path = "crates/emulator-http", default-features = false }
 emulator-tracing = { path = "crates/emulator-tracing" }
-fifo-rwlock = { path = "crates/fifo-rwlock" }
-futures-executor = { version = "0.3.34", default-features = false, features = ["std"] }
 futures-util = { version = "0.3.34", default-features = false, features = ["alloc", "async-await"] }
 googleapis = { path = "crates/googleapis" }
 googletest = "0.14.4"
@@ -46,7 +44,6 @@ proptest = { version = "1.6.0", default-features = false, features = ["std"] }
 rstest = { version = "0.28.0", default-features = false }
 serde = "1.0.229"
 serde_json = "1.0.154"
-static_assertions = "1.1.0"
 string_cache = "0.11.0"
 thiserror = "2.0.21"
 tikv-jemallocator = "0.7.0"

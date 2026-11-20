@@ -42,7 +42,7 @@ const MAX_PIPELINE_RESPONSE_BYTES: usize = 1024 * 1024;
 
 fn rollback_new_txn_sync(database: &FirestoreDatabase, new_txn_bytes: &[u8]) {
     if !new_txn_bytes.is_empty()
-        && let Ok(id) = new_txn_bytes.to_vec().try_into()
+        && let Ok(id) = new_txn_bytes.try_into()
     {
         drop(database.rollback_sync(id));
     }
@@ -443,14 +443,15 @@ impl Firestore for FirestoreEmulator {
             check_write_database(write, &database.name)?;
         }
 
-        let (commit_time, write_results) = if transaction.is_empty() {
-            database.commit_non_transactional(writes).await?
+        let txn_id = if transaction.is_empty() {
+            None
         } else {
             let txn_id = transaction.try_into()?;
             Span::current().record("txn_id", display(txn_id));
             debug!(?txn_id);
-            database.commit(writes, txn_id).await?
+            Some(txn_id)
         };
+        let (commit_time, write_results) = database.commit(writes, txn_id).await?;
 
         Ok(Response::new(CommitResponse {
             write_results,
@@ -1304,7 +1305,7 @@ mod tests {
                     update_write(d2.to_string(), 2),
                     update_write(blocker_doc.to_string(), 2),
                 ],
-                blocker_txn,
+                Some(blocker_txn),
             )
             .await
             .map(|_| ())
@@ -1750,7 +1751,7 @@ mod tests {
             .expect("retry_transaction should succeed");
         tokio::task::yield_now().await;
 
-        let commit_res = db.commit(Vec::new(), retried_id).await;
+        let commit_res = db.commit(Vec::new(), Some(retried_id)).await;
         assert!(
             commit_res.is_ok(),
             "duplicate rollback from cancelled attempt 1 must not destroy active retry \

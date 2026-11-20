@@ -2379,16 +2379,13 @@ async fn new_transaction_errors_rollback_cleanly_across_all_five_rpcs() {
 
         let mut blocker_db = db.clone();
         let mut commit_blocker = ContentionProbe::spawn_op(async move {
-            blocker_db
-                .commit_writes(
-                    WriteBatchSpec::new()
-                        .put("locks/d2", fields!({ "emb": vec_val([0.0, 0.0]) }))
-                        .put("locks/h1", fields!({ "v": 2i64 }))
-                        .put("locks/h2", fields!({ "v": 2i64 }))
-                        .put("locks/h3", fields!({ "v": 2i64 }))
-                        .put("locks/h4", fields!({ "v": 2i64 })),
-                )
-                .await
+            let mut tx = blocker_db.begin_rw_txn().await?;
+            tx.put("locks/d2", fields!({ "emb": vec_val([0.0, 0.0]) }))
+                .put("locks/h1", fields!({ "v": 2i64 }))
+                .put("locks/h2", fields!({ "v": 2i64 }))
+                .put("locks/h3", fields!({ "v": 2i64 }))
+                .put("locks/h4", fields!({ "v": 2i64 }));
+            tx.commit().await
         });
         commit_blocker.drive_settled().await;
 
@@ -2541,4 +2538,107 @@ async fn run_query_find_nearest_tie_breaks_by_sorted_non_name_inequality_fields_
         .await
         .unwrap();
     expect_eq!(short_ids(&docs.documents), vec!["d", "c", "b", "a"]);
+}
+
+#[gtest]
+#[tokio::test(start_paused = true)]
+async fn standard_find_nearest_drops_unmatched_leases_and_preserves_prior_retained_reads() {
+    let mut db = TestEnv::new().build_db(); // STANDARD -> PESSIMISTIC
+
+    // `d_top`: matches prefilter, within threshold, top-1 winner -> LOCKED.
+    db.put(
+        "std_drop/d_top",
+        fields!({ "emb": vec_val([1.0, 0.0]), "tag": "keep" }),
+    )
+    .await
+    .unwrap();
+    // `d_prefilter_miss`: filtered out before distance calc -> UNLOCKED.
+    db.put(
+        "std_drop/d_prefilter_miss",
+        fields!({ "emb": vec_val([1.0, 0.0]), "tag": "skip" }),
+    )
+    .await
+    .unwrap();
+    // `d_missing_vec`: matches prefilter, lacks vector field -> UNLOCKED.
+    db.put("std_drop/d_missing_vec", fields!({ "tag": "keep" }))
+        .await
+        .unwrap();
+    // `d_over_threshold`: matches prefilter, Euclidean distance 5.0 > threshold 2.5 -> UNLOCKED.
+    db.put(
+        "std_drop/d_over_threshold",
+        fields!({ "emb": vec_val([6.0, 0.0]), "tag": "keep" }),
+    )
+    .await
+    .unwrap();
+    // `d_over_limit`: matches prefilter, within threshold (distance 1.0), beaten by `d_top` (0.0)
+    // under `limit(1)` -> UNLOCKED.
+    db.put(
+        "std_drop/d_over_limit",
+        fields!({ "emb": vec_val([2.0, 0.0]), "tag": "keep" }),
+    )
+    .await
+    .unwrap();
+    // `d_prior_get`: explicitly read via `tx.get` before `findNearest`, then filtered out by
+    // `findNearest` -> must STAY LOCKED (`hold.retained = true`).
+    db.put(
+        "std_drop/d_prior_get",
+        fields!({ "emb": vec_val([1.0, 0.0]), "tag": "prior" }),
+    )
+    .await
+    .unwrap();
+
+    let probe = ContentionProbe::new(&db);
+    let mut tx = probe.actor_a.clone().begin_rw_txn().await.unwrap();
+    let _unused = tx.get("std_drop/d_prior_get").await.unwrap();
+
+    let res = tx
+        .query(
+            QuerySpec::collection("std_drop")
+                .where_filter(field_filter("tag", Operator::Equal, "keep"))
+                .find_nearest(make_find_nearest(
+                    "emb",
+                    vec_val([1.0, 0.0]),
+                    find_nearest::DistanceMeasure::Euclidean,
+                    1,
+                    None,
+                    Some(2.5),
+                )),
+        )
+        .await
+        .unwrap();
+    expect_eq!(short_ids(&res.documents), vec!["d_top"]);
+
+    // All unmatched preliminary `ReadLease`s must be dropped immediately.
+    let mut free = probe.actor_b.clone();
+    for doc in [
+        "std_drop/d_prefilter_miss",
+        "std_drop/d_missing_vec",
+        "std_drop/d_over_threshold",
+        "std_drop/d_over_limit",
+    ] {
+        free.put(doc, fields!({ "tag": "mutated" }))
+            .await
+            .unwrap_or_else(|e| panic!("unmatched doc {doc} must be unlocked: {e:?}"));
+    }
+
+    // Both top-K winner `d_top` and prior-retained `d_prior_get` remain read-locked until
+    // `tx.rollback()`.
+    let mut b_top = probe.actor_b.clone();
+    let mut blocked_top = ContentionProbe::spawn_op(async move {
+        b_top
+            .put("std_drop/d_top", fields!({ "tag": "mutated" }))
+            .await
+    });
+    let mut b_prior = probe.actor_b.clone();
+    let mut blocked_prior = ContentionProbe::spawn_op(async move {
+        b_prior
+            .put("std_drop/d_prior_get", fields!({ "tag": "mutated" }))
+            .await
+    });
+    blocked_top.assert_pending().await;
+    blocked_prior.assert_pending().await;
+
+    tx.rollback().await.unwrap();
+    blocked_top.expect_ready().await.unwrap();
+    blocked_prior.expect_ready().await.unwrap();
 }

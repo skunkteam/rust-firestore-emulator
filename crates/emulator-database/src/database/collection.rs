@@ -8,20 +8,18 @@ use super::{
     document::DocumentMeta,
     reference::{CollectionRef, DocumentRef},
 };
-use crate::{FirestoreProject, error::Result, utils::RwLockHashMapExt};
+use crate::{error::Result, utils::RwLockHashMapExt};
 
 #[derive(Debug)]
 pub(crate) struct Collection {
-    project:   &'static FirestoreProject,
     pub name:  CollectionRef,
     documents: RwLock<HashMap<DefaultAtom, Arc<DocumentMeta>>>,
 }
 
 impl Collection {
     #[instrument(level = Level::DEBUG, skip_all)]
-    pub(super) fn new(project: &'static FirestoreProject, name: CollectionRef) -> Self {
+    pub(super) fn new(name: CollectionRef) -> Self {
         Self {
-            project,
             name,
             documents: Default::default(),
         }
@@ -32,11 +30,20 @@ impl Collection {
         Arc::clone(
             self.documents
                 .get_or_insert(&name.document_id, || {
-                    Arc::new(DocumentMeta::new(self.project, name.clone()))
+                    Arc::new(DocumentMeta::new(name.clone()))
                 })
                 .await
                 .deref(),
         )
+    }
+
+    pub(crate) async fn peek_doc(&self, name: &DocumentRef) -> Option<Arc<DocumentMeta>> {
+        debug_assert_eq!(self.name, name.collection_ref);
+        self.documents
+            .read()
+            .await
+            .get(&name.document_id)
+            .map(Arc::clone)
     }
 
     /// Get all documents in an allocated Vec, not using Iterator to keep the lock time minimal.
@@ -44,13 +51,14 @@ impl Collection {
         self.documents.read().await.values().cloned().collect()
     }
 
-    /// Checks if this collection has a document with a current version.
+    /// Checks if this collection has a document with a current version without entering lock wait
+    /// queues.
     pub(crate) async fn has_doc(&self) -> Result<bool> {
-        for doc in self.documents.read().await.values() {
-            if doc.read().await?.exists() {
-                return Ok(true);
-            }
-        }
-        Ok(false)
+        Ok(self
+            .documents
+            .read()
+            .await
+            .values()
+            .any(|doc| doc.read_latest_uncontended(|c| c.exists())))
     }
 }

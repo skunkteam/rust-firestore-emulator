@@ -1,10 +1,13 @@
+use std::sync::Arc;
+
+use emulator_database::{query::QueryBuilder, read_consistency::ReadConsistency, reference::Ref};
 use googleapis::{
     fields,
     google::{
         firestore::v1::{
-            BatchGetDocumentsRequest, Precondition, TransactionOptions,
-            batch_get_documents_request, document_transform, precondition,
-            structured_query::field_filter::Operator,
+            BatchGetDocumentsRequest, BeginTransactionRequest, Precondition, TransactionOptions,
+            batch_get_documents_request, document_transform, list_documents_request, precondition,
+            structured_query::{CollectionSelector, field_filter::Operator},
             transaction_options::{self, ReadOnly, ReadWrite, read_only},
         },
         protobuf::Timestamp,
@@ -13,7 +16,8 @@ use googleapis::{
 use googletest::prelude::*;
 use http::{Method, StatusCode};
 use serde_json::json;
-use tonic::Code;
+use tokio::sync::Barrier;
+use tonic::{Code, Status};
 
 use crate::harness::{
     builders::{
@@ -77,12 +81,13 @@ async fn pessimistic_begin_commit_rollback_retry_and_invalid_txn_ids() {
         Code::InvalidArgument,
     );
 
-    // Retrying with the released txn_id now succeeds
+    // Retrying with the released txn_id now succeeds and rotates the 16-byte token
     let retried = db
         .begin_retry_rw_txn(&saved_id)
         .await
         .expect("retry after rollback");
-    expect_eq!(retried.id(), saved_id.as_slice());
+    expect_ne!(retried.id(), saved_id.as_slice());
+    expect_eq!(retried.id().len(), 16);
     retried.rollback().await.unwrap();
 
     // Malformed transaction bytes -> InvalidArgument
@@ -547,7 +552,7 @@ async fn pessimistic_commit_cleanup_releases_locks_and_serializes_concurrent_com
     assert_status_code(db.rollback_raw(&id_dup).await, Code::Aborted);
     assert_status_code(db.rollback_raw(&id_dup).await, Code::Aborted);
 
-    // 5. TransactionId(0) wire bytes are never valid.
+    // 5. Invalid-length and zero TransactionId wire bytes are never valid.
     assert_status_code(
         db.begin_retry_rw_txn(&0usize.to_ne_bytes()).await,
         Code::InvalidArgument,
@@ -556,6 +561,11 @@ async fn pessimistic_commit_cleanup_releases_locks_and_serializes_concurrent_com
         db.rollback_raw(&0usize.to_ne_bytes()).await,
         Code::InvalidArgument,
     );
+    assert_status_code(
+        db.begin_retry_rw_txn(&[0u8; 16]).await,
+        Code::InvalidArgument,
+    );
+    assert_status_code(db.rollback_raw(&[0u8; 16]).await, Code::InvalidArgument);
 }
 
 #[gtest]
@@ -735,7 +745,8 @@ async fn rollback_idempotency_validation_preservation_and_read_only_commit_lifec
 
     let mut failed_txn = db.begin_rw_txn().await.unwrap();
     let failed_id = failed_txn.id().to_vec();
-    let failed_numeric = usize::from_ne_bytes(failed_id.clone().try_into().unwrap());
+    let failed_lineage = u64::from_le_bytes(failed_id[..8].try_into().unwrap());
+    let failed_attempt = u64::from_le_bytes(failed_id[8..16].try_into().unwrap());
     failed_txn.stage_writes(WriteBatchSpec::new().update_with(
         "docs/a",
         fields!({ "v": 100i64 }),
@@ -751,9 +762,10 @@ async fn rollback_idempotency_validation_preservation_and_read_only_commit_lifec
     expect_eq!(poll_st, StatusCode::OK);
     expect_eq!(del_st, StatusCode::OK);
     let captured = String::from_utf8_lossy(&poll_bytes);
-    let expected_err_fragment = format!("invalid transaction ID: {failed_numeric}");
+    let expected_err_fragment =
+        format!("invalid transaction ID: {failed_lineage}:{failed_attempt}");
     assert!(
-        !captured.contains(&expected_err_fragment),
+        !captured.contains(&expected_err_fragment) && !captured.contains("invalid transaction ID"),
         "failed commit + follow-up rollback must not log `{expected_err_fragment}`, \
          got:\n{captured}"
     );
@@ -897,4 +909,898 @@ async fn optimistic_commit_prevents_lost_updates_and_write_skew() {
         "c/a",
         &fields!({ "val": 11i64 }),
     );
+}
+
+#[gtest]
+#[tokio::test]
+async fn remote_wound_aborts_follow_ups_inherits_root_seq_with_rotated_tokens_and_preserves_tombstones()
+ {
+    let mut db = TestEnv::new().build_db();
+    db.set_admin_mode(Some("ENTERPRISE"), Some("PESSIMISTIC"))
+        .await;
+    for doc in ["txl/seed_oldest", "txl/seed_mid", "txl/a", "txl/b"] {
+        db.put(doc, fields!({ "v": 0i64 })).await.unwrap();
+    }
+
+    let mut oldest = db.begin_rw_txn().await.unwrap();
+    let _unused = oldest.get("txl/seed_oldest").await.unwrap();
+
+    let mut target1 = db.begin_rw_txn().await.unwrap();
+    let target1_id = target1.id().to_vec();
+    expect_eq!(target1_id.len(), 16);
+    let _unused = target1.get("txl/a").await.unwrap();
+
+    let mut mid = db.begin_rw_txn().await.unwrap();
+    let mid_id = mid.id().to_vec();
+    let _unused = mid.get("txl/seed_mid").await.unwrap();
+
+    // `oldest` commits a write to `txl/a`, remotely wounding `target1`.
+    oldest.put("txl/a", fields!({ "v": 1i64 }));
+    oldest.commit().await.unwrap();
+
+    // Every follow-up operation on wounded `target1` returns `Code::Aborted`.
+    assert_status_code(db.get_in_txn("txl/b", &target1_id).await, Code::Aborted);
+    assert_status_code(
+        db.query_in_txn(QuerySpec::collection("txl"), &target1_id)
+            .await,
+        Code::Aborted,
+    );
+    assert_status_code(
+        db.batch_get_in_txn(["txl/b"], &target1_id).await,
+        Code::Aborted,
+    );
+    assert_status_code(
+        db.pipeline_in_txn(PipelineSpec::collection("txl"), &target1_id)
+            .await,
+        Code::Aborted,
+    );
+    assert_status_code(
+        db.commit_raw(
+            &target1_id,
+            WriteBatchSpec::new()
+                .put("txl/b", fields!({ "v": 9i64 }))
+                .into_writes(),
+        )
+        .await,
+        Code::Aborted,
+    );
+
+    // Best-effort `Rollback(target1)` is idempotent `Ok(())` and preserves the Wounded tombstone +
+    // `root_seq` for the subsequent retry.
+    db.rollback_raw(&target1_id)
+        .await
+        .expect("rollback after remote wound must return Ok");
+
+    let mut target2 = db
+        .begin_retry_rw_txn(&target1_id)
+        .await
+        .expect("retry after wound + rollback succeeds");
+    let target2_id = target2.id().to_vec();
+    expect_eq!(target2_id.len(), 16);
+    expect_ne!(target2_id, target1_id);
+
+    // Delayed duplicate `Rollback(attempt_1)` while `attempt_2` is Active is an idempotent no-op.
+    db.rollback_raw(&target1_id).await.unwrap();
+
+    // `mid` reads `txl/b`; `target2` inherited `target1`'s original `root_seq` (< `mid`), so
+    // `target2` wounds `mid` and commits cleanly!
+    let _unused = mid.get("txl/b").await.unwrap();
+    target2.put("txl/b", fields!({ "v": 2i64 }));
+    target2
+        .commit()
+        .await
+        .expect("retried transaction inherits original root_seq and wounds younger mid");
+    assert_status_code(db.get_in_txn("txl/seed_mid", &mid_id).await, Code::Aborted);
+    let _unused = mid.rollback().await;
+
+    // Delayed `Rollback(attempt_1)` after `attempt_2` is Committed STILL returns `Ok(())`, whereas
+    // `Rollback(attempt_2)` returns `Code::Aborted`.
+    db.rollback_raw(&target1_id).await.unwrap();
+    assert_status_code(db.rollback_raw(&target2_id).await, Code::Aborted);
+    assert_doc_wire_eq(
+        &db.get("txl/b").await.unwrap(),
+        "txl/b",
+        &fields!({ "v": 2i64 }),
+    );
+}
+
+#[gtest]
+#[tokio::test(start_paused = true)]
+async fn commit_retry_aborted_lineage_drop_cancel_clear_and_eviction_lifecycle() {
+    let mut db = TestEnv::new().build_db();
+    for doc in ["lc/a", "lc/seed_mid", "lc/u", "lc/v", "lc/drop"] {
+        db.put(doc, fields!({ "v": 0i64 })).await.unwrap();
+    }
+
+    // 1. `BeginTransaction(retry_transaction)` while `Committing` fails with `FailedPrecondition`;
+    //    after commit finishes, retry on `Closed { read_only: false, Committed }` rotates token.
+    let mut blocker = db.begin_rw_txn().await.unwrap();
+    let _unused = blocker.get("lc/a").await.unwrap();
+
+    let committer = db.begin_rw_txn().await.unwrap();
+    let committer_id = committer.id().to_vec();
+    let mut commit_client = db.clone();
+    let mut commit_op = ContentionProbe::spawn_op(async move {
+        commit_client
+            .commit_raw(
+                &committer_id,
+                WriteBatchSpec::new()
+                    .put("lc/a", fields!({ "v": 1i64 }))
+                    .into_writes(),
+            )
+            .await
+    });
+    commit_op.assert_pending().await;
+
+    assert_status_code(
+        db.begin_retry_rw_txn(committer.id()).await,
+        Code::FailedPrecondition,
+    );
+    blocker.rollback().await.unwrap();
+    commit_op.expect_ready().await.unwrap();
+    assert_status_code(db.rollback_raw(committer.id()).await, Code::Aborted);
+
+    let after_committed = db
+        .begin_retry_rw_txn(committer.id())
+        .await
+        .expect("retry after Committed RW slot succeeds with rotated bytes");
+    expect_ne!(after_committed.id(), committer.id());
+    after_committed.rollback().await.unwrap();
+
+    // 2. Contention abort enters `AbortedLineage`: follow-up ops return `InvalidArgument`,
+    //    `Rollback` returns `Ok(())` without clearing `root_seq`, and retry still wounds `mid`.
+    let mut t1 = db.begin_rw_txn().await.unwrap();
+    let _unused = t1.get("lc/u").await.unwrap();
+    let mut t2 = db.begin_rw_txn().await.unwrap();
+    let t2_id = t2.id().to_vec();
+    let _unused = t2.get("lc/u").await.unwrap();
+    let mut mid = db.begin_rw_txn().await.unwrap();
+    let mid_id = mid.id().to_vec();
+    let _unused = mid.get("lc/seed_mid").await.unwrap();
+
+    let mut t2_commit = ContentionProbe::spawn_op(async move {
+        t2.put("lc/u", fields!({ "v": 2i64 }));
+        t2.commit().await
+    });
+    t2_commit.assert_pending().await;
+    t1.put("lc/u", fields!({ "v": 1i64 }));
+    t1.commit().await.unwrap();
+    t2_commit.expect_aborted().await;
+
+    assert_status_code(db.get_in_txn("lc/u", &t2_id).await, Code::InvalidArgument);
+    assert_status_code(
+        db.query_in_txn(QuerySpec::collection("lc"), &t2_id).await,
+        Code::InvalidArgument,
+    );
+    assert_status_code(
+        db.commit_raw(
+            &t2_id,
+            WriteBatchSpec::new()
+                .put("lc/u", fields!({ "v": 3i64 }))
+                .into_writes(),
+        )
+        .await,
+        Code::InvalidArgument,
+    );
+    db.rollback_raw(&t2_id).await.unwrap();
+
+    let mut t2_retry = db.begin_retry_rw_txn(&t2_id).await.unwrap();
+    expect_ne!(t2_retry.id(), t2_id.as_slice());
+    let _unused = mid.get("lc/v").await.unwrap();
+    t2_retry.put("lc/v", fields!({ "v": 5i64 }));
+    t2_retry
+        .commit()
+        .await
+        .expect("retry after AbortedLineage preserves root_seq across Rollback");
+    assert_status_code(db.get_in_txn("lc/seed_mid", &mid_id).await, Code::Aborted);
+    let _unused = mid.rollback().await;
+
+    // 3. Dropping an in-flight blocked `Commit` future cleans up via `CommitSlotGuard::drop`: held
+    //    locks release, `GetDocument` returns `InvalidArgument`, and `Rollback` returns `Ok`.
+    let mut drop_blocker = db.begin_rw_txn().await.unwrap();
+    let _unused = drop_blocker.get("lc/drop").await.unwrap();
+    let dropped_txn = db.begin_rw_txn().await.unwrap();
+    let dropped_id = dropped_txn.id().to_vec();
+    let mut drop_client = db.clone();
+    let mut dropped_op = ContentionProbe::spawn_op(async move {
+        drop_client
+            .commit_raw(
+                &dropped_id,
+                WriteBatchSpec::new()
+                    .put("lc/drop", fields!({ "v": 9i64 }))
+                    .into_writes(),
+            )
+            .await
+    });
+    dropped_op.assert_pending().await;
+    drop(dropped_op);
+
+    assert_status_code(
+        db.get_in_txn("lc/drop", dropped_txn.id()).await,
+        Code::InvalidArgument,
+    );
+    db.rollback_raw(dropped_txn.id()).await.unwrap();
+    drop_blocker.rollback().await.unwrap();
+    db.put("lc/drop", fields!({ "v": 10i64 }))
+        .await
+        .expect("cancelled commit future did not leak lock");
+
+    // 4. Evicted `Vacant` valid issued ID can still be retried with rotated generation, and
+    //    `clear_database` deletes active/closed slots immediately without retaining tombstones.
+    let old_closed = db.begin_rw_txn().await.unwrap();
+    let old_closed_id = old_closed.id().to_vec();
+    old_closed.rollback().await.unwrap();
+    for _ in 0..4_100 {
+        let churn = db.begin_rw_txn().await.unwrap();
+        churn.rollback().await.unwrap();
+    }
+    assert_status_code(db.rollback_raw(&old_closed_id).await, Code::InvalidArgument);
+    let revived = db
+        .begin_retry_rw_txn(&old_closed_id)
+        .await
+        .expect("retry on evicted valid issued ID succeeds");
+    expect_ne!(revived.id(), old_closed_id.as_slice());
+
+    let revived_id = revived.id().to_vec();
+    let closed_before_clear = db.begin_rw_txn().await.unwrap();
+    let closed_before_clear_id = closed_before_clear.id().to_vec();
+    closed_before_clear.rollback().await.unwrap();
+    let cleared_db = db.project().database(&TestEnv::root_ref()).await;
+    db.clear_default_db().await;
+
+    let revived_txn_id = revived_id.clone().try_into().unwrap();
+    let closed_txn_id = closed_before_clear_id.clone().try_into().unwrap();
+    assert!(matches!(
+        cleared_db.commit(vec![], Some(revived_txn_id)).await,
+        Err(emulator_database::GenericDatabaseError::Aborted(_))
+    ));
+    assert!(matches!(
+        cleared_db.rollback(closed_txn_id).await,
+        Err(emulator_database::GenericDatabaseError::Aborted(_))
+    ));
+    // Over gRPC, the old database was dropped so recreated database rejects stale handles cleanly.
+    assert_status_code(
+        db.get_in_txn("lc/a", &revived_id).await,
+        Code::InvalidArgument,
+    );
+    assert_status_code(
+        db.rollback_raw(&closed_before_clear_id).await,
+        Code::InvalidArgument,
+    );
+}
+
+#[gtest]
+#[tokio::test]
+async fn optimistic_missing_doc_unary_get_detects_write_skew() {
+    let mut db = TestEnv::enterprise().build_db();
+
+    // 1. Unary GetDocument on a missing document in an absent collection must still pin `read_time`
+    //    so concurrent creation aborts commit with `Code::Aborted`.
+    let mut txn1 = db.begin_rw_txn().await.unwrap();
+    assert_status_code(txn1.get("opt_missing/a").await, Code::NotFound);
+    db.put("opt_missing/a", fields!({ "created": true }))
+        .await
+        .unwrap();
+    txn1.put("opt_missing_out/w1", fields!({ "n": 1i64 }));
+    assert_status_code(txn1.commit().await, Code::Aborted);
+
+    // 2. Unary GetDocument on a missing document in an existing collection must also detect
+    //    concurrent creation.
+    db.put("opt_existing/seed", fields!({ "v": 0i64 }))
+        .await
+        .unwrap();
+    let mut txn2 = db.begin_rw_txn().await.unwrap();
+    assert_status_code(txn2.get("opt_existing/absent").await, Code::NotFound);
+    db.put("opt_existing/absent", fields!({ "created": true }))
+        .await
+        .unwrap();
+    txn2.put("opt_missing_out/w2", fields!({ "n": 2i64 }));
+    assert_status_code(txn2.commit().await, Code::Aborted);
+}
+
+#[gtest]
+#[tokio::test]
+async fn optimistic_phantom_ancestor_detects_write_skew() {
+    let mut db = TestEnv::enterprise().build_db();
+
+    // 1. `list_docs(show_missing = true)` on a phantom ancestor must abort if materialized.
+    db.put("phantoms/p1/sub/child", fields!({ "v": 1i64 }))
+        .await
+        .unwrap();
+    let mut txn1 = db.begin_rw_txn().await.unwrap();
+    let listed = db
+        .list_docs(
+            "phantoms",
+            0,
+            "",
+            "",
+            None,
+            true,
+            Some(list_documents_request::ConsistencySelector::Transaction(
+                txn1.id().to_vec(),
+            )),
+        )
+        .await
+        .unwrap();
+    expect_eq!(short_ids(&listed.documents), vec!["p1"]);
+    db.put("phantoms/p1", fields!({ "materialized": true }))
+        .await
+        .unwrap();
+    txn1.put("opt_missing_out/w3", fields!({ "n": 3i64 }));
+    assert_status_code(txn1.commit().await, Code::Aborted);
+
+    // 2. Standalone `Query::missing_docs` on a fresh optimistic transaction also reads phantom
+    //    ancestors via `get_doc` (`peek_doc_meta == None`) and must pin `read_time`.
+    db.put("phantoms2/p1/sub/child", fields!({ "v": 1i64 }))
+        .await
+        .unwrap();
+    let raw_db = db.project().database(&TestEnv::root_ref()).await;
+    let mut txn2 = db.begin_rw_txn().await.unwrap();
+    let txn2_id = txn2.id().to_vec().try_into().unwrap();
+    let missing_query = QueryBuilder::from(
+        Ref::Root(TestEnv::root_ref()),
+        vec![CollectionSelector {
+            collection_id:   "phantoms2".to_string(),
+            all_descendants: false,
+        }],
+    )
+    .enterprise_edition(true)
+    .consistency(ReadConsistency::Transaction(txn2_id))
+    .build()
+    .unwrap();
+    let missing = missing_query.missing_docs(&raw_db).await.unwrap();
+    expect_eq!(missing, vec![doc_path("phantoms2/p1")]);
+    db.put("phantoms2/p1", fields!({ "materialized": true }))
+        .await
+        .unwrap();
+    txn2.put("opt_missing_out/w4", fields!({ "n": 4i64 }));
+    assert_status_code(txn2.commit().await, Code::Aborted);
+}
+
+fn assert_no_internal_or_cleared<T: std::fmt::Debug>(
+    label: &str,
+    res: Result<T, Status>,
+    allow_aborted: bool,
+) {
+    if let Err(status) = res {
+        assert_ne!(
+            status.code(),
+            Code::Internal,
+            "{label} must never return Code::Internal: {status:?}"
+        );
+        assert!(
+            !status.message().contains("database was cleared"),
+            "{label} must never return \"database was cleared\": {status:?}"
+        );
+        if allow_aborted {
+            assert!(
+                matches!(status.code(), Code::InvalidArgument | Code::Aborted),
+                "{label} returned unexpected error status: {status:?}"
+            );
+        } else {
+            assert_eq!(
+                status.code(),
+                Code::InvalidArgument,
+                "{label} expected InvalidArgument, got {status:?}"
+            );
+        }
+    }
+}
+
+#[gtest]
+#[tokio::test(start_paused = true)]
+async fn concurrent_get_promoted_waiter_racing_rollback_never_returns_cleared() {
+    let mut db = TestEnv::new().build_db();
+    for doc in ["race/seed", "race/a", "race/b"] {
+        db.put(doc, fields!({ "v": 1i64 })).await.unwrap();
+    }
+
+    // Promoted GetDocument waiter interrupted by Rollback before `consume_wait_grant` runs must
+    // fail with `InvalidArgument` (never `"database was cleared"`).
+    let mut hold_b = db.begin_rw_txn().await.unwrap();
+    let _unused = hold_b.get("race/b").await.unwrap();
+    let mut writer = db.begin_rw_txn().await.unwrap();
+    let _unused = writer.get("race/seed").await.unwrap();
+    writer
+        .put("race/a", fields!({ "v": 2i64 }))
+        .put("race/b", fields!({ "v": 2i64 }));
+    let mut writer_commit = ContentionProbe::spawn_op(writer.commit());
+    writer_commit.assert_pending().await;
+
+    let tx = db.begin_rw_txn().await.unwrap();
+    let tx_id = tx.id().to_vec();
+    let mut reader_db = db.clone();
+    let reader_id = tx_id.clone();
+    let mut tx_read =
+        ContentionProbe::spawn_op(async move { reader_db.get_in_txn("race/a", &reader_id).await });
+    tx_read.assert_pending().await;
+
+    hold_b.rollback().await.unwrap();
+    writer_commit.expect_ready().await.unwrap();
+
+    // Roll back before polling `tx_read` so `consume_wait_grant` sees a closed session.
+    db.rollback_raw(&tx_id).await.unwrap();
+    let err = tx_read
+        .expect_ready()
+        .await
+        .expect_err("rolled-back promoted read must fail");
+    assert_no_internal_or_cleared("promoted read after rollback", Err::<(), _>(err), false);
+}
+
+#[gtest]
+#[tokio::test(start_paused = true)]
+async fn concurrent_get_parked_waiter_racing_same_txn_commit_never_returns_cleared() {
+    let mut db = TestEnv::new().build_db();
+    for doc in ["race2/seed", "race2/a", "race2/b"] {
+        db.put(doc, fields!({ "v": 1i64 })).await.unwrap();
+    }
+
+    // Parked GetDocument waiter on `race2/a` when the same transaction commits `race2/x` (sealing
+    // & closing its session) must fail cleanly without `"database was cleared"`.
+    let mut hold_b2 = db.begin_rw_txn().await.unwrap();
+    let _unused = hold_b2.get("race2/b").await.unwrap();
+    let mut writer2 = db.begin_rw_txn().await.unwrap();
+    let _unused = writer2.get("race2/seed").await.unwrap();
+    writer2
+        .put("race2/a", fields!({ "v": 3i64 }))
+        .put("race2/b", fields!({ "v": 3i64 }));
+    let mut writer2_commit = ContentionProbe::spawn_op(writer2.commit());
+    writer2_commit.assert_pending().await;
+
+    let tx2 = db.begin_rw_txn().await.unwrap();
+    let tx2_id = tx2.id().to_vec();
+    let mut reader2_db = db.clone();
+    let reader2_id = tx2_id.clone();
+    let mut tx2_read =
+        ContentionProbe::spawn_op(
+            async move { reader2_db.get_in_txn("race2/a", &reader2_id).await },
+        );
+    tx2_read.assert_pending().await;
+
+    db.commit_raw(
+        &tx2_id,
+        WriteBatchSpec::new()
+            .put("race2/x", fields!({ "v": 10i64 }))
+            .into_writes(),
+    )
+    .await
+    .unwrap();
+    hold_b2.rollback().await.unwrap();
+    writer2_commit.expect_ready().await.unwrap();
+
+    let err2 = tx2_read
+        .expect_ready()
+        .await
+        .expect_err("parked read during same-txn commit must fail");
+    assert_no_internal_or_cleared(
+        "parked read during same-txn commit",
+        Err::<(), _>(err2),
+        true,
+    );
+}
+
+#[gtest]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_get_and_query_racing_commit_or_rollback_mt_never_return_internal_or_cleared() {
+    let mut db = TestEnv::new().build_db();
+    db.put("race_mt/d1", fields!({ "v": 1i64 })).await.unwrap();
+    db.put("race_mt/d2", fields!({ "v": 2i64 })).await.unwrap();
+
+    for iter in 0..40i64 {
+        // Race GetDocument + RunQuery against Commit on the same TransactionId and documents.
+        {
+            let tx = db.begin_rw_txn().await.unwrap();
+            let id = tx.id().to_vec();
+            let barrier = Arc::new(Barrier::new(3));
+
+            let mut gdb = db.clone();
+            let gid = id.clone();
+            let gb = Arc::clone(&barrier);
+            let get_task = tokio::spawn(async move {
+                gb.wait().await;
+                gdb.get_in_txn("race_mt/d1", &gid).await
+            });
+
+            let mut qdb = db.clone();
+            let qid = id.clone();
+            let qb = Arc::clone(&barrier);
+            let query_task = tokio::spawn(async move {
+                qb.wait().await;
+                qdb.query_in_txn(QuerySpec::collection("race_mt"), &qid)
+                    .await
+            });
+
+            let mut cdb = db.clone();
+            let cid = id;
+            let cb = Arc::clone(&barrier);
+            let commit_task = tokio::spawn(async move {
+                cb.wait().await;
+                cdb.commit_raw(
+                    &cid,
+                    WriteBatchSpec::new()
+                        .put("race_mt/d1", fields!({ "v": iter + 10 }))
+                        .put("race_mt/d2", fields!({ "v": iter + 20 }))
+                        .into_writes(),
+                )
+                .await
+            });
+
+            let (gr, qr, cr) = tokio::join!(get_task, query_task, commit_task);
+            assert_no_internal_or_cleared("mt commit race get", gr.unwrap(), true);
+            assert_no_internal_or_cleared("mt commit race query", qr.unwrap(), true);
+            assert_no_internal_or_cleared("mt commit race commit", cr.unwrap(), true);
+        }
+
+        // Race GetDocument + RunQuery against Rollback on the same TransactionId.
+        {
+            let tx = db.begin_rw_txn().await.unwrap();
+            let id = tx.id().to_vec();
+            let barrier = Arc::new(Barrier::new(3));
+
+            let mut gdb = db.clone();
+            let gid = id.clone();
+            let gb = Arc::clone(&barrier);
+            let get_task = tokio::spawn(async move {
+                gb.wait().await;
+                gdb.get_in_txn("race_mt/d1", &gid).await
+            });
+
+            let mut qdb = db.clone();
+            let qid = id.clone();
+            let qb = Arc::clone(&barrier);
+            let query_task = tokio::spawn(async move {
+                qb.wait().await;
+                qdb.query_in_txn(QuerySpec::collection("race_mt"), &qid)
+                    .await
+            });
+
+            let mut rdb = db.clone();
+            let rid = id;
+            let rb = Arc::clone(&barrier);
+            let rollback_task = tokio::spawn(async move {
+                rb.wait().await;
+                rdb.rollback_raw(&rid).await
+            });
+
+            let (gr, qr, rr) = tokio::join!(get_task, query_task, rollback_task);
+            assert_no_internal_or_cleared("mt rollback race get", gr.unwrap(), false);
+            assert_no_internal_or_cleared("mt rollback race query", qr.unwrap(), false);
+            assert_no_internal_or_cleared("mt rollback race rollback", rr.unwrap(), false);
+        }
+    }
+}
+
+fn with_attempt_gen(token: &[u8], attempt_gen: u64) -> Vec<u8> {
+    let mut out = token.to_vec();
+    out[8..16].copy_from_slice(&attempt_gen.to_le_bytes());
+    out
+}
+
+#[gtest]
+#[tokio::test]
+async fn transaction_id_u64_max_attempt_gen_rejects_without_overflow_while_preserving_evicted_retry()
+ {
+    let mut db = TestEnv::new().build_db();
+
+    // `attempt_gen == u64::MAX` must return `InvalidArgument` (without overflowing/panicking)
+    // whether the lineage slot is active, closed, or evicted from the 4,096-entry ring.
+    let active_txn = db.begin_rw_txn().await.unwrap();
+    let active_max_gen = with_attempt_gen(active_txn.id(), u64::MAX);
+    assert_status_code(
+        db.begin_retry_rw_txn(&active_max_gen).await,
+        Code::InvalidArgument,
+    );
+    active_txn.rollback().await.unwrap();
+    assert_status_code(
+        db.begin_retry_rw_txn(&active_max_gen).await,
+        Code::InvalidArgument,
+    );
+
+    let evictable_rw = db.begin_rw_txn().await.unwrap();
+    let evictable_rw_id = evictable_rw.id().to_vec();
+    evictable_rw.rollback().await.unwrap();
+
+    for _ in 0..4_100 {
+        let churn = db.begin_rw_txn().await.unwrap();
+        churn.rollback().await.unwrap();
+    }
+
+    // Evicted `u64::MAX` must return `InvalidArgument` cleanly (no integer overflow panic!).
+    assert_status_code(
+        db.begin_retry_rw_txn(&active_max_gen).await,
+        Code::InvalidArgument,
+    );
+
+    // Normal same-DB evicted RW retry token must continue succeeding.
+    let revived = db
+        .begin_retry_rw_txn(&evictable_rw_id)
+        .await
+        .expect("normal same-DB evicted RW retry must still succeed");
+    expect_ne!(revived.id(), evictable_rw_id.as_slice());
+    revived.rollback().await.unwrap();
+}
+
+#[gtest]
+#[tokio::test]
+async fn transaction_id_rejects_cross_db_and_post_clear_retry_tokens() {
+    let mut db = TestEnv::new().build_db();
+
+    // 1. Cross-DB retry tokens (another database in the same `FirestoreProject` AND a separate
+    //    `TestEnv`) must be rejected with `InvalidArgument` for both RW and RO tokens.
+    let db_a_active = db.begin_rw_txn().await.unwrap();
+    let db_a_active_id = db_a_active.id().to_vec();
+    let db_a_closed = db.begin_rw_txn().await.unwrap();
+    let db_a_closed_id = db_a_closed.id().to_vec();
+    db_a_closed.rollback().await.unwrap();
+    let db_a_ro = db.begin_ro_txn(None).await.unwrap();
+    let db_a_ro_id = db_a_ro.id().to_vec();
+    db_a_ro.rollback().await.unwrap();
+
+    let other_db_root = "projects/test-project/databases/other-db";
+    for cross_id in [&db_a_active_id, &db_a_closed_id, &db_a_ro_id] {
+        let res = db
+            .raw_grpc()
+            .begin_transaction(BeginTransactionRequest {
+                database: other_db_root.to_string(),
+                options: Some(TransactionOptions {
+                    mode: Some(transaction_options::Mode::ReadWrite(ReadWrite {
+                        retry_transaction: cross_id.clone(),
+                        ..Default::default()
+                    })),
+                }),
+                request_options: None,
+            })
+            .await;
+        assert_status_code(res, Code::InvalidArgument);
+    }
+
+    let mut isolated_env_db = TestEnv::new().build_db();
+    assert_status_code(
+        isolated_env_db.begin_retry_rw_txn(&db_a_closed_id).await,
+        Code::InvalidArgument,
+    );
+    db_a_active.rollback().await.unwrap();
+
+    // 2. Post-`clear_default_db()` retry tokens on the recreated database must return
+    //    `InvalidArgument`.
+    let pre_clear_active = db.begin_rw_txn().await.unwrap();
+    let pre_clear_active_id = pre_clear_active.id().to_vec();
+    let pre_clear_closed = db.begin_rw_txn().await.unwrap();
+    let pre_clear_closed_id = pre_clear_closed.id().to_vec();
+    pre_clear_closed.rollback().await.unwrap();
+
+    db.clear_default_db().await;
+
+    assert_status_code(
+        db.begin_retry_rw_txn(&pre_clear_active_id).await,
+        Code::InvalidArgument,
+    );
+    assert_status_code(
+        db.begin_retry_rw_txn(&pre_clear_closed_id).await,
+        Code::InvalidArgument,
+    );
+}
+
+#[gtest]
+#[tokio::test(start_paused = true)]
+async fn cancel_mid_commit_cleans_retained_reads_partial_leases_and_optimistic_commit_lock() {
+    // Part A: Pessimistic mid-commit cancellation holding retained reads (`r1`, `w2`) and a
+    // partial `WriteLease` (`w1`) while blocked on `w2`.
+    {
+        let mut db = TestEnv::new().build_db();
+        for doc in ["canc/r1", "canc/w1", "canc/w2"] {
+            db.put(doc, fields!({ "v": 0i64 })).await.unwrap();
+        }
+
+        let mut blocker = db.begin_rw_txn().await.unwrap();
+        let _unused = blocker.get("canc/w2").await.unwrap();
+
+        let mut tx = db.begin_rw_txn().await.unwrap();
+        let tx_id = tx.id().to_vec();
+        let _unused = tx.get("canc/r1").await.unwrap();
+        let _unused = tx.get("canc/w2").await.unwrap();
+        tx.put("canc/w1", fields!({ "v": 99i64 }))
+            .put("canc/w2", fields!({ "v": 99i64 }));
+
+        let mut commit_op = ContentionProbe::spawn_op(tx.commit());
+        commit_op.assert_pending().await;
+        drop(commit_op);
+
+        assert_status_code(
+            db.get_in_txn("canc/r1", &tx_id).await,
+            Code::InvalidArgument,
+        );
+        db.rollback_raw(&tx_id).await.unwrap();
+
+        // Both the retained read lock on `r1` and partial write lease on `w1` are released.
+        db.put("canc/r1", fields!({ "v": 1i64 }))
+            .await
+            .expect("retained read lock must be released on commit cancel");
+        db.put("canc/w1", fields!({ "v": 2i64 }))
+            .await
+            .expect("partial write lease must be released on commit cancel");
+
+        blocker.rollback().await.unwrap();
+        assert_doc_wire_eq(
+            &db.get("canc/w2").await.unwrap(),
+            "canc/w2",
+            &fields!({ "v": 0i64 }),
+        );
+        let retried = db.begin_retry_rw_txn(&tx_id).await.unwrap();
+        retried.rollback().await.unwrap();
+    }
+
+    // Part B: Enterprise Optimistic mid-commit cancellation while parked on
+    // `optimistic_commit_lock`.
+    {
+        let mut db = TestEnv::enterprise().build_db();
+        db.put("opt_c/x", fields!({ "v": 0i64 })).await.unwrap();
+        db.put("opt_c/y", fields!({ "v": 0i64 })).await.unwrap();
+
+        db.set_admin_mode(Some("ENTERPRISE"), Some("PESSIMISTIC"))
+            .await;
+        let mut blocker = db.begin_rw_txn().await.unwrap();
+        assert_status_code(blocker.get("opt_c/lock").await, Code::NotFound);
+        db.set_admin_mode(None, Some("OPTIMISTIC")).await;
+
+        let mut holder = db.begin_rw_txn().await.unwrap();
+        let _unused = holder.get("opt_c/x").await.unwrap();
+        holder
+            .put("opt_c/lock", fields!({ "held": true }))
+            .put("opt_c/x", fields!({ "v": 1i64 }));
+        let mut holder_commit = ContentionProbe::spawn_op(holder.commit());
+        holder_commit.assert_pending().await;
+
+        let mut victim = db.begin_rw_txn().await.unwrap();
+        let victim_id = victim.id().to_vec();
+        let _unused = victim.get("opt_c/y").await.unwrap();
+        victim.put("opt_c/y", fields!({ "v": 77i64 }));
+        let mut victim_commit = ContentionProbe::spawn_op(victim.commit());
+        victim_commit.assert_pending().await;
+        drop(victim_commit);
+
+        assert_status_code(
+            db.get_in_txn("opt_c/y", &victim_id).await,
+            Code::InvalidArgument,
+        );
+        db.rollback_raw(&victim_id).await.unwrap();
+
+        blocker.rollback().await.unwrap();
+        holder_commit.expect_ready().await.unwrap();
+
+        let mut followup = db.begin_rw_txn().await.unwrap();
+        followup.put("opt_c/y", fields!({ "v": 5i64 }));
+        followup.commit().await.unwrap();
+        assert_doc_wire_eq(
+            &db.get("opt_c/y").await.unwrap(),
+            "opt_c/y",
+            &fields!({ "v": 5i64 }),
+        );
+    }
+}
+
+#[gtest]
+#[tokio::test]
+async fn stale_attempt_gen_rpc_matrix_across_active_wounded_and_closed_attempts() {
+    let mut db = TestEnv::enterprise().build_db();
+    db.set_admin_mode(Some("ENTERPRISE"), Some("PESSIMISTIC"))
+        .await;
+    for doc in ["stale/seed", "stale/d"] {
+        db.put(doc, fields!({ "v": 0i64 })).await.unwrap();
+    }
+
+    let mut older = db.begin_rw_txn().await.unwrap();
+    let _unused = older.get("stale/seed").await.unwrap();
+
+    let mut t1 = db.begin_rw_txn().await.unwrap();
+    let attempt_1 = t1.id().to_vec();
+    let _unused = t1.get("stale/d").await.unwrap();
+
+    // Wound `attempt_1` -> retry into `attempt_2` (Active).
+    older.put("stale/d", fields!({ "v": 1i64 }));
+    older.commit().await.unwrap();
+
+    let mut t2 = db.begin_retry_rw_txn(&attempt_1).await.unwrap();
+    let attempt_2 = t2.id().to_vec();
+
+    let assert_stale_matrix = |mut client: crate::harness::client::TestDb, stale_id: Vec<u8>| async move {
+        assert_status_code(
+            client.get_in_txn("stale/d", &stale_id).await,
+            Code::InvalidArgument,
+        );
+        assert_status_code(
+            client
+                .query_in_txn(QuerySpec::collection("stale"), &stale_id)
+                .await,
+            Code::InvalidArgument,
+        );
+        assert_status_code(
+            client
+                .commit_raw(
+                    &stale_id,
+                    WriteBatchSpec::new()
+                        .put("stale/d", fields!({ "v": 99i64 }))
+                        .into_writes(),
+                )
+                .await,
+            Code::InvalidArgument,
+        );
+        assert_status_code(
+            client.commit_raw(&stale_id, vec![]).await,
+            Code::InvalidArgument,
+        );
+        assert_status_code(
+            client.batch_get_in_txn(["stale/d"], &stale_id).await,
+            Code::InvalidArgument,
+        );
+        assert_status_code(
+            client
+                .list_docs(
+                    "stale",
+                    0,
+                    "",
+                    "",
+                    None,
+                    false,
+                    Some(list_documents_request::ConsistencySelector::Transaction(
+                        stale_id.clone(),
+                    )),
+                )
+                .await,
+            Code::InvalidArgument,
+        );
+        assert_status_code(
+            client
+                .aggregate_in_txn(
+                    QuerySpec::collection("stale"),
+                    AggregationSpec::new().count("n"),
+                    &stale_id,
+                )
+                .await,
+            Code::InvalidArgument,
+        );
+        assert_status_code(
+            client
+                .pipeline_in_txn(PipelineSpec::collection("stale"), &stale_id)
+                .await,
+            Code::InvalidArgument,
+        );
+        // Stale rollback remains an idempotent no-op without affecting newer attempts.
+        client.rollback_raw(&stale_id).await.unwrap();
+    };
+
+    // 1. `attempt_2` is Active: stale `attempt_1` rejected across all read/commit RPCs and returns
+    //    `FailedPrecondition` on `BeginTransaction(retry_transaction)`.
+    assert_stale_matrix(db.clone(), attempt_1.clone()).await;
+    assert_status_code(
+        db.begin_retry_rw_txn(&attempt_1).await,
+        Code::FailedPrecondition,
+    );
+    let _unused = t2.get("stale/d").await.unwrap();
+
+    // 2. `attempt_2` is Closed(Committed): stale `attempt_1` still rejected across RPC matrix while
+    //    `Rollback(attempt_1)` stays `Ok(())` and `Rollback(attempt_2)` returns `Aborted`.
+    t2.put("stale/d", fields!({ "v": 2i64 }));
+    t2.commit().await.unwrap();
+    assert_stale_matrix(db.clone(), attempt_1).await;
+    assert_status_code(db.rollback_raw(&attempt_2).await, Code::Aborted);
+
+    // 3. `attempt_2` is Wounded: stale `attempt_1` still rejected across RPC matrix, while
+    //    `attempt_2` returns `Aborted`.
+    let mut w_older = db.begin_rw_txn().await.unwrap();
+    let _unused = w_older.get("stale/seed").await.unwrap();
+    let w1 = db.begin_rw_txn().await.unwrap();
+    let w1_id = w1.id().to_vec();
+    w1.rollback().await.unwrap();
+    let mut w2 = db.begin_retry_rw_txn(&w1_id).await.unwrap();
+    let w2_id = w2.id().to_vec();
+    let _unused = w2.get("stale/d").await.unwrap();
+
+    w_older.put("stale/d", fields!({ "v": 3i64 }));
+    w_older.commit().await.unwrap();
+
+    assert_status_code(db.get_in_txn("stale/d", &w2_id).await, Code::Aborted);
+    assert_stale_matrix(db.clone(), w1_id).await;
+    assert_status_code(db.get_in_txn("stale/d", &w2_id).await, Code::Aborted);
+    db.rollback_raw(&w2_id).await.unwrap();
 }

@@ -2,7 +2,7 @@
 
 ## Architecture & Subsystem Contracts
 - **System Blueprint**: Read [README.md](./README.md) before designing features, changing cross-crate interfaces, or modifying build/verification workflows.
-- **Cloud Firestore Conformance Suite**: Read [test-suite/README.md](./test-suite/README.md) and [test-suite/tests/README.md](./test-suite/tests/README.md) whenever adding features, changing Firestore semantics, or fixing bugs in `crates/emulator-database`, `crates/emulator-grpc`, `crates/emulator-http`, `crates/googleapis`, or `crates/fifo-rwlock`.
+- **Cloud Firestore Conformance Suite**: Read [test-suite/README.md](./test-suite/README.md) and [test-suite/tests/README.md](./test-suite/tests/README.md) whenever adding features, changing Firestore semantics, or fixing bugs in `crates/emulator-database`, `crates/emulator-grpc`, `crates/emulator-http`, or `crates/googleapis`.
 
 ## Conformance-First Development Rule
 `firestore-emulator` conforms strictly to **production Google Cloud Firestore**, verified by `test-suite/`. Every new feature (including lifting `notImplementedInRust` guards) and every behavioral bugfix **must** include or update conformance tests in `test-suite/tests/`:

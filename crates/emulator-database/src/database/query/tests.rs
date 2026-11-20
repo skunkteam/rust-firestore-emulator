@@ -13,7 +13,7 @@ use tokio_test::{assert_ready, assert_ready_ok, task::spawn};
 
 use crate::{
     FirestoreConfig, FirestoreDatabase, FirestoreProject, GenericDatabaseError,
-    database::transaction::TransactionId,
+    database::{lock::LockPriority, transaction::TransactionId},
     document::DocumentMeta,
     query::{
         Direction, DistanceMeasure, FindNearest, Query, QueryBuilder,
@@ -90,8 +90,15 @@ fn check_matching_docs<'a, Id: Display>(
     );
 }
 
-fn is_locked(meta: &Arc<DocumentMeta>) -> bool {
-    spawn(meta.write_owned()).poll_until_idle().is_pending()
+fn is_locked(db: &FirestoreDatabase) -> impl Fn(&Arc<DocumentMeta>) -> bool + '_ {
+    move |meta| {
+        let session = db
+            .locks
+            .new_session(None, LockPriority::NextSeq, false, false);
+        spawn(session.acquire_write(&meta.name))
+            .poll_until_idle()
+            .is_pending()
+    }
 }
 
 type Docs = Vec<Arc<DocumentMeta>>;
@@ -157,8 +164,8 @@ async fn correct_locking_in_txn_with_cursors() -> Result<()> {
     check_matching_docs(&database, collection_id, &matched_docs, [2, 4, 6]);
 
     expect_that!(unmatched_docs, len(eq(7)));
-    expect_that!(matched_docs, each(predicate(is_locked)));
-    expect_that!(unmatched_docs, each(not(predicate(is_locked))));
+    expect_that!(matched_docs, each(predicate(is_locked(&database))));
+    expect_that!(unmatched_docs, each(not(predicate(is_locked(&database)))));
 
     Ok(())
 }
@@ -200,8 +207,8 @@ async fn correct_locking_in_txn_with_offset_and_limit() -> Result<()> {
     check_matching_docs(&database, collection_id, &matched_docs, [2, 4, 6]);
 
     expect_that!(unmatched_docs, len(eq(7)));
-    expect_that!(matched_docs, each(predicate(is_locked)));
-    expect_that!(unmatched_docs, each(not(predicate(is_locked))));
+    expect_that!(matched_docs, each(predicate(is_locked(&database))));
+    expect_that!(unmatched_docs, each(not(predicate(is_locked(&database)))));
 
     Ok(())
 }
