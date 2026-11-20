@@ -6,7 +6,13 @@ pub(crate) struct Timeouts {
     pub(crate) write: Duration,
     /// Usually a slightly longer timeout for read locks as these have less chance of failing in
     /// the end.
-    pub(crate) read:  Duration,
+    pub(crate) read: Duration,
+    /// Idle timeout for active transactions before expiration (`60s` Cloud default).
+    pub(crate) txn_idle: Duration,
+    /// Minimum post-first-activity lifetime for active transactions (`120s` Cloud default).
+    pub(crate) txn_used_min: Duration,
+    /// Hard maximum lifetime for active transactions (`270s` Cloud default).
+    pub(crate) txn_max: Duration,
 }
 
 impl Timeouts {
@@ -16,7 +22,10 @@ impl Timeouts {
     /// contention. This simulates that behavior more accurately.
     pub(crate) const CLOUD: Timeouts = Timeouts {
         write: Duration::from_secs(15),
-        read:  Duration::from_secs(16),
+        read: Duration::from_secs(16),
+        txn_idle: Duration::from_secs(60),
+        txn_used_min: Duration::from_secs(120),
+        txn_max: Duration::from_secs(270),
     };
 
     /// Must faster lock timeouts (than [`CLOUD`](Self::CLOUD)).
@@ -24,6 +33,9 @@ impl Timeouts {
     /// Reduced to 2 second write locks and 5 second read locks for faster unit-tests.
     pub(crate) const FAST: Timeouts = Timeouts {
         write: Duration::from_secs(2),
-        read:  Duration::from_secs(5),
+        read: Duration::from_secs(5),
+        txn_idle: Duration::from_secs(60),
+        txn_used_min: Duration::from_secs(120),
+        txn_max: Duration::from_secs(270),
     };
 }

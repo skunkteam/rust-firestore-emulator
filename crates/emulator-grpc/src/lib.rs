@@ -1036,6 +1036,7 @@ mod tests {
         Box::leak(Box::new(FirestoreProject::new(FirestoreConfig {
             long_contention_timeout: false,
             default_enterprise,
+            ..Default::default()
         })))
     }
 

@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use emulator_database::{FirestoreConfig, FirestoreProject, reference::RootRef};
 
 use super::client::TestDb;
@@ -9,7 +11,9 @@ pub(crate) const DOCUMENTS_ROOT: &str = "projects/test-project/databases/(defaul
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct TestEnv {
     long_contention_timeout: bool,
-    default_enterprise:      bool,
+    default_enterprise: bool,
+    transaction_idle_timeout: Option<Duration>,
+    transaction_max_lifetime: Option<Duration>,
 }
 
 impl TestEnv {
@@ -21,8 +25,8 @@ impl TestEnv {
     /// Creates an `ENTERPRISE` edition environment with `Timeouts::FAST` (`2s` write / `5s` read).
     pub(crate) fn enterprise() -> Self {
         Self {
-            long_contention_timeout: false,
-            default_enterprise:      true,
+            default_enterprise: true,
+            ..Self::default()
         }
     }
 
@@ -32,11 +36,40 @@ impl TestEnv {
         self
     }
 
+    /// Overrides the active transaction idle timeout (and sets post-first-read minimum window to
+    /// `2 * timeout` clamped to max lifetime).
+    pub(crate) fn transaction_idle_timeout(mut self, timeout: impl Into<Option<Duration>>) -> Self {
+        self.transaction_idle_timeout = timeout.into();
+        self
+    }
+
+    /// Overrides the active transaction maximum lifetime.
+    pub(crate) fn transaction_max_lifetime(
+        mut self,
+        lifetime: impl Into<Option<Duration>>,
+    ) -> Self {
+        self.transaction_max_lifetime = lifetime.into();
+        self
+    }
+
+    /// Overrides both the active transaction idle timeout and maximum lifetime.
+    pub(crate) fn transaction_timeouts(
+        mut self,
+        idle: impl Into<Option<Duration>>,
+        max: impl Into<Option<Duration>>,
+    ) -> Self {
+        self.transaction_idle_timeout = idle.into();
+        self.transaction_max_lifetime = max.into();
+        self
+    }
+
     /// Leaks one isolated [`FirestoreProject`] for the test (`database_id = "(default)"`).
     pub(crate) fn build_project(self) -> &'static FirestoreProject {
         Box::leak(Box::new(FirestoreProject::new(FirestoreConfig {
             long_contention_timeout: self.long_contention_timeout,
-            default_enterprise:      self.default_enterprise,
+            default_enterprise: self.default_enterprise,
+            transaction_idle_timeout: self.transaction_idle_timeout,
+            transaction_max_lifetime: self.transaction_max_lifetime,
         })))
     }
 
@@ -50,5 +83,44 @@ impl TestEnv {
         DATABASE_ROOT
             .parse()
             .expect("static DATABASE_ROOT must parse as RootRef")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use super::TestEnv;
+
+    #[test]
+    fn test_env_transaction_timeout_builders_configure_project() {
+        let env_idle = TestEnv::new().transaction_idle_timeout(Duration::from_secs(3));
+        assert_eq!(
+            env_idle.transaction_idle_timeout,
+            Some(Duration::from_secs(3))
+        );
+        assert_eq!(env_idle.transaction_max_lifetime, None);
+        let _proj_idle = env_idle.build_project();
+
+        let env_max = TestEnv::enterprise().transaction_max_lifetime(Duration::from_secs(15));
+        assert_eq!(env_max.transaction_idle_timeout, None);
+        assert_eq!(
+            env_max.transaction_max_lifetime,
+            Some(Duration::from_secs(15))
+        );
+        let _proj_max = env_max.build_project();
+
+        let env_both = TestEnv::new()
+            .cloud_timeouts()
+            .transaction_timeouts(Duration::from_secs(2), Duration::from_secs(10));
+        assert_eq!(
+            env_both.transaction_idle_timeout,
+            Some(Duration::from_secs(2))
+        );
+        assert_eq!(
+            env_both.transaction_max_lifetime,
+            Some(Duration::from_secs(10))
+        );
+        let _proj_both = env_both.build_project();
     }
 }

@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 
 use emulator_database::{query::QueryBuilder, read_consistency::ReadConsistency, reference::Ref};
 use googleapis::{
@@ -1803,4 +1803,350 @@ async fn stale_attempt_gen_rpc_matrix_across_active_wounded_and_closed_attempts(
     assert_stale_matrix(db.clone(), w1_id).await;
     assert_status_code(db.get_in_txn("stale/d", &w2_id).await, Code::Aborted);
     db.rollback_raw(&w2_id).await.unwrap();
+}
+
+const EXPIRED_TXN_MESSAGE: &str = "The referenced transaction has expired or is no longer valid.";
+
+fn assert_expired<T: std::fmt::Debug>(res: Result<T, Status>) {
+    let status = assert_status_code(res, Code::Aborted);
+    assert_eq!(status.message(), EXPIRED_TXN_MESSAGE);
+}
+
+async fn assert_expired_rpc_matrix(
+    db: &mut crate::harness::client::TestDb,
+    txn_id: &[u8],
+    doc_rel: &str,
+    col_rel: &str,
+    include_pipeline: bool,
+) {
+    assert_expired(db.get_in_txn(doc_rel, txn_id).await);
+    assert_expired(db.get_in_txn(doc_rel, txn_id).await);
+    assert_expired(db.batch_get_in_txn([doc_rel], txn_id).await);
+    assert_expired(db.batch_get_in_txn(["ttl/missing"], txn_id).await);
+    assert_expired(
+        db.query_in_txn(QuerySpec::collection(col_rel), txn_id)
+            .await,
+    );
+    assert_expired(
+        db.aggregate_in_txn(
+            QuerySpec::collection(col_rel),
+            AggregationSpec::new().count("n"),
+            txn_id,
+        )
+        .await,
+    );
+    if include_pipeline {
+        assert_expired(
+            db.pipeline_in_txn(PipelineSpec::collection(col_rel), txn_id)
+                .await,
+        );
+    }
+    assert_expired(db.commit_raw(txn_id, vec![]).await);
+    assert_expired(
+        db.commit_raw(
+            txn_id,
+            WriteBatchSpec::new()
+                .put(doc_rel, fields!({ "v": 999i64 }))
+                .into_writes(),
+        )
+        .await,
+    );
+}
+
+#[gtest]
+#[tokio::test(start_paused = true)]
+async fn unused_and_used_transaction_ttl_lifecycle_and_error_matrix() {
+    for (edition, mode, include_pipeline) in [
+        ("STANDARD", "PESSIMISTIC", false),
+        ("ENTERPRISE", "OPTIMISTIC", true),
+        ("ENTERPRISE", "PESSIMISTIC", true),
+    ] {
+        let mut db = TestEnv::new().build_db();
+        db.set_admin_mode(Some(edition), Some(mode)).await;
+        db.put("ttl/d1", fields!({ "v": 1i64 })).await.unwrap();
+
+        // 1. Unused RW & RO stay alive at 59s and expire at 60s.
+        let rw_unused_alive = db.begin_rw_txn().await.unwrap();
+        let ro_unused_alive = db.begin_ro_txn(None).await.unwrap();
+        let rw_unused_exp = db.begin_rw_txn().await.unwrap();
+        let rw_unused_exp_id = rw_unused_exp.id().to_vec();
+        let rw_unused_rb = db.begin_rw_txn().await.unwrap();
+        let rw_unused_rb_id = rw_unused_rb.id().to_vec();
+        let ro_unused_exp = db.begin_ro_txn(None).await.unwrap();
+        let ro_unused_exp_id = ro_unused_exp.id().to_vec();
+        let ro_unused_rb = db.begin_ro_txn(None).await.unwrap();
+        let ro_unused_rb_id = ro_unused_rb.id().to_vec();
+
+        // Used RW (read at t=0): check alive at 119s vs expired at 120s.
+        let mut rw_used_alive = db.begin_rw_txn().await.unwrap();
+        let _unused = rw_used_alive.get("ttl/d1").await.unwrap();
+        let mut rw_used_exp = db.begin_rw_txn().await.unwrap();
+        let rw_used_exp_id = rw_used_exp.id().to_vec();
+        let _unused = rw_used_exp.get("ttl/d1").await.unwrap();
+
+        tokio::time::advance(Duration::from_secs(59)).await;
+        tokio::task::yield_now().await;
+
+        let _unused = db.get_in_txn("ttl/d1", rw_unused_alive.id()).await.unwrap();
+        let _unused = db.get_in_txn("ttl/d1", ro_unused_alive.id()).await.unwrap();
+        rw_unused_alive.rollback().await.unwrap();
+        ro_unused_alive.rollback().await.unwrap();
+
+        tokio::time::advance(Duration::from_secs(1)).await;
+        tokio::task::yield_now().await;
+
+        // Unused RW & RO are expired at t=60s across every read/query/agg/pipeline/commit RPC.
+        assert_expired_rpc_matrix(
+            &mut db,
+            &rw_unused_exp_id,
+            "ttl/d1",
+            "ttl",
+            include_pipeline,
+        )
+        .await;
+        assert_expired_rpc_matrix(
+            &mut db,
+            &ro_unused_exp_id,
+            "ttl/d1",
+            "ttl",
+            include_pipeline,
+        )
+        .await;
+
+        // Idle-expired Rollback (<270s) is idempotent Ok(()), leaving follow-up reads/commits
+        // expired.
+        db.rollback_raw(&rw_unused_rb_id).await.unwrap();
+        db.rollback_raw(&rw_unused_rb_id).await.unwrap();
+        assert_expired(db.get_in_txn("ttl/d1", &rw_unused_rb_id).await);
+        assert_expired(db.commit_raw(&rw_unused_rb_id, vec![]).await);
+
+        db.rollback_raw(&ro_unused_rb_id).await.unwrap();
+        db.rollback_raw(&ro_unused_rb_id).await.unwrap();
+        assert_expired(db.get_in_txn("ttl/d1", &ro_unused_rb_id).await);
+
+        // Retry on expired RW succeeds (both direct and post-rollback) with rotated token bytes;
+        // retry on expired RO fails with InvalidArgument ("Cannot retry a read-only transaction").
+        for retry_target in [&rw_unused_exp_id, &rw_unused_rb_id] {
+            let mut retried = db.begin_retry_rw_txn(retry_target).await.unwrap();
+            expect_ne!(retried.id(), retry_target.as_slice());
+            let snap = retried.get("ttl/d1").await.unwrap();
+            expect_eq!(snap.fields["v"].as_integer(), Some(1));
+            retried.commit().await.unwrap();
+        }
+        for ro_target in [&ro_unused_exp_id, &ro_unused_rb_id] {
+            let err = assert_status_code(
+                db.begin_retry_rw_txn(ro_target).await,
+                Code::InvalidArgument,
+            );
+            assert!(
+                err.message()
+                    .contains("Cannot retry a read-only transaction"),
+                "unexpected RO retry error: {}",
+                err.message()
+            );
+        }
+
+        // 2. Used RW remains alive at 119s and expires at 120s.
+        tokio::time::advance(Duration::from_secs(59)).await; // total = 119s
+        tokio::task::yield_now().await;
+        let _unused = rw_used_alive.get("ttl/d1").await.unwrap();
+        rw_used_alive.rollback().await.unwrap();
+
+        tokio::time::advance(Duration::from_secs(1)).await; // total = 120s
+        tokio::task::yield_now().await;
+        assert_expired_rpc_matrix(&mut db, &rw_used_exp_id, "ttl/d1", "ttl", include_pipeline)
+            .await;
+        db.rollback_raw(&rw_used_exp_id).await.unwrap();
+        let mut retried_used = db.begin_retry_rw_txn(&rw_used_exp_id).await.unwrap();
+        expect_ne!(retried_used.id(), rw_used_exp_id.as_slice());
+        retried_used.put("ttl/d1", fields!({ "v": 2i64 }));
+        retried_used.commit().await.unwrap();
+        assert_doc_wire_eq(
+            &db.get("ttl/d1").await.unwrap(),
+            "ttl/d1",
+            &fields!({ "v": 2i64 }),
+        );
+    }
+}
+
+#[gtest]
+#[tokio::test(start_paused = true)]
+async fn active_transaction_activity_refresh_extends_past_120s_and_caps_at_270s_max_lifetime() {
+    let mut db = TestEnv::new().build_db();
+    db.put("ttl_max/d1", fields!({ "v": 1i64 })).await.unwrap();
+
+    let mut tx_periodic = db.begin_rw_txn().await.unwrap();
+    let tx_periodic_id = tx_periodic.id().to_vec();
+    let _unused = tx_periodic.get("ttl_max/d1").await.unwrap();
+
+    let tx_unused_270 = db.begin_rw_txn().await.unwrap();
+    let tx_unused_270_id = tx_unused_270.id().to_vec();
+    let ro_unused_270 = db.begin_ro_txn(None).await.unwrap();
+    let ro_unused_270_id = ro_unused_270.id().to_vec();
+    let mut ro_used_270 = db.begin_ro_txn(None).await.unwrap();
+    let ro_used_270_id = ro_used_270.id().to_vec();
+    let _unused = ro_used_270.get("ttl_max/d1").await.unwrap();
+
+    // Periodic reads every 45s keep RW alive past 120s up to 265s (<270s max lifetime).
+    for step_secs in [45u64, 45, 45, 45, 45, 40] {
+        tokio::time::advance(Duration::from_secs(step_secs)).await;
+        tokio::task::yield_now().await;
+        let _unused = tx_periodic.get("ttl_max/d1").await.unwrap();
+    }
+
+    // Advance 5s -> t=270s: hard max lifetime expires even right after a read at t=265s.
+    tokio::time::advance(Duration::from_secs(5)).await;
+    tokio::task::yield_now().await;
+
+    assert_expired_rpc_matrix(&mut db, &tx_periodic_id, "ttl_max/d1", "ttl_max", false).await;
+
+    // Past 270s max lifetime, Rollback returns Code::Aborted ("...expired...") on RW & RO.
+    for expired_id in [
+        &tx_periodic_id,
+        &tx_unused_270_id,
+        &ro_unused_270_id,
+        &ro_used_270_id,
+    ] {
+        assert_expired(db.rollback_raw(expired_id).await);
+    }
+
+    // Past 270s max lifetime, retryTransaction still succeeds on RW and rejects RO.
+    for rw_id in [&tx_periodic_id, &tx_unused_270_id] {
+        let mut retried = db.begin_retry_rw_txn(rw_id).await.unwrap();
+        expect_ne!(retried.id(), rw_id.as_slice());
+        retried.put("ttl_max/d1", fields!({ "v": 270i64 }));
+        retried.commit().await.unwrap();
+    }
+    assert_status_code(
+        db.begin_retry_rw_txn(&ro_used_270_id).await,
+        Code::InvalidArgument,
+    );
+    assert_doc_wire_eq(
+        &db.get("ttl_max/d1").await.unwrap(),
+        "ttl_max/d1",
+        &fields!({ "v": 270i64 }),
+    );
+}
+
+#[gtest]
+#[tokio::test(start_paused = true)]
+async fn expired_rw_retry_inherits_original_lineage_priority_and_wounds_younger_active_txn() {
+    for (edition, mode) in [("STANDARD", "PESSIMISTIC"), ("ENTERPRISE", "PESSIMISTIC")] {
+        let mut db = TestEnv::new().build_db();
+        db.set_admin_mode(Some(edition), Some(mode)).await;
+        for doc in ["ttl_prio/seed", "ttl_prio/contend"] {
+            db.put(doc, fields!({ "v": 0i64 })).await.unwrap();
+        }
+
+        // 1. Expired at 120s: retry inherits `t=0` `root_seq` and wounds `t=100s` active txn.
+        let mut old_120 = db.begin_rw_txn().await.unwrap();
+        let old_120_id = old_120.id().to_vec();
+        let _unused = old_120.get("ttl_prio/seed").await.unwrap();
+
+        let mut old_270 = db.begin_rw_txn().await.unwrap();
+        let old_270_id = old_270.id().to_vec();
+        let _unused = old_270.get("ttl_prio/seed").await.unwrap();
+
+        tokio::time::advance(Duration::from_secs(100)).await;
+        tokio::task::yield_now().await;
+        let mut mid = db.begin_rw_txn().await.unwrap();
+        let _unused = mid.get("ttl_prio/contend").await.unwrap();
+
+        tokio::time::advance(Duration::from_secs(20)).await; // total = 120s
+        tokio::task::yield_now().await;
+        assert_expired(db.get_in_txn("ttl_prio/contend", &old_120_id).await);
+
+        let mut retried_120 = db.begin_retry_rw_txn(&old_120_id).await.unwrap();
+        let _unused = retried_120.get("ttl_prio/contend").await.unwrap();
+        retried_120.put("ttl_prio/contend", fields!({ "v": 1i64 }));
+        retried_120.commit().await.unwrap();
+        assert_status_code(mid.commit().await, Code::Aborted);
+
+        // 2. Expired past 270s max lifetime: retry STILL inherits `t=0` `root_seq`.
+        tokio::time::advance(Duration::from_secs(130)).await; // total = 250s
+        tokio::task::yield_now().await;
+        let mut young_250 = db.begin_rw_txn().await.unwrap();
+        let _unused = young_250.get("ttl_prio/contend").await.unwrap();
+
+        tokio::time::advance(Duration::from_secs(20)).await; // total = 270s
+        tokio::task::yield_now().await;
+        assert_expired(db.rollback_raw(&old_270_id).await);
+
+        let mut retried_270 = db.begin_retry_rw_txn(&old_270_id).await.unwrap();
+        let _unused = retried_270.get("ttl_prio/contend").await.unwrap();
+        retried_270.put("ttl_prio/contend", fields!({ "v": 2i64 }));
+        retried_270.commit().await.unwrap();
+        assert_status_code(young_250.commit().await, Code::Aborted);
+    }
+}
+
+#[gtest]
+#[tokio::test(start_paused = true)]
+async fn high_volume_abandoned_ro_transactions_gc_without_evicting_rw_tombstones() {
+    let mut db = TestEnv::new().build_db();
+    for doc in ["gc/seed", "gc/w", "gc/d"] {
+        db.put(doc, fields!({ "v": 0i64 })).await.unwrap();
+    }
+
+    // Populate retry ring (wounded RW), closed ring (committed RW), and expired RW ring.
+    let mut older = db.begin_rw_txn().await.unwrap();
+    let _unused = older.get("gc/seed").await.unwrap();
+    let mut wounded_rw = db.begin_rw_txn().await.unwrap();
+    let wounded_rw_id = wounded_rw.id().to_vec();
+    let _unused = wounded_rw.get("gc/w").await.unwrap();
+    older.put("gc/w", fields!({ "v": 1i64 }));
+    older.commit().await.unwrap();
+    assert_status_code(db.get_in_txn("gc/w", &wounded_rw_id).await, Code::Aborted);
+
+    let mut committed_rw = db.begin_rw_txn().await.unwrap();
+    let committed_rw_id = committed_rw.id().to_vec();
+    committed_rw.put("gc/d", fields!({ "v": 1i64 }));
+    committed_rw.commit().await.unwrap();
+
+    let mut expired_rw = db.begin_rw_txn().await.unwrap();
+    let expired_rw_id = expired_rw.id().to_vec();
+    let _unused = expired_rw.get("gc/d").await.unwrap();
+
+    // Open 5,000 ReadOnly transactions (never committed or rolled back, simulating SDK RO leak).
+    let mut ro_ids = Vec::with_capacity(5_000);
+    for _ in 0..5_000 {
+        let mut ro = db.begin_ro_txn(None).await.unwrap();
+        let _unused = ro.get("gc/d").await.unwrap();
+        ro_ids.push(ro.id().to_vec());
+    }
+
+    tokio::time::advance(Duration::from_secs(120)).await;
+    tokio::task::yield_now().await;
+
+    // Trigger reaping and bounded RO ring eviction via normal non-tx reads/txns.
+    assert_doc_wire_eq(
+        &db.get("gc/d").await.unwrap(),
+        "gc/d",
+        &fields!({ "v": 1i64 }),
+    );
+    // Oldest entries beyond `MAX_EXPIRED_TXNS` (4,096) were evicted to keep memory bounded.
+    assert_status_code(
+        db.get_in_txn("gc/d", ro_ids.first().unwrap()).await,
+        Code::InvalidArgument,
+    );
+    // Most recent 4,096 expired RO entries retain exact Cloud-expired status.
+    for ro_id in [&ro_ids[2_500], ro_ids.last().unwrap()] {
+        assert_expired(db.get_in_txn("gc/d", ro_id).await);
+    }
+
+    // Isolated rings preserved RW retry tombstone, committed closed tombstone, and expired RW ring.
+    assert_status_code(db.rollback_raw(&committed_rw_id).await, Code::Aborted);
+
+    let mut mid = db.begin_rw_txn().await.unwrap();
+    let _unused = mid.get("gc/w").await.unwrap();
+    let mut retried_wounded = db.begin_retry_rw_txn(&wounded_rw_id).await.unwrap();
+    let _unused = retried_wounded.get("gc/w").await.unwrap();
+    retried_wounded.put("gc/w", fields!({ "v": 2i64 }));
+    retried_wounded.commit().await.unwrap();
+    assert_status_code(mid.commit().await, Code::Aborted);
+
+    assert_expired(db.get_in_txn("gc/d", &expired_rw_id).await);
+    let retried_expired = db.begin_retry_rw_txn(&expired_rw_id).await.unwrap();
+    expect_ne!(retried_expired.id(), expired_rw_id.as_slice());
+    retried_expired.rollback().await.unwrap();
 }

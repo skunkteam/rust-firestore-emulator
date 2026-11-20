@@ -901,12 +901,14 @@ impl Query {
                 if db.is_cleared() {
                     return Err(AbortReason::DatabaseCleared.into());
                 }
+                db.transactions.reap_if_due();
                 LockStrategy::ReadTime(Timestamp::now())
             }
             ReadConsistency::ReadTime(timestamp) => {
                 if db.is_cleared() {
                     return Err(AbortReason::DatabaseCleared.into());
                 }
+                db.transactions.reap_if_due();
                 LockStrategy::ReadTime(validate_read_time(timestamp)?)
             }
             ReadConsistency::Transaction(transaction_id) => {

@@ -153,6 +153,7 @@ impl FirestoreDatabase {
         }
         let validated = self.validate_commit_writes(writes)?;
         if validated.target_docs.is_empty() {
+            self.transactions.reap_if_due();
             return Ok((Timestamp::now(), Vec::new()));
         }
 
