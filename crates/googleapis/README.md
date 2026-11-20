@@ -7,15 +7,15 @@ Rust crate that compiles the upstream Google Firestore v1 Protocol Buffers (`inc
 - `[Cargo.toml:googleapis]`: Rust library crate exporting compiled Google Firestore v1 and protobuf well-known types, declarative construction macros, and domain extension traits/methods. Defines optional Cargo feature `client = ["tonic/channel", "tonic/gzip", "tonic-prost-build/transport"]` (`default = []`) to gate `FirestoreClient` generation for test/client consumers.
 - `[build.rs:main]`: Cargo build script invoking `tonic_prost_build` to compile `include/google/firestore/v1/firestore.proto` into `googleapis.rs`.
 - Subdirectories:
-  - [`./src/README.md`](./src/README.md): Crate root module (`lib.rs`), declarative macros (`macros.rs`), and extension implementations (`ser.rs`, `timestamp_ext.rs`, `transaction_options_ext.rs`, `value_ext.rs`).
+  - [`./src/README.md`](./src/README.md): Crate root module (`lib.rs`), declarative macros (`macros.rs`), and extension implementations (`ser.rs`, `timestamp_ext.rs`, `transaction_options_ext.rs`, `value_ext.rs`, `vector_ext.rs`).
 
 ## Invariants
-- `[build.rs:main]`: Generates gRPC client stubs only when `feature = "client"` is active (`.build_client(cfg!(feature = "client"))`), compiles protobuf well-known types (`.compile_well_known_types(true)`), and maps `bytes_value` protobuf fields to `prost::bytes::Bytes` (`.bytes("bytes_value")`).
-- `[build.rs:main]`: Attaches `serde` attributes across Firestore v1 types and patches generated `Value` and `ValueType` definitions (`assert_eq!(..., 1)`) so custom `crate::ser` serializers/deserializers govern ProtoJSON wire formatting under both `--no-default-features` and `--all-features`.
+- `[build.rs:main]`: Generates gRPC client stubs only when `feature = "client"` is active (`.build_client(cfg!(feature = "client"))`), compiles protobuf well-known types (`.compile_well_known_types(true)`), maps `bytes_value` protobuf fields to `prost::bytes::Bytes` (`.bytes("bytes_value")`), and derives `PartialOrd`/`Ord` on `google.protobuf.Timestamp` (`.type_attribute(".google.protobuf.Timestamp", "#[derive(PartialOrd, Ord)]")`).
+- `[build.rs:main]` & `[build.rs:strip_partial_eq_derives]`: Attaches `serde` attributes across serializable Firestore v1 container/request/response types (working alongside hand-written `crate::ser` implementations under both `--no-default-features` and `--all-features`) and strips `prost`'s derived `PartialEq` from `Value` and `value::ValueType` in `google.firestore.v1.rs` and `LatLng` in `google.r#type.rs` (`assert_eq!(..., 1)`) so `crate::value_ext` can provide Firestore-semantic `PartialEq` implementations.
 - `[Cargo.toml:lints.rust]`: Forbids unsafe code (`unsafe_code = "forbid"`) and explicit outlives requirements (`explicit_outlives_requirements = "forbid"`), and disables doctests (`[lib] doctest = false`) to accommodate upstream protobuf doc comments.
 
 ## Side Effects
-- `[build.rs:main]`: Reads `.proto` definitions from the `include/` directory at build time and writes generated Rust files (`googleapis.rs`) to Cargo's `OUT_DIR`.
+- `[build.rs:main]`: Reads `.proto` definitions from the `include/` directory at build time, writes generated Rust files (`googleapis.rs`, `google.firestore.v1.rs`, `google.r#type.rs`, etc.) to Cargo's `OUT_DIR`, and patches `google.firestore.v1.rs` and `google.r#type.rs` in place.
 
 ## Verification
 - Run: `cargo test -p googleapis`

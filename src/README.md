@@ -8,9 +8,10 @@ Root binary and library entry point for the `firestore-emulator` crate. Initiali
 - `[src/lib.rs:run]`: `pub async fn run(project: &'static FirestoreProject, listener: TcpListener, shutdown: impl Future<Output = ()> + Send + 'static, tracing: &'static impl Tracing) -> Result<()>` — Configures and runs the multiplexed HTTP/1.1 + HTTP/2 Tonic and Axum server on `listener` until `shutdown` resolves.
 - `[src/main.rs:main]`: Binary entry point (`#[tokio::main] async fn main() -> Result<(), CliError>`) that starts `DefaultTracing`, parses CLI `Args`, leaks `FirestoreProject` for `'static` lifetime, binds `TcpListener`, and awaits `run` until `tokio::signal::ctrl_c`.
 - `[src/main.rs:CliError]`: Binary-private CLI error wrapper formatting optional context, chained `Error::source` causes, and optional actionable suggestions via `Display`/`Debug`.
+- `[Cargo.toml:features]`: Root crate features `default = ["ui"]` and `ui = ["emulator-http/ui"]` toggling embedded/disk Web UI serving on the HTTP service.
 - `[src/main.rs:Args]`: `clap::Parser` CLI configuration struct supporting:
   - `--host-port` (`env = "FIRESTORE_EMULATOR_HOST"`): `SocketAddr` address to bind the TCP listener.
-  - `--long-contention-timeout` (`env = "LONG_CONTENTION_TIMEOUT"`): `bool` flag enabling 15s lock contention timeouts instead of the default 2s.
+  - `--long-contention-timeout` (`env = "LONG_CONTENTION_TIMEOUT"`): `bool` flag enabling `Timeouts::CLOUD` (`15s` write / `16s` read) instead of the default `Timeouts::FAST` (`2s` write / `5s` read).
   - `--default-enterprise` (`env = "FIRESTORE_EMULATOR_DEFAULT_ENTERPRISE"`): `bool` flag defaulting new databases to Enterprise Edition.
 - `[src/multiplex.rs:MultiplexLayer]` & `[src/multiplex.rs:MultiplexService]`: Crate-internal (`pub(crate)`) Tower `Layer` and `Service` that routes requests to an alternate service (`use_svc` / `other`) when predicate `when` returns `true`, or delegates to the inner `base` service otherwise.
 
