@@ -13,6 +13,8 @@ Root binary and library entry point for the `firestore-emulator` crate. Initiali
   - `--host-port` (`env = "FIRESTORE_EMULATOR_HOST"`): `SocketAddr` address to bind the TCP listener.
   - `--long-contention-timeout` (`env = "LONG_CONTENTION_TIMEOUT"`): `bool` flag enabling `Timeouts::CLOUD` (`15s` write / `16s` read) instead of the default `Timeouts::FAST` (`2s` write / `5s` read).
   - `--default-enterprise` (`env = "FIRESTORE_EMULATOR_DEFAULT_ENTERPRISE"`): `bool` flag defaulting new databases to Enterprise Edition.
+  - `--transaction-idle-timeout-ms` (`env = "FIRESTORE_EMULATOR_TRANSACTION_IDLE_TIMEOUT_MS"`): optional `NonZeroU64` override (ms) for active transaction idle timeout (defaults to `None`, using Cloud's 60s idle / 120s used-minimum window).
+  - `--transaction-max-lifetime-ms` (`env = "FIRESTORE_EMULATOR_TRANSACTION_MAX_LIFETIME_MS"`): optional `NonZeroU64` override (ms) for active transaction maximum lifetime (defaults to `None`, using Cloud's 270s max lifetime).
 - `[src/multiplex.rs:MultiplexLayer]` & `[src/multiplex.rs:MultiplexService]`: Crate-internal (`pub(crate)`) Tower `Layer` and `Service` that routes requests to an alternate service (`use_svc` / `other`) when predicate `when` returns `true`, or delegates to the inner `base` service otherwise.
 
 ## Invariants
