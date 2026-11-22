@@ -131,6 +131,7 @@ impl FirestoreDatabase {
         Vec<WriteResult>,
         Option<Arc<StoredDocumentVersion>>,
     )> {
+        self.transactions.reap_if_due();
         let session = self
             .locks
             .new_session(None, LockPriority::NextSeq, false, false);
@@ -169,6 +170,7 @@ impl FirestoreDatabase {
             return Ok((time, results));
         }
 
+        self.transactions.reap_if_due();
         let deadline = Instant::now() + self.project.timeouts.write;
         let mut priority = LockPriority::NextSeq;
         let mut wound_retries: u32 = 0;

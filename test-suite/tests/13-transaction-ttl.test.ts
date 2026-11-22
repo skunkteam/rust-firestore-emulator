@@ -7,14 +7,16 @@ const ONE_HOUR_MS = 60 * 60 * 1_000;
 const EXPIRED_TXN_DETAILS = 'The referenced transaction has expired or is no longer valid.';
 
 const rawIdleTimeoutMs = process.env.FIRESTORE_EMULATOR_TRANSACTION_IDLE_TIMEOUT_MS;
+const rawMaxLifetimeMs = process.env.FIRESTORE_EMULATOR_TRANSACTION_MAX_LIFETIME_MS;
 const isFastRustEmulator = connection === 'RUST EMULATOR' && rawIdleTimeoutMs != null && rawIdleTimeoutMs !== '';
 const idleTimeoutMs = isFastRustEmulator ? Number(rawIdleTimeoutMs) : 60_000;
+const maxLifetimeMs = isFastRustEmulator && rawMaxLifetimeMs != null && rawMaxLifetimeMs !== '' ? Number(rawMaxLifetimeMs) : null;
 const unusedWaitMs = idleTimeoutMs + 2_500;
 const usedWaitMs = idleTimeoutMs * 2 + 2_500;
 const refreshIntervalMs = Math.round(idleTimeoutMs * 0.6);
-const parkLeadMs = isFastRustEmulator ? 1_200 : 3_500;
-const parkVerifyPendingWaitMs = isFastRustEmulator ? 350 : 1_000;
-const testTimeoutMs = Math.max(120_000, Math.round(idleTimeoutMs * 2.4) + 75_000);
+const parkLeadMs = isFastRustEmulator ? 800 : 3_500;
+const parkVerifyPendingWaitMs = isFastRustEmulator ? 200 : 1_000;
+const testTimeoutMs = Math.max(120_000, Math.round((maxLifetimeMs ?? idleTimeoutMs * 2.4) + 75_000));
 
 type Edition = (typeof editions)[number];
 
@@ -279,8 +281,8 @@ async function runTransactionTtlSuiteForEdition(fs: Edition): Promise<void> {
             docPriorityContend.set(writeData({ v: 1 })),
         ]);
 
-        const tCreated = Date.now();
         const [rwStayAlive, rwUsedExpiry, rwPriorityOld] = await Promise.all([beginRw(), beginRw(), beginRw()]);
+        const tCreated = Date.now();
         await Promise.all([
             rawGet(docStayAlive, rwStayAlive, 'stay-alive-init-get'),
             rawGet(docParkedNonTx, rwUsedExpiry, 'used-init-get-nontx'),
@@ -304,6 +306,8 @@ async function runTransactionTtlSuiteForEdition(fs: Edition): Promise<void> {
         // unblock upon TTL expiration rather than hitting lock write timeout.
         let parkedNonTxDone = false;
         let parkedYoungDone = false;
+        let parkedNonTxErr: unknown = null;
+        let parkedYoungErr: unknown = null;
         let parkedNonTxPromise: Promise<void> = Promise.resolve();
         let parkedYoungPromise: Promise<void> = Promise.resolve();
 
@@ -311,15 +315,27 @@ async function runTransactionTtlSuiteForEdition(fs: Edition): Promise<void> {
             const parkAt = tCreated + idleTimeoutMs * 2 - parkLeadMs;
             await sleep(Math.max(0, parkAt - Date.now()));
 
-            parkedNonTxPromise = docParkedNonTx.set(writeData({ v: 2 })).then(() => {
-                parkedNonTxDone = true;
-            });
             const youngTxn = await beginRw();
-            parkedYoungPromise = rawCommitValue(docParkedYoung, youngTxn, 2, 'parked-young-commit').then(() => {
-                parkedYoungDone = true;
-            });
+            parkedNonTxPromise = docParkedNonTx.set(writeData({ v: 2 })).then(
+                () => {
+                    parkedNonTxDone = true;
+                },
+                (err: unknown) => {
+                    parkedNonTxErr = err;
+                },
+            );
+            parkedYoungPromise = rawCommitValue(docParkedYoung, youngTxn, 2, 'parked-young-commit').then(
+                () => {
+                    parkedYoungDone = true;
+                },
+                (err: unknown) => {
+                    parkedYoungErr = err;
+                },
+            );
 
             await sleep(parkVerifyPendingWaitMs);
+            expect(parkedNonTxErr).toBeNull();
+            expect(parkedYoungErr).toBeNull();
             expect(parkedNonTxDone).toBe(false);
             expect(parkedYoungDone).toBe(false);
         }
@@ -329,6 +345,8 @@ async function runTransactionTtlSuiteForEdition(fs: Edition): Promise<void> {
 
         await Promise.all([parkedNonTxPromise, parkedYoungPromise]);
         if (fs.concurrencyMode === 'pessimistic') {
+            expect(parkedNonTxErr).toBeNull();
+            expect(parkedYoungErr).toBeNull();
             expect(parkedNonTxDone).toBe(true);
             expect(parkedYoungDone).toBe(true);
             expect(await readDataRef(docParkedNonTx)).toEqual({ v: 2 });
@@ -366,7 +384,7 @@ async function runTransactionTtlSuiteForEdition(fs: Edition): Promise<void> {
             await rawGet(doc, rwRefresh, `refresh-ping-${step}`);
         }
 
-        // 4 * 0.6 * idle = 2.4 * idle > 2 * idle used threshold, well below 4.5 * idle max lifetime.
+        // 4 * 0.6 * idle = 2.4 * idle > 2 * idle used threshold, below max lifetime (30s fast / 270s Cloud).
         await rawCommitValue(doc, rwRefresh, 2, 'refresh-final-commit');
         expect(await readDataRef(doc)).toEqual({ v: 2 });
     };
@@ -390,12 +408,40 @@ async function runTransactionTtlSuiteForEdition(fs: Edition): Promise<void> {
         expect(await readDataRef(doc)).toEqual({ v: 11 });
     };
 
-    const results = await Promise.allSettled([
-        runUnusedScenario(),
-        runUsedLocksAndPriorityScenario(),
-        runActivityRefreshScenario(),
-        runSdkAutoRetryScenario(),
-    ]);
+    const runMaxLifetimeScenario = async (maxMs: number): Promise<void> => {
+        const holderDoc = fs.collection.doc();
+        const col = holderDoc.collection('ttl-max-lifetime');
+        const doc = col.doc('d');
+        await doc.set(writeData({ v: 1 }));
+
+        const rwMax = await beginRw();
+        const tMaxCreated = Date.now();
+        await rawGet(doc, rwMax, 'max-init-get');
+
+        for (let step = 0; tMaxCreated + (step + 1) * refreshIntervalMs <= tMaxCreated + maxMs - 2_000; step += 1) {
+            const nextPingAt = tMaxCreated + (step + 1) * refreshIntervalMs;
+            await sleep(Math.max(0, nextPingAt - Date.now()));
+            await rawGet(doc, rwMax, `max-ping-${step}`);
+        }
+
+        await sleep(Math.max(0, tMaxCreated + maxMs + 2_000 - Date.now()));
+
+        await expectExpiredRpcMatrix(holderDoc, col, doc, rwMax, 'max-rw');
+        await expectExpiredTransaction(() => rawRollback(rwMax, 'max-rw-rollback'), 'max-rw-rollback');
+
+        const retriedAfterMax = await beginRw(rwMax);
+        expect(Buffer.from(retriedAfterMax).equals(Buffer.from(rwMax))).toBe(false);
+        await rawGet(doc, retriedAfterMax, 'max-rw-retried-get');
+        await rawCommitValue(doc, retriedAfterMax, 2, 'max-rw-retried-commit');
+        expect(await readDataRef(doc)).toEqual({ v: 2 });
+    };
+
+    const scenarios = [runUnusedScenario(), runUsedLocksAndPriorityScenario(), runActivityRefreshScenario(), runSdkAutoRetryScenario()];
+    if (maxLifetimeMs != null && Number.isFinite(maxLifetimeMs) && maxLifetimeMs > 0) {
+        scenarios.push(runMaxLifetimeScenario(maxLifetimeMs));
+    }
+
+    const results = await Promise.allSettled(scenarios);
     const firstRejected = results.find((r): r is PromiseRejectedResult => r.status === 'rejected');
     if (firstRejected) {
         throw firstRejected.reason;

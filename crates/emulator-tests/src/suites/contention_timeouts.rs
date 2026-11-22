@@ -1582,9 +1582,21 @@ async fn realtime_short_ttl_concurrent_abandoned_rw_and_ro_contention_stress() {
                 for iter in 0..6usize {
                     let doc = format!("rt_ttl/d{}", (w + iter) % 4);
                     let mut rw = wdb.begin_rw_txn().await.unwrap();
-                    drop(rw.get(&doc).await);
+                    if let Err(e) = rw.get(&doc).await {
+                        assert_eq!(
+                            e.code(),
+                            Code::Aborted,
+                            "only contention/ttl Aborted allowed on rw.get, got {e:?}"
+                        );
+                    }
                     let mut ro = wdb.begin_ro_txn(None).await.unwrap();
-                    drop(ro.get(&doc).await);
+                    if let Err(e) = ro.get(&doc).await {
+                        assert_eq!(
+                            e.code(),
+                            Code::Aborted,
+                            "only ttl Aborted allowed on ro.get, got {e:?}"
+                        );
+                    }
                     tokio::time::sleep(Duration::from_millis(25)).await;
                 }
             }));
@@ -1617,15 +1629,24 @@ async fn realtime_short_ttl_concurrent_abandoned_rw_and_ro_contention_stress() {
                             .expect("WriteBatch must not time out behind expired RW");
                         }
                         _ => {
-                            if let Ok(mut tx) = wdb.begin_rw_txn().await
-                                && tx.get(&doc).await.is_ok()
-                            {
-                                tx.put(&doc, fields!({ "v": (iter + 1) as i64 }));
-                                if let Err(e) = tx.commit().await {
+                            let mut tx = wdb.begin_rw_txn().await.unwrap();
+                            match tx.get(&doc).await {
+                                Ok(_) => {
+                                    tx.put(&doc, fields!({ "v": (iter + 1) as i64 }));
+                                    if let Err(e) = tx.commit().await {
+                                        assert_eq!(
+                                            e.code(),
+                                            Code::Aborted,
+                                            "only contention/wound Aborted allowed, got {e:?}"
+                                        );
+                                    }
+                                }
+                                Err(e) => {
                                     assert_eq!(
                                         e.code(),
                                         Code::Aborted,
-                                        "only contention/wound Aborted allowed, got {e:?}"
+                                        "only contention/wound/ttl Aborted allowed on tx.get, got \
+                                         {e:?}"
                                     );
                                 }
                             }

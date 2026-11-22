@@ -82,7 +82,7 @@ impl TransactionId {
         self.attempt_gen
     }
 
-    pub(crate) fn from_parts(lineage_id: u64, attempt_gen: u64) -> Self {
+    fn from_parts(lineage_id: u64, attempt_gen: u64) -> Self {
         Self {
             lineage_id,
             attempt_gen,
@@ -178,6 +178,7 @@ pub(crate) enum ClosedOutcome {
 #[derive(Debug)]
 struct ActiveEntry {
     txn: Arc<Transaction>,
+    pessimistic: bool,
     unused_expiry_ns: u64,
     used_min_expiry_ns: u64,
     max_expiry_ns: u64,
@@ -188,12 +189,14 @@ struct ActiveEntry {
 
 impl ActiveEntry {
     fn new(txn: Arc<Transaction>, created_ns: u64, timeouts: &Timeouts) -> Self {
+        let pessimistic = is_pessimistic_rw(&txn);
         let max_ns = duration_to_ns(timeouts.txn_max);
         let idle_ns = duration_to_ns(timeouts.txn_idle).min(max_ns);
-        let used_min_ns = duration_to_ns(timeouts.txn_used_min).min(max_ns);
+        let used_min_ns = duration_to_ns(timeouts.txn_used_min()).min(max_ns);
         let unused_expiry_ns = created_ns.saturating_add(idle_ns);
         Self {
             txn,
+            pessimistic,
             unused_expiry_ns,
             used_min_expiry_ns: created_ns.saturating_add(used_min_ns),
             max_expiry_ns: created_ns.saturating_add(max_ns),
@@ -218,11 +221,33 @@ impl ActiveEntry {
     }
 }
 
+fn is_pessimistic_rw(txn: &Transaction) -> bool {
+    txn.as_read_write().is_some_and(|rw| !rw.is_optimistic())
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 struct ExpiryKey {
     deadline_ns: u64,
     lineage_id:  u64,
     attempt_gen: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RingKind {
+    Retry = 0,
+    Closed = 1,
+    ExpiredRw = 2,
+    ExpiredRo = 3,
+}
+
+impl RingKind {
+    const fn cap(self) -> usize {
+        match self {
+            Self::Retry => MAX_RETRY_TOMBSTONES,
+            Self::Closed => MAX_CLOSED_TXNS,
+            Self::ExpiredRw | Self::ExpiredRo => MAX_EXPIRED_TXNS,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -234,24 +259,36 @@ enum TxnSlot {
         reason: AbortReason,
         expiry_ns: u64,
         max_expiry_ns: u64,
-        ring_gen: u64,
     },
     AbortedLineage {
         root_seq:      Option<u64>,
         max_expiry_ns: u64,
-        ring_gen:      u64,
     },
     Expired {
         read_only:     bool,
         root_seq:      Option<u64>,
         max_expiry_ns: u64,
-        ring_gen:      u64,
     },
     Closed {
         outcome:   ClosedOutcome,
         read_only: bool,
-        ring_gen:  u64,
     },
+}
+
+impl TxnSlot {
+    const fn ring_kind(&self) -> Option<RingKind> {
+        match self {
+            Self::Wounded { .. } | Self::AbortedLineage { .. } => Some(RingKind::Retry),
+            Self::Closed { .. } => Some(RingKind::Closed),
+            Self::Expired {
+                read_only: false, ..
+            } => Some(RingKind::ExpiredRw),
+            Self::Expired {
+                read_only: true, ..
+            } => Some(RingKind::ExpiredRo),
+            Self::Active(_) | Self::Committing => None,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -262,18 +299,14 @@ struct LineageEntry {
 
 #[derive(Debug, Default)]
 struct BoundedRing {
-    order:    VecDeque<(u64, u64)>,
-    count:    usize,
-    next_gen: u64,
+    order: VecDeque<(u64, u64)>,
+    count: usize,
 }
 
 impl BoundedRing {
-    fn push(&mut self, lineage_id: u64) -> u64 {
-        self.next_gen = self.next_gen.wrapping_add(1).max(1);
-        let gen_id = self.next_gen;
+    fn push(&mut self, lineage_id: u64, attempt_gen: u64) {
         self.count += 1;
-        self.order.push_back((lineage_id, gen_id));
-        gen_id
+        self.order.push_back((lineage_id, attempt_gen));
     }
 
     fn decrement(&mut self) {
@@ -285,30 +318,25 @@ impl BoundedRing {
         self.count = 0;
     }
 
-    fn evict(
-        &mut self,
-        max_len: usize,
-        slots: &mut HashMap<u64, LineageEntry>,
-        matches_ring: impl Fn(&TxnSlot, u64) -> bool,
-    ) {
+    fn evict(&mut self, kind: RingKind, slots: &mut HashMap<u64, LineageEntry>) {
+        let max_len = kind.cap();
+        let is_live = |slots: &HashMap<u64, LineageEntry>, id: u64, attempt: u64| {
+            slots.get(&id).is_some_and(|entry| {
+                entry.current_attempt == attempt && entry.slot.ring_kind() == Some(kind)
+            })
+        };
         while self.count > max_len {
-            let Some((old_id, old_gen)) = self.order.pop_front() else {
+            let Some((old_id, old_attempt)) = self.order.pop_front() else {
                 break;
             };
-            let matches_live = slots
-                .get(&old_id)
-                .is_some_and(|e| matches_ring(&e.slot, old_gen));
-            if matches_live {
+            if is_live(slots, old_id, old_attempt) {
                 slots.remove(&old_id);
                 self.count -= 1;
             }
         }
         if self.order.len() > max_len.saturating_mul(2) {
-            self.order.retain(|(entry_id, entry_gen)| {
-                slots
-                    .get(entry_id)
-                    .is_some_and(|e| matches_ring(&e.slot, *entry_gen))
-            });
+            self.order
+                .retain(|&(entry_id, entry_attempt)| is_live(slots, entry_id, entry_attempt));
         }
     }
 }
@@ -317,45 +345,43 @@ impl BoundedRing {
 struct RunningTxnMap {
     slots: HashMap<u64, LineageEntry>,
     active_count: usize,
+    pessimistic_active_count: usize,
     expiry_heap: BinaryHeap<Reverse<ExpiryKey>>,
-    retry_ring: BoundedRing,
-    closed_ring: BoundedRing,
-    expired_rw_ring: BoundedRing,
-    expired_ro_ring: BoundedRing,
+    pessimistic_expiry_heap: BinaryHeap<Reverse<ExpiryKey>>,
+    rings: [BoundedRing; 4],
 }
 
 impl RunningTxnMap {
     fn decrement_slot_counters(&mut self, slot: &TxnSlot) {
         match slot {
-            TxnSlot::Active(_) => {
+            TxnSlot::Active(active) => {
                 self.active_count = self.active_count.saturating_sub(1);
-            }
-            TxnSlot::Wounded { .. } | TxnSlot::AbortedLineage { .. } => {
-                self.retry_ring.decrement();
-            }
-            TxnSlot::Closed { .. } => {
-                self.closed_ring.decrement();
-            }
-            TxnSlot::Expired {
-                read_only: false, ..
-            } => {
-                self.expired_rw_ring.decrement();
-            }
-            TxnSlot::Expired {
-                read_only: true, ..
-            } => {
-                self.expired_ro_ring.decrement();
+                if active.pessimistic {
+                    self.pessimistic_active_count = self.pessimistic_active_count.saturating_sub(1);
+                }
             }
             TxnSlot::Committing => {}
+            _ => {
+                if let Some(kind) = slot.ring_kind() {
+                    self.rings[kind as usize].decrement();
+                }
+            }
+        }
+    }
+
+    fn clear_empty_heaps(&mut self) {
+        if self.active_count == 0 {
+            self.expiry_heap.clear();
+        }
+        if self.pessimistic_active_count == 0 {
+            self.pessimistic_expiry_heap.clear();
         }
     }
 
     fn remove_slot(&mut self, lineage_id: u64) -> Option<Arc<Transaction>> {
         let entry = self.slots.remove(&lineage_id)?;
         self.decrement_slot_counters(&entry.slot);
-        if self.active_count == 0 {
-            self.expiry_heap.clear();
-        }
+        self.clear_empty_heaps();
         match entry.slot {
             TxnSlot::Active(active) => Some(active.txn),
             _ => None,
@@ -366,7 +392,7 @@ impl RunningTxnMap {
         &mut self,
         lineage_id: u64,
         current_attempt: u64,
-        mut new_slot: TxnSlot,
+        new_slot: TxnSlot,
     ) -> Option<Arc<Transaction>> {
         let dropped = if let Some(prev) = self.slots.remove(&lineage_id) {
             self.decrement_slot_counters(&prev.slot);
@@ -378,97 +404,20 @@ impl RunningTxnMap {
             None
         };
 
-        match &mut new_slot {
-            TxnSlot::Wounded { ring_gen, .. } | TxnSlot::AbortedLineage { ring_gen, .. } => {
-                *ring_gen = self.retry_ring.push(lineage_id);
-                self.slots.insert(
-                    lineage_id,
-                    LineageEntry {
-                        current_attempt,
-                        slot: new_slot,
-                    },
-                );
-                self.retry_ring
-                    .evict(MAX_RETRY_TOMBSTONES, &mut self.slots, |slot, gen_id| {
-                        matches!(
-                            slot,
-                            TxnSlot::Wounded { ring_gen, .. }
-                                | TxnSlot::AbortedLineage { ring_gen, .. }
-                                if *ring_gen == gen_id
-                        )
-                    });
-            }
-            TxnSlot::Closed { ring_gen, .. } => {
-                *ring_gen = self.closed_ring.push(lineage_id);
-                self.slots.insert(
-                    lineage_id,
-                    LineageEntry {
-                        current_attempt,
-                        slot: new_slot,
-                    },
-                );
-                self.closed_ring
-                    .evict(MAX_CLOSED_TXNS, &mut self.slots, |slot, gen_id| {
-                        matches!(slot, TxnSlot::Closed { ring_gen, .. } if *ring_gen == gen_id)
-                    });
-            }
-            TxnSlot::Expired {
-                read_only: false,
-                ring_gen,
-                ..
-            } => {
-                *ring_gen = self.expired_rw_ring.push(lineage_id);
-                self.slots.insert(
-                    lineage_id,
-                    LineageEntry {
-                        current_attempt,
-                        slot: new_slot,
-                    },
-                );
-                self.expired_rw_ring
-                    .evict(MAX_EXPIRED_TXNS, &mut self.slots, |slot, gen_id| {
-                        matches!(
-                            slot,
-                            TxnSlot::Expired {
-                                read_only: false,
-                                ring_gen,
-                                ..
-                            } if *ring_gen == gen_id
-                        )
-                    });
-            }
-            TxnSlot::Expired {
-                read_only: true,
-                ring_gen,
-                ..
-            } => {
-                *ring_gen = self.expired_ro_ring.push(lineage_id);
-                self.slots.insert(
-                    lineage_id,
-                    LineageEntry {
-                        current_attempt,
-                        slot: new_slot,
-                    },
-                );
-                self.expired_ro_ring
-                    .evict(MAX_EXPIRED_TXNS, &mut self.slots, |slot, gen_id| {
-                        matches!(
-                            slot,
-                            TxnSlot::Expired {
-                                read_only: true,
-                                ring_gen,
-                                ..
-                            } if *ring_gen == gen_id
-                        )
-                    });
-            }
+        let kind = new_slot.ring_kind();
+        match &new_slot {
             TxnSlot::Active(active) => {
-                self.active_count += 1;
-                self.expiry_heap.push(Reverse(ExpiryKey {
+                let key = ExpiryKey {
                     deadline_ns: active.heap_deadline_ns,
                     lineage_id,
                     attempt_gen: current_attempt,
-                }));
+                };
+                self.active_count += 1;
+                self.expiry_heap.push(Reverse(key));
+                if active.pessimistic {
+                    self.pessimistic_active_count += 1;
+                    self.pessimistic_expiry_heap.push(Reverse(key));
+                }
                 self.slots.insert(
                     lineage_id,
                     LineageEntry {
@@ -478,7 +427,15 @@ impl RunningTxnMap {
                 );
                 if self.expiry_heap.len() > self.active_count.saturating_mul(2).max(MAX_CLOSED_TXNS)
                 {
-                    self.compact_expiry_heap();
+                    compact_expiry_heap(&mut self.expiry_heap, &self.slots, false);
+                }
+                if self.pessimistic_expiry_heap.len()
+                    > self
+                        .pessimistic_active_count
+                        .saturating_mul(2)
+                        .max(MAX_CLOSED_TXNS)
+                {
+                    compact_expiry_heap(&mut self.pessimistic_expiry_heap, &self.slots, true);
                 }
             }
             TxnSlot::Committing => {
@@ -490,47 +447,35 @@ impl RunningTxnMap {
                     },
                 );
             }
+            _ => {
+                self.slots.insert(
+                    lineage_id,
+                    LineageEntry {
+                        current_attempt,
+                        slot: new_slot,
+                    },
+                );
+                if let Some(kind) = kind {
+                    let ring = &mut self.rings[kind as usize];
+                    ring.push(lineage_id, current_attempt);
+                    ring.evict(kind, &mut self.slots);
+                }
+            }
         }
-        if self.active_count == 0 {
-            self.expiry_heap.clear();
-        }
+        self.clear_empty_heaps();
         dropped
     }
 
-    fn compact_expiry_heap(&mut self) {
-        let slots = &self.slots;
-        self.expiry_heap.retain(|Reverse(key)| {
-            matches!(
-                slots.get(&key.lineage_id),
-                Some(LineageEntry {
-                    current_attempt,
-                    slot: TxnSlot::Active(active),
-                }) if *current_attempt == key.attempt_gen
-                    && active.heap_deadline_ns == key.deadline_ns
-            )
-        });
-    }
-
-    fn refresh_next_expiry(&mut self) -> u64 {
-        if self.active_count == 0 {
-            self.expiry_heap.clear();
-            return u64::MAX;
-        }
-        while let Some(&Reverse(top)) = self.expiry_heap.peek() {
-            let matches_live = matches!(
-                self.slots.get(&top.lineage_id),
-                Some(LineageEntry {
-                    current_attempt,
-                    slot: TxnSlot::Active(active),
-                }) if *current_attempt == top.attempt_gen
-                    && active.heap_deadline_ns == top.deadline_ns
-            );
-            if matches_live {
-                return top.deadline_ns;
-            }
-            self.expiry_heap.pop();
-        }
-        u64::MAX
+    fn refresh_next_expiries(&mut self) -> (u64, u64) {
+        let all = refresh_heap_next(&mut self.expiry_heap, self.active_count, &self.slots, false);
+        let pess = refresh_heap_next(
+            &mut self.pessimistic_expiry_heap,
+            self.pessimistic_active_count,
+            &self.slots,
+            true,
+        );
+        debug_assert!(pess >= all);
+        (all, pess)
     }
 
     fn clear_all(&mut self) -> Vec<Arc<Transaction>> {
@@ -541,13 +486,57 @@ impl RunningTxnMap {
             }
         }
         self.active_count = 0;
+        self.pessimistic_active_count = 0;
         self.expiry_heap.clear();
-        self.retry_ring.clear();
-        self.closed_ring.clear();
-        self.expired_rw_ring.clear();
-        self.expired_ro_ring.clear();
+        self.pessimistic_expiry_heap.clear();
+        for ring in &mut self.rings {
+            ring.clear();
+        }
         active_txns
     }
+}
+
+fn matches_live_expiry_key(
+    slots: &HashMap<u64, LineageEntry>,
+    key: ExpiryKey,
+    require_pessimistic: bool,
+) -> bool {
+    matches!(
+        slots.get(&key.lineage_id),
+        Some(LineageEntry {
+            current_attempt,
+            slot: TxnSlot::Active(active),
+        }) if *current_attempt == key.attempt_gen
+            && active.heap_deadline_ns == key.deadline_ns
+            && (!require_pessimistic || active.pessimistic)
+    )
+}
+
+fn compact_expiry_heap(
+    heap: &mut BinaryHeap<Reverse<ExpiryKey>>,
+    slots: &HashMap<u64, LineageEntry>,
+    require_pessimistic: bool,
+) {
+    heap.retain(|Reverse(key)| matches_live_expiry_key(slots, *key, require_pessimistic));
+}
+
+fn refresh_heap_next(
+    heap: &mut BinaryHeap<Reverse<ExpiryKey>>,
+    active_count: usize,
+    slots: &HashMap<u64, LineageEntry>,
+    require_pessimistic: bool,
+) -> u64 {
+    if active_count == 0 {
+        heap.clear();
+        return u64::MAX;
+    }
+    while let Some(&Reverse(top)) = heap.peek() {
+        if matches_live_expiry_key(slots, top, require_pessimistic) {
+            return top.deadline_ns;
+        }
+        heap.pop();
+    }
+    u64::MAX
 }
 
 #[derive(Debug)]
@@ -599,18 +588,13 @@ impl CommitSlotGuard {
         self.finalize_slot(cleared, || TxnSlot::Closed {
             outcome:   ClosedOutcome::Committed,
             read_only: false,
-            ring_gen:  0,
         });
     }
 
     pub(crate) fn abort_commit(mut self, abort_reason: Option<AbortReason>) {
         self.armed = false;
         let root_seq = self.session.root_seq();
-        if matches!(abort_reason, Some(AbortReason::TransactionExpired)) {
-            self.session.close_expired();
-        } else {
-            self.session.close();
-        }
+        self.session.close();
 
         let cleared = is_cleared(&self.database, &self.locks)
             || matches!(
@@ -623,7 +607,6 @@ impl CommitSlotGuard {
                 reason,
                 expiry_ns: self.expiry_ns,
                 max_expiry_ns: self.max_expiry_ns,
-                ring_gen: 0,
             },
             Some(
                 AbortReason::UpgradeContention
@@ -633,21 +616,20 @@ impl CommitSlotGuard {
             ) => TxnSlot::AbortedLineage {
                 root_seq,
                 max_expiry_ns: self.max_expiry_ns,
-                ring_gen: 0,
             },
-            Some(AbortReason::TransactionExpired) => TxnSlot::Expired {
-                read_only: false,
-                root_seq,
-                max_expiry_ns: self.max_expiry_ns,
-                ring_gen: 0,
-            },
+            Some(AbortReason::TransactionExpired) => {
+                debug_assert!(false, "Committing slots are immune to TTL expiration");
+                TxnSlot::Closed {
+                    outcome:   ClosedOutcome::AbortedOrRolledBack,
+                    read_only: false,
+                }
+            }
             Some(AbortReason::DatabaseCleared | AbortReason::DatabaseDropped) => {
                 unreachable!("handled above")
             }
             None => TxnSlot::Closed {
                 outcome:   ClosedOutcome::AbortedOrRolledBack,
                 read_only: false,
-                ring_gen:  0,
             },
         });
     }
@@ -663,9 +645,15 @@ impl Drop for CommitSlotGuard {
         self.finalize_slot(cleared, || TxnSlot::Closed {
             outcome:   ClosedOutcome::AbortedOrRolledBack,
             read_only: false,
-            ring_gen:  0,
         });
     }
+}
+
+#[derive(Debug, Default)]
+struct WriteCleanup {
+    sessions_to_expire: Vec<Arc<LockSession>>,
+    sessions_to_close: Vec<Arc<LockSession>>,
+    txns_to_drop: Vec<Arc<Transaction>>,
 }
 
 #[derive(Debug)]
@@ -677,6 +665,7 @@ pub(crate) struct RunningTransactions {
     timeouts: Timeouts,
     epoch: Instant,
     next_expiry_ns: AtomicU64,
+    pessimistic_next_expiry_ns: AtomicU64,
     expiry_notify: Arc<Notify>,
     state: Arc<RwLock<RunningTxnMap>>,
 }
@@ -701,6 +690,7 @@ impl RunningTransactions {
             timeouts,
             epoch: Instant::now(),
             next_expiry_ns: AtomicU64::new(u64::MAX),
+            pessimistic_next_expiry_ns: AtomicU64::new(u64::MAX),
             expiry_notify,
             state: Default::default(),
         }
@@ -738,11 +728,71 @@ impl RunningTransactions {
         )
     }
 
+    fn store_next_expiries(&self, map: &mut RunningTxnMap) -> (u64, u64) {
+        let (all, pess) = map.refresh_next_expiries();
+        self.next_expiry_ns.store(all, Ordering::Release);
+        self.pessimistic_next_expiry_ns
+            .store(pess, Ordering::Release);
+        (all, pess)
+    }
+
+    fn clear_next_expiries(&self) {
+        self.next_expiry_ns.store(u64::MAX, Ordering::Release);
+        self.pessimistic_next_expiry_ns
+            .store(u64::MAX, Ordering::Release);
+    }
+
+    fn reject_if_cleared(&self, lineage_id: u64) -> Result<()> {
+        if is_cleared(&self.database, &self.locks) {
+            let dropped = {
+                let mut map = self.state.write().unwrap_or_else(PoisonError::into_inner);
+                let dropped = map.remove_slot(lineage_id);
+                self.store_next_expiries(&mut map);
+                dropped
+            };
+            drop(dropped);
+            return Err(AbortReason::DatabaseCleared.into());
+        }
+        Ok(())
+    }
+
+    fn with_write_state<T>(
+        &self,
+        f: impl FnOnce(&mut RunningTxnMap, u64, &mut WriteCleanup) -> (Result<T>, bool),
+    ) -> Result<T> {
+        let mut cleanup = WriteCleanup::default();
+        let should_notify;
+        let result = {
+            let mut map = self.state.write().unwrap_or_else(PoisonError::into_inner);
+            if is_cleared(&self.database, &self.locks) {
+                cleanup.txns_to_drop = map.clear_all();
+                self.clear_next_expiries();
+                should_notify = false;
+                Err(AbortReason::DatabaseCleared.into())
+            } else {
+                let now_ns = self.now_ns();
+                if now_ns >= self.next_expiry_ns.load(Ordering::Acquire) {
+                    self.reap_due_locked(&mut map, now_ns, &mut cleanup);
+                }
+                let pre_pess_next = self.pessimistic_next_expiry_ns.load(Ordering::Acquire);
+                let (res, check_notify) = f(&mut map, now_ns, &mut cleanup);
+                let (_, pess_next) = self.store_next_expiries(&mut map);
+                should_notify = check_notify && res.is_ok() && pess_next < pre_pess_next;
+                res
+            }
+        };
+        finish_write_cleanup(&self.locks, cleanup);
+        if should_notify {
+            self.expiry_notify.notify_waiters();
+        }
+        result
+    }
+
     pub(crate) fn clear_all(&self) {
         let txns = {
             let mut map = self.state.write().unwrap_or_else(PoisonError::into_inner);
             let txns = map.clear_all();
-            self.next_expiry_ns.store(u64::MAX, Ordering::Release);
+            self.clear_next_expiries();
             txns
         };
         drop(txns);
@@ -753,42 +803,48 @@ impl RunningTransactions {
     }
 
     pub(crate) fn reap_and_next_expiry(&self) -> Option<Instant> {
+        self.reap_and_next_expiry_inner(false)
+    }
+
+    pub(crate) fn reap_and_next_pessimistic_expiry(&self) -> Option<Instant> {
+        self.reap_and_next_expiry_inner(true)
+    }
+
+    fn reap_and_next_expiry_inner(&self, pessimistic_only: bool) -> Option<Instant> {
+        let expiry_atomic = if pessimistic_only {
+            &self.pessimistic_next_expiry_ns
+        } else {
+            &self.next_expiry_ns
+        };
         let now_ns = self.now_ns();
-        let cached_next = self.next_expiry_ns.load(Ordering::Acquire);
+        let cached_next = expiry_atomic.load(Ordering::Acquire);
         if now_ns < cached_next {
             return self.instant_from_ns(cached_next);
         }
 
-        let mut sessions_to_expire = Vec::new();
-        let mut txns_to_drop = Vec::new();
+        let mut cleanup = WriteCleanup::default();
         let next_ns = {
             let mut map = self.state.write().unwrap_or_else(PoisonError::into_inner);
             if is_cleared(&self.database, &self.locks) {
-                txns_to_drop = map.clear_all();
-                self.next_expiry_ns.store(u64::MAX, Ordering::Release);
+                cleanup.txns_to_drop = map.clear_all();
+                self.clear_next_expiries();
                 u64::MAX
             } else {
                 let write_now_ns = self.now_ns();
-                self.reap_due_locked(
-                    &mut map,
-                    write_now_ns,
-                    &mut sessions_to_expire,
-                    &mut txns_to_drop,
-                );
-                self.next_expiry_ns.load(Ordering::Acquire)
+                let locked_cached = expiry_atomic.load(Ordering::Relaxed);
+                if write_now_ns < locked_cached {
+                    locked_cached
+                } else {
+                    self.reap_due_locked(&mut map, write_now_ns, &mut cleanup);
+                    expiry_atomic.load(Ordering::Acquire)
+                }
             }
         };
-        finish_write_cleanup(sessions_to_expire, Vec::new(), txns_to_drop);
+        finish_write_cleanup(&self.locks, cleanup);
         self.instant_from_ns(next_ns)
     }
 
-    fn reap_due_locked(
-        &self,
-        map: &mut RunningTxnMap,
-        now_ns: u64,
-        sessions_to_expire: &mut Vec<Arc<LockSession>>,
-        txns_to_drop: &mut Vec<Arc<Transaction>>,
-    ) {
+    fn reap_due_locked(&self, map: &mut RunningTxnMap, now_ns: u64, cleanup: &mut WriteCleanup) {
         let idle_ns = duration_to_ns(self.timeouts.txn_idle);
         while let Some(&Reverse(top)) = map.expiry_heap.peek() {
             if top.deadline_ns > now_ns {
@@ -809,7 +865,18 @@ impl RunningTransactions {
                 continue;
             }
 
+            let id = TransactionId::from_parts(top.lineage_id, top.attempt_gen);
             let true_deadline = active.effective_expiry(idle_ns);
+            let max_expiry_ns = active.max_expiry_ns;
+            if let Some(promoted) = active_abort_promotion(&active.txn) {
+                let (dropped, _) =
+                    promote_active_slot(map, id, promoted, true_deadline, max_expiry_ns, now_ns);
+                if let Some(txn) = dropped {
+                    cleanup.txns_to_drop.push(txn);
+                }
+                continue;
+            }
+
             if true_deadline > now_ns {
                 let Some(TxnSlot::Active(active_mut)) =
                     map.slots.get_mut(&top.lineage_id).map(|e| &mut e.slot)
@@ -817,82 +884,40 @@ impl RunningTransactions {
                     unreachable!("entry verified Active");
                 };
                 active_mut.heap_deadline_ns = true_deadline;
-                map.expiry_heap.push(Reverse(ExpiryKey {
+                let key = ExpiryKey {
                     deadline_ns: true_deadline,
                     lineage_id:  top.lineage_id,
                     attempt_gen: top.attempt_gen,
-                }));
+                };
+                map.expiry_heap.push(Reverse(key));
+                if active_mut.pessimistic {
+                    map.pessimistic_expiry_heap.push(Reverse(key));
+                }
                 continue;
             }
 
-            let id = TransactionId::from_parts(top.lineage_id, top.attempt_gen);
-            let max_expiry_ns = active.max_expiry_ns;
-            let dropped = match active_abort_promotion(&active.txn) {
-                Some(promoted) => {
-                    let (dropped, _) = promote_active_slot(
-                        map,
-                        id,
-                        promoted,
-                        true_deadline,
-                        max_expiry_ns,
-                        now_ns,
-                    );
-                    dropped
-                }
-                None => {
-                    let (read_only, root_seq) =
-                        extract_expired_info(active.txn.as_ref(), sessions_to_expire);
-                    expire_active_slot(map, id, read_only, root_seq, max_expiry_ns)
-                }
-            };
-            if let Some(txn) = dropped {
-                txns_to_drop.push(txn);
+            let (read_only, root_seq) =
+                extract_expired_info(active.txn.as_ref(), &mut cleanup.sessions_to_expire);
+            if let Some(dropped) = expire_active_slot(map, id, read_only, root_seq, max_expiry_ns) {
+                cleanup.txns_to_drop.push(dropped);
             }
         }
-        let next = map.refresh_next_expiry();
-        self.next_expiry_ns.store(next, Ordering::Release);
+        self.store_next_expiries(map);
     }
 
     fn insert_new_active(&self, id: TransactionId, txn: Arc<Transaction>) -> Result<TransactionId> {
-        let mut sessions_to_expire = Vec::new();
-        let mut txns_to_drop = Vec::new();
-        let should_notify;
-        let res = {
-            let mut map = self.state.write().unwrap_or_else(PoisonError::into_inner);
-            if is_cleared(&self.database, &self.locks) {
-                txns_to_drop = map.clear_all();
-                self.next_expiry_ns.store(u64::MAX, Ordering::Release);
-                txns_to_drop.push(txn);
-                should_notify = false;
-                Err(AbortReason::DatabaseCleared.into())
-            } else {
-                let now_ns = self.now_ns();
-                if now_ns >= self.next_expiry_ns.load(Ordering::Acquire) {
-                    self.reap_due_locked(
-                        &mut map,
-                        now_ns,
-                        &mut sessions_to_expire,
-                        &mut txns_to_drop,
-                    );
-                }
-                let pre_insert_next = self.next_expiry_ns.load(Ordering::Acquire);
-                let active = ActiveEntry::new(txn, now_ns, &self.timeouts);
-                if let Some(dropped) =
-                    map.set_slot(id.lineage_id, id.attempt_gen, TxnSlot::Active(active))
-                {
-                    txns_to_drop.push(dropped);
-                }
-                let new_next = map.refresh_next_expiry();
-                self.next_expiry_ns.store(new_next, Ordering::Release);
-                should_notify = new_next < pre_insert_next;
-                Ok(id)
+        let mut txn_slot = Some(txn);
+        self.with_write_state(|map, now_ns, cleanup| {
+            let txn = txn_slot.take().expect("txn present once");
+            let active = ActiveEntry::new(txn, now_ns, &self.timeouts);
+            let notify = active.pessimistic;
+            if let Some(dropped) =
+                map.set_slot(id.lineage_id, id.attempt_gen, TxnSlot::Active(active))
+            {
+                cleanup.txns_to_drop.push(dropped);
             }
-        };
-        finish_write_cleanup(sessions_to_expire, Vec::new(), txns_to_drop);
-        if should_notify {
-            self.expiry_notify.notify_waiters();
-        }
-        res
+            (Ok(id), notify)
+        })
     }
 
     pub(crate) fn start_read_write(&self, optimistic_concurrency: bool) -> Result<TransactionId> {
@@ -929,17 +954,7 @@ impl RunningTransactions {
 
     pub(crate) fn get_active(&self, id: TransactionId) -> Result<Arc<Transaction>> {
         self.check_id(id)?;
-        if is_cleared(&self.database, &self.locks) {
-            let dropped = {
-                let mut map = self.state.write().unwrap_or_else(PoisonError::into_inner);
-                let dropped = map.remove_slot(id.lineage_id);
-                self.next_expiry_ns
-                    .store(map.refresh_next_expiry(), Ordering::Release);
-                dropped
-            };
-            drop(dropped);
-            return Err(AbortReason::DatabaseCleared.into());
-        }
+        self.reject_if_cleared(id.lineage_id)?;
 
         let idle_ns = duration_to_ns(self.timeouts.txn_idle);
         // Read-lock fast path for un-wounded, un-expired active transactions; only upgrade to
@@ -993,90 +1008,64 @@ impl RunningTransactions {
             }
         }
 
-        let mut sessions_to_expire = Vec::new();
-        let mut txns_to_drop = Vec::new();
-        let result = {
-            let mut map = self.state.write().unwrap_or_else(PoisonError::into_inner);
-            if is_cleared(&self.database, &self.locks) {
-                txns_to_drop = map.clear_all();
-                self.next_expiry_ns.store(u64::MAX, Ordering::Release);
-                Err(AbortReason::DatabaseCleared.into())
-            } else {
-                let now_ns = self.now_ns();
-                if now_ns >= self.next_expiry_ns.load(Ordering::Acquire) {
-                    self.reap_due_locked(
-                        &mut map,
-                        now_ns,
-                        &mut sessions_to_expire,
-                        &mut txns_to_drop,
-                    );
-                }
-                let res = match map.slots.get(&id.lineage_id) {
-                    Some(entry) if entry.current_attempt == id.attempt_gen => match &entry.slot {
-                        TxnSlot::Active(active) => match active_abort_promotion(&active.txn) {
-                            Some(promoted) => {
-                                let expiry_ns = active.effective_expiry(idle_ns);
-                                let max_expiry_ns = active.max_expiry_ns;
-                                let (dropped, err) = promote_active_slot(
-                                    &mut map,
-                                    id,
-                                    promoted,
-                                    expiry_ns,
-                                    max_expiry_ns,
-                                    now_ns,
-                                );
-                                if let Some(txn) = dropped {
-                                    txns_to_drop.push(txn);
-                                }
-                                Err(err)
+        self.with_write_state(|map, now_ns, cleanup| {
+            let res = match map.slots.get(&id.lineage_id) {
+                Some(entry) if entry.current_attempt == id.attempt_gen => match &entry.slot {
+                    TxnSlot::Active(active) => match active_abort_promotion(&active.txn) {
+                        Some(promoted) => {
+                            let expiry_ns = active.effective_expiry(idle_ns);
+                            let max_expiry_ns = active.max_expiry_ns;
+                            let (dropped, err) = promote_active_slot(
+                                map,
+                                id,
+                                promoted,
+                                expiry_ns,
+                                max_expiry_ns,
+                                now_ns,
+                            );
+                            if let Some(txn) = dropped {
+                                cleanup.txns_to_drop.push(txn);
                             }
-                            None if now_ns >= active.effective_expiry(idle_ns) => {
-                                let max_expiry_ns = active.max_expiry_ns;
-                                let (read_only, root_seq) = extract_expired_info(
-                                    active.txn.as_ref(),
-                                    &mut sessions_to_expire,
-                                );
-                                if let Some(dropped) = expire_active_slot(
-                                    &mut map,
-                                    id,
-                                    read_only,
-                                    root_seq,
-                                    max_expiry_ns,
-                                ) {
-                                    txns_to_drop.push(dropped);
-                                }
-                                Err(AbortReason::TransactionExpired.into())
+                            Err(err)
+                        }
+                        None if now_ns >= active.effective_expiry(idle_ns) => {
+                            let max_expiry_ns = active.max_expiry_ns;
+                            let (read_only, root_seq) = extract_expired_info(
+                                active.txn.as_ref(),
+                                &mut cleanup.sessions_to_expire,
+                            );
+                            if let Some(dropped) =
+                                expire_active_slot(map, id, read_only, root_seq, max_expiry_ns)
+                            {
+                                cleanup.txns_to_drop.push(dropped);
                             }
-                            None => {
-                                active.record_activity(now_ns);
-                                Ok(Arc::clone(&active.txn))
-                            }
-                        },
-                        TxnSlot::Expired { .. } => Err(AbortReason::TransactionExpired.into()),
-                        TxnSlot::Wounded {
-                            reason, expiry_ns, ..
-                        } => Err(if now_ns >= *expiry_ns {
-                            AbortReason::TransactionExpired.into()
-                        } else {
-                            (*reason).into()
-                        }),
-                        TxnSlot::Committing
-                        | TxnSlot::AbortedLineage { .. }
-                        | TxnSlot::Closed { .. } => Err(GenericDatabaseError::invalid_argument(
-                            format!("invalid transaction ID: {id}"),
-                        )),
+                            Err(AbortReason::TransactionExpired.into())
+                        }
+                        None => {
+                            active.record_activity(now_ns);
+                            Ok(Arc::clone(&active.txn))
+                        }
                     },
-                    _ => Err(GenericDatabaseError::invalid_argument(format!(
-                        "invalid transaction ID: {id}"
-                    ))),
-                };
-                self.next_expiry_ns
-                    .store(map.refresh_next_expiry(), Ordering::Release);
-                res
-            }
-        };
-        finish_write_cleanup(sessions_to_expire, Vec::new(), txns_to_drop);
-        result
+                    TxnSlot::Expired { .. } => Err(AbortReason::TransactionExpired.into()),
+                    TxnSlot::Wounded {
+                        reason, expiry_ns, ..
+                    } => Err(if now_ns >= *expiry_ns {
+                        AbortReason::TransactionExpired.into()
+                    } else {
+                        (*reason).into()
+                    }),
+                    TxnSlot::Committing
+                    | TxnSlot::AbortedLineage { .. }
+                    | TxnSlot::Closed { .. } => Err(GenericDatabaseError::invalid_argument(
+                        format!("invalid transaction ID: {id}"),
+                    )),
+                },
+                _ => Err(GenericDatabaseError::invalid_argument(format!(
+                    "invalid transaction ID: {id}"
+                ))),
+            };
+            (res, false)
+        })
     }
 
     pub(crate) fn take_for_commit(
@@ -1085,45 +1074,143 @@ impl RunningTransactions {
         has_writes: bool,
     ) -> Result<CommitTake> {
         self.check_id(id)?;
-        if is_cleared(&self.database, &self.locks) {
-            let dropped = {
-                let mut map = self.state.write().unwrap_or_else(PoisonError::into_inner);
-                let dropped = map.remove_slot(id.lineage_id);
-                self.next_expiry_ns
-                    .store(map.refresh_next_expiry(), Ordering::Release);
-                dropped
-            };
-            drop(dropped);
-            return Err(AbortReason::DatabaseCleared.into());
-        }
+        self.reject_if_cleared(id.lineage_id)?;
 
         let idle_ns = duration_to_ns(self.timeouts.txn_idle);
-        let mut sessions_to_expire = Vec::new();
-        let mut txns_to_drop = Vec::new();
-        let result = {
-            let mut map = self.state.write().unwrap_or_else(PoisonError::into_inner);
-            if is_cleared(&self.database, &self.locks) {
-                txns_to_drop = map.clear_all();
-                self.next_expiry_ns.store(u64::MAX, Ordering::Release);
-                Err(AbortReason::DatabaseCleared.into())
-            } else {
-                let now_ns = self.now_ns();
-                if now_ns >= self.next_expiry_ns.load(Ordering::Acquire) {
-                    self.reap_due_locked(
-                        &mut map,
-                        now_ns,
-                        &mut sessions_to_expire,
-                        &mut txns_to_drop,
-                    );
-                }
-                let res = match map.slots.get(&id.lineage_id) {
-                    Some(entry) if entry.current_attempt == id.attempt_gen => match &entry.slot {
-                        TxnSlot::Active(active) => {
-                            let expiry_ns = active.effective_expiry(idle_ns);
-                            let max_expiry_ns = active.max_expiry_ns;
-                            if let Some(promoted) = active_abort_promotion(&active.txn) {
+        self.with_write_state(|map, now_ns, cleanup| {
+            let res = match map.slots.get(&id.lineage_id) {
+                Some(entry) if entry.current_attempt == id.attempt_gen => match &entry.slot {
+                    TxnSlot::Active(active) => {
+                        let expiry_ns = active.effective_expiry(idle_ns);
+                        let max_expiry_ns = active.max_expiry_ns;
+                        if let Some(promoted) = active_abort_promotion(&active.txn) {
+                            let (dropped, err) = promote_active_slot(
+                                map,
+                                id,
+                                promoted,
+                                expiry_ns,
+                                max_expiry_ns,
+                                now_ns,
+                            );
+                            if let Some(txn) = dropped {
+                                cleanup.txns_to_drop.push(txn);
+                            }
+                            Err(err)
+                        } else if now_ns >= expiry_ns {
+                            let (read_only, root_seq) = extract_expired_info(
+                                active.txn.as_ref(),
+                                &mut cleanup.sessions_to_expire,
+                            );
+                            if let Some(dropped) =
+                                expire_active_slot(map, id, read_only, root_seq, max_expiry_ns)
+                            {
+                                cleanup.txns_to_drop.push(dropped);
+                            }
+                            Err(AbortReason::TransactionExpired.into())
+                        } else {
+                            match active.txn.as_ref() {
+                                Transaction::ReadOnly(ro) => {
+                                    let ro = Arc::clone(ro);
+                                    let (outcome, ret) = if has_writes {
+                                        (
+                                            ClosedOutcome::AbortedOrRolledBack,
+                                            Err(GenericDatabaseError::invalid_argument(
+                                                "Cannot modify entities in a read-only transaction",
+                                            )),
+                                        )
+                                    } else {
+                                        (ClosedOutcome::Committed, Ok(CommitTake::ReadOnly(ro)))
+                                    };
+                                    if let Some(dropped) = map.set_slot(
+                                        id.lineage_id,
+                                        id.attempt_gen,
+                                        TxnSlot::Closed {
+                                            outcome,
+                                            read_only: true,
+                                        },
+                                    ) {
+                                        cleanup.txns_to_drop.push(dropped);
+                                    }
+                                    ret
+                                }
+                                Transaction::ReadWrite(rw) => {
+                                    let rw = Arc::clone(rw);
+                                    let session = Arc::clone(rw.session());
+                                    // Disallow new reads on this session immediately while
+                                    // keeping `STATE_ACTIVE` and `woundable = true` until
+                                    // `seal_for_commit`.
+                                    session.mark_commit_started();
+                                    if let Some(dropped) = map.set_slot(
+                                        id.lineage_id,
+                                        id.attempt_gen,
+                                        TxnSlot::Committing,
+                                    ) {
+                                        cleanup.txns_to_drop.push(dropped);
+                                    }
+                                    let guard = CommitSlotGuard {
+                                        database: Weak::clone(&self.database),
+                                        locks: Arc::clone(&self.locks),
+                                        state: Arc::clone(&self.state),
+                                        id,
+                                        session,
+                                        expiry_ns,
+                                        max_expiry_ns,
+                                        armed: true,
+                                    };
+                                    Ok(CommitTake::ReadWrite((rw, guard)))
+                                }
+                            }
+                        }
+                    }
+                    TxnSlot::Expired { .. } => Err(AbortReason::TransactionExpired.into()),
+                    TxnSlot::Wounded {
+                        reason, expiry_ns, ..
+                    } => Err(if now_ns >= *expiry_ns {
+                        AbortReason::TransactionExpired.into()
+                    } else {
+                        (*reason).into()
+                    }),
+                    TxnSlot::Committing
+                    | TxnSlot::AbortedLineage { .. }
+                    | TxnSlot::Closed { .. } => Err(GenericDatabaseError::invalid_argument(
+                        format!("invalid transaction ID: {id}"),
+                    )),
+                },
+                _ => Err(GenericDatabaseError::invalid_argument(format!(
+                    "invalid transaction ID: {id}"
+                ))),
+            };
+            (res, false)
+        })
+    }
+
+    pub(crate) fn rollback(&self, id: TransactionId) -> Result<()> {
+        self.check_id(id)?;
+        self.reject_if_cleared(id.lineage_id)?;
+
+        let idle_ns = duration_to_ns(self.timeouts.txn_idle);
+        self.with_write_state(|map, now_ns, cleanup| {
+            let res = match map.slots.get(&id.lineage_id) {
+                None => Err(GenericDatabaseError::invalid_argument(format!(
+                    "invalid transaction ID: {id}"
+                ))),
+                Some(entry) if id.attempt_gen > entry.current_attempt => Err(
+                    GenericDatabaseError::invalid_argument(format!("invalid transaction ID: {id}")),
+                ),
+                // Stale generation (`id.attempt_gen < current_attempt`): return idempotent
+                // Ok(()) immediately without inspecting or mutating the active/committed newer
+                // attempt.
+                Some(entry) if id.attempt_gen < entry.current_attempt => Ok(()),
+                Some(entry) => match &entry.slot {
+                    TxnSlot::Active(active) => {
+                        let expiry_ns = active.effective_expiry(idle_ns);
+                        let max_expiry_ns = active.max_expiry_ns;
+                        match active_abort_promotion(&active.txn) {
+                            Some(promoted) => {
+                                let is_clear = matches!(promoted, Promotion::Clear);
+                                let is_closed = matches!(promoted, Promotion::Closed);
                                 let (dropped, err) = promote_active_slot(
-                                    &mut map,
+                                    map,
                                     id,
                                     promoted,
                                     expiry_ns,
@@ -1131,287 +1218,68 @@ impl RunningTransactions {
                                     now_ns,
                                 );
                                 if let Some(txn) = dropped {
-                                    txns_to_drop.push(txn);
+                                    cleanup.txns_to_drop.push(txn);
                                 }
-                                Err(err)
-                            } else if now_ns >= expiry_ns {
+                                if is_clear {
+                                    Err(err)
+                                } else if is_closed {
+                                    Ok(())
+                                } else {
+                                    rollback_expiry_result(now_ns, max_expiry_ns)
+                                }
+                            }
+                            None if now_ns >= expiry_ns => {
                                 let (read_only, root_seq) = extract_expired_info(
                                     active.txn.as_ref(),
-                                    &mut sessions_to_expire,
+                                    &mut cleanup.sessions_to_expire,
                                 );
-                                if let Some(dropped) = expire_active_slot(
-                                    &mut map,
-                                    id,
-                                    read_only,
-                                    root_seq,
-                                    max_expiry_ns,
-                                ) {
-                                    txns_to_drop.push(dropped);
+                                if let Some(dropped) =
+                                    expire_active_slot(map, id, read_only, root_seq, max_expiry_ns)
+                                {
+                                    cleanup.txns_to_drop.push(dropped);
                                 }
-                                Err(AbortReason::TransactionExpired.into())
-                            } else {
-                                match active.txn.as_ref() {
-                                    Transaction::ReadOnly(ro) => {
-                                        let ro = Arc::clone(ro);
-                                        let (outcome, ret) = if has_writes {
-                                            (
-                                                ClosedOutcome::AbortedOrRolledBack,
-                                                Err(GenericDatabaseError::invalid_argument(
-                                                    "Cannot modify entities in a read-only \
-                                                     transaction",
-                                                )),
-                                            )
-                                        } else {
-                                            (ClosedOutcome::Committed, Ok(CommitTake::ReadOnly(ro)))
-                                        };
-                                        if let Some(dropped) = map.set_slot(
-                                            id.lineage_id,
-                                            id.attempt_gen,
-                                            TxnSlot::Closed {
-                                                outcome,
-                                                read_only: true,
-                                                ring_gen: 0,
-                                            },
-                                        ) {
-                                            txns_to_drop.push(dropped);
-                                        }
-                                        ret
-                                    }
+                                rollback_expiry_result(now_ns, max_expiry_ns)
+                            }
+                            None => {
+                                let read_only = match active.txn.as_ref() {
                                     Transaction::ReadWrite(rw) => {
-                                        let rw = Arc::clone(rw);
-                                        let session = Arc::clone(rw.session());
-                                        // Disallow new reads on this session immediately while
-                                        // keeping `STATE_ACTIVE` and `woundable = true` until
-                                        // `seal_for_commit`.
-                                        session.mark_commit_started();
-                                        if let Some(dropped) = map.set_slot(
-                                            id.lineage_id,
-                                            id.attempt_gen,
-                                            TxnSlot::Committing,
-                                        ) {
-                                            txns_to_drop.push(dropped);
-                                        }
-                                        let guard = CommitSlotGuard {
-                                            database: Weak::clone(&self.database),
-                                            locks: Arc::clone(&self.locks),
-                                            state: Arc::clone(&self.state),
-                                            id,
-                                            session,
-                                            expiry_ns,
-                                            max_expiry_ns,
-                                            armed: true,
-                                        };
-                                        Ok(CommitTake::ReadWrite((rw, guard)))
+                                        cleanup.sessions_to_close.push(Arc::clone(rw.session()));
+                                        false
                                     }
-                                }
-                            }
-                        }
-                        TxnSlot::Expired { .. } => Err(AbortReason::TransactionExpired.into()),
-                        TxnSlot::Wounded {
-                            reason, expiry_ns, ..
-                        } => Err(if now_ns >= *expiry_ns {
-                            AbortReason::TransactionExpired.into()
-                        } else {
-                            (*reason).into()
-                        }),
-                        TxnSlot::Committing
-                        | TxnSlot::AbortedLineage { .. }
-                        | TxnSlot::Closed { .. } => Err(GenericDatabaseError::invalid_argument(
-                            format!("invalid transaction ID: {id}"),
-                        )),
-                    },
-                    _ => Err(GenericDatabaseError::invalid_argument(format!(
-                        "invalid transaction ID: {id}"
-                    ))),
-                };
-                self.next_expiry_ns
-                    .store(map.refresh_next_expiry(), Ordering::Release);
-                res
-            }
-        };
-        finish_write_cleanup(sessions_to_expire, Vec::new(), txns_to_drop);
-        result
-    }
-
-    pub(crate) fn rollback(&self, id: TransactionId) -> Result<()> {
-        self.check_id(id)?;
-        if is_cleared(&self.database, &self.locks) {
-            let dropped = {
-                let mut map = self.state.write().unwrap_or_else(PoisonError::into_inner);
-                let dropped = map.remove_slot(id.lineage_id);
-                self.next_expiry_ns
-                    .store(map.refresh_next_expiry(), Ordering::Release);
-                dropped
-            };
-            drop(dropped);
-            return Err(AbortReason::DatabaseCleared.into());
-        }
-
-        let idle_ns = duration_to_ns(self.timeouts.txn_idle);
-        let mut sessions_to_expire = Vec::new();
-        let mut sessions_to_close = Vec::new();
-        let mut txns_to_drop = Vec::new();
-        let result = {
-            let mut map = self.state.write().unwrap_or_else(PoisonError::into_inner);
-            if is_cleared(&self.database, &self.locks) {
-                txns_to_drop = map.clear_all();
-                self.next_expiry_ns.store(u64::MAX, Ordering::Release);
-                Err(AbortReason::DatabaseCleared.into())
-            } else {
-                let now_ns = self.now_ns();
-                if now_ns >= self.next_expiry_ns.load(Ordering::Acquire) {
-                    self.reap_due_locked(
-                        &mut map,
-                        now_ns,
-                        &mut sessions_to_expire,
-                        &mut txns_to_drop,
-                    );
-                }
-                let res = match map.slots.get(&id.lineage_id) {
-                    None => Err(GenericDatabaseError::invalid_argument(format!(
-                        "invalid transaction ID: {id}"
-                    ))),
-                    Some(entry) if id.attempt_gen > entry.current_attempt => {
-                        Err(GenericDatabaseError::invalid_argument(format!(
-                            "invalid transaction ID: {id}"
-                        )))
-                    }
-                    // Stale generation (`id.attempt_gen < current_attempt`): return idempotent
-                    // Ok(()) immediately without inspecting or mutating the active/committed newer
-                    // attempt.
-                    Some(entry) if id.attempt_gen < entry.current_attempt => Ok(()),
-                    Some(entry) => match &entry.slot {
-                        TxnSlot::Active(active) => {
-                            let expiry_ns = active.effective_expiry(idle_ns);
-                            let max_expiry_ns = active.max_expiry_ns;
-                            match active_abort_promotion(&active.txn) {
-                                Some(Promotion::Clear) => {
-                                    if let Some(dropped) = map.remove_slot(id.lineage_id) {
-                                        txns_to_drop.push(dropped);
-                                    }
-                                    Err(AbortReason::DatabaseCleared.into())
-                                }
-                                Some(Promotion::Wounded { root_seq, reason }) => {
-                                    if let Some(dropped) = map.set_slot(
-                                        id.lineage_id,
-                                        id.attempt_gen,
-                                        TxnSlot::Wounded {
-                                            root_seq,
-                                            reason,
-                                            expiry_ns,
-                                            max_expiry_ns,
-                                            ring_gen: 0,
-                                        },
-                                    ) {
-                                        txns_to_drop.push(dropped);
-                                    }
-                                    rollback_expiry_result(now_ns, max_expiry_ns)
-                                }
-                                Some(Promotion::AbortedLineage { root_seq }) => {
-                                    if let Some(dropped) = map.set_slot(
-                                        id.lineage_id,
-                                        id.attempt_gen,
-                                        TxnSlot::AbortedLineage {
-                                            root_seq,
-                                            max_expiry_ns,
-                                            ring_gen: 0,
-                                        },
-                                    ) {
-                                        txns_to_drop.push(dropped);
-                                    }
-                                    rollback_expiry_result(now_ns, max_expiry_ns)
-                                }
-                                Some(Promotion::Expired { root_seq }) => {
-                                    if let Some(dropped) = map.set_slot(
-                                        id.lineage_id,
-                                        id.attempt_gen,
-                                        TxnSlot::Expired {
-                                            read_only: false,
-                                            root_seq,
-                                            max_expiry_ns,
-                                            ring_gen: 0,
-                                        },
-                                    ) {
-                                        txns_to_drop.push(dropped);
-                                    }
-                                    rollback_expiry_result(now_ns, max_expiry_ns)
-                                }
-                                Some(Promotion::Closed) => {
-                                    if let Some(dropped) = map.set_slot(
-                                        id.lineage_id,
-                                        id.attempt_gen,
-                                        TxnSlot::Closed {
-                                            outcome:   ClosedOutcome::AbortedOrRolledBack,
-                                            read_only: false,
-                                            ring_gen:  0,
-                                        },
-                                    ) {
-                                        txns_to_drop.push(dropped);
-                                    }
-                                    Ok(())
-                                }
-                                None if now_ns >= expiry_ns => {
-                                    let (read_only, root_seq) = extract_expired_info(
-                                        active.txn.as_ref(),
-                                        &mut sessions_to_expire,
-                                    );
-                                    if let Some(dropped) = expire_active_slot(
-                                        &mut map,
-                                        id,
+                                    Transaction::ReadOnly(_) => true,
+                                };
+                                if let Some(dropped) = map.set_slot(
+                                    id.lineage_id,
+                                    id.attempt_gen,
+                                    TxnSlot::Closed {
+                                        outcome: ClosedOutcome::AbortedOrRolledBack,
                                         read_only,
-                                        root_seq,
-                                        max_expiry_ns,
-                                    ) {
-                                        txns_to_drop.push(dropped);
-                                    }
-                                    rollback_expiry_result(now_ns, max_expiry_ns)
+                                    },
+                                ) {
+                                    cleanup.txns_to_drop.push(dropped);
                                 }
-                                None => {
-                                    let read_only = match active.txn.as_ref() {
-                                        Transaction::ReadWrite(rw) => {
-                                            sessions_to_close.push(Arc::clone(rw.session()));
-                                            false
-                                        }
-                                        Transaction::ReadOnly(_) => true,
-                                    };
-                                    if let Some(dropped) = map.set_slot(
-                                        id.lineage_id,
-                                        id.attempt_gen,
-                                        TxnSlot::Closed {
-                                            outcome: ClosedOutcome::AbortedOrRolledBack,
-                                            read_only,
-                                            ring_gen: 0,
-                                        },
-                                    ) {
-                                        txns_to_drop.push(dropped);
-                                    }
-                                    Ok(())
-                                }
+                                Ok(())
                             }
                         }
-                        TxnSlot::Expired { max_expiry_ns, .. }
-                        | TxnSlot::Wounded { max_expiry_ns, .. }
-                        | TxnSlot::AbortedLineage { max_expiry_ns, .. } => {
-                            rollback_expiry_result(now_ns, *max_expiry_ns)
-                        }
-                        TxnSlot::Committing
-                        | TxnSlot::Closed {
-                            outcome: ClosedOutcome::AbortedOrRolledBack,
-                            ..
-                        } => Ok(()),
-                        TxnSlot::Closed {
-                            outcome: ClosedOutcome::Committed,
-                            ..
-                        } => Err(GenericDatabaseError::aborted(EXPIRED_TRANSACTION_MSG)),
-                    },
-                };
-                self.next_expiry_ns
-                    .store(map.refresh_next_expiry(), Ordering::Release);
-                res
-            }
-        };
-        finish_write_cleanup(sessions_to_expire, sessions_to_close, txns_to_drop);
-        result
+                    }
+                    TxnSlot::Expired { max_expiry_ns, .. }
+                    | TxnSlot::Wounded { max_expiry_ns, .. }
+                    | TxnSlot::AbortedLineage { max_expiry_ns, .. } => {
+                        rollback_expiry_result(now_ns, *max_expiry_ns)
+                    }
+                    TxnSlot::Committing
+                    | TxnSlot::Closed {
+                        outcome: ClosedOutcome::AbortedOrRolledBack,
+                        ..
+                    } => Ok(()),
+                    TxnSlot::Closed {
+                        outcome: ClosedOutcome::Committed,
+                        ..
+                    } => Err(GenericDatabaseError::aborted(EXPIRED_TRANSACTION_MSG)),
+                },
+            };
+            (res, false)
+        })
     }
 
     pub(crate) fn start_read_write_with_id(
@@ -1420,68 +1288,48 @@ impl RunningTransactions {
         optimistic_concurrency: bool,
     ) -> Result<TransactionId> {
         self.check_id(id)?;
-        if is_cleared(&self.database, &self.locks) {
-            let dropped = {
-                let mut map = self.state.write().unwrap_or_else(PoisonError::into_inner);
-                let dropped = map.remove_slot(id.lineage_id);
-                self.next_expiry_ns
-                    .store(map.refresh_next_expiry(), Ordering::Release);
-                dropped
-            };
-            drop(dropped);
-            return Err(AbortReason::DatabaseCleared.into());
-        }
+        self.reject_if_cleared(id.lineage_id)?;
 
         let idle_ns = duration_to_ns(self.timeouts.txn_idle);
-        let mut sessions_to_expire = Vec::new();
-        let mut txns_to_drop = Vec::new();
-        let mut should_notify = false;
-        let result = {
-            let mut map = self.state.write().unwrap_or_else(PoisonError::into_inner);
-            if is_cleared(&self.database, &self.locks) {
-                txns_to_drop = map.clear_all();
-                self.next_expiry_ns.store(u64::MAX, Ordering::Release);
-                Err(AbortReason::DatabaseCleared.into())
-            } else {
-                let now_ns = self.now_ns();
-                if now_ns >= self.next_expiry_ns.load(Ordering::Acquire) {
-                    self.reap_due_locked(
-                        &mut map,
-                        now_ns,
-                        &mut sessions_to_expire,
-                        &mut txns_to_drop,
-                    );
-                }
-                let pre_insert_next = self.next_expiry_ns.load(Ordering::Acquire);
-
-                let plan = match map.slots.get(&id.lineage_id) {
-                    Some(entry) if id.attempt_gen > entry.current_attempt => {
-                        Err(GenericDatabaseError::invalid_argument(format!(
-                            "invalid transaction ID: {id}"
-                        )))
-                    }
-                    Some(entry) => {
-                        let cur = entry.current_attempt;
-                        match &entry.slot {
-                            TxnSlot::Active(active) => match active.txn.as_ref() {
-                                Transaction::ReadOnly(_) => {
-                                    Err(GenericDatabaseError::invalid_argument(
-                                        "Cannot retry a read-only transaction",
-                                    ))
-                                }
-                                Transaction::ReadWrite(rw) => {
-                                    match active_abort_promotion(&active.txn) {
-                                        Some(Promotion::Clear) => {
-                                            if let Some(dropped) = map.remove_slot(id.lineage_id) {
-                                                txns_to_drop.push(dropped);
-                                            }
-                                            Err(AbortReason::DatabaseCleared.into())
+        self.with_write_state(|map, now_ns, cleanup| {
+            let plan = match map.slots.get(&id.lineage_id) {
+                Some(entry) if id.attempt_gen > entry.current_attempt => Err(
+                    GenericDatabaseError::invalid_argument(format!("invalid transaction ID: {id}")),
+                ),
+                Some(entry) => {
+                    let cur = entry.current_attempt;
+                    match &entry.slot {
+                        TxnSlot::Active(active) => match active.txn.as_ref() {
+                            Transaction::ReadOnly(_) => {
+                                Err(GenericDatabaseError::invalid_argument(
+                                    "Cannot retry a read-only transaction",
+                                ))
+                            }
+                            Transaction::ReadWrite(rw) => {
+                                match active_abort_promotion(&active.txn) {
+                                    Some(Promotion::Clear) => {
+                                        if let Some(dropped) = map.remove_slot(id.lineage_id) {
+                                            cleanup.txns_to_drop.push(dropped);
                                         }
-                                        Some(
-                                            Promotion::Wounded { root_seq, .. }
-                                            | Promotion::AbortedLineage { root_seq }
-                                            | Promotion::Expired { root_seq },
-                                        ) => next_attempt_gen(cur, id).map(|next_attempt| {
+                                        Err(AbortReason::DatabaseCleared.into())
+                                    }
+                                    Some(
+                                        Promotion::Wounded { root_seq, .. }
+                                        | Promotion::AbortedLineage { root_seq },
+                                    ) => next_attempt_gen(cur, id).map(|next_attempt| {
+                                        (
+                                            next_attempt,
+                                            root_seq
+                                                .map_or(LockPriority::Lazy, LockPriority::Assigned),
+                                        )
+                                    }),
+                                    Some(Promotion::Closed) => next_attempt_gen(cur, id)
+                                        .map(|next_attempt| (next_attempt, LockPriority::Lazy)),
+                                    None if now_ns >= active.effective_expiry(idle_ns) => {
+                                        let session = Arc::clone(rw.session());
+                                        let root_seq = session.root_seq();
+                                        cleanup.sessions_to_expire.push(session);
+                                        next_attempt_gen(cur, id).map(|next_attempt| {
                                             (
                                                 next_attempt,
                                                 root_seq.map_or(
@@ -1489,113 +1337,87 @@ impl RunningTransactions {
                                                     LockPriority::Assigned,
                                                 ),
                                             )
-                                        }),
-                                        Some(Promotion::Closed) => next_attempt_gen(cur, id)
-                                            .map(|next_attempt| (next_attempt, LockPriority::Lazy)),
-                                        None if now_ns >= active.effective_expiry(idle_ns) => {
-                                            let session = Arc::clone(rw.session());
-                                            let root_seq = session.root_seq();
-                                            sessions_to_expire.push(session);
-                                            next_attempt_gen(cur, id).map(|next_attempt| {
-                                                (
-                                                    next_attempt,
-                                                    root_seq.map_or(
-                                                        LockPriority::Lazy,
-                                                        LockPriority::Assigned,
-                                                    ),
-                                                )
-                                            })
-                                        }
-                                        None => Err(GenericDatabaseError::failed_precondition(
-                                            "transaction_id already/still in use",
-                                        )),
+                                        })
                                     }
+                                    None => Err(GenericDatabaseError::failed_precondition(
+                                        "transaction_id already/still in use",
+                                    )),
                                 }
-                            },
-                            TxnSlot::Closed {
-                                read_only: true, ..
                             }
-                            | TxnSlot::Expired {
-                                read_only: true, ..
-                            } => Err(GenericDatabaseError::invalid_argument(
-                                "Cannot retry a read-only transaction",
-                            )),
-                            TxnSlot::Committing => Err(GenericDatabaseError::failed_precondition(
-                                "transaction_id already/still in use",
-                            )),
-                            TxnSlot::Wounded { root_seq, .. }
-                            | TxnSlot::AbortedLineage { root_seq, .. }
-                            | TxnSlot::Expired {
-                                read_only: false,
-                                root_seq,
-                                ..
-                            } => {
-                                let root_seq = *root_seq;
-                                next_attempt_gen(cur, id).map(|next_attempt| {
-                                    (
-                                        next_attempt,
-                                        root_seq.map_or(LockPriority::Lazy, LockPriority::Assigned),
-                                    )
-                                })
-                            }
-                            TxnSlot::Closed {
-                                read_only: false, ..
-                            } => next_attempt_gen(cur, id)
-                                .map(|next_attempt| (next_attempt, LockPriority::Lazy)),
+                        },
+                        TxnSlot::Closed {
+                            read_only: true, ..
                         }
-                    }
-                    None => next_attempt_gen(id.attempt_gen, id)
-                        .map(|next_attempt| (next_attempt, LockPriority::Lazy)),
-                };
-
-                let res = match plan {
-                    Ok((next_attempt, priority)) => {
-                        let new_id = id.with_attempt(next_attempt);
-                        let txn =
-                            Arc::new(Transaction::ReadWrite(Arc::new(ReadWriteTransaction::new(
-                                new_id,
-                                Weak::clone(&self.database),
-                                &self.locks,
-                                priority,
-                                optimistic_concurrency,
-                            ))));
-                        let active = ActiveEntry::new(txn, now_ns, &self.timeouts);
-                        if let Some(prev) =
-                            map.set_slot(id.lineage_id, next_attempt, TxnSlot::Active(active))
-                        {
-                            txns_to_drop.push(prev);
+                        | TxnSlot::Expired {
+                            read_only: true, ..
+                        } => Err(GenericDatabaseError::invalid_argument(
+                            "Cannot retry a read-only transaction",
+                        )),
+                        TxnSlot::Committing => Err(GenericDatabaseError::failed_precondition(
+                            "transaction_id already/still in use",
+                        )),
+                        TxnSlot::Wounded { root_seq, .. }
+                        | TxnSlot::AbortedLineage { root_seq, .. }
+                        | TxnSlot::Expired {
+                            read_only: false,
+                            root_seq,
+                            ..
+                        } => {
+                            let root_seq = *root_seq;
+                            next_attempt_gen(cur, id).map(|next_attempt| {
+                                (
+                                    next_attempt,
+                                    root_seq.map_or(LockPriority::Lazy, LockPriority::Assigned),
+                                )
+                            })
                         }
-                        Ok(new_id)
+                        TxnSlot::Closed {
+                            read_only: false, ..
+                        } => next_attempt_gen(cur, id)
+                            .map(|next_attempt| (next_attempt, LockPriority::Lazy)),
                     }
-                    Err(err) => Err(err),
-                };
+                }
+                None => next_attempt_gen(id.attempt_gen, id)
+                    .map(|next_attempt| (next_attempt, LockPriority::Lazy)),
+            };
 
-                let new_next = map.refresh_next_expiry();
-                self.next_expiry_ns.store(new_next, Ordering::Release);
-                should_notify = res.is_ok() && new_next < pre_insert_next;
-                res
+            match plan {
+                Ok((next_attempt, priority)) => {
+                    let new_id = id.with_attempt(next_attempt);
+                    let txn =
+                        Arc::new(Transaction::ReadWrite(Arc::new(ReadWriteTransaction::new(
+                            new_id,
+                            Weak::clone(&self.database),
+                            &self.locks,
+                            priority,
+                            optimistic_concurrency,
+                        ))));
+                    if is_cleared(&self.database, &self.locks) {
+                        cleanup.txns_to_drop.extend(map.clear_all());
+                        cleanup.txns_to_drop.push(txn);
+                        return (Err(AbortReason::DatabaseCleared.into()), false);
+                    }
+                    let active = ActiveEntry::new(txn, now_ns, &self.timeouts);
+                    let notify = active.pessimistic;
+                    if let Some(prev) =
+                        map.set_slot(id.lineage_id, next_attempt, TxnSlot::Active(active))
+                    {
+                        cleanup.txns_to_drop.push(prev);
+                    }
+                    (Ok(new_id), notify)
+                }
+                Err(err) => (Err(err), false),
             }
-        };
-        finish_write_cleanup(sessions_to_expire, Vec::new(), txns_to_drop);
-        if should_notify {
-            self.expiry_notify.notify_waiters();
-        }
-        result
+        })
     }
 }
 
-fn finish_write_cleanup(
-    sessions_to_expire: Vec<Arc<LockSession>>,
-    sessions_to_close: Vec<Arc<LockSession>>,
-    txns_to_drop: Vec<Arc<Transaction>>,
-) {
-    for session in sessions_to_expire {
-        session.close_expired();
-    }
-    for session in sessions_to_close {
+fn finish_write_cleanup(locks: &LockManager, cleanup: WriteCleanup) {
+    locks.close_expired_sessions(&cleanup.sessions_to_expire);
+    for session in cleanup.sessions_to_close {
         session.close();
     }
-    drop(txns_to_drop);
+    drop(cleanup.txns_to_drop);
 }
 
 fn rollback_expiry_result(now_ns: u64, max_expiry_ns: u64) -> Result<()> {
@@ -1635,7 +1457,6 @@ fn expire_active_slot(
             read_only,
             root_seq,
             max_expiry_ns,
-            ring_gen: 0,
         },
     )
 }
@@ -1668,7 +1489,6 @@ fn promote_active_slot(
                     reason,
                     expiry_ns,
                     max_expiry_ns,
-                    ring_gen: 0,
                 },
             ),
             if now_ns >= expiry_ns {
@@ -1684,23 +1504,9 @@ fn promote_active_slot(
                 TxnSlot::AbortedLineage {
                     root_seq,
                     max_expiry_ns,
-                    ring_gen: 0,
                 },
             ),
             GenericDatabaseError::invalid_argument(format!("invalid transaction ID: {id}")),
-        ),
-        Promotion::Expired { root_seq } => (
-            map.set_slot(
-                id.lineage_id,
-                id.attempt_gen,
-                TxnSlot::Expired {
-                    read_only: false,
-                    root_seq,
-                    max_expiry_ns,
-                    ring_gen: 0,
-                },
-            ),
-            AbortReason::TransactionExpired.into(),
         ),
         Promotion::Closed => (
             map.set_slot(
@@ -1709,7 +1515,6 @@ fn promote_active_slot(
                 TxnSlot::Closed {
                     outcome:   ClosedOutcome::AbortedOrRolledBack,
                     read_only: false,
-                    ring_gen:  0,
                 },
             ),
             GenericDatabaseError::invalid_argument(format!("invalid transaction ID: {id}")),
@@ -1723,9 +1528,6 @@ enum Promotion {
         reason:   AbortReason,
     },
     AbortedLineage {
-        root_seq: Option<u64>,
-    },
-    Expired {
         root_seq: Option<u64>,
     },
     Clear,
@@ -1744,9 +1546,13 @@ fn active_abort_promotion(txn: &Transaction) -> Option<Promotion> {
         SessionAbortState::TimedOut(_) => Some(Promotion::AbortedLineage {
             root_seq: session.root_seq(),
         }),
-        SessionAbortState::Expired(_) => Some(Promotion::Expired {
-            root_seq: session.root_seq(),
-        }),
+        SessionAbortState::Expired(_) => {
+            debug_assert!(
+                false,
+                "Active slot cannot hold an already-expired LockSession"
+            );
+            Some(Promotion::Closed)
+        }
         SessionAbortState::Cleared(_) => Some(Promotion::Clear),
         SessionAbortState::Closed => Some(Promotion::Closed),
     }
@@ -2108,7 +1914,6 @@ mod tests {
             TxnSlot::Closed {
                 outcome:   ClosedOutcome::AbortedOrRolledBack,
                 read_only: false,
-                ring_gen:  0,
             },
         );
         drop(dropped);
@@ -2130,7 +1935,6 @@ mod tests {
                 },
                 expiry_ns: u64::MAX,
                 max_expiry_ns: u64::MAX,
-                ring_gen: 0,
             },
         );
         drop(dropped);
@@ -2280,7 +2084,7 @@ mod tests {
         // Both Timeouts::FAST and Timeouts::CLOUD share identical Cloud transaction TTL defaults.
         for timeouts in [Timeouts::FAST, Timeouts::CLOUD] {
             assert_eq!(timeouts.txn_idle, Duration::from_secs(60));
-            assert_eq!(timeouts.txn_used_min, Duration::from_secs(120));
+            assert_eq!(timeouts.txn_used_min(), Duration::from_secs(120));
             assert_eq!(timeouts.txn_max, Duration::from_secs(270));
 
             let txns = test_txns(timeouts);
@@ -2663,41 +2467,6 @@ mod tests {
         assert!(c_rw.session().check_active().is_ok());
         c_guard.finish_committed();
         assert_eq!(txns2.rollback(committing_id).unwrap_err(), expired_err());
-
-        // 5. `CommitSlotGuard::abort_commit(Some(AbortReason::TransactionExpired))` preserves
-        //    `root_seq`!
-        let exp_abort_id = txns2.start_read_write(false).unwrap();
-        let exp_txn = txns2.get_active(exp_abort_id).unwrap();
-        let lease = exp_txn
-            .as_read_write()
-            .unwrap()
-            .session()
-            .acquire_read(&doc_ref("abort_exp_seq"))
-            .await
-            .unwrap();
-        let seq_before = exp_txn
-            .as_read_write()
-            .unwrap()
-            .session()
-            .root_seq()
-            .unwrap();
-        drop(lease);
-        drop(exp_txn);
-        let CommitTake::ReadWrite((_, g_exp)) = txns2.take_for_commit(exp_abort_id, true).unwrap()
-        else {
-            panic!();
-        };
-        g_exp.abort_commit(Some(AbortReason::TransactionExpired));
-        let exp_retried = txns2.start_read_write_with_id(exp_abort_id, false).unwrap();
-        let exp_retried_txn = txns2.get_active(exp_retried).unwrap();
-        assert_eq!(
-            exp_retried_txn
-                .as_read_write()
-                .unwrap()
-                .session()
-                .root_seq(),
-            Some(seq_before)
-        );
     }
 
     #[tokio::test(start_paused = true)]
@@ -2951,10 +2720,13 @@ mod tests {
             let map = txns.state.read().unwrap();
             assert_eq!(map.active_count, 0);
             assert!(map.expiry_heap.is_empty());
-            assert_eq!(map.expired_ro_ring.count, MAX_EXPIRED_TXNS);
-            assert_eq!(map.expired_rw_ring.count, 1);
-            assert_eq!(map.retry_ring.count, 1);
-            assert_eq!(map.closed_ring.count, 1);
+            assert_eq!(
+                map.rings[RingKind::ExpiredRo as usize].count,
+                MAX_EXPIRED_TXNS
+            );
+            assert_eq!(map.rings[RingKind::ExpiredRw as usize].count, 1);
+            assert_eq!(map.rings[RingKind::Retry as usize].count, 1);
+            assert_eq!(map.rings[RingKind::Closed as usize].count, 1);
         }
         assert_eq!(txns.next_expiry_ns.load(Ordering::Acquire), u64::MAX);
 
@@ -3042,7 +2814,7 @@ mod tests {
             FirestoreConfig::default().with_transaction_timeouts(Duration::ZERO, Duration::ZERO);
         let proj_zero_both = FirestoreProject::new(zero_both);
         assert_eq!(proj_zero_both.timeouts.txn_idle, Duration::ZERO);
-        assert_eq!(proj_zero_both.timeouts.txn_used_min, Duration::ZERO);
+        assert_eq!(proj_zero_both.timeouts.txn_used_min(), Duration::ZERO);
         assert_eq!(proj_zero_both.timeouts.txn_max, Duration::ZERO);
         let txns_zb = test_txns(proj_zero_both.timeouts);
         let z_rw = txns_zb.start_read_write(false).unwrap();
@@ -3055,7 +2827,7 @@ mod tests {
             .with_transaction_max_lifetime(Duration::from_secs(10));
         let proj_zi = FirestoreProject::new(zero_idle);
         assert_eq!(proj_zi.timeouts.txn_idle, Duration::ZERO);
-        assert_eq!(proj_zi.timeouts.txn_used_min, Duration::ZERO);
+        assert_eq!(proj_zi.timeouts.txn_used_min(), Duration::ZERO);
         assert_eq!(proj_zi.timeouts.txn_max, Duration::from_secs(10));
         let txns_zi = test_txns(proj_zi.timeouts);
         let zi_ro = txns_zi.start_read_only(None).unwrap();
@@ -3065,14 +2837,14 @@ mod tests {
         let zero_max = FirestoreConfig::default().with_transaction_max_lifetime(Duration::ZERO);
         let proj_zm = FirestoreProject::new(zero_max);
         assert_eq!(proj_zm.timeouts.txn_idle, Duration::ZERO);
-        assert_eq!(proj_zm.timeouts.txn_used_min, Duration::ZERO);
+        assert_eq!(proj_zm.timeouts.txn_used_min(), Duration::ZERO);
         assert_eq!(proj_zm.timeouts.txn_max, Duration::ZERO);
 
         let max_both =
             FirestoreConfig::default().with_transaction_timeouts(Duration::MAX, Duration::MAX);
         let proj_max = FirestoreProject::new(max_both);
         assert_eq!(proj_max.timeouts.txn_idle, Duration::MAX);
-        assert_eq!(proj_max.timeouts.txn_used_min, Duration::MAX);
+        assert_eq!(proj_max.timeouts.txn_used_min(), Duration::MAX);
         assert_eq!(proj_max.timeouts.txn_max, Duration::MAX);
         let txns_max = test_txns(proj_max.timeouts);
         let m_rw = txns_max.start_read_write(false).unwrap();
@@ -3165,6 +2937,163 @@ mod tests {
             db.transactions.next_expiry_ns.load(Ordering::Acquire),
             u64::MAX
         );
+        assert_eq!(
+            db.transactions
+                .pessimistic_next_expiry_ns
+                .load(Ordering::Acquire),
+            u64::MAX
+        );
         assert_eq!(db.locks.table_counts(), (0, 0));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn reap_due_locked_promotes_wounded_used_txn_at_unused_deadline_without_repush() {
+        use tokio::time::advance;
+
+        let txns = test_txns(Timeouts::FAST);
+        let doc = doc_ref("wounded_early_reap");
+
+        let seq1_holder = txns
+            .locks
+            .new_session(None, LockPriority::NextSeq, true, true);
+        let victim_id = txns.start_read_write(false).unwrap();
+        let victim_txn = txns.get_active(victim_id).unwrap();
+        let victim_weak = Arc::downgrade(&victim_txn);
+        let victim_sess = Arc::clone(victim_txn.as_read_write().unwrap().session());
+        drop(victim_txn);
+
+        let vr = victim_sess.acquire_read(&doc).await.unwrap();
+        let expected_seq = victim_sess.root_seq().unwrap();
+        let hw = seq1_holder.acquire_write(&doc).await.unwrap();
+        assert!(victim_sess.is_wounded());
+        drop(vr);
+        drop(hw);
+        drop(seq1_holder);
+        drop(victim_sess);
+
+        // At t = 60s (the stale `heap_deadline_ns` before used expansion to 120s), reaping must
+        // immediately promote the wounded active slot to `TxnSlot::Wounded` and drop its
+        // `Arc<Transaction>` instead of re-pushing it to 120s.
+        advance(Duration::from_secs(60)).await;
+        txns.reap_if_due();
+
+        assert_eq!(victim_weak.strong_count(), 0);
+        {
+            let map = txns.state.read().unwrap();
+            assert_eq!(map.active_count, 0);
+            assert_eq!(map.pessimistic_active_count, 0);
+            assert!(matches!(
+                map.slots.get(&victim_id.lineage_id()).map(|e| &e.slot),
+                Some(TxnSlot::Wounded { root_seq, .. }) if *root_seq == Some(expected_seq)
+            ));
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn pessimistic_expiry_heap_ignores_read_only_and_optimistic_transactions() {
+        let txns = test_txns(Timeouts::FAST);
+        let notify = txns.locks.expiry_notify();
+        let notified = notify.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+
+        let _ro = txns.start_read_only(None).unwrap();
+        let _opt = txns.start_read_write(true).unwrap();
+
+        assert_ne!(txns.next_expiry_ns.load(Ordering::Acquire), u64::MAX);
+        assert_eq!(
+            txns.pessimistic_next_expiry_ns.load(Ordering::Acquire),
+            u64::MAX
+        );
+        assert!(txns.reap_and_next_pessimistic_expiry().is_none());
+        assert!(futures_util::poll!(&mut notified).is_pending());
+
+        // Starting a pessimistic RW transaction populates `pessimistic_next_expiry_ns` and wakes
+        // parked waiters.
+        let pess = txns.start_read_write(false).unwrap();
+        assert_ne!(
+            txns.pessimistic_next_expiry_ns.load(Ordering::Acquire),
+            u64::MAX
+        );
+        assert!(txns.reap_and_next_pessimistic_expiry().is_some());
+        assert!(futures_util::poll!(&mut notified).is_ready());
+
+        txns.rollback(pess).unwrap();
+        assert_eq!(
+            txns.pessimistic_next_expiry_ns.load(Ordering::Acquire),
+            u64::MAX
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn exp_equal_deadline_boundary_prefers_transaction_expired_over_lock_timeout() {
+        use googleapis::google::firestore::v1::TransactionOptions;
+        use tokio::time::advance;
+
+        // A. Self-expiry at exact `exp == deadline`: `idle = 2s, max = 5s` (`read_timeout = 5s`).
+        let project_a: &'static FirestoreProject = Box::leak(Box::new(FirestoreProject::new(
+            FirestoreConfig::default()
+                .with_transaction_timeouts(Duration::from_secs(2), Duration::from_secs(5)),
+        )));
+        let root: RootRef = "projects/p/databases/(default)".parse().unwrap();
+        let db_a = project_a.database(&root).await;
+
+        let d_block = doc_ref("exp_eq_dl_block");
+        let blocker = db_a
+            .locks
+            .new_session(None, LockPriority::NextSeq, false, false);
+        let held_w = blocker.acquire_write(&d_block).await.unwrap();
+
+        let self_txn = db_a.new_txn(TransactionOptions::READ_WRITE).await.unwrap();
+        let db_a_read = Arc::clone(&db_a);
+        let self_wait = tokio::spawn(async move {
+            db_a_read
+                .get_doc(&d_block, ReadConsistency::Transaction(self_txn))
+                .await
+        });
+        tokio::task::yield_now().await;
+
+        // Advance to exact `t = 5.000s == read_timeout == max_expiry_ns`: TransactionExpired must
+        // win over ReadTimeout!
+        advance(Duration::from_secs(5)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(self_wait.await.unwrap().unwrap_err(), expired_err());
+        assert_eq!(
+            db_a.transactions.get_active(self_txn).unwrap_err(),
+            expired_err()
+        );
+        drop(held_w);
+        drop(blocker);
+
+        // B. Contended waiter where `write_deadline == holder_expiry` (`used_min = 2s == write`).
+        let project_b: &'static FirestoreProject = Box::leak(Box::new(FirestoreProject::new(
+            FirestoreConfig::default()
+                .with_transaction_timeouts(Duration::from_secs(1), Duration::from_secs(10)),
+        )));
+        let db_b = project_b.database(&root).await;
+        let d_contend = doc_ref("exp_eq_dl_contend");
+        let holder = db_b.new_txn(TransactionOptions::READ_WRITE).await.unwrap();
+        drop(
+            db_b.get_doc(&d_contend, ReadConsistency::Transaction(holder))
+                .await
+                .unwrap(),
+        );
+
+        let db_b_write = Arc::clone(&db_b);
+        let waiter_write =
+            tokio::spawn(
+                async move { db_b_write.write(upsert_write("exp_eq_dl_contend", 7)).await },
+            );
+        tokio::task::yield_now().await;
+
+        // Advance to exact `t = 2.000s == write_timeout == holder_used_min`: holder is reaped and
+        // writer succeeds instead of hitting WriteTimeout!
+        advance(Duration::from_secs(2)).await;
+        tokio::task::yield_now().await;
+        assert!(waiter_write.await.unwrap().is_ok());
+        assert_eq!(
+            db_b.transactions.get_active(holder).unwrap_err(),
+            expired_err()
+        );
     }
 }

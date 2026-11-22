@@ -100,7 +100,8 @@ mod tests {
             Some(Duration::from_secs(3))
         );
         assert_eq!(env_idle.transaction_max_lifetime, None);
-        let _proj_idle = env_idle.build_project();
+        let dbg_idle = format!("{:?}", env_idle.build_project());
+        assert!(dbg_idle.contains("txn_idle: 3s"), "got {dbg_idle}");
 
         let env_max = TestEnv::enterprise().transaction_max_lifetime(Duration::from_secs(15));
         assert_eq!(env_max.transaction_idle_timeout, None);
@@ -108,7 +109,8 @@ mod tests {
             env_max.transaction_max_lifetime,
             Some(Duration::from_secs(15))
         );
-        let _proj_max = env_max.build_project();
+        let dbg_max = format!("{:?}", env_max.build_project());
+        assert!(dbg_max.contains("txn_max: 15s"), "got {dbg_max}");
 
         let env_both = TestEnv::new()
             .cloud_timeouts()
@@ -121,6 +123,10 @@ mod tests {
             env_both.transaction_max_lifetime,
             Some(Duration::from_secs(10))
         );
-        let _proj_both = env_both.build_project();
+        let dbg_both = format!("{:?}", env_both.build_project());
+        assert!(
+            dbg_both.contains("txn_idle: 2s") && dbg_both.contains("txn_max: 10s"),
+            "got {dbg_both}"
+        );
     }
 }

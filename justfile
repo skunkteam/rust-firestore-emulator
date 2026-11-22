@@ -140,7 +140,14 @@ sdk-test: (build "--no-default-features") sdk-deps
     #!/usr/bin/env bash
     set -euo pipefail
     mkdir -p ../tmp/jest
-    TMPDIR="{{ justfile_directory() }}/tmp/jest" npm run test:rust-emulator -- --maxConcurrency="${JEST_MAX_CONCURRENCY:-3}"
+    (
+        unset FIRESTORE_EMULATOR_TRANSACTION_IDLE_TIMEOUT_MS FIRESTORE_EMULATOR_TRANSACTION_MAX_LIFETIME_MS
+        TMPDIR="{{ justfile_directory() }}/tmp/jest" npm run test:rust-emulator -- --maxConcurrency="${JEST_MAX_CONCURRENCY:-3}" --testPathIgnorePatterns='13-transaction-ttl\.test\.ts'
+    )
+    TMPDIR="{{ justfile_directory() }}/tmp/jest" \
+        FIRESTORE_EMULATOR_TRANSACTION_IDLE_TIMEOUT_MS="${FIRESTORE_EMULATOR_TRANSACTION_IDLE_TIMEOUT_MS:-10000}" \
+        FIRESTORE_EMULATOR_TRANSACTION_MAX_LIFETIME_MS="${FIRESTORE_EMULATOR_TRANSACTION_MAX_LIFETIME_MS:-30000}" \
+        npm run test:rust-emulator -- --maxConcurrency="${JEST_MAX_CONCURRENCY:-3}" tests/13-transaction-ttl.test.ts
 
 # Watch code and execute just command on change, e.g. `just watch test googleapis`
 watch *cmd:

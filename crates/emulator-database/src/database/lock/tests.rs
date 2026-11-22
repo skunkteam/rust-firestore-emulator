@@ -1441,4 +1441,26 @@ async fn close_expired_strips_locks_surfaces_expired_error_and_respects_committi
     drop(sealed);
     // Clean up dummy session from `locks` so `locks.table_counts()` is clean too.
     expect_eq!(locks.table_counts(), (0, 0));
+
+    // 4. `LockManager::close_expired_sessions` strips multiple active sessions under a single lock
+    //    while skipping non-active sessions.
+    let s1 = locks.new_session(None, LockPriority::NextSeq, true, true);
+    let s2 = locks.new_session(None, LockPriority::NextSeq, true, true);
+    let s_closed = locks.new_session(None, LockPriority::NextSeq, true, true);
+    let l1 = s1.acquire_read(&d_read).await.unwrap();
+    let l2 = s2.acquire_read(&d_retained).await.unwrap();
+    s1.retain_read(l1, None).unwrap();
+    s2.retain_read(l2, None).unwrap();
+    s_closed.close();
+    let wait_other = locks.new_session(None, LockPriority::NextSeq, false, false);
+    let mut w1 = Box::pin(wait_other.acquire_write(&d_read));
+    let mut w2 = Box::pin(wait_other.acquire_write(&d_retained));
+    assert!(poll!(&mut w1).is_pending());
+    assert!(poll!(&mut w2).is_pending());
+
+    locks.close_expired_sessions(&[s1, s2, s_closed]);
+    drop(w1.await.unwrap());
+    drop(w2.await.unwrap());
+    drop(wait_other);
+    expect_eq!(locks.table_counts(), (0, 0));
 }

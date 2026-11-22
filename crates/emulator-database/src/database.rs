@@ -139,6 +139,7 @@ impl FirestoreDatabase {
                 if self.is_cleared() {
                     return Err(AbortReason::DatabaseCleared.into());
                 }
+                self.transactions.reap_if_due();
                 let session = self
                     .locks
                     .new_session(None, LockPriority::NextSeq, false, false);

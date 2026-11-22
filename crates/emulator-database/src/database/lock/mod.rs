@@ -204,17 +204,30 @@ impl LockManager {
         Arc::clone(&self.expiry_notify)
     }
 
-    pub(crate) fn reap_if_due(&self) {
-        if let Some(db) = self.reaper.get().and_then(Weak::upgrade) {
-            db.transactions.reap_if_due();
+    pub(crate) fn close_expired_sessions(&self, sessions: &[Arc<LockSession>]) {
+        if !sessions
+            .iter()
+            .any(|s| s.shared.state_code() == STATE_ACTIVE)
+        {
+            return;
         }
+        let mut garbage = LockTableGarbage::default();
+        {
+            let mut table = self.table.lock().unwrap_or_else(PoisonError::into_inner);
+            for session in sessions {
+                if session.shared.state_code() == STATE_ACTIVE {
+                    table.close_expired(session.session_id, &mut garbage);
+                }
+            }
+        }
+        drop(garbage);
     }
 
     fn reap_and_next_expiry(&self) -> Option<Instant> {
         self.reaper
             .get()
             .and_then(Weak::upgrade)
-            .and_then(|db| db.transactions.reap_and_next_expiry())
+            .and_then(|db| db.transactions.reap_and_next_pessimistic_expiry())
     }
 
     pub(crate) fn new_session(
@@ -453,6 +466,7 @@ impl LockSession {
         drop(garbage);
     }
 
+    #[cfg(test)]
     pub(crate) fn close_expired(&self) {
         if self.shared.state_code() != STATE_ACTIVE {
             return;
@@ -512,7 +526,6 @@ impl LockSession {
         self: &Arc<Self>,
         doc_ref: &DocumentRef,
     ) -> Result<ReadLease, CommitError> {
-        self.manager.reap_if_due();
         self.check_read_active()?;
         let mut garbage = LockTableGarbage::default();
         let outcome = {
@@ -565,7 +578,6 @@ impl LockSession {
         self: &Arc<Self>,
         doc_ref: &DocumentRef,
     ) -> Result<(WriteLease, ReadObservation), CommitError> {
-        self.manager.reap_if_due();
         self.check_active()?;
         let mut garbage = LockTableGarbage::default();
         let outcome = {
@@ -622,7 +634,6 @@ impl LockSession {
         docs: &BTreeSet<DocumentRef>,
         deadline: Instant,
     ) -> Result<BTreeMap<DocumentRef, WriteLease>, CommitError> {
-        self.manager.reap_if_due();
         self.check_active()?;
         if docs.is_empty() {
             return Ok(BTreeMap::new());
@@ -940,7 +951,14 @@ impl LockSession {
 
             match tick {
                 WaitTick::Rx(res) => return Some(res),
-                WaitTick::TimedOut => return None,
+                WaitTick::TimedOut => {
+                    let _ = self.manager.reap_and_next_expiry();
+                    match rx.try_recv() {
+                        Ok(res) => return Some(Ok(res)),
+                        Err(oneshot::error::TryRecvError::Closed) => return Some(rx.await),
+                        Err(oneshot::error::TryRecvError::Empty) => return None,
+                    }
+                }
                 WaitTick::Expiry => {}
                 WaitTick::SlowWarn => {
                     *warned = true;

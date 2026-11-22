@@ -41,16 +41,10 @@ impl FirestoreProject {
             .transaction_idle_timeout
             .unwrap_or(base.txn_idle)
             .min(txn_max);
-        let txn_used_min = if let Some(idle) = config.transaction_idle_timeout {
-            idle.saturating_mul(2).min(txn_max)
-        } else {
-            base.txn_used_min.min(txn_max)
-        };
         let timeouts = Timeouts {
             write: base.write,
             read: base.read,
             txn_idle,
-            txn_used_min,
             txn_max,
         };
         Self {
