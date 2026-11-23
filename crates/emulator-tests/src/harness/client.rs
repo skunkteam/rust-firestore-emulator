@@ -94,21 +94,17 @@ impl TestDb {
     // In-memory HTTP / Admin / SSE helpers
     // -------------------------------------------------------------------------
 
-    /// Sends a unary HTTP request through `emulator_http::RouterBuilder` in-memory via `oneshot`,
-    /// returning `(StatusCode, Bytes)`.
-    pub(crate) async fn http_oneshot(
+    async fn http_request(
         &self,
         method: Method,
         uri: &str,
-        json_body: Option<&serde_json::Value>,
+        content_type: Option<&str>,
+        body: Body,
     ) -> (StatusCode, Bytes) {
         let mut builder = Request::builder().method(method).uri(uri);
-        let body = if let Some(val) = json_body {
-            builder = builder.header(http::header::CONTENT_TYPE, "application/json");
-            Body::from(serde_json::to_vec(val).expect("valid json payload"))
-        } else {
-            Body::empty()
-        };
+        if let Some(ct) = content_type {
+            builder = builder.header(http::header::CONTENT_TYPE, ct);
+        }
         let req = builder.body(body).expect("valid http request");
         let resp = self
             .http
@@ -123,6 +119,24 @@ impl TestDb {
         (status, bytes)
     }
 
+    /// Sends a unary HTTP request through `emulator_http::RouterBuilder` in-memory via `oneshot`,
+    /// returning `(StatusCode, Bytes)`.
+    pub(crate) async fn http_oneshot(
+        &self,
+        method: Method,
+        uri: &str,
+        json_body: Option<&serde_json::Value>,
+    ) -> (StatusCode, Bytes) {
+        let (content_type, body) = match json_body {
+            Some(val) => (
+                Some("application/json"),
+                Body::from(serde_json::to_vec(val).expect("valid json payload")),
+            ),
+            None => (None, Body::empty()),
+        };
+        self.http_request(method, uri, content_type, body).await
+    }
+
     pub(crate) async fn http_raw_body(
         &self,
         method: Method,
@@ -130,24 +144,8 @@ impl TestDb {
         content_type: Option<&str>,
         raw_body: impl Into<Bytes>,
     ) -> (StatusCode, Bytes) {
-        let mut builder = Request::builder().method(method).uri(uri);
-        if let Some(ct) = content_type {
-            builder = builder.header(http::header::CONTENT_TYPE, ct);
-        }
-        let req = builder
-            .body(Body::from(raw_body.into()))
-            .expect("valid http request");
-        let resp = self
-            .http
-            .clone()
-            .oneshot(req)
+        self.http_request(method, uri, content_type, Body::from(raw_body.into()))
             .await
-            .expect("infallible router oneshot");
-        let status = resp.status();
-        let bytes = to_bytes(resp.into_body(), usize::MAX)
-            .await
-            .expect("in-memory response body read");
-        (status, bytes)
     }
 
     /// Opens an in-memory SSE or streaming HTTP response via `oneshot`, returning status and

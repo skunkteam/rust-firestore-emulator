@@ -6,7 +6,7 @@ use rstest::rstest;
 use tonic::Code;
 
 use crate::harness::{
-    builders::{PipelineSpec, doc_path, field_ref_val, fn_val},
+    builders::{PipelineSpec, SortDirection, doc_path, field_ref_val, fn_val},
     env::TestEnv,
     matchers::{assert_doc_wire_eq, assert_status_code, short_ids},
 };
@@ -156,8 +156,10 @@ async fn execute_pipeline_covers_all_ten_implemented_stages_and_expression_funct
                     ),
                 ]))
                 .remove_fields(["csv"])
-                .sort_asc("__name__")
-                .sort_desc("subtotal")
+                .sort([
+                    ("subtotal", SortDirection::Desc),
+                    ("__name__", SortDirection::Asc),
+                ])
                 .offset(1)
                 .limit(2)
                 .select(HashMap::from([
@@ -179,8 +181,8 @@ async fn execute_pipeline_covers_all_ten_implemented_stages_and_expression_funct
         .await
         .expect("ExecutePipeline multi-stage");
 
-    // Active orders have subtotals: o4=50, o1=30, o2=30 -> after sort_asc(__name__) +
-    // sort_desc(subtotal) + offset(1) + limit(2): [o1, o2]
+    // Active orders have subtotals: o4=50, o1=30, o2=30 -> after sort(subtotal desc, __name__ asc)
+    // + offset(1) + limit(2): [o1, o2]
     expect_that!(p1.execution_time, some(anything()));
     expect_eq!(short_ids(&p1.results), vec!["o1", "o2"]);
     assert_doc_wire_eq(
@@ -848,8 +850,7 @@ async fn execute_pipeline_aggregates_and_expression_sort() {
     let sorted_tag = db
         .pipeline(
             PipelineSpec::collection("line_items")
-                .sort_asc("tag")
-                .sort_asc("id")
+                .sort([("tag", SortDirection::Asc), ("id", SortDirection::Asc)])
                 .select(HashMap::from([("id".to_string(), field_ref_val("id"))])),
         )
         .await
@@ -860,6 +861,21 @@ async fn execute_pipeline_aggregates_and_expression_sort() {
         .map(|d| d.name.rsplit('/').next().unwrap())
         .collect();
     expect_eq!(tag_ids, vec!["d1", "d2", "d3"]);
+
+    let sorted_tag_desc = db
+        .pipeline(
+            PipelineSpec::collection("line_items")
+                .sort([("tag", SortDirection::Desc), ("id", SortDirection::Asc)])
+                .select(HashMap::from([("id".to_string(), field_ref_val("id"))])),
+        )
+        .await
+        .unwrap();
+    let tag_desc_ids: Vec<_> = sorted_tag_desc
+        .results
+        .iter()
+        .map(|d| d.name.rsplit('/').next().unwrap())
+        .collect();
+    expect_eq!(tag_desc_ids, vec!["d3", "d1", "d2"]);
 
     let sorted_expr = db
         .pipeline(PipelineSpec::collection("line_items").raw_stage(

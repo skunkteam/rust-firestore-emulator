@@ -336,6 +336,22 @@ pub(crate) fn fn_val(name: &str, args: Vec<Value>) -> Value {
     }
 }
 
+/// Direction for a single criterion in [`PipelineSpec::sort`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SortDirection {
+    Asc,
+    Desc,
+}
+
+impl SortDirection {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Asc => "ascending",
+            Self::Desc => "descending",
+        }
+    }
+}
+
 /// Typed `StructuredPipeline` builder for `ExecutePipeline`.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct PipelineSpec {
@@ -431,24 +447,29 @@ impl PipelineSpec {
         self.raw_stage("remove_fields", args)
     }
 
+    pub(crate) fn sort<I, S>(self, criteria: I) -> Self
+    where
+        I: IntoIterator<Item = (S, SortDirection)>,
+        S: AsRef<str>,
+    {
+        let args = criteria
+            .into_iter()
+            .map(|(field, direction)| {
+                Value::map(HashMap::from([
+                    ("expression".to_string(), field_ref_val(field.as_ref())),
+                    ("direction".to_string(), Value::string(direction.as_str())),
+                ]))
+            })
+            .collect();
+        self.raw_stage("sort", args)
+    }
+
     pub(crate) fn sort_asc(self, field: &str) -> Self {
-        self.raw_stage(
-            "sort",
-            vec![Value::map(HashMap::from([
-                ("expression".to_string(), field_ref_val(field)),
-                ("direction".to_string(), Value::string("ascending")),
-            ]))],
-        )
+        self.sort([(field, SortDirection::Asc)])
     }
 
     pub(crate) fn sort_desc(self, field: &str) -> Self {
-        self.raw_stage(
-            "sort",
-            vec![Value::map(HashMap::from([
-                ("expression".to_string(), field_ref_val(field)),
-                ("direction".to_string(), Value::string("descending")),
-            ]))],
-        )
+        self.sort([(field, SortDirection::Desc)])
     }
 
     pub(crate) fn limit(self, n: i64) -> Self {
@@ -669,18 +690,7 @@ impl TxnClient {
     }
 
     pub(crate) fn put(&mut self, rel_doc: &str, fields: HashMap<String, Value>) -> &mut Self {
-        self.writes.push(Write {
-            update_mask: None,
-            update_transforms: vec![],
-            current_document: None,
-            operation: Some(write::Operation::Update(Document {
-                name: doc_path(rel_doc),
-                fields,
-                create_time: None,
-                update_time: None,
-            })),
-        });
-        self
+        self.stage_writes(WriteBatchSpec::new().put(rel_doc, fields))
     }
 
     pub(crate) fn delete(
@@ -688,13 +698,7 @@ impl TxnClient {
         rel_doc: &str,
         current_document: Option<Precondition>,
     ) -> &mut Self {
-        self.writes.push(Write {
-            update_mask: None,
-            update_transforms: vec![],
-            current_document,
-            operation: Some(write::Operation::Delete(doc_path(rel_doc))),
-        });
-        self
+        self.stage_writes(WriteBatchSpec::new().delete(rel_doc, current_document))
     }
 
     pub(crate) fn stage_writes(&mut self, batch: WriteBatchSpec) -> &mut Self {
@@ -703,10 +707,98 @@ impl TxnClient {
     }
 
     pub(crate) async fn commit(mut self) -> Result<(Option<Timestamp>, Vec<WriteResult>), Status> {
-        self.db.commit_raw(&self.txn_id, self.writes).await
+        let writes = std::mem::take(&mut self.writes);
+        self.db.commit_raw(&self.txn_id, writes).await
     }
 
     pub(crate) async fn rollback(mut self) -> Result<(), Status> {
+        self.writes.clear();
         self.db.rollback_raw(&self.txn_id).await
+    }
+}
+
+impl Drop for TxnClient {
+    fn drop(&mut self) {
+        if !self.writes.is_empty() {
+            eprintln!(
+                "TxnClient dropped with {} uncommitted staged write(s); call commit() or \
+                 rollback()",
+                self.writes.len()
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pipeline_spec_sort_builds_single_and_multi_criteria_stages() {
+        let single_asc = PipelineSpec::collection("items")
+            .sort_asc("a")
+            .into_structured();
+        let single_desc = PipelineSpec::collection("items")
+            .sort_desc("b")
+            .into_structured();
+        let multi = PipelineSpec::collection("items")
+            .sort([("a", SortDirection::Desc), ("__name__", SortDirection::Asc)])
+            .into_structured();
+
+        let asc_stage = &single_asc.pipeline.unwrap().stages[1];
+        assert_eq!(asc_stage.name, "sort");
+        assert_eq!(asc_stage.args.len(), 1);
+        assert_eq!(
+            asc_stage.args[0].as_map().unwrap().get("direction"),
+            Some(&Value::string("ascending"))
+        );
+
+        let desc_stage = &single_desc.pipeline.unwrap().stages[1];
+        assert_eq!(desc_stage.name, "sort");
+        assert_eq!(desc_stage.args.len(), 1);
+        assert_eq!(
+            desc_stage.args[0].as_map().unwrap().get("direction"),
+            Some(&Value::string("descending"))
+        );
+
+        let multi_stage = &multi.pipeline.unwrap().stages[1];
+        assert_eq!(multi_stage.name, "sort");
+        assert_eq!(multi_stage.args.len(), 2);
+        assert_eq!(
+            multi_stage.args[0].as_map().unwrap().get("expression"),
+            Some(&field_ref_val("a"))
+        );
+        assert_eq!(
+            multi_stage.args[0].as_map().unwrap().get("direction"),
+            Some(&Value::string("descending"))
+        );
+        assert_eq!(
+            multi_stage.args[1].as_map().unwrap().get("expression"),
+            Some(&field_ref_val("__name__"))
+        );
+        assert_eq!(
+            multi_stage.args[1].as_map().unwrap().get("direction"),
+            Some(&Value::string("ascending"))
+        );
+    }
+
+    #[tokio::test]
+    async fn txn_client_put_and_delete_match_write_batch_spec_and_clear_on_rollback() {
+        use googleapis::fields;
+
+        use crate::harness::env::TestEnv;
+
+        let mut db = TestEnv::new().build_db();
+        let mut txn = db.begin_rw_txn().await.unwrap();
+        txn.put("c/d1", fields!({ "x": 1i64 }))
+            .delete("c/d2", Some(pre_exists(true)));
+
+        let expected = WriteBatchSpec::new()
+            .put("c/d1", fields!({ "x": 1i64 }))
+            .delete("c/d2", Some(pre_exists(true)))
+            .into_writes();
+        assert_eq!(txn.writes, expected);
+
+        txn.rollback().await.unwrap();
     }
 }

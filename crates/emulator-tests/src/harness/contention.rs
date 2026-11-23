@@ -82,20 +82,33 @@ impl<F: Future> fmt::Debug for SpawnedOp<F> {
 }
 
 impl<F: Future> SpawnedOp<F> {
-    /// Polls the spawned future repeatedly across cooperative yields until either it resolves
-    /// (caching the output in `self.completed`) or remains quiescently `Poll::Pending`.
+    /// Polls the spawned future across cooperative yields until either it resolves (caching the
+    /// output in `self.completed`) or remains unwoken across two consecutive cooperative yields
+    /// (`Poll::Pending`).
     pub(crate) async fn drive_settled(&mut self) {
         if self.completed.is_some() {
             return;
         }
-        for _ in 0..8 {
-            if let std::task::Poll::Ready(out) = self.task.poll() {
-                self.completed = Some(out);
-                return;
+        let mut quiescent_yields = 0u8;
+        let mut should_poll = true;
+        for _ in 0..16 {
+            if should_poll {
+                if let std::task::Poll::Ready(out) = self.task.poll() {
+                    self.completed = Some(out);
+                    return;
+                }
+                quiescent_yields = 0;
             }
             tokio::task::yield_now().await;
-            if !self.task.is_woken() {
-                break;
+            if self.task.is_woken() {
+                should_poll = true;
+                quiescent_yields = 0;
+            } else {
+                should_poll = false;
+                quiescent_yields += 1;
+                if quiescent_yields >= 2 {
+                    break;
+                }
             }
         }
     }
@@ -108,7 +121,7 @@ impl<F: Future> SpawnedOp<F> {
         );
     }
 
-    pub(crate) async fn expect_ready(&mut self) -> F::Output {
+    pub(crate) async fn expect_ready(mut self) -> F::Output {
         if let Some(out) = self.completed.take() {
             return out;
         }
@@ -127,7 +140,7 @@ where
     F: Future<Output = Result<T, Status>>,
     T: fmt::Debug,
 {
-    pub(crate) async fn expect_aborted(&mut self) -> Status {
+    pub(crate) async fn expect_aborted(self) -> Status {
         let err = self
             .expect_ready()
             .await
@@ -140,5 +153,61 @@ where
             err.message()
         );
         err
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        pin::Pin,
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        },
+        task::{Context, Poll},
+    };
+
+    use tokio::sync::oneshot;
+
+    use super::*;
+
+    #[tokio::test]
+    async fn drive_settled_catches_two_hop_wakeup() {
+        let (hop1_tx, hop1_rx) = oneshot::channel::<()>();
+        let (done_tx, done_rx) = oneshot::channel::<u32>();
+
+        tokio::spawn(async move {
+            hop1_rx.await.unwrap();
+            tokio::task::yield_now().await;
+            let _ = done_tx.send(42);
+        });
+
+        let mut op = ContentionProbe::spawn_op(async move {
+            let _ = hop1_tx.send(());
+            done_rx.await.unwrap()
+        });
+
+        op.drive_settled().await;
+        assert_eq!(op.completed, Some(42));
+        assert_eq!(op.expect_ready().await, 42);
+    }
+
+    #[tokio::test]
+    async fn drive_settled_avoids_spurious_repolls_when_unwoken() {
+        struct CountingPending(Arc<AtomicUsize>);
+
+        impl Future for CountingPending {
+            type Output = ();
+
+            fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<()> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Poll::Pending
+            }
+        }
+
+        let polls = Arc::new(AtomicUsize::new(0));
+        let mut op = ContentionProbe::spawn_op(CountingPending(Arc::clone(&polls)));
+        op.assert_pending().await;
+        assert_eq!(polls.load(Ordering::SeqCst), 1);
     }
 }

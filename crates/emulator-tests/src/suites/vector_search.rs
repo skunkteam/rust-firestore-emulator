@@ -1345,7 +1345,7 @@ async fn transaction_concurrency_edition_lock_scope_and_optimistic_aborts() {
         );
 
         let mut b_d1 = probe.actor_b.clone();
-        let mut write_d1 = ContentionProbe::spawn_op(async move {
+        let write_d1 = ContentionProbe::spawn_op(async move {
             b_d1.put(
                 "ent/d1",
                 fields!({ "emb": vec_val([1.0, 0.1]), "tag": "keep" }),
