@@ -29,6 +29,14 @@ use crate::google::{
     r#type::LatLng,
 };
 
+pub(crate) fn deserialize_null_default<'de, D, T>(d: D) -> Result<T, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Deserialize<'de> + Default,
+{
+    Option::<T>::deserialize(d).map(Option::unwrap_or_default)
+}
+
 pub(crate) fn serialize_sorted_map<S: Serializer>(
     fields: &HashMap<String, Value>,
     serializer: S,
@@ -733,19 +741,29 @@ impl Serialize for Order {
     }
 }
 
+struct ProtoDirection(i32);
+
+impl<'de> Deserialize<'de> for ProtoDirection {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        deserialize_direction(deserializer).map(ProtoDirection)
+    }
+}
+
 impl<'de> Deserialize<'de> for Order {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         #[derive(Deserialize)]
         #[serde(rename_all = "camelCase", deny_unknown_fields)]
         struct OrderDe {
             field:     FieldReference,
-            #[serde(default, deserialize_with = "deserialize_direction")]
-            direction: i32,
+            #[serde(default)]
+            direction: Option<ProtoDirection>,
         }
         let helper = OrderDe::deserialize(deserializer)?;
         Ok(Order {
             field:     Some(helper.field),
-            direction: helper.direction,
+            direction: helper
+                .direction
+                .map_or(Direction::Unspecified as i32, |d| d.0),
         })
     }
 }
@@ -774,7 +792,7 @@ impl<'de> Deserialize<'de> for CompositeFilter {
         struct CompositeFilterDe {
             #[serde(deserialize_with = "deserialize_composite_op")]
             op:      i32,
-            #[serde(default)]
+            #[serde(default, deserialize_with = "deserialize_null_default")]
             filters: Vec<Filter>,
         }
         let helper = CompositeFilterDe::deserialize(deserializer)?;
@@ -995,9 +1013,11 @@ impl<'de> Deserialize<'de> for StructuredQuery {
         #[serde(rename_all = "camelCase", default, deny_unknown_fields)]
         struct StructuredQueryDe {
             select: Option<Projection>,
+            #[serde(deserialize_with = "deserialize_null_default")]
             from: Vec<CollectionSelector>,
             #[serde(rename = "where")]
             r#where: Option<Filter>,
+            #[serde(deserialize_with = "deserialize_null_default")]
             order_by: Vec<Order>,
             start_at: Option<Cursor>,
             end_at: Option<Cursor>,
@@ -1081,6 +1101,7 @@ impl<'de> Deserialize<'de> for RunQueryRequest {
         #[derive(Deserialize, Default)]
         #[serde(rename_all = "camelCase", default, deny_unknown_fields)]
         struct RunQueryRequestDe {
+            #[serde(deserialize_with = "deserialize_null_default")]
             parent: String,
             structured_query: Option<StructuredQuery>,
             read_time: Option<Timestamp>,
@@ -1143,7 +1164,7 @@ impl<'de> Deserialize<'de> for RunQueryResponse {
             transaction: Option<DecodedBytes>,
             document: Option<Document>,
             read_time: Option<Timestamp>,
-            skipped_results: i32,
+            skipped_results: Option<ProtoInt32>,
             done: Option<bool>,
         }
         let helper = RunQueryResponseDe::deserialize(deserializer)?;
@@ -1151,7 +1172,7 @@ impl<'de> Deserialize<'de> for RunQueryResponse {
             transaction: helper.transaction.map_or_else(Vec::new, |b| b.0.to_vec()),
             document: helper.document,
             read_time: helper.read_time,
-            skipped_results: helper.skipped_results,
+            skipped_results: helper.skipped_results.map_or(0, |v| v.0),
             continuation_selector: helper
                 .done
                 .map(run_query_response::ContinuationSelector::Done),
@@ -1191,8 +1212,10 @@ impl<'de> Deserialize<'de> for ListCollectionIdsRequest {
         #[derive(Deserialize, Default)]
         #[serde(rename_all = "camelCase", default, deny_unknown_fields)]
         struct ListCollectionIdsRequestDe {
+            #[serde(deserialize_with = "deserialize_null_default")]
             parent:     String,
             page_size:  Option<ProtoInt32>,
+            #[serde(deserialize_with = "deserialize_null_default")]
             page_token: String,
             read_time:  Option<Timestamp>,
         }
@@ -1763,6 +1786,254 @@ mod tests {
         expect_eq!(var_ref_json, json!({ "variableReferenceValue": "v" }));
         let var_ref_roundtrip: Value = serde_json::from_value(var_ref_json).unwrap();
         expect_true!(var_ref.storage_eq(&var_ref_roundtrip));
+    }
+
+    #[gtest]
+    fn protojson_null_as_default_and_string_int_normalization() {
+        use crate::google::firestore::v1::{
+            DocumentMask, ListCollectionIdsResponse, ListDocumentsResponse,
+        };
+
+        // RunQueryResponse: skippedResults accepts integer, decimal string, null, and omitted
+        for (input, expected) in [
+            (json!({ "skippedResults": 5 }), 5),
+            (json!({ "skippedResults": "5" }), 5),
+            (json!({ "skippedResults": null }), 0),
+            (json!({}), 0),
+        ] {
+            let resp: RunQueryResponse = serde_json::from_value(input).unwrap();
+            expect_eq!(resp.skipped_results, expected);
+        }
+        for bad in [
+            json!({ "skippedResults": 3_000_000_000_i64 }),
+            json!({ "skippedResults": "not-an-i32" }),
+            json!({ "skippedResults": true }),
+        ] {
+            expect_that!(
+                serde_json::from_value::<RunQueryResponse>(bad),
+                err(anything())
+            );
+        }
+
+        // Order: explicit `"direction": null` -> Direction::Unspecified (0)
+        let order_null: Order =
+            serde_json::from_value(json!({ "field": { "fieldPath": "age" }, "direction": null }))
+                .unwrap();
+        expect_eq!(order_null.direction, Direction::Unspecified as i32);
+        expect_eq!(
+            order_null.field,
+            Some(FieldReference {
+                field_path: "age".to_string(),
+            })
+        );
+        let order_omitted: Order =
+            serde_json::from_value(json!({ "field": { "fieldPath": "age" } })).unwrap();
+        expect_eq!(order_omitted.direction, Direction::Unspecified as i32);
+
+        // CompositeFilter.filters accepts null when op is present
+        let comp: CompositeFilter =
+            serde_json::from_value(json!({ "op": "AND", "filters": null })).unwrap();
+        expect_eq!(comp.op, composite_filter::Operator::And as i32);
+        expect_true!(comp.filters.is_empty());
+
+        // StructuredQuery accepts null on all fields (including string-int offset/limit)
+        let sq: StructuredQuery = serde_json::from_value(json!({
+            "select": null,
+            "from": null,
+            "where": null,
+            "orderBy": null,
+            "startAt": null,
+            "endAt": null,
+            "offset": null,
+            "limit": null,
+            "findNearest": null
+        }))
+        .unwrap();
+        expect_eq!(sq, StructuredQuery::default());
+
+        let sq_str_ints: StructuredQuery =
+            serde_json::from_value(json!({ "offset": "5", "limit": "10" })).unwrap();
+        expect_eq!(sq_str_ints.offset, 5);
+        expect_eq!(sq_str_ints.limit, Some(Int32Value { value: 10 }));
+
+        // RunQueryRequest.parent accepts null
+        let rq: RunQueryRequest = serde_json::from_value(json!({
+            "parent": null,
+            "structuredQuery": null,
+            "readTime": null,
+            "transaction": null
+        }))
+        .unwrap();
+        expect_eq!(rq, RunQueryRequest::default());
+
+        // ListCollectionIdsRequest accepts null and string-int pageSize
+        let lci_null: ListCollectionIdsRequest = serde_json::from_value(json!({
+            "parent": null,
+            "pageSize": null,
+            "pageToken": null,
+            "readTime": null
+        }))
+        .unwrap();
+        expect_eq!(lci_null, ListCollectionIdsRequest::default());
+        let lci_str: ListCollectionIdsRequest =
+            serde_json::from_value(json!({ "pageSize": "25" })).unwrap();
+        expect_eq!(lci_str.page_size, 25);
+
+        // All 10 build.rs derived structs accept explicit JSON null on non-Option fields
+        let arr: ArrayValue = serde_json::from_value(json!({ "values": null })).unwrap();
+        expect_eq!(arr, ArrayValue::default());
+
+        let map: MapValue = serde_json::from_value(json!({ "fields": null })).unwrap();
+        expect_eq!(map, MapValue::default());
+
+        let doc: Document = serde_json::from_value(json!({
+            "name": null,
+            "fields": null,
+            "createTime": null,
+            "updateTime": null
+        }))
+        .unwrap();
+        expect_eq!(doc, Document::default());
+
+        let mask: DocumentMask = serde_json::from_value(json!({ "fieldPaths": null })).unwrap();
+        expect_eq!(mask, DocumentMask::default());
+
+        let list_docs: ListDocumentsResponse = serde_json::from_value(json!({
+            "documents": null,
+            "nextPageToken": null
+        }))
+        .unwrap();
+        expect_eq!(list_docs, ListDocumentsResponse::default());
+
+        let list_cols: ListCollectionIdsResponse = serde_json::from_value(json!({
+            "collectionIds": null,
+            "nextPageToken": null
+        }))
+        .unwrap();
+        expect_eq!(list_cols, ListCollectionIdsResponse::default());
+
+        let col_sel: CollectionSelector = serde_json::from_value(json!({
+            "collectionId": null,
+            "allDescendants": null
+        }))
+        .unwrap();
+        expect_eq!(col_sel, CollectionSelector::default());
+
+        let field_ref: FieldReference =
+            serde_json::from_value(json!({ "fieldPath": null })).unwrap();
+        expect_eq!(field_ref, FieldReference::default());
+
+        let proj: Projection = serde_json::from_value(json!({ "fields": null })).unwrap();
+        expect_eq!(proj, Projection::default());
+
+        let cursor: Cursor = serde_json::from_value(json!({
+            "values": null,
+            "before": null
+        }))
+        .unwrap();
+        expect_eq!(cursor, Cursor::default());
+    }
+
+    #[gtest]
+    fn strict_value_and_required_filter_order_fields_reject_null() {
+        use crate::google::firestore::v1::DocumentMask;
+
+        // Bare null and null inside Value variant payloads (except nullValue) MUST fail
+        expect_that!(serde_json::from_str::<Value>("null"), err(anything()));
+        for bad_val in [
+            json!({ "stringValue": null }),
+            json!({ "booleanValue": null }),
+            json!({ "integerValue": null }),
+            json!({ "doubleValue": null }),
+            json!({ "timestampValue": null }),
+            json!({ "bytesValue": null }),
+            json!({ "referenceValue": null }),
+            json!({ "geoPointValue": null }),
+            json!({ "arrayValue": null }),
+            json!({ "mapValue": null }),
+            json!({ "fieldReferenceValue": null }),
+            json!({ "variableReferenceValue": null }),
+            json!({ "mapValue": { "fields": { "k": null } } }),
+            json!({ "arrayValue": { "values": [null] } }),
+        ] {
+            expect_that!(serde_json::from_value::<Value>(bad_val), err(anything()));
+        }
+
+        // Null values inside containers of Value or required sub-elements MUST fail
+        expect_that!(
+            serde_json::from_value::<Document>(json!({ "fields": { "k": null } })),
+            err(anything())
+        );
+        expect_that!(
+            serde_json::from_value::<MapValue>(json!({ "fields": { "k": null } })),
+            err(anything())
+        );
+        expect_that!(
+            serde_json::from_value::<ArrayValue>(json!({ "values": [null] })),
+            err(anything())
+        );
+        expect_that!(
+            serde_json::from_value::<Cursor>(json!({ "values": [null] })),
+            err(anything())
+        );
+        expect_that!(
+            serde_json::from_value::<DocumentMask>(json!({ "fieldPaths": [null] })),
+            err(anything())
+        );
+        expect_that!(
+            serde_json::from_value::<StructuredQuery>(json!({ "from": [null] })),
+            err(anything())
+        );
+        expect_that!(
+            serde_json::from_value::<StructuredQuery>(json!({ "orderBy": [null] })),
+            err(anything())
+        );
+        expect_that!(
+            serde_json::from_value::<Projection>(json!({ "fields": [null] })),
+            err(anything())
+        );
+
+        // Required Order, CompositeFilter, FieldFilter, and UnaryFilter fields MUST fail on null or
+        // omitted
+        expect_that!(
+            serde_json::from_value::<Order>(json!({ "field": null, "direction": "ASCENDING" })),
+            err(anything())
+        );
+        expect_that!(
+            serde_json::from_value::<Order>(json!({ "field": null })),
+            err(anything())
+        );
+        expect_that!(
+            serde_json::from_value::<CompositeFilter>(json!({ "op": null, "filters": [] })),
+            err(anything())
+        );
+        expect_that!(
+            serde_json::from_value::<CompositeFilter>(json!({ "filters": [] })),
+            err(anything())
+        );
+        expect_that!(
+            serde_json::from_value::<CompositeFilter>(json!({ "op": "AND", "filters": [null] })),
+            err(anything())
+        );
+        for bad_ff in [
+            json!({ "field": null, "op": "EQUAL", "value": { "integerValue": "1" } }),
+            json!({ "field": { "fieldPath": "a" }, "op": null, "value": { "integerValue": "1" } }),
+            json!({ "field": { "fieldPath": "a" }, "op": "EQUAL", "value": null }),
+        ] {
+            expect_that!(
+                serde_json::from_value::<FieldFilter>(bad_ff),
+                err(anything())
+            );
+        }
+        for bad_uf in [
+            json!({ "op": null, "field": { "fieldPath": "a" } }),
+            json!({ "op": "IS_NULL", "field": null }),
+        ] {
+            expect_that!(
+                serde_json::from_value::<UnaryFilter>(bad_uf),
+                err(anything())
+            );
+        }
     }
 
     mod proptests {
