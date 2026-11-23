@@ -92,6 +92,18 @@ export async function callRawUnaryRpc<TReq extends object, TRes = unknown>(
     return client.request<TReq, TRes>(rpc, req, tag);
 }
 
+export function normalizeStreamError(err: unknown): Error {
+    if (err instanceof Error) {
+        return err;
+    }
+    if (typeof err === 'object' && err !== null) {
+        const obj = err as { message?: unknown; details?: unknown };
+        const msg = typeof obj.message === 'string' ? obj.message : typeof obj.details === 'string' ? obj.details : String(err);
+        return Object.assign(new Error(msg, { cause: err }), err);
+    }
+    return new Error(String(err), { cause: err });
+}
+
 export async function callRawStreamRpc<TReq extends object, TChunk = unknown>(
     firestore: Firestore,
     rpc: string,
@@ -109,18 +121,36 @@ export async function callRawStreamRpc<TReq extends object, TChunk = unknown>(
             if (settled) return;
             settled = true;
             if (err !== undefined) {
-                reject(err instanceof Error ? err : new Error(String(err)));
+                reject(normalizeStreamError(err));
             } else {
                 resolve(chunks);
             }
         };
         stream.on('data', (chunk: unknown) => {
-            const typed = chunk as TChunk;
-            onChunk?.(typed);
-            chunks.push(typed);
+            if (settled) return;
+            try {
+                const typed = chunk as TChunk;
+                onChunk?.(typed);
+                chunks.push(typed);
+            } catch (err: unknown) {
+                finish(err ?? new Error(`Unknown error in onChunk during ${rpc}`));
+            }
         });
         stream.on('end', () => finish());
-        stream.on('error', err => finish(err));
+        stream.on('error', err => finish(err ?? new Error(`Unknown stream error during ${rpc}`)));
+        stream.on('close', () => {
+            setImmediate(() => {
+                if (settled) return;
+                const state = stream as NodeJS.ReadableStream & { errored?: unknown; readableEnded?: boolean };
+                if (state.errored != null) {
+                    finish(state.errored);
+                } else if (state.readableEnded) {
+                    finish();
+                } else {
+                    finish(new Error(`Stream closed prematurely during ${rpc}`));
+                }
+            });
+        });
         stream.resume();
     });
 }
