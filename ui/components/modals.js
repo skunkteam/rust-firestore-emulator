@@ -12,6 +12,7 @@ import {
 import { generateAutoId } from "../values.js";
 import { extractSessionFields, renderHybridEditor } from "./editor.js";
 import {
+  getActiveRootPath,
   isValidPathSegment,
   relativeSegments,
   startsWithSegments,
@@ -223,10 +224,12 @@ function renderCreateDocModal(m, state, callbacks, close) {
       const fullName = created.name ?? "";
       const match =
         /^projects\/[^/]+\/databases\/[^/]+\/documents\/(.+)$/.exec(fullName);
-      if (match && state.activeProjectId && state.activeDatabaseId) {
-        const cols = await listCollectionIds(
-          `projects/${state.activeProjectId}/databases/${state.activeDatabaseId}/documents`
-        );
+      const rootPath = getActiveRootPath(
+        state.activeProjectId,
+        state.activeDatabaseId
+      );
+      if (match && rootPath) {
+        const cols = await listCollectionIds(rootPath);
         if (myDbEpoch !== getDbEpoch()) return;
         state.rootCollections = cols;
         state.segments = match[1].split("/");
@@ -340,6 +343,44 @@ function renderCreateDocModal(m, state, callbacks, close) {
 }
 
 /**
+ * Refreshes explorer collection listings and active segments after deleting a document or collection.
+ * @param {AppState} state
+ * @param {string} targetPath
+ * @param {boolean} shouldTruncateSegments
+ * @param {number} myDbEpoch
+ * @param {ModalCallbacks} callbacks
+ * @returns {Promise<boolean>} False if the active database changed while refreshing; otherwise true.
+ */
+async function refreshExplorerAfterDelete(
+  state,
+  targetPath,
+  shouldTruncateSegments,
+  myDbEpoch,
+  callbacks
+) {
+  const rootPath = getActiveRootPath(
+    state.activeProjectId,
+    state.activeDatabaseId
+  );
+  if (!rootPath) return true;
+  const targetSegs = relativeSegments(rootPath, targetPath);
+  if (
+    shouldTruncateSegments &&
+    targetSegs &&
+    startsWithSegments(state.segments, targetSegs)
+  ) {
+    state.segments = state.segments.slice(0, targetSegs.length - 1);
+  }
+  const myNavEpoch = bumpNavEpoch();
+  const cols = await listCollectionIds(rootPath);
+  if (myDbEpoch !== getDbEpoch()) return false;
+  state.rootCollections = cols;
+  syncBrowserUrl(state.activeProjectId, state.activeDatabaseId, state.segments);
+  await callbacks.onHydrateVisiblePath(myDbEpoch, myNavEpoch);
+  return true;
+}
+
+/**
  * @param {Extract<ActiveModal, { kind: 'delete_doc' }>} m
  * @param {AppState} state
  * @param {ModalCallbacks} callbacks
@@ -359,31 +400,21 @@ function renderDeleteDocModal(m, state, callbacks, close) {
         callbacks.onRerender();
         return;
       }
-      deleteDocumentLevelCache(m.docPath);
+      deleteDocumentLevelCache(m.docPath, state);
       if (m.recursive) {
-        pruneCachesWithPrefix(m.docPath);
+        pruneCachesWithPrefix(m.docPath, state);
       }
       state.modal = null;
-      if (state.activeProjectId && state.activeDatabaseId) {
-        const rootPath = `projects/${state.activeProjectId}/databases/${state.activeDatabaseId}/documents`;
-        const docSegs = relativeSegments(rootPath, m.docPath);
-        if (
-          (m.recursive || !m.hasSubcollections) &&
-          docSegs &&
-          startsWithSegments(state.segments, docSegs)
-        ) {
-          state.segments = state.segments.slice(0, docSegs.length - 1);
-        }
-        const myNavEpoch = bumpNavEpoch();
-        const cols = await listCollectionIds(rootPath);
-        if (myDbEpoch !== getDbEpoch()) return;
-        state.rootCollections = cols;
-        syncBrowserUrl(
-          state.activeProjectId,
-          state.activeDatabaseId,
-          state.segments
-        );
-        await callbacks.onHydrateVisiblePath(myDbEpoch, myNavEpoch);
+      if (
+        !(await refreshExplorerAfterDelete(
+          state,
+          m.docPath,
+          m.recursive || !m.hasSubcollections,
+          myDbEpoch,
+          callbacks
+        ))
+      ) {
+        return;
       }
       callbacks.onToast("Document deleted", "success");
     } catch (err) {
@@ -462,24 +493,18 @@ function renderDeleteColModal(m, state, callbacks, close) {
         callbacks.onRerender();
         return;
       }
-      pruneCachesWithPrefix(m.colPath);
+      pruneCachesWithPrefix(m.colPath, state);
       state.modal = null;
-      if (state.activeProjectId && state.activeDatabaseId) {
-        const rootPath = `projects/${state.activeProjectId}/databases/${state.activeDatabaseId}/documents`;
-        const colSegs = relativeSegments(rootPath, m.colPath);
-        if (colSegs && startsWithSegments(state.segments, colSegs)) {
-          state.segments = state.segments.slice(0, colSegs.length - 1);
-        }
-        const myNavEpoch = bumpNavEpoch();
-        const cols = await listCollectionIds(rootPath);
-        if (myDbEpoch !== getDbEpoch()) return;
-        state.rootCollections = cols;
-        syncBrowserUrl(
-          state.activeProjectId,
-          state.activeDatabaseId,
-          state.segments
-        );
-        await callbacks.onHydrateVisiblePath(myDbEpoch, myNavEpoch);
+      if (
+        !(await refreshExplorerAfterDelete(
+          state,
+          m.colPath,
+          true,
+          myDbEpoch,
+          callbacks
+        ))
+      ) {
+        return;
       }
       callbacks.onToast(`Deleted collection ${m.colId}`, "success");
     } catch (err) {
@@ -547,7 +572,7 @@ function renderClearDbModal(m, state, callbacks, close) {
         (db) => db.rootPath !== clearedRoot
       );
       state.modal = null;
-      clearActiveDatabaseState();
+      clearActiveDatabaseState(state);
       const applied = await callbacks.onRefreshDatabaseList();
       if (myDbEpoch !== getDbEpoch()) return;
       if (applied && !state.activeProjectId && state.databases.length > 0) {

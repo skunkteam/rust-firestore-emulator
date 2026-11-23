@@ -165,63 +165,78 @@ export function isCurrentDocSeq(docPath, seq) {
 }
 
 /**
- * Removes cached document level state and its request sequence for `docPath`.
+ * Removes cached document level state (and its request sequence when targeting the global state) for `docPath`.
  * @param {string} docPath
+ * @param {AppState} [targetState]
  */
-export function deleteDocumentLevelCache(docPath) {
-  state.documentLevels.delete(docPath);
-  docRequestSeq.delete(docPath);
+export function deleteDocumentLevelCache(docPath, targetState = state) {
+  targetState.documentLevels.delete(docPath);
+  if (targetState === state) {
+    docRequestSeq.delete(docPath);
+  }
 }
 
 /**
  * Clears cached collection/document levels and query runner state for the active database.
+ * @param {AppState} [targetState]
  */
-export function resetDatabaseCaches() {
-  state.activeDbMeta = null;
-  state.rootCollections = [];
-  state.collectionColumns.clear();
-  state.documentLevels.clear();
-  colRequestSeq.clear();
-  docRequestSeq.clear();
-  state.queryState = createQueryRunnerState();
+export function resetDatabaseCaches(targetState = state) {
+  targetState.activeDbMeta = null;
+  targetState.rootCollections = [];
+  targetState.collectionColumns.clear();
+  targetState.documentLevels.clear();
+  if (targetState === state) {
+    colRequestSeq.clear();
+    docRequestSeq.clear();
+  }
+  targetState.queryState = createQueryRunnerState();
 }
 
 /**
  * Clears the active database selection, segments, and all associated caches.
+ * @param {AppState} [targetState]
  */
-export function clearActiveDatabaseState() {
-  state.activeProjectId = null;
-  state.activeDatabaseId = null;
-  state.segments = [];
-  resetDatabaseCaches();
+export function clearActiveDatabaseState(targetState = state) {
+  targetState.activeProjectId = null;
+  targetState.activeDatabaseId = null;
+  targetState.segments = [];
+  resetDatabaseCaches(targetState);
 }
 
 /**
- * Removes cached collection/document state and request sequences under `prefix`.
+ * Removes cached collection/document state (and request sequences when targeting the global state) under `prefix`.
  * @param {string} prefix
+ * @param {AppState} [targetState]
  */
-export function pruneCachesWithPrefix(prefix) {
+export function pruneCachesWithPrefix(prefix, targetState = state) {
   const slashPrefix = `${prefix}/`;
-  for (const key of state.collectionColumns.keys()) {
+  for (const key of targetState.collectionColumns.keys()) {
     if (key === prefix || key.startsWith(slashPrefix)) {
-      state.collectionColumns.delete(key);
-      colRequestSeq.delete(key);
+      targetState.collectionColumns.delete(key);
+      if (targetState === state) {
+        colRequestSeq.delete(key);
+      }
     }
   }
-  for (const key of state.documentLevels.keys()) {
+  for (const key of targetState.documentLevels.keys()) {
     if (key === prefix || key.startsWith(slashPrefix)) {
-      state.documentLevels.delete(key);
-      docRequestSeq.delete(key);
+      targetState.documentLevels.delete(key);
+      if (targetState === state) {
+        docRequestSeq.delete(key);
+      }
     }
   }
 }
 
 /**
- * Removes a toast notification by id.
+ * Removes a toast notification by id and returns whether a toast was removed.
  * @param {number} id
+ * @returns {boolean}
  */
 export function dismissToast(id) {
+  const prevLen = state.toasts.length;
   state.toasts = state.toasts.filter((t) => t.id !== id);
+  return state.toasts.length !== prevLen;
 }
 
 /**
@@ -235,7 +250,6 @@ export function pushToast(text, tone = "info", onChange) {
   state.toasts.push({ id, text, tone });
   onChange?.();
   setTimeout(() => {
-    dismissToast(id);
-    onChange?.();
+    if (dismissToast(id)) onChange?.();
   }, 4200);
 }
