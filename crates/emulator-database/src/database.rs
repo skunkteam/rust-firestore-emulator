@@ -259,7 +259,7 @@ impl FirestoreDatabase {
 
     /// Lists direct child collection IDs underneath a root or document parent in lexicographical
     /// order, applying optional `page_size` and opaque `page_token` pagination.
-    #[instrument(level = Level::DEBUG, skip_all, err)]
+    #[instrument(level = Level::DEBUG, skip_all, err(level = Level::DEBUG))]
     pub async fn list_collection_ids(
         &self,
         parent: &Ref,
@@ -1060,6 +1060,7 @@ fn decode_list_collection_ids_page_token(page_token: &str, parent_str: &str) -> 
         || token.kind != LIST_COLLECTION_IDS_TOKEN_KIND
         || token.parent != parent_str
         || token.last_collection_id.is_empty()
+        || token.last_collection_id.contains('/')
         || token.encode_to_vec() != raw
     {
         return Err(GenericDatabaseError::invalid_argument("invalid page token"));
@@ -2543,6 +2544,12 @@ mod tests {
                 version: LIST_COLLECTION_IDS_TOKEN_VERSION,
                 parent: parent_doc.to_string(),
                 last_collection_id: String::new(),
+                kind: LIST_COLLECTION_IDS_TOKEN_KIND.to_string(),
+            },
+            ListCollectionIdsPageToken {
+                version: LIST_COLLECTION_IDS_TOKEN_VERSION,
+                parent: parent_doc.to_string(),
+                last_collection_id: "a/b".to_string(),
                 kind: LIST_COLLECTION_IDS_TOKEN_KIND.to_string(),
             },
             ListCollectionIdsPageToken {
