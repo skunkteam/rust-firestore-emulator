@@ -110,10 +110,10 @@ impl DocumentMeta {
 
     pub(crate) fn apply_sealed_commit<R>(
         seal: CommitSeal,
-        docs: BTreeMap<DocumentRef, Arc<DocumentMeta>>,
+        docs: BTreeMap<DocumentRef, Option<Arc<DocumentMeta>>>,
         apply: impl FnOnce(
             Timestamp,
-            &mut BTreeMap<DocumentRef, &mut DocumentContents>,
+            &mut BTreeMap<DocumentRef, Option<&mut DocumentContents>>,
         ) -> std::result::Result<R, CommitError>,
     ) -> std::result::Result<R, CommitError> {
         seal.check_committing_active()?;
@@ -124,19 +124,25 @@ impl DocumentMeta {
             )));
         }
 
-        let metas: Vec<(DocumentRef, Arc<DocumentMeta>)> = docs.into_iter().collect();
-        let mut guards: Vec<(&DocumentRef, RwLockWriteGuard<'_, DocumentContents>)> =
+        let metas: Vec<(DocumentRef, Option<Arc<DocumentMeta>>)> = docs.into_iter().collect();
+        let mut guards: Vec<(&DocumentRef, Option<RwLockWriteGuard<'_, DocumentContents>>)> =
             Vec::with_capacity(metas.len());
         for (doc_ref, meta) in &metas {
-            if &meta.name != doc_ref {
-                let actual = &meta.name;
-                drop(guards);
-                drop(seal);
-                return Err(CommitError::Other(GenericDatabaseError::internal(format!(
-                    "document meta name {actual} does not match key {doc_ref}",
-                ))));
-            }
-            guards.push((doc_ref, meta.contents.write()));
+            let guard = match meta {
+                Some(meta) => {
+                    if &meta.name != doc_ref {
+                        let actual = &meta.name;
+                        drop(guards);
+                        drop(seal);
+                        return Err(CommitError::Other(GenericDatabaseError::internal(format!(
+                            "document meta name {actual} does not match key {doc_ref}",
+                        ))));
+                    }
+                    Some(meta.contents.write())
+                }
+                None => None,
+            };
+            guards.push((doc_ref, guard));
         }
 
         let commit_time = Timestamp::now();
@@ -159,9 +165,9 @@ impl DocumentMeta {
         }
 
         let res = {
-            let mut contents_map: BTreeMap<DocumentRef, &mut DocumentContents> = guards
+            let mut contents_map: BTreeMap<DocumentRef, Option<&mut DocumentContents>> = guards
                 .iter_mut()
-                .map(|(doc_ref, guard)| ((*doc_ref).clone(), &mut **guard))
+                .map(|(doc_ref, guard)| ((*doc_ref).clone(), guard.as_deref_mut()))
                 .collect();
             apply(commit_time, &mut contents_map)
         };
@@ -213,6 +219,11 @@ impl DocumentContents {
 
     pub(crate) fn last_updated(&self) -> Option<Timestamp> {
         self.versions.last().map(DocumentVersion::update_time)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn version_count(&self) -> usize {
+        self.versions.len()
     }
 
     pub(crate) fn maybe_add_version(&mut self, version: &DocumentVersion) -> Result<()> {
@@ -546,9 +557,9 @@ mod tests {
         let seal = s
             .seal_for_commit(BTreeMap::from([(name.clone(), w)]))
             .unwrap();
-        let docs = BTreeMap::from([(name.clone(), Arc::clone(&meta))]);
+        let docs = BTreeMap::from([(name.clone(), Some(Arc::clone(&meta)))]);
         let commit_ts = DocumentMeta::apply_sealed_commit(seal, docs, |ts, map| {
-            let contents = map.get_mut(&name).unwrap();
+            let contents = map.get_mut(&name).unwrap().as_deref_mut().unwrap();
             contents.maybe_update(
                 &name,
                 HashMap::from([("v".to_string(), Value::integer(7))]),
@@ -682,5 +693,104 @@ mod tests {
                 .map(|v| (v.create_time, v.fields["v"].as_integer())),
             Some((t4, Some(4)))
         );
+    }
+
+    #[gtest]
+    #[tokio::test]
+    async fn apply_sealed_commit_supports_absent_docs_and_validates_all_leases() {
+        use std::collections::BTreeSet;
+
+        use tokio::time::{Duration, Instant};
+
+        use crate::{GenericDatabaseError, error::CommitError};
+
+        let root: RootRef = "projects/p/databases/(default)".parse().unwrap();
+        let present_ref: DocumentRef = "projects/p/databases/(default)/documents/col/present"
+            .parse()
+            .unwrap();
+        let absent_ref: DocumentRef = "projects/p/databases/(default)/documents/col/absent"
+            .parse()
+            .unwrap();
+        let unsealed_ref: DocumentRef = "projects/p/databases/(default)/documents/col/unsealed"
+            .parse()
+            .unwrap();
+
+        let locks = Arc::new(LockManager::new(root, Timeouts::FAST));
+        let present_meta = Arc::new(DocumentMeta::new(present_ref.clone()));
+
+        // Mixed `Some(meta)` + `None` commit succeeds and honors both lease `acquire_time`s.
+        let s1 = locks.new_session(
+            None,
+            crate::database::lock::SessionKind::PessimisticTxn,
+            LockPriority::NextSeq,
+            true,
+            true,
+        );
+        let leases = s1
+            .acquire_writes_all(
+                &BTreeSet::from([present_ref.clone(), absent_ref.clone()]),
+                Instant::now() + Duration::from_secs(1),
+            )
+            .await
+            .unwrap();
+        let max_acquire = leases
+            .values()
+            .map(|l| l.acquire_time())
+            .max()
+            .expect("leases present");
+        let seal = s1.seal_for_commit(leases).unwrap();
+        let docs = BTreeMap::from([
+            (present_ref.clone(), Some(Arc::clone(&present_meta))),
+            (absent_ref.clone(), None),
+        ]);
+        let commit_ts = DocumentMeta::apply_sealed_commit(seal, docs, |ts, map| {
+            expect_that!(map.get(&present_ref), some(some(anything())));
+            expect_that!(map.get(&absent_ref), some(none()));
+            Ok(ts)
+        })
+        .unwrap();
+        expect_true!(commit_ts >= max_acquire);
+
+        // Missing entry in `docs` still fails count check.
+        let s2 = locks.new_session(
+            None,
+            crate::database::lock::SessionKind::PessimisticTxn,
+            LockPriority::NextSeq,
+            true,
+            true,
+        );
+        let w2 = s2.acquire_write(&absent_ref).await.unwrap();
+        let seal2 = s2
+            .seal_for_commit(BTreeMap::from([(absent_ref.clone(), w2)]))
+            .unwrap();
+        let err =
+            DocumentMeta::apply_sealed_commit(seal2, BTreeMap::new(), |_, _| Ok(())).unwrap_err();
+        expect_true!(matches!(
+            err,
+            CommitError::Other(GenericDatabaseError::Internal(_))
+        ));
+
+        // Same count, mismatched key (`None` entry for an unsealed doc) fails lease lookup.
+        let s3 = locks.new_session(
+            None,
+            crate::database::lock::SessionKind::PessimisticTxn,
+            LockPriority::NextSeq,
+            true,
+            true,
+        );
+        let w3 = s3.acquire_write(&absent_ref).await.unwrap();
+        let seal3 = s3
+            .seal_for_commit(BTreeMap::from([(absent_ref.clone(), w3)]))
+            .unwrap();
+        let err = DocumentMeta::apply_sealed_commit(
+            seal3,
+            BTreeMap::from([(unsealed_ref, None)]),
+            |_, _| Ok(()),
+        )
+        .unwrap_err();
+        expect_true!(matches!(
+            err,
+            CommitError::Other(GenericDatabaseError::Internal(_))
+        ));
     }
 }

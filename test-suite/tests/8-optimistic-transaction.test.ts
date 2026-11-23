@@ -184,6 +184,62 @@ suite('$description - concurrent tests', fs => {
             },
         );
 
+        test.concurrent.each(['never-existing', 'already-deleted'] as const)(
+            'no retry when reading %s document that is concurrently deleted by another process',
+            // Deleting an already-absent document is a no-op on Cloud Firestore and does not
+            // advance the document's version or trigger optimistic write-skew retries.
+            async which => {
+                const t = new ConcurrentTest();
+                const [sharedRef, writeRef] = refs();
+
+                if (which === 'already-deleted') {
+                    await sharedRef.set(writeData({ version: 0 }));
+                    await sharedRef.delete();
+                }
+
+                await t.run(
+                    // Process 1
+                    async () => {
+                        let attempt = 0;
+                        await fs.firestore.runTransaction(async txn => {
+                            t.event(`txn attempt ${++attempt} started`);
+                            const snap = await txn.get(sharedRef);
+                            expect(snap.exists).toBeFalse();
+                            t.event('read missing doc');
+
+                            if (attempt === 1) await t.when('missing document deleted');
+                            t.event('committing writes');
+
+                            txn.create(writeRef, writeData({ created: true }));
+                            txn.create(sharedRef, writeData({ created: true }));
+                        });
+                        t.event('txn completed');
+                    },
+                    // Process 2
+                    async () => {
+                        await t.when('read missing doc');
+                        t.event('deleting missing document');
+                        await sharedRef.delete();
+                        t.event('missing document deleted');
+                    },
+                );
+
+                expect(await getData(writeRef.get())).toEqual({ created: true });
+                expect(await getData(sharedRef.get())).toEqual({ created: true });
+
+                expect(t.log).toEqual([
+                    '       | <<2>> | WAITING UNTIL: read missing doc',
+                    ' <<1>> | EVENT: txn attempt 1 started',
+                    ' <<1>> | EVENT: read missing doc',
+                    ' <<1>> | WAITING UNTIL: missing document deleted',
+                    '       | <<2>> | EVENT: deleting missing document',
+                    '       | <<2>> | EVENT: missing document deleted',
+                    ' <<1>> | EVENT: committing writes',
+                    ' <<1>> | EVENT: txn completed',
+                ]);
+            },
+        );
+
         test.concurrent.each(['existing', 'non-existing'] as const)(
             'retry when writing to %s document that was changed by another process before txn ends',
             // The most common concurrency conflict: A transaction reads a document,

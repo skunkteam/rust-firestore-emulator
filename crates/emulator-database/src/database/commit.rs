@@ -329,10 +329,35 @@ impl FirestoreDatabase {
         ),
         CommitError,
     > {
+        // Track whether each target document's final write in this batch can persist a document
+        // version. When a document is absent from storage (`peek_doc_meta` is `None`) and its
+        // final write is `Delete`, staging is guaranteed to cancel any in-batch pending state
+        // back to `None` (or fail a precondition), so we skip allocating phantom
+        // `Collection`/`DocumentMeta` entries while still holding the exclusive `WriteLease` in
+        // `seal`. Keep this as an exhaustive `match` so future `ValidatedWriteOperation` variants
+        // (such as `Transform`) must explicitly declare their storage requirements at compile time.
+        let mut last_write_persists: HashMap<&DocumentRef, bool> =
+            HashMap::with_capacity(seal.len());
+        for write in &writes {
+            #[allow(clippy::match_like_matches_macro)]
+            let persists = match write.operation {
+                ValidatedWriteOperation::Update { .. } => true,
+                ValidatedWriteOperation::Delete => false,
+            };
+            last_write_persists.insert(&write.doc_ref, persists);
+        }
+
         let doc_refs: Vec<DocumentRef> = seal.doc_refs().cloned().collect();
         let mut docs = BTreeMap::new();
         for doc_ref in doc_refs {
-            docs.insert(doc_ref.clone(), self.get_doc_meta(&doc_ref).await?);
+            let meta = match self.peek_doc_meta(&doc_ref).await? {
+                Some(meta) => Some(meta),
+                None if last_write_persists.get(&doc_ref).copied().unwrap_or(false) => {
+                    Some(self.get_doc_meta(&doc_ref).await?)
+                }
+                None => None,
+            };
+            docs.insert(doc_ref, meta);
         }
 
         DocumentMeta::apply_sealed_commit(seal, docs, |commit_time, contents_map| {
@@ -342,30 +367,61 @@ impl FirestoreDatabase {
 
             let mut staged_docs: BTreeMap<DocumentRef, StagedDocument<'_>> = contents_map
                 .iter_mut()
-                .map(|(name, doc)| (name.clone(), StagedDocument::new(name.clone(), doc)))
+                .map(|(name, doc)| {
+                    (
+                        name.clone(),
+                        StagedDocument::new(name.clone(), doc.as_deref_mut()),
+                    )
+                })
                 .collect();
-            let mut write_results = Vec::with_capacity(writes.len());
+            let mut staged_results: Vec<(DocumentRef, Vec<Value>)> =
+                Vec::with_capacity(writes.len());
 
             for write in writes {
-                let staged = staged_docs.get_mut(&write.doc_ref).ok_or_else(|| {
-                    GenericDatabaseError::internal(format!(
-                        "missing staged document for {}",
-                        write.doc_ref
-                    ))
+                let doc_ref = write.doc_ref.clone();
+                let staged = staged_docs.get_mut(&doc_ref).ok_or_else(|| {
+                    GenericDatabaseError::internal(format!("missing staged document for {doc_ref}"))
                 })?;
-                write_results.push(self.stage_write(write, staged, commit_time)?);
+                let transform_results = self.stage_write(write, staged, commit_time)?;
+                staged_results.push((doc_ref, transform_results));
             }
+
+            // Cloud Firestore populates every `WriteResult.update_time` in a commit from the
+            // target document's post-commit stored version (`None` whenever the document does not
+            // exist after commit, e.g. `Delete` or `[Update, Delete]`, and the final stored
+            // `update_time` for `[Delete, Update]` or `[Update, revert-Update]`).
+            let write_results: Vec<WriteResult> = staged_results
+                .into_iter()
+                .map(|(doc_ref, transform_results)| {
+                    let update_time = staged_docs
+                        .get(&doc_ref)
+                        .and_then(StagedDocument::current_version)
+                        .map(|v| v.update_time);
+                    WriteResult {
+                        update_time,
+                        transform_results,
+                    }
+                })
+                .collect();
 
             let mut updates = HashMap::new();
             let mut single_stored = None;
             let track_single = staged_docs.len() == 1;
-            for (name, staged) in staged_docs {
+            for (name, mut staged) in staged_docs {
                 if let Some(version) = staged.pending {
-                    staged.doc.maybe_add_version(&version)?;
+                    let doc = staged.doc.as_deref_mut().ok_or_else(|| {
+                        GenericDatabaseError::internal(format!(
+                            "missing persisted storage slot for staged write on {name}"
+                        ))
+                    })?;
+                    doc.maybe_add_version(&version)?;
                     updates.insert(name, version);
                 }
                 if track_single {
-                    single_stored = staged.doc.current_version().cloned();
+                    single_stored = staged
+                        .doc
+                        .as_deref()
+                        .and_then(|doc| doc.current_version().cloned());
                 }
             }
 
@@ -387,7 +443,7 @@ impl FirestoreDatabase {
         write: ValidatedWrite,
         document: &mut StagedDocument<'_>,
         commit_time: Timestamp,
-    ) -> Result<WriteResult> {
+    ) -> Result<Vec<Value>> {
         let ValidatedWrite {
             doc_ref: _,
             precondition,
@@ -399,7 +455,7 @@ impl FirestoreDatabase {
         }
         let mut transform_results = vec![];
 
-        let update_time = match operation {
+        match operation {
             ValidatedWriteOperation::Update {
                 fields,
                 update_mask,
@@ -424,29 +480,25 @@ impl FirestoreDatabase {
                 } else {
                     debug_assert!(validation::validate_writable_fields(&fields).is_ok());
                 }
-                document.stage_update(fields, commit_time)
+                document.stage_update(fields, commit_time);
             }
             ValidatedWriteOperation::Delete => {
                 debug!(name = %document.name, "Delete");
                 document.stage_delete(commit_time);
-                commit_time
             }
-        };
-        Ok(WriteResult {
-            update_time: Some(update_time),
-            transform_results,
-        })
+        }
+        Ok(transform_results)
     }
 }
 
 struct StagedDocument<'a> {
     name:    DocumentRef,
-    doc:     &'a mut DocumentContents,
+    doc:     Option<&'a mut DocumentContents>,
     pending: Option<DocumentVersion>,
 }
 
 impl<'a> StagedDocument<'a> {
-    fn new(name: DocumentRef, doc: &'a mut DocumentContents) -> Self {
+    fn new(name: DocumentRef, doc: Option<&'a mut DocumentContents>) -> Self {
         Self {
             name,
             doc,
@@ -454,8 +506,22 @@ impl<'a> StagedDocument<'a> {
         }
     }
 
+    fn persisted_latest_version(&self) -> Option<&DocumentVersion> {
+        self.doc
+            .as_deref()
+            .and_then(DocumentContents::latest_version)
+    }
+
+    fn persisted_current_version(&self) -> Option<&Arc<StoredDocumentVersion>> {
+        self.doc
+            .as_deref()
+            .and_then(DocumentContents::current_version)
+    }
+
     fn latest_version(&self) -> Option<&DocumentVersion> {
-        self.pending.as_ref().or_else(|| self.doc.latest_version())
+        self.pending
+            .as_ref()
+            .or_else(|| self.persisted_latest_version())
     }
 
     fn current_version(&self) -> Option<&Arc<StoredDocumentVersion>> {
@@ -467,28 +533,27 @@ impl<'a> StagedDocument<'a> {
         check_version_precondition(&self.name, self.latest_version(), condition)
     }
 
-    fn stage_update(
-        &mut self,
-        fields: HashMap<String, Value>,
-        commit_time: Timestamp,
-    ) -> Timestamp {
-        let (update_time, version) =
+    fn stage_update(&mut self, fields: HashMap<String, Value>, commit_time: Timestamp) {
+        let (_, version) =
             stage_stored_version(&self.name, self.latest_version(), fields, commit_time);
         if let Some(version) = version {
             if let (Some(orig), Some(staged)) =
-                (self.doc.current_version(), version.stored_document())
+                (self.persisted_current_version(), version.stored_document())
                 && orig.create_time == staged.create_time
                 && Value::fields_storage_eq(&orig.fields, &staged.fields)
             {
                 self.pending = None;
-                return orig.update_time;
+                return;
             }
             self.pending = Some(version);
         }
-        update_time
     }
 
     fn stage_delete(&mut self, delete_time: Timestamp) {
+        if self.persisted_current_version().is_none() {
+            self.pending = None;
+            return;
+        }
         self.pending = Some(DocumentVersion::Deleted(Arc::new(DeletedDocumentVersion {
             name: self.name.clone(),
             delete_time,
@@ -1142,5 +1207,796 @@ mod tests {
             db.commit(vec![invalid_write], None).await,
             Err(GenericDatabaseError::Aborted(_))
         ));
+    }
+
+    fn delete_write(doc_ref: &DocumentRef, precondition: Option<Precondition>) -> Write {
+        Write {
+            current_document: precondition,
+            operation: Some(write::Operation::Delete(doc_ref.to_string())),
+            ..Default::default()
+        }
+    }
+
+    fn update_write(
+        doc_ref: &DocumentRef,
+        fields: HashMap<String, Value>,
+        precondition: Option<Precondition>,
+    ) -> Write {
+        Write {
+            current_document: precondition,
+            operation: Some(write::Operation::Update(Document {
+                name: doc_ref.to_string(),
+                fields,
+                ..Default::default()
+            })),
+            ..Default::default()
+        }
+    }
+
+    fn rw_txn_opts() -> TransactionOptions {
+        TransactionOptions {
+            mode: Some(transaction_options::Mode::ReadWrite(
+                transaction_options::ReadWrite::default(),
+            )),
+        }
+    }
+
+    #[tokio::test]
+    async fn missing_and_already_deleted_doc_deletes_avoid_tombstones_allocations_and_events() {
+        use tokio::sync::broadcast::error::TryRecvError;
+
+        let (_project, _root, db) = test_db().await;
+        let mut events = db.subscribe();
+        let never_ref: DocumentRef = "projects/p/databases/(default)/documents/c/never"
+            .parse()
+            .unwrap();
+        let live_ref: DocumentRef = "projects/p/databases/(default)/documents/c/live"
+            .parse()
+            .unwrap();
+
+        // Repeated deletes of a never-existed document advance `commit_time`, return
+        // `WriteResult.update_time == None`, emit no `DatabaseEvent`, and allocate no
+        // `Collection` or `DocumentMeta`.
+        let mut prev_commit_ts = None;
+        for i in 0..5 {
+            let precondition = (i == 2).then_some(Precondition {
+                condition_type: Some(precondition::ConditionType::Exists(false)),
+            });
+            let (commit_ts, results) = db
+                .commit(vec![delete_write(&never_ref, precondition)], None)
+                .await
+                .unwrap();
+            assert_eq!(results.len(), 1);
+            assert_eq!(results[0].update_time, None);
+            if let Some(prev) = prev_commit_ts {
+                assert!(
+                    commit_ts > prev,
+                    "commit_time must advance on consecutive no-op deletes"
+                );
+            }
+            prev_commit_ts = Some(commit_ts);
+        }
+        db.delete_doc(&never_ref, None).await.unwrap();
+        assert!(
+            db.collections.read().await.is_empty(),
+            "deleting never-existed docs must not allocate phantom collections or DocumentMeta"
+        );
+        assert!(matches!(events.try_recv(), Err(TryRecvError::Empty)));
+
+        // Preconditions on never-existed docs remain unchanged and allocate no storage.
+        let err = db
+            .delete_doc(
+                &never_ref,
+                Some(Precondition {
+                    condition_type: Some(precondition::ConditionType::Exists(true)),
+                }),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, GenericDatabaseError::NotFound(_)));
+        let err = db
+            .delete_doc(
+                &never_ref,
+                Some(Precondition {
+                    condition_type: Some(precondition::ConditionType::UpdateTime(Timestamp {
+                        seconds: 100,
+                        nanos:   0,
+                    })),
+                }),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, GenericDatabaseError::FailedPrecondition(_)));
+        assert!(db.collections.read().await.is_empty());
+        assert!(matches!(events.try_recv(), Err(TryRecvError::Empty)));
+
+        // Create and delete `c/live`: the real delete emits an event, records a single tombstone,
+        // and still returns `WriteResult.update_time == None`.
+        let created = db
+            .update_doc(
+                &live_ref,
+                HashMap::from([("v".to_string(), Value::integer(1))]),
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        let create_ts = created.update_time.unwrap();
+        let create_ev = events.try_recv().expect("create event");
+        assert!(create_ev.updates.contains_key(&live_ref));
+
+        let (del_ts, del_results) = db
+            .commit(vec![delete_write(&live_ref, None)], None)
+            .await
+            .unwrap();
+        assert_eq!(del_results.len(), 1);
+        assert_eq!(del_results[0].update_time, None);
+        assert!(del_ts > create_ts);
+        let del_ev = events.try_recv().expect("real delete event");
+        assert!(matches!(
+            del_ev.updates.get(&live_ref),
+            Some(super::DocumentVersion::Deleted(_))
+        ));
+
+        let meta = db.peek_doc_meta(&live_ref).await.unwrap().unwrap();
+        assert_eq!(
+            meta.read_latest_uncontended(|c| (c.version_count(), c.last_updated())),
+            (2, Some(del_ts))
+        );
+
+        // Repeated deletes on the already-deleted doc advance `commit_time`, keep
+        // `WriteResult.update_time == None`, do NOT grow `versions`, do NOT advance
+        // `last_updated()`, and emit NO `DatabaseEvent`.
+        let mut prev_noop_ts = del_ts;
+        for i in 0..5 {
+            let precondition = (i == 1).then_some(Precondition {
+                condition_type: Some(precondition::ConditionType::Exists(false)),
+            });
+            let (noop_ts, results) = db
+                .commit(vec![delete_write(&live_ref, precondition)], None)
+                .await
+                .unwrap();
+            assert_eq!(results.len(), 1);
+            assert_eq!(results[0].update_time, None);
+            assert!(noop_ts > prev_noop_ts);
+            prev_noop_ts = noop_ts;
+        }
+        assert_eq!(
+            meta.read_latest_uncontended(|c| (c.version_count(), c.last_updated())),
+            (2, Some(del_ts))
+        );
+        assert!(matches!(events.try_recv(), Err(TryRecvError::Empty)));
+
+        // Preconditions on already-deleted docs remain unchanged.
+        let err = db
+            .delete_doc(
+                &live_ref,
+                Some(Precondition {
+                    condition_type: Some(precondition::ConditionType::Exists(true)),
+                }),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, GenericDatabaseError::NotFound(_)));
+        let err = db
+            .delete_doc(
+                &live_ref,
+                Some(Precondition {
+                    condition_type: Some(precondition::ConditionType::UpdateTime(del_ts)),
+                }),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, GenericDatabaseError::FailedPrecondition(_)));
+        assert!(matches!(events.try_recv(), Err(TryRecvError::Empty)));
+    }
+
+    #[tokio::test]
+    async fn multi_write_batches_cancel_absent_update_delete_and_preserve_recreate_create_time() {
+        use tokio::sync::broadcast::error::TryRecvError;
+
+        let (_project, _root, db) = test_db().await;
+        let mut events = db.subscribe();
+        let absent_ref: DocumentRef = "projects/p/databases/(default)/documents/c/absent"
+            .parse()
+            .unwrap();
+        let reused_ref: DocumentRef = "projects/p/databases/(default)/documents/c/reused"
+            .parse()
+            .unwrap();
+        let existing_ref: DocumentRef = "projects/p/databases/(default)/documents/c/existing"
+            .parse()
+            .unwrap();
+        let real_ref: DocumentRef = "projects/p/databases/(default)/documents/c/real"
+            .parse()
+            .unwrap();
+        let ghost_ref: DocumentRef = "projects/p/databases/(default)/documents/c/ghost"
+            .parse()
+            .unwrap();
+
+        // 1. `[Update(D), Delete(D, Exists(true))]` on a never-existed doc evaluates transforms and
+        //    intra-batch preconditions, cancels pending state to `None`, allocates no
+        //    Collection/DocumentMeta, and emits no DatabaseEvent.
+        let (ts, results) = db
+            .commit(
+                vec![
+                    Write {
+                        update_transforms: vec![FieldTransform {
+                            field_path:     "ts".to_string(),
+                            transform_type: Some(TransformType::SetToServerValue(
+                                ServerValue::RequestTime as i32,
+                            )),
+                        }],
+                        operation: Some(write::Operation::Update(Document {
+                            name: absent_ref.to_string(),
+                            fields: HashMap::from([("v".to_string(), Value::integer(1))]),
+                            ..Default::default()
+                        })),
+                        ..Default::default()
+                    },
+                    delete_write(
+                        &absent_ref,
+                        Some(Precondition {
+                            condition_type: Some(precondition::ConditionType::Exists(true)),
+                        }),
+                    ),
+                ],
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].update_time, None);
+        assert_eq!(results[0].transform_results, vec![Value::timestamp(ts)]);
+        assert_eq!(results[1].update_time, None);
+        assert!(db.collections.read().await.is_empty());
+        assert!(matches!(events.try_recv(), Err(TryRecvError::Empty)));
+
+        // `[Update(D), Delete(D, Exists(false))]` sees staged Update -> AlreadyExists, zero alloc.
+        let err = db
+            .commit(
+                vec![
+                    update_write(
+                        &absent_ref,
+                        HashMap::from([("v".to_string(), Value::integer(1))]),
+                        None,
+                    ),
+                    delete_write(
+                        &absent_ref,
+                        Some(Precondition {
+                            condition_type: Some(precondition::ConditionType::Exists(false)),
+                        }),
+                    ),
+                ],
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, GenericDatabaseError::AlreadyExists(_)));
+        assert!(db.collections.read().await.is_empty());
+
+        // 2. `[Update(D), Delete(D)]` on an already-deleted doc cancels pending state to `None`
+        //    without growing `versions`, advancing `last_updated()`, or emitting a `DatabaseEvent`.
+        db.update_doc(
+            &reused_ref,
+            HashMap::from([("v".to_string(), Value::integer(1))]),
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let (del_ts, _) = db
+            .commit(vec![delete_write(&reused_ref, None)], None)
+            .await
+            .unwrap();
+        while events.try_recv().is_ok() {}
+
+        let (_batch_ts, results) = db
+            .commit(
+                vec![
+                    update_write(
+                        &reused_ref,
+                        HashMap::from([("v".to_string(), Value::integer(2))]),
+                        None,
+                    ),
+                    delete_write(&reused_ref, None),
+                ],
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(results[0].update_time, None);
+        assert_eq!(results[1].update_time, None);
+        let reused_meta = db.peek_doc_meta(&reused_ref).await.unwrap().unwrap();
+        assert_eq!(
+            reused_meta.read_latest_uncontended(|c| (c.version_count(), c.last_updated())),
+            (2, Some(del_ts))
+        );
+        assert!(matches!(events.try_recv(), Err(TryRecvError::Empty)));
+
+        // 3. `[Delete(D), Update(D, same_fields)]` on an existing doc MUST still advance
+        //    `create_time` and `update_time`, report `Some(recreate_ts)` on both WriteResults, and
+        //    emit a `DatabaseEvent`.
+        let same_fields = HashMap::from([("k".to_string(), Value::string("same"))]);
+        let initial = db
+            .update_doc(&existing_ref, same_fields.clone(), None, None, None)
+            .await
+            .unwrap();
+        let orig_create = initial.create_time.unwrap();
+        while events.try_recv().is_ok() {}
+
+        let (recreate_ts, results) = db
+            .commit(
+                vec![
+                    delete_write(&existing_ref, None),
+                    update_write(&existing_ref, same_fields.clone(), None),
+                ],
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(results[0].update_time, Some(recreate_ts));
+        assert_eq!(results[1].update_time, Some(recreate_ts));
+        let recreated = db
+            .get_doc(&existing_ref, ReadConsistency::Default)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(recreated.create_time, recreate_ts);
+        assert_eq!(recreated.update_time, recreate_ts);
+        assert!(recreated.create_time > orig_create);
+        assert_eq!(recreated.fields, same_fields);
+        let recreate_ev = events.try_recv().expect("recreate event");
+        assert!(matches!(
+            recreate_ev.updates.get(&existing_ref),
+            Some(super::DocumentVersion::Stored(_))
+        ));
+
+        // 3b. `[Update(D, diff), Update(D, same_fields)]` reverts to the persisted state: both
+        //     WriteResults report `Some(recreate_ts)` (unchanged update_time) and emit no event.
+        let (_, revert_results) = db
+            .commit(
+                vec![
+                    update_write(
+                        &existing_ref,
+                        HashMap::from([("k".to_string(), Value::string("diff"))]),
+                        None,
+                    ),
+                    update_write(&existing_ref, same_fields.clone(), None),
+                ],
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(revert_results[0].update_time, Some(recreate_ts));
+        assert_eq!(revert_results[1].update_time, Some(recreate_ts));
+        assert!(matches!(events.try_recv(), Err(TryRecvError::Empty)));
+
+        // 4. `[Delete(D, Exists(true)), Delete(D, Exists(true))]` fails atomically on the 2nd write
+        //    leaving `existing_ref` intact; `[Delete(D), Delete(D)]` still deletes it once.
+        let err = db
+            .commit(
+                vec![
+                    delete_write(
+                        &existing_ref,
+                        Some(Precondition {
+                            condition_type: Some(precondition::ConditionType::Exists(true)),
+                        }),
+                    ),
+                    delete_write(
+                        &existing_ref,
+                        Some(Precondition {
+                            condition_type: Some(precondition::ConditionType::Exists(true)),
+                        }),
+                    ),
+                ],
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, GenericDatabaseError::NotFound(_)));
+        assert!(
+            db.get_doc(&existing_ref, ReadConsistency::Default)
+                .await
+                .unwrap()
+                .is_some()
+        );
+
+        let (_, del2_results) = db
+            .commit(
+                vec![
+                    delete_write(&existing_ref, None),
+                    delete_write(&existing_ref, None),
+                ],
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(del2_results[0].update_time, None);
+        assert_eq!(del2_results[1].update_time, None);
+        assert!(
+            db.get_doc(&existing_ref, ReadConsistency::Default)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let del2_ev = events.try_recv().expect("double-delete event");
+        assert!(matches!(
+            del2_ev.updates.get(&existing_ref),
+            Some(super::DocumentVersion::Deleted(_))
+        ));
+
+        // 5. Mixed multi-doc batch `[Update(real), Delete(ghost)]` emits event only for `real` and
+        //    does not allocate `DocumentMeta` for `ghost`.
+        let (mixed_ts, mixed_results) = db
+            .commit(
+                vec![
+                    update_write(
+                        &real_ref,
+                        HashMap::from([("ok".to_string(), Value::boolean(true))]),
+                        None,
+                    ),
+                    delete_write(&ghost_ref, None),
+                ],
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(mixed_results[0].update_time, Some(mixed_ts));
+        assert_eq!(mixed_results[1].update_time, None);
+        assert!(db.peek_doc_meta(&ghost_ref).await.unwrap().is_none());
+        let mixed_ev = events.try_recv().expect("mixed event");
+        assert_eq!(mixed_ev.updates.len(), 1);
+        assert!(mixed_ev.updates.contains_key(&real_ref));
+    }
+
+    #[tokio::test]
+    async fn optimistic_txn_reading_missing_doc_ignores_concurrent_missing_doc_deletes() {
+        let (_project, _root, db) = test_db().await;
+        db.set_config(true, true);
+
+        let never_ref: DocumentRef = "projects/p/databases/(default)/documents/opt/never"
+            .parse()
+            .unwrap();
+        let deleted_ref: DocumentRef = "projects/p/databases/(default)/documents/opt/deleted"
+            .parse()
+            .unwrap();
+        let other_ref: DocumentRef = "projects/p/databases/(default)/documents/opt/other"
+            .parse()
+            .unwrap();
+        let existing_ref: DocumentRef = "projects/p/databases/(default)/documents/opt/existing"
+            .parse()
+            .unwrap();
+
+        // Prepare an already-deleted document and a live control document.
+        db.update_doc(
+            &deleted_ref,
+            HashMap::from([("v".to_string(), Value::integer(1))]),
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        db.delete_doc(&deleted_ref, None).await.unwrap();
+        db.update_doc(
+            &existing_ref,
+            HashMap::from([("v".to_string(), Value::integer(1))]),
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        // Both never-existed and already-deleted docs: concurrent non-txn AND transactional
+        // missing-doc deletes must NOT abort an optimistic txn that read the missing doc.
+        for target_ref in [&never_ref, &deleted_ref] {
+            // Subcase A: txn reads missing `target_ref`, concurrent deletes run, txn writes
+            // `other`.
+            let txn_a = db.new_txn(rw_txn_opts()).await.unwrap();
+            assert!(
+                db.get_doc(target_ref, ReadConsistency::Transaction(txn_a))
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+
+            db.delete_doc(target_ref, None).await.unwrap();
+            let txn_del = db.new_txn(rw_txn_opts()).await.unwrap();
+            db.commit(vec![delete_write(target_ref, None)], Some(txn_del))
+                .await
+                .unwrap();
+
+            db.commit(
+                vec![update_write(
+                    &other_ref,
+                    HashMap::from([("from".to_string(), Value::string(target_ref.to_string()))]),
+                    None,
+                )],
+                Some(txn_a),
+            )
+            .await
+            .expect("missing-doc delete must not cause optimistic write-skew");
+
+            // Subcase B: txn reads missing `target_ref`, concurrent delete runs, txn creates
+            // `target_ref` itself.
+            let txn_b = db.new_txn(rw_txn_opts()).await.unwrap();
+            assert!(
+                db.get_doc(target_ref, ReadConsistency::Transaction(txn_b))
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            db.delete_doc(target_ref, None).await.unwrap();
+            db.commit(
+                vec![update_write(
+                    target_ref,
+                    HashMap::from([("created".to_string(), Value::boolean(true))]),
+                    None,
+                )],
+                Some(txn_b),
+            )
+            .await
+            .expect("creating missing doc after concurrent no-op delete must succeed");
+            // Reset back to deleted for clean state.
+            db.delete_doc(target_ref, None).await.unwrap();
+        }
+
+        // Control 1: concurrent creation of a missing doc DOES abort optimistic txn.
+        let control_missing: DocumentRef = "projects/p/databases/(default)/documents/opt/ctrl_miss"
+            .parse()
+            .unwrap();
+        let txn_ctrl1 = db.new_txn(rw_txn_opts()).await.unwrap();
+        assert!(
+            db.get_doc(&control_missing, ReadConsistency::Transaction(txn_ctrl1))
+                .await
+                .unwrap()
+                .is_none()
+        );
+        db.update_doc(
+            &control_missing,
+            HashMap::from([("v".to_string(), Value::integer(1))]),
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let err = db
+            .commit(
+                vec![update_write(
+                    &other_ref,
+                    HashMap::from([("v".to_string(), Value::integer(99))]),
+                    None,
+                )],
+                Some(txn_ctrl1),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, GenericDatabaseError::Aborted(_)));
+
+        // Control 2: concurrent deletion of an EXISTING doc DOES abort optimistic txn.
+        let txn_ctrl2 = db.new_txn(rw_txn_opts()).await.unwrap();
+        assert!(
+            db.get_doc(&existing_ref, ReadConsistency::Transaction(txn_ctrl2))
+                .await
+                .unwrap()
+                .is_some()
+        );
+        db.delete_doc(&existing_ref, None).await.unwrap();
+        let err = db
+            .commit(
+                vec![update_write(
+                    &other_ref,
+                    HashMap::from([("v".to_string(), Value::integer(100))]),
+                    None,
+                )],
+                Some(txn_ctrl2),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, GenericDatabaseError::Aborted(_)));
+    }
+
+    #[tokio::test]
+    async fn pessimistic_txn_missing_doc_delete_still_blocks_and_wounds() {
+        use std::time::Duration;
+
+        let (_project, _root, db) = test_db().await;
+        db.set_config(false, false);
+
+        let never_ref: DocumentRef = "projects/p/databases/(default)/documents/pess/never"
+            .parse()
+            .unwrap();
+        let deleted_ref: DocumentRef = "projects/p/databases/(default)/documents/pess/deleted"
+            .parse()
+            .unwrap();
+        let unrelated_ref: DocumentRef = "projects/p/databases/(default)/documents/pess/unrelated"
+            .parse()
+            .unwrap();
+
+        db.update_doc(
+            &deleted_ref,
+            HashMap::from([("v".to_string(), Value::integer(1))]),
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        db.delete_doc(&deleted_ref, None).await.unwrap();
+
+        // 1. Non-txn `delete(D)` blocks while pessimistic Txn A holds read lock on missing `D`,
+        //    then runs after A commits (deleting the doc A just created).
+        for doc_ref in [&never_ref, &deleted_ref] {
+            let txn_a = db.new_txn(rw_txn_opts()).await.unwrap();
+            assert!(
+                db.get_doc(doc_ref, ReadConsistency::Transaction(txn_a))
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+
+            let db_bg = std::sync::Arc::clone(&db);
+            let del_ref = doc_ref.clone();
+            let del_handle = tokio::spawn(async move {
+                db_bg.commit(vec![delete_write(&del_ref, None)], None).await
+            });
+
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            assert!(
+                !del_handle.is_finished(),
+                "non-txn missing-doc delete must block behind pessimistic read lock"
+            );
+
+            let (a_ts, _) = db
+                .commit(
+                    vec![update_write(
+                        doc_ref,
+                        HashMap::from([("v".to_string(), Value::integer(7))]),
+                        None,
+                    )],
+                    Some(txn_a),
+                )
+                .await
+                .unwrap();
+
+            let (del_ts, del_results) = del_handle.await.unwrap().unwrap();
+            assert!(del_ts > a_ts);
+            assert_eq!(del_results[0].update_time, None);
+            assert!(
+                db.get_doc(doc_ref, ReadConsistency::Default)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+        }
+
+        // 2. Cloud probe b2(i): older A & younger B read missing D; B commits delete(D) (blocks
+        //    behind A); A upgrades to write D -> A commits, B aborts.
+        let d_b2_i: DocumentRef = "projects/p/databases/(default)/documents/pess/b2_i"
+            .parse()
+            .unwrap();
+        let txn_a = db.new_txn(rw_txn_opts()).await.unwrap();
+        let txn_b = db.new_txn(rw_txn_opts()).await.unwrap();
+        assert!(
+            db.get_doc(&d_b2_i, ReadConsistency::Transaction(txn_a))
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            db.get_doc(&d_b2_i, ReadConsistency::Transaction(txn_b))
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let db_bg = std::sync::Arc::clone(&db);
+        let d_bg = d_b2_i.clone();
+        let b_handle = tokio::spawn(async move {
+            db_bg
+                .commit(vec![delete_write(&d_bg, None)], Some(txn_b))
+                .await
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(!b_handle.is_finished());
+
+        db.commit(
+            vec![update_write(
+                &d_b2_i,
+                HashMap::from([("winner".to_string(), Value::string("A"))]),
+                None,
+            )],
+            Some(txn_a),
+        )
+        .await
+        .unwrap();
+        let b_err = b_handle.await.unwrap().unwrap_err();
+        assert!(matches!(b_err, GenericDatabaseError::Aborted(_)));
+
+        // 3. Cloud probe b2(ii): older A & younger B read missing D; B commits delete(D) (blocks);
+        //    A writes unrelated E and commits -> A commits, then B unblocks and commits cleanly.
+        let d_b2_ii: DocumentRef = "projects/p/databases/(default)/documents/pess/b2_ii"
+            .parse()
+            .unwrap();
+        let txn_a = db.new_txn(rw_txn_opts()).await.unwrap();
+        let txn_b = db.new_txn(rw_txn_opts()).await.unwrap();
+        assert!(
+            db.get_doc(&d_b2_ii, ReadConsistency::Transaction(txn_a))
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            db.get_doc(&d_b2_ii, ReadConsistency::Transaction(txn_b))
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let db_bg = std::sync::Arc::clone(&db);
+        let d_bg = d_b2_ii.clone();
+        let b_handle = tokio::spawn(async move {
+            db_bg
+                .commit(vec![delete_write(&d_bg, None)], Some(txn_b))
+                .await
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(!b_handle.is_finished());
+
+        db.commit(
+            vec![update_write(
+                &unrelated_ref,
+                HashMap::from([("from".to_string(), Value::string("b2_ii"))]),
+                None,
+            )],
+            Some(txn_a),
+        )
+        .await
+        .unwrap();
+        let (_, b_results) = b_handle.await.unwrap().unwrap();
+        assert_eq!(b_results[0].update_time, None);
+        assert!(db.peek_doc_meta(&d_b2_ii).await.unwrap().is_none());
+
+        // 4. Cloud probe b2(iii): older A & younger B read missing D; older A commits delete(D) ->
+        //    A commits and wounds younger B even when B writes unrelated E.
+        let d_b2_iii: DocumentRef = "projects/p/databases/(default)/documents/pess/b2_iii"
+            .parse()
+            .unwrap();
+        let txn_a = db.new_txn(rw_txn_opts()).await.unwrap();
+        let txn_b = db.new_txn(rw_txn_opts()).await.unwrap();
+        assert!(
+            db.get_doc(&d_b2_iii, ReadConsistency::Transaction(txn_a))
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            db.get_doc(&d_b2_iii, ReadConsistency::Transaction(txn_b))
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        let (_, a_results) = db
+            .commit(vec![delete_write(&d_b2_iii, None)], Some(txn_a))
+            .await
+            .unwrap();
+        assert_eq!(a_results[0].update_time, None);
+        assert!(db.peek_doc_meta(&d_b2_iii).await.unwrap().is_none());
+
+        let b_err = db
+            .commit(
+                vec![update_write(
+                    &unrelated_ref,
+                    HashMap::from([("from".to_string(), Value::string("b2_iii"))]),
+                    None,
+                )],
+                Some(txn_b),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(b_err, GenericDatabaseError::Aborted(_)));
     }
 }
