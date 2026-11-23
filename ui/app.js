@@ -22,7 +22,11 @@ import {
   syncSessionWithDocument,
 } from "./components/editor.js";
 import { renderExplorer } from "./components/explorer.js";
-import { renderModal as renderModalView } from "./components/modals.js";
+import {
+  getModalFocusableElements,
+  handleModalKeydown,
+  renderModal as renderModalView,
+} from "./components/modals.js";
 import {
   buildStructuredQueryFromVisual,
   createQueryRunnerState,
@@ -916,6 +920,7 @@ export function renderTopbar() {
           ? html`
               <select
                 class="select mono"
+                aria-label="Select database"
                 .value=${activeKey}
                 @change=${(/** @type {Event} */ e) => {
                   const val = /** @type {HTMLSelectElement} */ (e.target).value;
@@ -1025,6 +1030,7 @@ export function renderTopbar() {
           type="button"
           class="sse-badge"
           title="Click to pause or resume live SSE updates"
+          aria-pressed=${String(state.ssePaused)}
           @click=${toggleSsePaused}
         >
           <span class="sse-dot ${dotClass}"></span>
@@ -1167,7 +1173,11 @@ export function renderModal() {
   });
 }
 
-function renderToasts() {
+/**
+ * Renders active toast notifications.
+ * @returns {TemplateResult}
+ */
+export function renderToasts() {
   return html`
     ${state.toasts.map(
       (t) => html`
@@ -1177,6 +1187,7 @@ function renderToasts() {
             type="button"
             class="btn btn-sm btn-ghost"
             style="color: inherit; padding: 0 4px;"
+            aria-label="Dismiss notification"
             @click=${() => {
               dismissToast(t.id);
               renderApp();
@@ -1190,11 +1201,100 @@ function renderToasts() {
   `;
 }
 
+let wasModalOpen = false;
+/** @type {Element | null} */
+let previousModalFocus = null;
+/** @type {((e: KeyboardEvent) => void) | null} */
+let modalKeydownListener = null;
+
+function closeActiveModal() {
+  if (!state.modal || state.modal.busy) return;
+  state.modal = null;
+  renderApp();
+}
+
+/**
+ * Manages modal Escape/Tab keyboard listener, initial focus, and focus restoration.
+ * @param {boolean} wasOpenBefore
+ * @param {Element | null} prevActiveBeforeRender
+ */
+function syncModalAccessibility(wasOpenBefore, prevActiveBeforeRender) {
+  const isOpenNow = state.modal !== null;
+  if (!wasOpenBefore && isOpenNow) {
+    previousModalFocus = prevActiveBeforeRender;
+    if (
+      typeof document !== "undefined" &&
+      typeof document?.addEventListener === "function" &&
+      !modalKeydownListener
+    ) {
+      modalKeydownListener = (e) => {
+        handleModalKeydown(e, state, modalRootEl, closeActiveModal);
+      };
+      document.addEventListener("keydown", modalKeydownListener);
+    }
+    const focusEntry = () => {
+      if (!state.modal) return;
+      const dialogEl =
+        typeof modalRootEl?.querySelector === "function"
+          ? modalRootEl.querySelector('[role="dialog"]')
+          : null;
+      if (!dialogEl) return;
+      const initialField =
+        typeof dialogEl.querySelector === "function"
+          ? dialogEl.querySelector(
+              'input:not([disabled]):not([type="hidden"]), select:not([disabled]), textarea:not([disabled])'
+            )
+          : null;
+      const fallback = getModalFocusableElements(dialogEl)[0] ?? dialogEl;
+      const target = /** @type {Partial<HTMLElement>} */ (
+        initialField ?? fallback
+      );
+      if (typeof target?.focus === "function") {
+        target.focus();
+      }
+    };
+    if (typeof requestAnimationFrame === "function") {
+      requestAnimationFrame(focusEntry);
+    } else {
+      focusEntry();
+    }
+  } else if (wasOpenBefore && !isOpenNow) {
+    if (
+      typeof document !== "undefined" &&
+      typeof document?.removeEventListener === "function" &&
+      modalKeydownListener
+    ) {
+      document.removeEventListener("keydown", modalKeydownListener);
+      modalKeydownListener = null;
+    }
+    const toRestore = /** @type {(Element & Partial<HTMLElement>) | null} */ (
+      previousModalFocus
+    );
+    previousModalFocus = null;
+    if (
+      toRestore &&
+      typeof toRestore.focus === "function" &&
+      toRestore.isConnected !== false
+    ) {
+      toRestore.focus();
+    }
+  }
+  wasModalOpen = isOpenNow;
+}
+
 function renderApp() {
+  const prevActive =
+    !wasModalOpen &&
+    state.modal !== null &&
+    typeof document !== "undefined" &&
+    document
+      ? (document.activeElement ?? null)
+      : null;
   if (topbarEl) render(renderTopbar(), topbarEl);
   if (workspaceEl) render(renderWorkspace(), workspaceEl);
   if (modalRootEl) render(renderModal(), modalRootEl);
   if (toastRootEl) render(renderToasts(), toastRootEl);
+  syncModalAccessibility(wasModalOpen, prevActive);
 }
 
 let popstateBound = false;

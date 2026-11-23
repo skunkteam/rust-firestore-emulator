@@ -42,6 +42,8 @@ const NODE_BOOTSTRAP: &str = r#"
 import assert from "node:assert/strict";
 
 const popstateListeners = [];
+const docKeydownListeners = [];
+let mockActiveElement = null;
 let fetchImpl = async () => {
   throw new Error("unexpected fetch call");
 };
@@ -49,6 +51,21 @@ let fetchImpl = async () => {
 globalThis.document = {
   createTreeWalker: () => ({ currentNode: null, nextNode: () => null }),
   getElementById: () => null,
+  get activeElement() {
+    return mockActiveElement;
+  },
+  set activeElement(el) {
+    mockActiveElement = el;
+  },
+  addEventListener(type, fn) {
+    if (type === "keydown") docKeydownListeners.push(fn);
+  },
+  removeEventListener(type, fn) {
+    if (type === "keydown") {
+      const idx = docKeydownListeners.indexOf(fn);
+      if (idx >= 0) docKeydownListeners.splice(idx, 1);
+    }
+  },
 };
 globalThis.window = {
   EMULATOR_VERSION: "test",
@@ -157,6 +174,84 @@ function findClickHandler(node, labelText) {
       }
       const nested = findClickHandler(v, labelText);
       if (nested) return nested;
+    }
+  }
+  return null;
+}
+
+function renderTemplateMarkup(node) {
+  const LIT_NOTHING = Symbol.for("lit-nothing");
+  if (node == null || node === LIT_NOTHING || typeof node === "symbol") return "";
+  if (typeof node === "string" || typeof node === "number" || typeof node === "boolean") {
+    return String(node);
+  }
+  if (Array.isArray(node)) {
+    return node.map(renderTemplateMarkup).join("");
+  }
+  if (typeof node === "object" && Array.isArray(node.strings) && Array.isArray(node.values)) {
+    let out = "";
+    for (let i = 0; i < node.strings.length; i++) {
+      let chunk = node.strings[i];
+      if (i < node.values.length) {
+        const val = node.values[i];
+        const boolMatch = /\s+\?([A-Za-z0-9_:-]+)=$/.exec(chunk);
+        if (boolMatch) {
+          chunk = chunk.slice(0, boolMatch.index) + (val && val !== LIT_NOTHING ? ` ${boolMatch[1]}` : "");
+          out += chunk;
+          continue;
+        }
+        if (val === LIT_NOTHING) {
+          const attrMatch = /\s+[A-Za-z0-9_:-]+=$/.exec(chunk);
+          if (attrMatch) {
+            chunk = chunk.slice(0, attrMatch.index);
+          }
+          out += chunk;
+          continue;
+        }
+        out += chunk;
+        if (typeof val === "function") {
+          out += "[fn]";
+        } else if (typeof val === "string" && /=\s*$/.test(chunk)) {
+          out += JSON.stringify(val);
+        } else {
+          out += renderTemplateMarkup(val);
+        }
+      } else {
+        out += chunk;
+      }
+    }
+    return out;
+  }
+  return "";
+}
+
+function findElementEventHandlers(node, classSubstr) {
+  if (!node || typeof node !== "object") return null;
+  if (Array.isArray(node)) {
+    for (const item of node) {
+      const hit = findElementEventHandlers(item, classSubstr);
+      if (hit) return hit;
+    }
+    return null;
+  }
+  if (Array.isArray(node.strings) && Array.isArray(node.values)) {
+    for (let i = 0; i < node.strings.length; i++) {
+      if (node.strings[i].includes(classSubstr)) {
+        const handlers = {};
+        for (let k = i; k < node.values.length; k++) {
+          const s = node.strings[k];
+          if (k > i && s.includes(">")) break;
+          const m = /@([a-z]+)=\s*$/.exec(s);
+          if (m && typeof node.values[k] === "function") {
+            handlers[m[1]] = node.values[k];
+          }
+        }
+        if (Object.keys(handlers).length > 0) return handlers;
+      }
+    }
+    for (const v of node.values) {
+      const hit = findElementEventHandlers(v, classSubstr);
+      if (hit) return hit;
     }
   }
   return null;
@@ -2083,6 +2178,422 @@ assert.equal(encoded.valid, true);
 assert.equal(encoded.base64, Buffer.from(largeText, "utf8").toString("base64"));
 
 console.log("regression_uint8_to_base64_chunked_large_arrays passed");
+"#
+    );
+
+    run_node_ui_test(&script);
+}
+
+#[test]
+fn regression_a11y_miller_columns_forms_and_icon_labels() {
+    let repo_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let css =
+        fs::read_to_string(repo_root.join("ui/styles.css")).expect("failed to read ui/styles.css");
+
+    // Preserve bug_web_ui_8 CSS invariants and verify button reset + ellipsis + :focus-visible
+    // rules.
+    assert!(css.contains(".miller-col") && css.contains("overflow: hidden;"));
+    assert!(css.contains(".col-header > span") && css.contains("min-width: 0;"));
+    assert!(
+        css.contains(".col-item")
+            && css.contains("border: none;")
+            && css.contains("background: transparent;")
+            && css.contains("width: 100%;")
+            && css.contains("text-align: left;")
+    );
+    assert!(
+        css.contains(".item-label")
+            && css.contains("min-width: 0;")
+            && css.contains("text-overflow: ellipsis;")
+    );
+    assert!(css.contains(":focus-visible"));
+
+    let script = format!(
+        r#"{NODE_BOOTSTRAP}
+const app = await import("./ui/app.js");
+const {{ renderExplorer }} = await import("./ui/components/explorer.js");
+const {{ createEditorSession, renderHybridEditor }} = await import("./ui/components/editor.js");
+const {{ createQueryRunnerState, renderQueryRunner }} = await import("./ui/components/query.js");
+
+const rootPath = "projects/p/databases/(default)/documents";
+const usersColPath = `${{rootPath}}/users`;
+const aliceDocPath = `${{usersColPath}}/alice`;
+const postsColPath = `${{aliceDocPath}}/posts`;
+const post1DocPath = `${{postsColPath}}/p1`;
+
+const collectionColumns = new Map([
+  [usersColPath, {{
+    collectionPath: usersColPath,
+    collectionId: "users",
+    parentPath: rootPath,
+    documents: [
+      {{ id: "alice", fullName: aliceDocPath, phantom: false }},
+      {{ id: "ghost", fullName: `${{usersColPath}}/ghost`, phantom: true }},
+    ],
+    nextPageToken: "",
+    filterText: "",
+    loading: false,
+  }}],
+  [postsColPath, {{
+    collectionPath: postsColPath,
+    collectionId: "posts",
+    parentPath: aliceDocPath,
+    documents: [
+      {{ id: "p1", fullName: post1DocPath, phantom: false }},
+    ],
+    nextPageToken: "",
+    filterText: "",
+    loading: false,
+  }}],
+]);
+
+const session = createEditorSession(post1DocPath, "p", "(default)", {{
+  name: post1DocPath,
+  fields: {{ title: {{ stringValue: "Hello" }} }},
+}});
+
+const documentLevels = new Map([
+  [aliceDocPath, {{
+    docPath: aliceDocPath,
+    docId: "alice",
+    exists: true,
+    loading: false,
+    subcollections: ["posts", "tags"],
+    editorSession: null,
+  }}],
+  [post1DocPath, {{
+    docPath: post1DocPath,
+    docId: "p1",
+    exists: true,
+    loading: false,
+    subcollections: [],
+    editorSession: session,
+  }}],
+]);
+
+// 1. Explorer uses semantic <button type="button" class="col-item ..."> inside <li> across all 3 columns,
+//    sets aria-current="true" ONLY on selected items, and sets descriptive aria-labels on icon-only controls.
+let selectedPath = null;
+const explorerTpl = renderExplorer({{
+  projectId: "p",
+  databaseId: "(default)",
+  rootCollections: ["users", "orders"],
+  rootLoading: false,
+  segments: ["users", "alice", "posts", "p1"],
+  collectionColumns,
+  documentLevels,
+  onSelectSegments: (s) => {{ selectedPath = s; }},
+  onOpenStartCollection: () => {{}},
+  onOpenAddDocument: () => {{}},
+  onOpenDeleteCollection: () => {{}},
+  onOpenDeleteDocument: () => {{}},
+  onOpenQueryCollection: () => {{}},
+  onLoadMoreDocuments: () => {{}},
+  onSaveDocument: () => {{}},
+  onFilterChange: () => {{}},
+  onRerender: () => {{}},
+}});
+const explorerMarkup = renderTemplateMarkup(explorerTpl);
+
+assert.equal(explorerMarkup.includes('<li class="col-item'), false, "<li> must wrap <button class=col-item>");
+assert.ok(explorerMarkup.includes('<nav aria-label="Breadcrumb" class="breadcrumbs">'));
+assert.ok(explorerMarkup.includes('aria-current="page"'));
+assert.ok(explorerMarkup.includes('aria-label="Delete collection users"'));
+assert.ok(explorerMarkup.includes('aria-label="Delete collection posts"'));
+
+// Count aria-current="true" occurrences on col-item buttons: selected root "users", selected doc "alice",
+// selected ancestor subcol "posts", selected leaf doc "p1" => 4 selected col-item buttons!
+const currentTrueMatches = explorerMarkup.match(/aria-current="true"/g) ?? [];
+assert.equal(currentTrueMatches.length, 4, "expected aria-current=true on all 4 selected Miller items");
+
+// findClickHandler compatibility is preserved with <button type="button" class="col-item">.
+const clickOrders = findClickHandler(explorerTpl, "orders");
+assert.ok(clickOrders, "findClickHandler must still match <button class=col-item>");
+clickOrders();
+assert.deepEqual(selectedPath, ["orders"]);
+
+// 2. Editor icon-only remove field button has descriptive aria-label.
+const editorMarkup = renderTemplateMarkup(renderHybridEditor({{
+  session,
+  onChange: () => {{}},
+}}));
+assert.ok(editorMarkup.includes('aria-label="Remove field title"'));
+
+// 3. Query Runner has proper label for/id associations and icon-only aria-labels.
+const qState = createQueryRunnerState("users");
+qState.filters.push({{
+  id: 1,
+  fieldPath: "age",
+  op: "EQUAL",
+  valueType: "integerValue",
+  valueText: "21",
+  latText: "0",
+  lngText: "0",
+}});
+qState.orders.push({{ id: 2, fieldPath: "age", direction: "ASCENDING" }});
+const queryMarkup = renderTemplateMarkup(renderQueryRunner({{
+  projectId: "p",
+  databaseId: "(default)",
+  knownCollections: ["users"],
+  state: qState,
+  onRerender: () => {{}},
+  onExecuteQuery: () => {{}},
+  onOpenResultDocument: () => {{}},
+}}));
+assert.ok(queryMarkup.includes('for="query-parent-subpath"') && queryMarkup.includes('id="query-parent-subpath"'));
+assert.ok(queryMarkup.includes('for="query-collection-id"') && queryMarkup.includes('id="query-collection-id"'));
+assert.ok(queryMarkup.includes('for="query-all-descendants"') && queryMarkup.includes('id="query-all-descendants"'));
+assert.ok(queryMarkup.includes('for="query-limit"') && queryMarkup.includes('id="query-limit"'));
+assert.ok(queryMarkup.includes('aria-label="Remove filter 1"'));
+assert.ok(queryMarkup.includes('aria-label="Remove sort order 1"'));
+
+// 4. Topbar database selector & toast dismiss button have descriptive aria-labels.
+app.state.databases = [{{ projectId: "p", databaseId: "(default)", rootPath }}];
+app.state.toasts = [{{ id: 1, text: "Saved", tone: "success" }}];
+const topbarMarkup = renderTemplateMarkup(app.renderTopbar());
+const toastsMarkup = renderTemplateMarkup(app.renderToasts());
+assert.ok(topbarMarkup.includes('aria-label="Select database"'));
+assert.ok(toastsMarkup.includes('aria-label="Dismiss notification"'));
+
+console.log("regression_a11y_miller_columns_forms_and_icon_labels passed");
+"#
+    );
+
+    run_node_ui_test(&script);
+}
+
+#[test]
+fn regression_a11y_modals_aria_labels_escape_focus_and_backdrop() {
+    let script = format!(
+        r#"{NODE_BOOTSTRAP}
+const app = await import("./ui/app.js");
+const {{ createEditorSession }} = await import("./ui/components/editor.js");
+const {{ handleModalKeydown }} = await import("./ui/components/modals.js");
+
+// 1. All 5 modal kinds expose role="dialog", aria-modal="true", aria-labelledby matching title id,
+//    aria-label="Close dialog", and unique for/id label associations on every control.
+const modalFixtures = [
+  {{
+    kind: "open_db",
+    modal: {{ kind: "open_db", projectId: "p", databaseId: "(default)", edition: "STANDARD", busy: false, error: null }},
+    titleId: "modal-title-open-db",
+    expectedForIds: ["modal-open-db-project", "modal-open-db-database", "modal-open-db-edition"],
+  }},
+  {{
+    kind: "create_doc",
+    modal: {{
+      kind: "create_doc",
+      parentPath: "projects/p/databases/(default)/documents",
+      collectionId: "",
+      lockCollection: false,
+      docId: "d1",
+      lockDocId: false,
+      session: createEditorSession("", "p", "(default)", null),
+      busy: false,
+      error: null,
+    }},
+    titleId: "modal-title-create-doc",
+    expectedForIds: ["modal-create-doc-collection", "modal-create-doc-id"],
+  }},
+  {{
+    kind: "delete_doc",
+    modal: {{
+      kind: "delete_doc",
+      docPath: "projects/p/databases/(default)/documents/users/alice",
+      recursive: false,
+      hasSubcollections: true,
+      busy: false,
+      error: null,
+    }},
+    titleId: "modal-title-delete-doc",
+    expectedForIds: ["modal-delete-doc-recursive"],
+  }},
+  {{
+    kind: "delete_col",
+    modal: {{
+      kind: "delete_col",
+      colPath: "projects/p/databases/(default)/documents/users",
+      colId: "users",
+      busy: false,
+      error: null,
+    }},
+    titleId: "modal-title-delete-col",
+    expectedForIds: [],
+  }},
+  {{
+    kind: "clear_db",
+    modal: {{
+      kind: "clear_db",
+      projectId: "p",
+      databaseId: "(default)",
+      busy: false,
+      error: null,
+    }},
+    titleId: "modal-title-clear-db",
+    expectedForIds: [],
+  }},
+];
+
+for (const fx of modalFixtures) {{
+  app.state.modal = fx.modal;
+  const markup = renderTemplateMarkup(app.renderModal());
+  assert.ok(markup.includes('role="dialog"'), `${{fx.kind}} missing role=dialog`);
+  assert.ok(markup.includes('aria-modal="true"'), `${{fx.kind}} missing aria-modal=true`);
+  assert.ok(markup.includes(`aria-labelledby="${{fx.titleId}}"`), `${{fx.kind}} missing aria-labelledby`);
+  assert.ok(markup.includes(`<h2 id="${{fx.titleId}}"`), `${{fx.kind}} missing matching heading id`);
+  assert.ok(markup.includes('aria-label="Close dialog"'), `${{fx.kind}} missing Close dialog aria-label`);
+  assert.equal(/<label(?![^>]*\bfor=)/.test(markup), false, `${{fx.kind}} has unassociated <label>`);
+  for (const id of fx.expectedForIds) {{
+    assert.ok(markup.includes(`for="${{id}}"`), `${{fx.kind}} missing for=${{id}}`);
+    assert.ok(markup.includes(`id="${{id}}"`), `${{fx.kind}} missing id=${{id}}`);
+  }}
+}}
+
+// 2. Safe backdrop dismissal: drag-release from inside modal onto backdrop MUST NOT dismiss.
+{{
+  app.state.modal = {{
+    kind: "clear_db",
+    projectId: "p",
+    databaseId: "(default)",
+    busy: false,
+    error: null,
+  }};
+  const handlers = findElementEventHandlers(app.renderModal(), "modal-backdrop");
+  assert.ok(handlers?.mousedown && handlers?.click, "expected mousedown & click on .modal-backdrop");
+
+  const backdropEl = {{ kind: "backdrop" }};
+  const innerCardEl = {{ kind: "card" }};
+
+  // Drag from inside modal out to backdrop -> must remain open.
+  handlers.mousedown({{ target: innerCardEl, currentTarget: backdropEl }});
+  handlers.click({{ target: backdropEl, currentTarget: backdropEl }});
+  assert.ok(app.state.modal !== null, "drag-release onto backdrop must not dismiss modal");
+
+  // Press on backdrop and release inside card -> must remain open.
+  handlers.mousedown({{ target: backdropEl, currentTarget: backdropEl }});
+  handlers.click({{ target: innerCardEl, currentTarget: backdropEl }});
+  assert.ok(app.state.modal !== null, "press on backdrop released inside card must not dismiss modal");
+
+  // While busy, direct click on backdrop must NOT dismiss.
+  app.state.modal.busy = true;
+  handlers.mousedown({{ target: backdropEl, currentTarget: backdropEl }});
+  handlers.click({{ target: backdropEl, currentTarget: backdropEl }});
+  assert.ok(app.state.modal !== null, "busy modal must not dismiss on backdrop click");
+
+  // Direct press and release on backdrop when not busy MUST dismiss.
+  app.state.modal.busy = false;
+  handlers.mousedown({{ target: backdropEl, currentTarget: backdropEl }});
+  handlers.click({{ target: backdropEl, currentTarget: backdropEl }});
+  assert.equal(app.state.modal, null, "direct backdrop click must close modal");
+}}
+
+// 3. Guarded Escape close (respecting !m.busy), keydown listener cleanup, and previousFocus restoration.
+{{
+  app.state.modal = null;
+  const triggerBtn = {{
+    isConnected: true,
+    focusCalls: 0,
+    focus() {{
+      this.focusCalls++;
+      mockActiveElement = this;
+    }},
+  }};
+  mockActiveElement = triggerBtn;
+
+  const openModalBtn = findClickHandler(app.renderTopbar(), "+ Open / Create Database");
+  assert.ok(openModalBtn);
+  openModalBtn();
+  assert.equal(app.state.modal?.kind, "open_db");
+  assert.equal(docKeydownListeners.length, 1, "opening modal registers document keydown listener");
+
+  // Busy modal ignores Escape.
+  app.state.modal.busy = true;
+  let preventedBusy = false;
+  docKeydownListeners[0]({{ key: "Escape", preventDefault() {{ preventedBusy = true; }} }});
+  assert.ok(app.state.modal !== null, "Escape must not close busy modal");
+  assert.equal(preventedBusy, false);
+
+  // Idle modal closes on Escape, detaches keydown listener, and restores previousFocus.
+  app.state.modal.busy = false;
+  let preventedIdle = false;
+  docKeydownListeners[0]({{ key: "Escape", preventDefault() {{ preventedIdle = true; }} }});
+  assert.equal(preventedIdle, true);
+  assert.equal(app.state.modal, null);
+  assert.equal(docKeydownListeners.length, 0, "closing modal removes document keydown listener");
+  assert.equal(triggerBtn.focusCalls, 1, "closing modal restores focus to trigger button");
+}}
+
+// 4. Tab and Shift+Tab focus wrap within the dialog container.
+{{
+  const el1 = {{ focusCount: 0, hasAttribute: () => false, focus() {{ this.focusCount++; mockActiveElement = this; }} }};
+  const el2 = {{ focusCount: 0, hasAttribute: () => false, focus() {{ this.focusCount++; mockActiveElement = this; }} }};
+  const el3 = {{ focusCount: 0, hasAttribute: () => false, focus() {{ this.focusCount++; mockActiveElement = this; }} }};
+  const outsideEl = {{ focus() {{ mockActiveElement = this; }} }};
+  const focusables = [el1, el2, el3];
+  const dialogEl = {{
+    contains: (target) => focusables.includes(target),
+    querySelectorAll: () => focusables,
+    focus() {{ mockActiveElement = this; }},
+  }};
+  const containerEl = {{
+    querySelector: (sel) => (sel === '[role="dialog"]' ? dialogEl : null),
+  }};
+
+  app.state.modal = {{ kind: "delete_col", colPath: "p/d/c", colId: "c", busy: false, error: null }};
+
+  // Tab on last element wraps to first.
+  mockActiveElement = el3;
+  let tabLastPrevented = false;
+  handleModalKeydown({{ key: "Tab", shiftKey: false, preventDefault() {{ tabLastPrevented = true; }} }}, app.state, containerEl, () => {{}});
+  assert.equal(tabLastPrevented, true);
+  assert.equal(mockActiveElement, el1);
+
+  // Shift+Tab on first element wraps to last.
+  let shiftTabFirstPrevented = false;
+  handleModalKeydown({{ key: "Tab", shiftKey: true, preventDefault() {{ shiftTabFirstPrevented = true; }} }}, app.state, containerEl, () => {{}});
+  assert.equal(shiftTabFirstPrevented, true);
+  assert.equal(mockActiveElement, el3);
+
+  // Tab on middle element lets native focus advance without preventDefault.
+  mockActiveElement = el2;
+  let tabMiddlePrevented = false;
+  handleModalKeydown({{ key: "Tab", shiftKey: false, preventDefault() {{ tabMiddlePrevented = true; }} }}, app.state, containerEl, () => {{}});
+  assert.equal(tabMiddlePrevented, false);
+
+  // Tab when focus is outside dialog pulls focus to first element inside dialog.
+  mockActiveElement = outsideEl;
+  let tabOutsidePrevented = false;
+  handleModalKeydown({{ key: "Tab", shiftKey: false, preventDefault() {{ tabOutsidePrevented = true; }} }}, app.state, containerEl, () => {{}});
+  assert.equal(tabOutsidePrevented, true);
+  assert.equal(mockActiveElement, el1);
+
+  // Modified Tab shortcuts (Ctrl/Meta/Alt+Tab) are ignored by focus wrap.
+  mockActiveElement = el3;
+  for (const mod of ["ctrlKey", "metaKey", "altKey"]) {{
+    let modPrevented = false;
+    handleModalKeydown({{ key: "Tab", [mod]: true, preventDefault() {{ modPrevented = true; }} }}, app.state, containerEl, () => {{}});
+    assert.equal(modPrevented, false, mod + "+Tab must not be intercepted");
+  }}
+  assert.equal(mockActiveElement, el3);
+
+  // Detached trigger element (isConnected: false) must not receive focus on close.
+  app.state.modal = null;
+  const detachedTrigger = {{
+    isConnected: false,
+    focusCalls: 0,
+    focus() {{
+      this.focusCalls++;
+    }},
+  }};
+  mockActiveElement = detachedTrigger;
+  const openBtn2 = findClickHandler(app.renderTopbar(), "+ Open / Create Database");
+  openBtn2();
+  docKeydownListeners[0]({{ key: "Escape", preventDefault() {{}} }});
+  assert.equal(app.state.modal, null);
+  assert.equal(detachedTrigger.focusCalls, 0, "disconnected trigger must not be refocused");
+}}
+
+console.log("regression_a11y_modals_aria_labels_escape_focus_and_backdrop passed");
 "#
     );
 

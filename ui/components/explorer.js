@@ -163,27 +163,29 @@ export function renderExplorer(props) {
 
   return html`
     <div class="breadcrumb-bar">
-      <div class="breadcrumbs">
+      <nav aria-label="Breadcrumb" class="breadcrumbs">
         <button
           type="button"
           class="crumb ${segments.length === 0 ? "active" : ""}"
+          aria-current=${segments.length === 0 ? "page" : nothing}
           @click=${() => onSelectSegments([])}
         >
           ${projectId}/${databaseId}
         </button>
         ${segments.map(
           (seg, idx) => html`
-            <span class="crumb-sep">/</span>
+            <span class="crumb-sep" aria-hidden="true">/</span>
             <button
               type="button"
               class="crumb ${idx === segments.length - 1 ? "active" : ""}"
+              aria-current=${idx === segments.length - 1 ? "page" : nothing}
               @click=${() => onSelectSegments(segments.slice(0, idx + 1))}
             >
               ${seg}
             </button>
           `
         )}
-      </div>
+      </nav>
     </div>
 
     <div class="miller-scroller">
@@ -215,14 +217,20 @@ export function renderExplorer(props) {
                 <ul class="col-list">
                   ${rootCollections.map(
                     (colId) => html`
-                      <li
-                        class="col-item ${selectedRootCol === colId
-                          ? "selected"
-                          : ""}"
-                        @click=${() => onSelectSegments([colId])}
-                      >
-                        <span class="item-label">${colId}</span>
-                        <span>›</span>
+                      <li>
+                        <button
+                          type="button"
+                          class="col-item ${selectedRootCol === colId
+                            ? "selected"
+                            : ""}"
+                          aria-current=${selectedRootCol === colId
+                            ? "true"
+                            : nothing}
+                          @click=${() => onSelectSegments([colId])}
+                        >
+                          <span class="item-label">${colId}</span>
+                          <span aria-hidden="true">›</span>
+                        </button>
                       </li>
                     `
                   )}
@@ -284,6 +292,7 @@ function renderDocumentsColumn(p) {
             type="button"
             class="btn btn-sm btn-ghost"
             title="Delete collection"
+            aria-label=${`Delete collection ${p.colId}`}
             @click=${p.onDeleteCol}
           >
             🗑
@@ -297,6 +306,7 @@ function renderDocumentsColumn(p) {
               <input
                 type="text"
                 class="input mono"
+                aria-label=${`Filter document IDs in ${p.colId}`}
                 placeholder="Filter document IDs..."
                 .value=${p.colState?.filterText ?? ""}
                 @input=${(/** @type {Event} */ e) =>
@@ -316,19 +326,25 @@ function renderDocumentsColumn(p) {
               <ul class="col-list">
                 ${filtered.map(
                   (d) => html`
-                    <li
-                      class="col-item ${p.selectedDocId === d.id
-                        ? "selected"
-                        : ""} ${d.phantom ? "phantom" : ""}"
-                      title=${d.phantom
-                        ? "Non-existent ancestor document (has subcollections)"
-                        : d.fullName}
-                      @click=${() => p.onSelectDoc(d.id)}
-                    >
-                      <span class="item-label">${d.id}</span>
-                      ${d.phantom
-                        ? html`<span class="phantom-pill">Non-existent ancestor</span>`
-                        : html`<span>›</span>`}
+                    <li>
+                      <button
+                        type="button"
+                        class="col-item ${p.selectedDocId === d.id
+                          ? "selected"
+                          : ""} ${d.phantom ? "phantom" : ""}"
+                        aria-current=${p.selectedDocId === d.id
+                          ? "true"
+                          : nothing}
+                        title=${d.phantom
+                          ? "Non-existent ancestor document (has subcollections)"
+                          : d.fullName}
+                        @click=${() => p.onSelectDoc(d.id)}
+                      >
+                        <span class="item-label">${d.id}</span>
+                        ${d.phantom
+                          ? html`<span class="phantom-pill">Non-existent ancestor</span>`
+                          : html`<span aria-hidden="true">›</span>`}
+                      </button>
                     </li>
                   `
                 )}
@@ -390,12 +406,16 @@ function renderCompactAncestorSubcollections(p) {
       <ul class="col-list">
         ${subs.map(
           (sub) => html`
-            <li
-              class="col-item ${p.selectedSubcol === sub ? "selected" : ""}"
-              @click=${() => p.onSelectSubcol(sub)}
-            >
-              <span class="item-label">${sub}</span>
-              <span>›</span>
+            <li>
+              <button
+                type="button"
+                class="col-item ${p.selectedSubcol === sub ? "selected" : ""}"
+                aria-current=${p.selectedSubcol === sub ? "true" : nothing}
+                @click=${() => p.onSelectSubcol(sub)}
+              >
+                <span class="item-label">${sub}</span>
+                <span aria-hidden="true">›</span>
+              </button>
             </li>
           `
         )}
@@ -458,10 +478,11 @@ function renderDocumentInspector(p) {
                       class="subcol-chip ${p.selectedSubcol === sub
                         ? "active"
                         : ""}"
+                      aria-current=${p.selectedSubcol === sub ? "true" : nothing}
                       @click=${() => p.onSelectSubcol(sub)}
                     >
                       <span>${sub}</span>
-                      <span>›</span>
+                      <span aria-hidden="true">›</span>
                     </button>
                   `
                 )}
