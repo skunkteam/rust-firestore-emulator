@@ -561,7 +561,7 @@ fn validate_standard_key_ref(value: &Value, expected_root: &RootRef) -> Result<(
     Ok(())
 }
 
-fn validate_cursor_key_ref(value: &Value, expected_root: &RootRef) -> Result<()> {
+pub(super) fn validate_cursor_key_ref(value: &Value, expected_root: &RootRef) -> Result<()> {
     let Some(s) = value.as_reference() else {
         return Err(GenericDatabaseError::invalid_argument(
             "Cursor __key__ value is not a document reference.",
@@ -878,6 +878,10 @@ impl Query {
         Ok(())
     }
 
+    pub fn order_by(&self) -> &[Order] {
+        &self.order_by
+    }
+
     pub fn has_find_nearest(&self) -> bool {
         self.find_nearest.is_some()
     }
@@ -1087,7 +1091,7 @@ impl Query {
                 result.push(name.to_string());
             }
         }
-        result.sort();
+        result.sort_by(|a, b| googleapis::cmp_reference_paths(a, b));
         Ok(result)
     }
 
@@ -1315,6 +1319,16 @@ impl Query {
 pub struct Order {
     field:     FieldReference,
     direction: Direction,
+}
+
+impl Order {
+    pub fn field(&self) -> &FieldReference {
+        &self.field
+    }
+
+    pub fn direction(&self) -> Direction {
+        self.direction
+    }
 }
 
 impl TryFrom<structured_query::Order> for Order {
