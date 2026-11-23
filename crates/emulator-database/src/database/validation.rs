@@ -73,12 +73,7 @@ impl ValidatedWrite {
         };
         let doc_ref: DocumentRef = raw_name.parse()?;
 
-        if &doc_ref.collection_ref.root_ref != expected_root {
-            return Err(GenericDatabaseError::invalid_argument(format!(
-                "resource root {} does not match database {expected_root}",
-                doc_ref.collection_ref.root_ref
-            )));
-        }
+        super::ensure_owns_root(expected_root, &doc_ref.collection_ref.root_ref)?;
 
         if let Some(precondition) = &write.current_document {
             validate_precondition(precondition)?;

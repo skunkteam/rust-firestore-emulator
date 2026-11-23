@@ -538,7 +538,7 @@ mod tests {
         reference::{DocumentRef, RootRef},
     };
 
-    fn test_db() -> (
+    async fn test_db() -> (
         &'static FirestoreProject,
         RootRef,
         std::sync::Arc<crate::FirestoreDatabase>,
@@ -546,14 +546,13 @@ mod tests {
         let project: &'static FirestoreProject =
             Box::leak(Box::new(FirestoreProject::new(FirestoreConfig::default())));
         let root: RootRef = "projects/p/databases/(default)".parse().unwrap();
-        let rt = tokio::runtime::Handle::current();
-        let db = tokio::task::block_in_place(|| rt.block_on(project.database(&root)));
+        let db = project.database(&root).await;
         (project, root, db)
     }
 
-    #[tokio::test(flavor = "multi_thread")]
+    #[tokio::test]
     async fn transform_only_empty_mask_preserves_existing_fields_while_none_overwrites() {
-        let (_project, _root, db) = test_db();
+        let (_project, _root, db) = test_db().await;
         let doc_ref: DocumentRef = "projects/p/databases/(default)/documents/c/d"
             .parse()
             .unwrap();
@@ -638,9 +637,9 @@ mod tests {
         );
     }
 
-    #[tokio::test(flavor = "multi_thread")]
+    #[tokio::test]
     async fn max_min_checks_precondition_before_not_implemented_and_rejects_bad_operand_prelock() {
-        let (_project, _root, db) = test_db();
+        let (_project, _root, db) = test_db().await;
         let doc_ref: DocumentRef = "projects/p/databases/(default)/documents/c/mm"
             .parse()
             .unwrap();
@@ -788,9 +787,9 @@ mod tests {
         assert!(matches!(err, GenericDatabaseError::NotImplemented(_)));
     }
 
-    #[tokio::test(flavor = "multi_thread")]
+    #[tokio::test]
     async fn overlapping_and_repeated_mask_paths_apply_cleanly_without_losing_values() {
-        let (_project, _root, db) = test_db();
+        let (_project, _root, db) = test_db().await;
         let doc_ref: DocumentRef = "projects/p/databases/(default)/documents/c/overlap"
             .parse()
             .unwrap();
@@ -799,9 +798,20 @@ mod tests {
             &doc_ref,
             HashMap::from([
                 ("keep".to_string(), Value::boolean(true)),
+                ("emb".to_string(), Value::vector([1.0, 2.0])),
                 (
                     "a".to_string(),
-                    Value::map(HashMap::from([("old".to_string(), Value::integer(1))])),
+                    Value::map(HashMap::from([
+                        ("old".to_string(), Value::integer(1)),
+                        ("sib".to_string(), Value::integer(2)),
+                        (
+                            "b".to_string(),
+                            Value::map(HashMap::from([
+                                ("c".to_string(), Value::integer(10)),
+                                ("keep_b".to_string(), Value::integer(20)),
+                            ])),
+                        ),
+                    ])),
                 ),
             ]),
             None,
@@ -811,22 +821,28 @@ mod tests {
         .await
         .unwrap();
 
+        // Descendant-only mask preserves unmasked siblings (`a.sib`, `a.b.keep_b`), ignores
+        // unmasked incoming fields (`a.ignored`), explicitly deletes absent `a.old`, and leaves
+        // stored `VectorValue` `emb` intact when absent subpath `emb.value` is masked.
         let updated = db
             .update_doc(
                 &doc_ref,
                 HashMap::from([(
                     "a".to_string(),
-                    Value::map(HashMap::from([(
-                        "b".to_string(),
-                        Value::map(HashMap::from([("c".to_string(), Value::integer(3))])),
-                    )])),
+                    Value::map(HashMap::from([
+                        ("ignored".to_string(), Value::integer(99)),
+                        (
+                            "b".to_string(),
+                            Value::map(HashMap::from([("c".to_string(), Value::integer(3))])),
+                        ),
+                    ])),
                 )]),
                 Some(DocumentMask {
                     field_paths: vec![
-                        "a".to_string(),
-                        "a.b".to_string(),
                         "a.b.c".to_string(),
-                        "a".to_string(),
+                        "a.old".to_string(),
+                        "a.b.c".to_string(),
+                        "emb.value".to_string(),
                     ],
                 }),
                 None,
@@ -839,20 +855,158 @@ mod tests {
             updated.fields,
             HashMap::from([
                 ("keep".to_string(), Value::boolean(true)),
+                ("emb".to_string(), Value::vector([1.0, 2.0])),
+                (
+                    "a".to_string(),
+                    Value::map(HashMap::from([
+                        ("sib".to_string(), Value::integer(2)),
+                        (
+                            "b".to_string(),
+                            Value::map(HashMap::from([
+                                ("c".to_string(), Value::integer(3)),
+                                ("keep_b".to_string(), Value::integer(20)),
+                            ])),
+                        ),
+                    ])),
+                ),
+            ])
+        );
+
+        // Descendant-before-ancestor mask `["a.b.c", "a.b", "a", "emb.value"]`: ancestor `"a"`
+        // overwrites existing siblings (`a.sib`, `a.b.keep_b`) while applying `a.new_sib`, and
+        // `emb.value` still leaves `VectorValue` `emb` intact.
+        let updated = db
+            .update_doc(
+                &doc_ref,
+                HashMap::from([(
+                    "a".to_string(),
+                    Value::map(HashMap::from([
+                        ("new_sib".to_string(), Value::integer(4)),
+                        (
+                            "b".to_string(),
+                            Value::map(HashMap::from([("c".to_string(), Value::integer(5))])),
+                        ),
+                    ])),
+                )]),
+                Some(DocumentMask {
+                    field_paths: vec![
+                        "a.b.c".to_string(),
+                        "a.b".to_string(),
+                        "a".to_string(),
+                        "emb.value".to_string(),
+                    ],
+                }),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            updated.fields,
+            HashMap::from([
+                ("keep".to_string(), Value::boolean(true)),
+                ("emb".to_string(), Value::vector([1.0, 2.0])),
+                (
+                    "a".to_string(),
+                    Value::map(HashMap::from([
+                        ("new_sib".to_string(), Value::integer(4)),
+                        (
+                            "b".to_string(),
+                            Value::map(HashMap::from([("c".to_string(), Value::integer(5))])),
+                        ),
+                    ])),
+                ),
+            ])
+        );
+
+        // Ancestor-before-descendant repeated mask `["a", "a.b", "a.b.c", "a"]` deletes
+        // `a.new_sib`, while `["emb", "emb.value"]` writes `VectorValue` without corrupting its
+        // sentinel `value` key.
+        let updated = db
+            .update_doc(
+                &doc_ref,
+                HashMap::from([
+                    (
+                        "a".to_string(),
+                        Value::map(HashMap::from([(
+                            "b".to_string(),
+                            Value::map(HashMap::from([("c".to_string(), Value::integer(6))])),
+                        )])),
+                    ),
+                    ("emb".to_string(), Value::vector([3.0, 4.0])),
+                ]),
+                Some(DocumentMask {
+                    field_paths: vec![
+                        "a".to_string(),
+                        "a.b".to_string(),
+                        "a.b.c".to_string(),
+                        "a".to_string(),
+                        "emb".to_string(),
+                        "emb.value".to_string(),
+                    ],
+                }),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            updated.fields,
+            HashMap::from([
+                ("keep".to_string(), Value::boolean(true)),
+                ("emb".to_string(), Value::vector([3.0, 4.0])),
                 (
                     "a".to_string(),
                     Value::map(HashMap::from([(
                         "b".to_string(),
-                        Value::map(HashMap::from([("c".to_string(), Value::integer(3))])),
+                        Value::map(HashMap::from([("c".to_string(), Value::integer(6))])),
+                    )])),
+                ),
+            ])
+        );
+
+        // Writing a subpath onto a stored `VectorValue` replaces it atomically as a valid map
+        // (satisfying post-merge `debug_assert!(validate_writable_fields(&fields).is_ok())`).
+        let updated = db
+            .update_doc(
+                &doc_ref,
+                HashMap::from([(
+                    "emb".to_string(),
+                    Value::map(HashMap::from([("nested".to_string(), Value::string("ok"))])),
+                )]),
+                Some(DocumentMask {
+                    field_paths: vec!["emb.nested".to_string()],
+                }),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            updated.fields,
+            HashMap::from([
+                ("keep".to_string(), Value::boolean(true)),
+                (
+                    "emb".to_string(),
+                    Value::map(HashMap::from([("nested".to_string(), Value::string("ok"))])),
+                ),
+                (
+                    "a".to_string(),
+                    Value::map(HashMap::from([(
+                        "b".to_string(),
+                        Value::map(HashMap::from([("c".to_string(), Value::integer(6))])),
                     )])),
                 ),
             ])
         );
     }
 
-    #[tokio::test(flavor = "multi_thread")]
+    #[tokio::test]
     async fn commit_preserves_multi_write_order_for_same_document_and_cleared_db_precedence() {
-        let (project, root, db) = test_db();
+        let (project, root, db) = test_db().await;
         let doc_ref: DocumentRef = "projects/p/databases/(default)/documents/c/seq"
             .parse()
             .unwrap();
