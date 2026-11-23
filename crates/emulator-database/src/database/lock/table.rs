@@ -11,7 +11,12 @@ use tokio::sync::oneshot;
 
 use super::{
     ReadLease, STATE_CLEARED, STATE_COMMITTING, STATE_EXPIRED, STATE_TIMED_OUT, STATE_WOUNDED,
-    SessionAbortState, SessionSharedState, WriteLease, transaction_closed,
+    SessionAbortState, SessionSharedState, WriteLease,
+    contention::{
+        ContendedDocumentSnapshot, ContentionSessionState, MAX_SNAPSHOT_CONTENDED_DOCS,
+        MAX_SNAPSHOT_DOC_PARTICIPANTS, ReaderSnapshot, SessionKind, WaiterSnapshot, WriterSnapshot,
+    },
+    transaction_closed,
 };
 use crate::{
     GenericDatabaseError,
@@ -53,9 +58,27 @@ type ParkedWaiterMap = HashMap<u64, (DocumentRef, (u64, u64))>;
 pub(super) struct WoundEvent {
     pub(super) victim_session_id: u64,
     pub(super) victim_txn_id: Option<TransactionId>,
+    pub(super) victim_kind: SessionKind,
     pub(super) victim_seq: u64,
     pub(super) doc_ref: DocumentRef,
     pub(super) reason: AbortReason,
+}
+
+#[derive(Debug, Clone)]
+pub(super) struct ExpiredSessionOutcome {
+    pub(super) session_id: u64,
+    pub(super) txn_id: Option<TransactionId>,
+    pub(super) seq: Option<u64>,
+    pub(super) kind: SessionKind,
+    pub(super) doc_ref: Option<DocumentRef>,
+    pub(super) had_resources: bool,
+    pub(super) notify_state_change: bool,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(super) struct CloseOutcome {
+    pub(super) actually_closed:     bool,
+    pub(super) notify_state_change: bool,
 }
 
 #[derive(Debug)]
@@ -63,6 +86,7 @@ struct Waiter {
     wait_id: u64,
     session_id: u64,
     mode: LockMode,
+    enqueued_at: tokio::time::Instant,
     tx: oneshot::Sender<Result<(), CommitError>>,
 }
 
@@ -93,6 +117,7 @@ struct SessionRecord {
     seq: u64,
     can_wound: bool,
     woundable: bool,
+    kind: SessionKind,
     state: SessionState,
     abort_reason: Option<AbortReason>,
     held_reads: HashSet<DocumentRef>,
@@ -107,6 +132,7 @@ struct SessionRecord {
 pub(super) struct LockTableGarbage {
     sessions: HashMap<u64, SessionRecord>,
     docs: HashMap<DocumentRef, DocLockState>,
+    contended_docs: BTreeSet<DocumentRef>,
     records: Vec<SessionRecord>,
     doc_sets: Vec<HashSet<DocumentRef>>,
     doc_vecs: Vec<Vec<DocumentRef>>,
@@ -118,13 +144,15 @@ pub(super) struct LockTableGarbage {
 pub(super) enum AcquireOutcome {
     Granted {
         observation: ReadObservation,
-        wounds:      Vec<WoundEvent>,
+        wounds: Vec<WoundEvent>,
+        notify_contention: bool,
     },
     Wait {
         wait_id: u64,
         rx: oneshot::Receiver<Result<(), CommitError>>,
         observation: ReadObservation,
         wounds: Vec<WoundEvent>,
+        notify_contention: bool,
     },
 }
 
@@ -140,11 +168,13 @@ pub(super) struct BatchAcquireOutcome {
     pub(super) granted_docs: Vec<DocumentRef>,
     pub(super) pending: Vec<PendingWait>,
     pub(super) wounds: Vec<WoundEvent>,
+    pub(super) notify_contention: bool,
 }
 
 #[derive(Debug, Default)]
 pub(super) struct LockTable {
     docs: HashMap<DocumentRef, DocLockState>,
+    contended_docs: BTreeSet<DocumentRef>,
     sessions: HashMap<u64, SessionRecord>,
     next_arrival: u64,
     next_wait_id: u64,
@@ -152,11 +182,13 @@ pub(super) struct LockTable {
 }
 
 impl LockTable {
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn register_session(
         &mut self,
         session_id: u64,
         shared: Arc<SessionSharedState>,
         txn_id: Option<TransactionId>,
+        kind: SessionKind,
         seq: u64,
         can_wound: bool,
         woundable: bool,
@@ -173,6 +205,7 @@ impl LockTable {
                 seq,
                 can_wound,
                 woundable,
+                kind,
                 state: SessionState::Active,
                 abort_reason: None,
                 held_reads: HashSet::new(),
@@ -210,14 +243,17 @@ impl LockTable {
         }
 
         if already_reader {
+            let mut notify_contention = false;
             if let Some(doc) = self.docs.get_mut(doc_ref)
                 && let Some(hold) = doc.readers.get_mut(&session_id)
             {
                 hold.active_leases += 1;
+                notify_contention = !doc.waiters.is_empty();
             }
             return Ok(AcquireOutcome::Granted {
                 observation: ReadObservation::NeverRead,
-                wounds:      Vec::new(),
+                wounds: Vec::new(),
+                notify_contention,
             });
         }
 
@@ -253,18 +289,21 @@ impl LockTable {
                     observation:   None,
                 },
             );
-            let should_wake = !wounds.is_empty() && !doc.waiters.is_empty();
+            let has_waiters = !doc.waiters.is_empty();
+            let should_wake = !wounds.is_empty() && has_waiters;
+            let mut notify_contention = !wounds.is_empty() || has_waiters;
             self.sessions
                 .get_mut(&session_id)
                 .expect("session registered")
                 .held_reads
                 .insert(doc_ref.clone());
-            if should_wake {
-                self.wake_waiters(doc_ref);
+            if should_wake && self.wake_waiters(doc_ref) {
+                notify_contention = true;
             }
             return Ok(AcquireOutcome::Granted {
                 observation: ReadObservation::NeverRead,
                 wounds,
+                notify_contention,
             });
         }
 
@@ -278,6 +317,7 @@ impl LockTable {
             rx,
             observation: ReadObservation::NeverRead,
             wounds,
+            notify_contention: true,
         })
     }
 
@@ -335,12 +375,14 @@ impl LockTable {
             let doc = self.docs.entry(doc_ref.clone()).or_default();
             doc.readers.remove(&session_id);
             doc.writer = Some(session_id);
+            let notify_contention = !wounds.is_empty() || !doc.waiters.is_empty();
             let rec = self.sessions.get_mut(&session_id).expect("session exists");
             rec.held_reads.remove(doc_ref);
             rec.held_writes.insert(doc_ref.clone());
             return Ok(AcquireOutcome::Granted {
                 observation,
                 wounds,
+                notify_contention,
             });
         }
 
@@ -371,6 +413,7 @@ impl LockTable {
             rx,
             observation,
             wounds,
+            notify_contention: true,
         })
     }
 
@@ -410,6 +453,7 @@ impl LockTable {
         let mut granted_docs = Vec::new();
         let mut pending = Vec::new();
         let mut waiters_to_wake = Vec::new();
+        let mut notify_contention = !wounds.is_empty();
 
         for doc_ref in docs {
             let arrival = self.next_arrival_order();
@@ -420,7 +464,11 @@ impl LockTable {
             });
 
             if can_grant {
-                self.docs.entry(doc_ref.clone()).or_default().writer = Some(session_id);
+                let doc = self.docs.entry(doc_ref.clone()).or_default();
+                doc.writer = Some(session_id);
+                if !doc.waiters.is_empty() {
+                    notify_contention = true;
+                }
                 self.sessions
                     .get_mut(&session_id)
                     .expect("session exists")
@@ -430,6 +478,7 @@ impl LockTable {
             } else {
                 let (wait_id, rx) =
                     self.park_waiter(session_id, doc_ref, seq, arrival, LockMode::Write);
+                notify_contention = true;
                 pending.push(PendingWait {
                     doc_ref: doc_ref.clone(),
                     wait_id,
@@ -443,7 +492,9 @@ impl LockTable {
         }
 
         for doc_ref in &waiters_to_wake {
-            self.wake_waiters(doc_ref);
+            if self.wake_waiters(doc_ref) {
+                notify_contention = true;
+            }
         }
         if !waiters_to_wake.is_empty() {
             garbage.doc_vecs.push(waiters_to_wake);
@@ -453,6 +504,7 @@ impl LockTable {
             granted_docs,
             pending,
             wounds,
+            notify_contention,
         })
     }
 
@@ -462,20 +514,19 @@ impl LockTable {
         shared: &SessionSharedState,
         doc_ref: &DocumentRef,
         observed_update_time: Option<Timestamp>,
-    ) -> Result<(), CommitError> {
+    ) -> Result<bool, CommitError> {
         self.check_read_retaining_session(session_id, shared)?;
-        let Some(hold) = self
-            .docs
-            .get_mut(doc_ref)
-            .and_then(|d| d.readers.get_mut(&session_id))
-        else {
+        let Some(doc) = self.docs.get_mut(doc_ref) else {
+            return Err(transaction_closed());
+        };
+        let Some(hold) = doc.readers.get_mut(&session_id) else {
             return Err(transaction_closed());
         };
         hold.active_leases = hold.active_leases.saturating_sub(1);
         hold.retained = true;
         // Preserve the transaction's earliest read observation on this document.
         hold.observation.get_or_insert(observed_update_time);
-        Ok(())
+        Ok(!doc.waiters.is_empty())
     }
 
     pub(super) fn retain_reads(
@@ -483,7 +534,7 @@ impl LockTable {
         session_id: u64,
         shared: &SessionSharedState,
         leases: &[(ReadLease, Option<Timestamp>)],
-    ) -> Result<(), CommitError> {
+    ) -> Result<bool, CommitError> {
         self.check_read_retaining_session(session_id, shared)?;
         for (lease, _) in leases {
             if !self
@@ -494,31 +545,49 @@ impl LockTable {
                 return Err(transaction_closed());
             }
         }
+        let mut notify_contention = false;
         for (lease, observed_update_time) in leases {
-            let hold = self
+            let doc = self
                 .docs
                 .get_mut(lease.doc_ref())
-                .and_then(|d| d.readers.get_mut(&session_id))
+                .expect("validated read doc exists");
+            let hold = doc
+                .readers
+                .get_mut(&session_id)
                 .expect("validated read hold exists");
             hold.active_leases = hold.active_leases.saturating_sub(1);
             hold.retained = true;
             // Preserve the transaction's earliest read observation on this document.
             hold.observation.get_or_insert(*observed_update_time);
+            if !doc.waiters.is_empty() {
+                notify_contention = true;
+            }
         }
-        Ok(())
+        Ok(notify_contention)
     }
 
-    pub(super) fn release_read_lease(&mut self, session_id: u64, doc_ref: &DocumentRef) {
+    pub(super) fn release_read_lease(&mut self, session_id: u64, doc_ref: &DocumentRef) -> bool {
         let mut wake_doc = false;
         let mut remove_doc = false;
+        let mut notify = false;
         if let Some(doc) = self.docs.get_mut(doc_ref) {
             if let Some(hold) = doc.readers.get_mut(&session_id) {
+                let prev_leases = hold.active_leases;
                 hold.active_leases = hold.active_leases.saturating_sub(1);
-                if hold.active_leases == 0 && !hold.retained {
+                let lease_decremented = hold.active_leases != prev_leases;
+                let removed_hold = if hold.active_leases == 0 && !hold.retained {
                     doc.readers.remove(&session_id);
                     if let Some(rec) = self.sessions.get_mut(&session_id) {
                         rec.held_reads.remove(doc_ref);
                     }
+                    true
+                } else {
+                    false
+                };
+                if !doc.waiters.is_empty() && (removed_hold || lease_decremented) {
+                    notify = true;
+                }
+                if removed_hold {
                     wake_doc = doc.writer.is_none() && !doc.waiters.is_empty();
                     remove_doc = doc.is_empty();
                 }
@@ -528,14 +597,16 @@ impl LockTable {
         }
         if remove_doc {
             self.docs.remove(doc_ref);
-        } else if wake_doc {
-            self.wake_waiters(doc_ref);
+        } else if wake_doc && self.wake_waiters(doc_ref) {
+            notify = true;
         }
+        notify
     }
 
-    pub(super) fn release_write_lease(&mut self, session_id: u64, doc_ref: &DocumentRef) {
+    pub(super) fn release_write_lease(&mut self, session_id: u64, doc_ref: &DocumentRef) -> bool {
         let mut wake_doc = false;
         let mut remove_doc = false;
+        let mut notify = false;
         if let Some(doc) = self.docs.get_mut(doc_ref)
             && doc.writer == Some(session_id)
         {
@@ -544,13 +615,15 @@ impl LockTable {
                 rec.held_writes.remove(doc_ref);
             }
             wake_doc = !doc.waiters.is_empty();
+            notify = wake_doc;
             remove_doc = doc.is_empty();
         }
         if remove_doc {
             self.docs.remove(doc_ref);
-        } else if wake_doc {
-            self.wake_waiters(doc_ref);
+        } else if wake_doc && self.wake_waiters(doc_ref) {
+            notify = true;
         }
+        notify
     }
 
     pub(super) fn consume_wait_grant(
@@ -558,38 +631,43 @@ impl LockTable {
         session_id: u64,
         shared: &SessionSharedState,
         wait_id: u64,
-    ) -> Result<(), CommitError> {
+    ) -> (Result<(), CommitError>, bool) {
         if self.cleared {
-            return Err(CommitError::Aborted(AbortReason::DatabaseCleared));
+            return (
+                Err(CommitError::Aborted(AbortReason::DatabaseCleared)),
+                false,
+            );
         }
         let Some(rec) = self.sessions.get_mut(&session_id) else {
-            return Err(missing_session_error(shared));
+            return (Err(missing_session_error(shared)), false);
         };
         if rec.state != SessionState::Active {
-            return Err(inactive_record_error(rec));
+            return (Err(inactive_record_error(rec)), false);
         }
         let Some((doc_ref, mode)) = rec.promoted_grants.remove(&wait_id) else {
-            return Err(transaction_closed());
+            return (Err(transaction_closed()), false);
         };
         if mode == LockMode::Read && !rec.shared.is_accepting_reads() {
             let mut wake_doc = false;
             let mut remove_doc = false;
+            let mut notify = false;
             if let Some(doc) = self.docs.get_mut(&doc_ref) {
                 rollback_promoted_grant(doc, rec, session_id, &doc_ref, mode);
+                notify = !doc.waiters.is_empty();
                 wake_doc = doc.writer.is_none() && !doc.waiters.is_empty();
                 remove_doc = doc.is_empty();
             }
             if remove_doc {
                 self.docs.remove(&doc_ref);
-            } else if wake_doc {
-                self.wake_waiters(&doc_ref);
+            } else if wake_doc && self.wake_waiters(&doc_ref) {
+                notify = true;
             }
-            return Err(transaction_closed());
+            return (Err(transaction_closed()), notify);
         }
-        Ok(())
+        (Ok(()), false)
     }
 
-    pub(super) fn revoke_waiter(&mut self, session_id: u64, wait_id: u64) {
+    pub(super) fn revoke_waiter(&mut self, session_id: u64, wait_id: u64) -> bool {
         let parked = self
             .sessions
             .get_mut(&session_id)
@@ -597,8 +675,12 @@ impl LockTable {
         if let Some((doc_ref, key)) = parked {
             let mut wake_doc = false;
             let mut remove_doc = false;
+            let mut removed_waiter = false;
             if let Some(doc) = self.docs.get_mut(&doc_ref) {
-                doc.waiters.remove(&key);
+                removed_waiter = doc.waiters.remove(&key).is_some();
+                if removed_waiter && doc.waiters.is_empty() {
+                    self.contended_docs.remove(&doc_ref);
+                }
                 wake_doc = doc.writer.is_none() && !doc.waiters.is_empty();
                 remove_doc = doc.is_empty();
             }
@@ -607,7 +689,7 @@ impl LockTable {
             } else if wake_doc {
                 self.wake_waiters(&doc_ref);
             }
-            return;
+            return removed_waiter;
         }
 
         let promoted = self
@@ -615,11 +697,12 @@ impl LockTable {
             .get_mut(&session_id)
             .and_then(|rec| rec.promoted_grants.remove(&wait_id));
         if let Some((doc_ref, mode)) = promoted {
-            match mode {
+            return match mode {
                 LockMode::Read => self.release_read_lease(session_id, &doc_ref),
                 LockMode::Write => self.release_write_lease(session_id, &doc_ref),
-            }
+            };
         }
+        false
     }
 
     pub(super) fn seal_for_commit(
@@ -628,7 +711,7 @@ impl LockTable {
         shared: &SessionSharedState,
         write_docs: &BTreeMap<DocumentRef, WriteLease>,
         garbage: &mut LockTableGarbage,
-    ) -> Result<(), CommitError> {
+    ) -> Result<bool, CommitError> {
         if self.cleared {
             return Err(CommitError::Aborted(AbortReason::DatabaseCleared));
         }
@@ -648,6 +731,11 @@ impl LockTable {
             }
         }
 
+        let mut notify_contention = write_docs.keys().any(|doc_ref| {
+            self.docs
+                .get(doc_ref)
+                .is_some_and(|d| !d.waiters.is_empty())
+        });
         let mut docs_to_wake = Vec::new();
         if let Some(rec) = self.sessions.get_mut(&session_id) {
             rec.state = SessionState::Committing;
@@ -659,12 +747,17 @@ impl LockTable {
                 if let Some(doc) = self.docs.get_mut(doc_ref) {
                     match mode {
                         LockMode::Read => {
+                            let prev_leases =
+                                doc.readers.get(&session_id).map_or(0, |h| h.active_leases);
                             let remove_hold = if let Some(hold) = doc.readers.get_mut(&session_id) {
                                 hold.active_leases = hold.active_leases.saturating_sub(1);
                                 hold.active_leases == 0 && !hold.retained
                             } else {
                                 false
                             };
+                            if !doc.waiters.is_empty() && (remove_hold || prev_leases > 0) {
+                                notify_contention = true;
+                            }
                             if remove_hold {
                                 doc.readers.remove(&session_id);
                                 rec.held_reads.remove(doc_ref);
@@ -679,6 +772,9 @@ impl LockTable {
                             if !write_docs.contains_key(doc_ref) {
                                 if doc.writer == Some(session_id) {
                                     doc.writer = None;
+                                    if !doc.waiters.is_empty() {
+                                        notify_contention = true;
+                                    }
                                 }
                                 rec.held_writes.remove(doc_ref);
                                 record_doc_wake_or_prune(
@@ -698,6 +794,9 @@ impl LockTable {
                 if let Some(doc) = self.docs.get_mut(doc_ref)
                     && doc.readers.remove(&session_id).is_some()
                 {
+                    if !doc.waiters.is_empty() {
+                        notify_contention = true;
+                    }
                     if doc.writer.is_none() && !doc.waiters.is_empty() {
                         docs_to_wake.push(doc_ref.clone());
                     } else if doc.is_empty() {
@@ -712,6 +811,10 @@ impl LockTable {
                 if let Some(doc) = self.docs.get_mut(doc_ref) {
                     if let Some(waiter) = doc.waiters.remove(key) {
                         let _unused = waiter.tx.send(Err(transaction_closed()));
+                        notify_contention = true;
+                        if doc.waiters.is_empty() {
+                            self.contended_docs.remove(doc_ref);
+                        }
                     }
                     if doc.writer.is_none() && !doc.waiters.is_empty() {
                         docs_to_wake.push(doc_ref.clone());
@@ -724,14 +827,14 @@ impl LockTable {
         }
 
         for (idx, doc_ref) in docs_to_wake.iter().enumerate() {
-            if !docs_to_wake[..idx].contains(doc_ref) {
-                self.wake_waiters(doc_ref);
+            if !docs_to_wake[..idx].contains(doc_ref) && self.wake_waiters(doc_ref) {
+                notify_contention = true;
             }
         }
         if !docs_to_wake.is_empty() {
             garbage.doc_vecs.push(docs_to_wake);
         }
-        Ok(())
+        Ok(notify_contention)
     }
 
     pub(super) fn close_session(
@@ -740,16 +843,30 @@ impl LockTable {
         timeout_reason: Option<AbortReason>,
         closed_state_code: u8,
         garbage: &mut LockTableGarbage,
-    ) {
+    ) -> CloseOutcome {
         let disposition = match timeout_reason {
             Some(reason) => CloseDisposition::TimedOut(reason),
             None => CloseDisposition::Normal(closed_state_code),
         };
-        self.close_session_inner(session_id, disposition, garbage);
+        match self.close_session_inner(session_id, disposition, garbage) {
+            Some((_, notify_state_change)) => CloseOutcome {
+                actually_closed: true,
+                notify_state_change,
+            },
+            None => CloseOutcome {
+                actually_closed:     false,
+                notify_state_change: false,
+            },
+        }
     }
 
-    pub(super) fn close_expired(&mut self, session_id: u64, garbage: &mut LockTableGarbage) {
-        self.close_session_inner(session_id, CloseDisposition::Expired, garbage);
+    pub(super) fn close_expired(
+        &mut self,
+        session_id: u64,
+        garbage: &mut LockTableGarbage,
+    ) -> Option<ExpiredSessionOutcome> {
+        self.close_session_inner(session_id, CloseDisposition::Expired, garbage)
+            .map(|(expired, _)| expired.expect("expired disposition yields outcome"))
     }
 
     fn close_session_inner(
@@ -757,13 +874,11 @@ impl LockTable {
         session_id: u64,
         disposition: CloseDisposition,
         garbage: &mut LockTableGarbage,
-    ) {
-        let Some(rec) = self.sessions.get(&session_id) else {
-            return;
-        };
+    ) -> Option<(Option<ExpiredSessionOutcome>, bool)> {
+        let rec = self.sessions.get(&session_id)?;
         if !matches!(disposition, CloseDisposition::Normal(_)) && rec.state != SessionState::Active
         {
-            return;
+            return None;
         }
 
         let mut rec = self
@@ -771,6 +886,7 @@ impl LockTable {
             .remove(&session_id)
             .expect("session verified present");
 
+        let mut expired_outcome = None;
         let cancel_err = match disposition {
             CloseDisposition::TimedOut(reason) => {
                 rec.state = SessionState::TimedOut;
@@ -779,6 +895,31 @@ impl LockTable {
                 CommitError::Aborted(reason)
             }
             CloseDisposition::Expired => {
+                let had_resources = !rec.held_reads.is_empty()
+                    || !rec.held_writes.is_empty()
+                    || !rec.promoted_grants.is_empty()
+                    || !rec.parked_waiters.is_empty();
+                let doc_ref = if had_resources {
+                    rec.parked_waiters
+                        .values()
+                        .map(|(doc, _)| doc)
+                        .min()
+                        .or_else(|| rec.held_writes.iter().min())
+                        .or_else(|| rec.held_reads.iter().min())
+                        .or_else(|| rec.promoted_grants.values().map(|(doc, _)| doc).min())
+                        .cloned()
+                } else {
+                    None
+                };
+                expired_outcome = Some(ExpiredSessionOutcome {
+                    session_id,
+                    txn_id: rec.txn_id,
+                    seq: (rec.seq != 0).then_some(rec.seq),
+                    kind: rec.kind,
+                    doc_ref,
+                    had_resources,
+                    notify_state_change: false,
+                });
                 let reason = AbortReason::TransactionExpired;
                 rec.state = SessionState::Expired;
                 rec.abort_reason = Some(reason);
@@ -794,29 +935,41 @@ impl LockTable {
         };
 
         let mut affected_docs = Vec::new();
+        let mut notify_state_change = false;
         self.strip_session_resources(
             session_id,
             &mut rec,
             &cancel_err,
             &mut affected_docs,
+            &mut notify_state_change,
             garbage,
         );
 
         for (idx, doc_ref) in affected_docs.iter().enumerate() {
-            if !affected_docs[..idx].contains(doc_ref) {
-                self.wake_waiters(doc_ref);
+            if !affected_docs[..idx].contains(doc_ref) && self.wake_waiters(doc_ref) {
+                notify_state_change = true;
             }
         }
         if !affected_docs.is_empty() {
             garbage.doc_vecs.push(affected_docs);
         }
         garbage.records.push(rec);
+        if let Some(outcome) = expired_outcome.as_mut() {
+            outcome.notify_state_change = notify_state_change;
+        }
+        Some((expired_outcome, notify_state_change))
     }
 
-    pub(super) fn abort_all(&mut self, reason: AbortReason, garbage: &mut LockTableGarbage) {
+    pub(super) fn abort_all(
+        &mut self,
+        reason: AbortReason,
+        garbage: &mut LockTableGarbage,
+    ) -> bool {
         if reason == AbortReason::DatabaseCleared {
             self.cleared = true;
         }
+        let had_contended = !self.contended_docs.is_empty();
+        garbage.contended_docs = std::mem::take(&mut self.contended_docs);
         let sessions = std::mem::take(&mut self.sessions);
         let mut docs = std::mem::take(&mut self.docs);
         for rec in sessions.values() {
@@ -829,6 +982,7 @@ impl LockTable {
         }
         garbage.sessions = sessions;
         garbage.docs = docs;
+        had_contended
     }
 
     fn active_session_mut(
@@ -905,19 +1059,21 @@ impl LockTable {
         let wait_id = self.next_wait_id();
         let (tx, rx) = oneshot::channel();
         let key = (seq, arrival);
-        self.docs
-            .entry(doc_ref.clone())
-            .or_default()
-            .waiters
-            .insert(
-                key,
-                Waiter {
-                    wait_id,
-                    session_id,
-                    mode,
-                    tx,
-                },
-            );
+        let doc = self.docs.entry(doc_ref.clone()).or_default();
+        let was_empty = doc.waiters.is_empty();
+        doc.waiters.insert(
+            key,
+            Waiter {
+                wait_id,
+                session_id,
+                mode,
+                enqueued_at: tokio::time::Instant::now(),
+                tx,
+            },
+        );
+        if was_empty {
+            self.contended_docs.insert(doc_ref.clone());
+        }
         self.sessions
             .get_mut(&session_id)
             .expect("session registered")
@@ -1000,6 +1156,7 @@ impl LockTable {
         };
         let mut affected_docs = Vec::new();
         let mut events = Vec::with_capacity(eligible.len());
+        let mut notify_state_change = false;
 
         for (victim_id, trigger_doc) in eligible {
             // Remove the victim record completely so dead Wounded records do not accumulate in
@@ -1013,6 +1170,7 @@ impl LockTable {
             events.push(WoundEvent {
                 victim_session_id: victim_id,
                 victim_txn_id: rec.txn_id,
+                victim_kind: rec.kind,
                 victim_seq: rec.seq,
                 doc_ref: trigger_doc,
                 reason,
@@ -1023,6 +1181,7 @@ impl LockTable {
                 &mut rec,
                 &cancel_err,
                 &mut affected_docs,
+                &mut notify_state_change,
                 garbage,
             );
             garbage.records.push(rec);
@@ -1037,6 +1196,7 @@ impl LockTable {
         rec: &mut SessionRecord,
         cancel_err: &CommitError,
         affected_docs: &mut Vec<DocumentRef>,
+        notify_state_change: &mut bool,
         garbage: &mut LockTableGarbage,
     ) {
         let held_reads = std::mem::take(&mut rec.held_reads);
@@ -1044,6 +1204,9 @@ impl LockTable {
             if let Some(doc) = self.docs.get_mut(doc_ref)
                 && doc.readers.remove(&session_id).is_some()
             {
+                if !doc.waiters.is_empty() {
+                    *notify_state_change = true;
+                }
                 if doc.writer.is_none() && !doc.waiters.is_empty() {
                     affected_docs.push(doc_ref.clone());
                 } else if doc.is_empty() {
@@ -1062,6 +1225,7 @@ impl LockTable {
             {
                 doc.writer = None;
                 if !doc.waiters.is_empty() {
+                    *notify_state_change = true;
                     affected_docs.push(doc_ref.clone());
                 } else if doc.is_empty() {
                     self.docs.remove(doc_ref);
@@ -1087,6 +1251,9 @@ impl LockTable {
                     }
                 };
                 if changed {
+                    if !doc.waiters.is_empty() {
+                        *notify_state_change = true;
+                    }
                     if doc.writer.is_none() && !doc.waiters.is_empty() {
                         affected_docs.push(doc_ref.clone());
                     } else if doc.is_empty() {
@@ -1104,6 +1271,10 @@ impl LockTable {
             if let Some(doc) = self.docs.get_mut(doc_ref) {
                 if let Some(waiter) = doc.waiters.remove(key) {
                     let _unused = waiter.tx.send(Err(cancel_err.clone()));
+                    *notify_state_change = true;
+                    if doc.waiters.is_empty() {
+                        self.contended_docs.remove(doc_ref);
+                    }
                 }
                 if doc.writer.is_none() && !doc.waiters.is_empty() {
                     affected_docs.push(doc_ref.clone());
@@ -1117,14 +1288,23 @@ impl LockTable {
         }
     }
 
-    fn wake_waiters(&mut self, doc_ref: &DocumentRef) {
-        let Self { docs, sessions, .. } = self;
+    fn wake_waiters(&mut self, doc_ref: &DocumentRef) -> bool {
+        let Self {
+            docs,
+            contended_docs,
+            sessions,
+            ..
+        } = self;
+        let mut any_popped = false;
         let remove_empty = {
             let Some(doc) = docs.get_mut(doc_ref) else {
-                return;
+                return false;
             };
             loop {
                 let Some((_, first)) = doc.waiters.first_key_value() else {
+                    if any_popped {
+                        contended_docs.remove(doc_ref);
+                    }
                     break doc.is_empty();
                 };
                 let eligible = match first.mode {
@@ -1132,10 +1312,11 @@ impl LockTable {
                     LockMode::Write => doc.writer.is_none() && doc.readers.is_empty(),
                 };
                 if !eligible {
-                    return;
+                    return any_popped;
                 }
 
                 let (_, waiter) = doc.waiters.pop_first().expect("waiter existed");
+                any_popped = true;
                 let Some(rec) = sessions.get_mut(&waiter.session_id) else {
                     continue;
                 };
@@ -1179,11 +1360,121 @@ impl LockTable {
         if remove_empty {
             docs.remove(doc_ref);
         }
+        any_popped
+    }
+
+    pub(super) fn contention_snapshot(
+        &self,
+        now: tokio::time::Instant,
+    ) -> (Vec<ContendedDocumentSnapshot>, usize, bool) {
+        let total_contended = self.contended_docs.len();
+        let truncated = total_contended > MAX_SNAPSHOT_CONTENDED_DOCS;
+        let mut contended_documents =
+            Vec::with_capacity(total_contended.min(MAX_SNAPSHOT_CONTENDED_DOCS));
+
+        for doc_ref in self.contended_docs.iter().take(MAX_SNAPSHOT_CONTENDED_DOCS) {
+            let Some(doc) = self.docs.get(doc_ref) else {
+                continue;
+            };
+            let writer = doc.writer.and_then(|session_id| {
+                let rec = self.sessions.get(&session_id)?;
+                Some(WriterSnapshot {
+                    session_id,
+                    txn_id: rec.txn_id.map(|id| id.to_string()),
+                    kind: rec.kind,
+                    seq: (rec.seq != 0).then_some(rec.seq),
+                    state: session_snapshot_state(rec.state),
+                    woundable: rec.woundable,
+                })
+            });
+
+            let reader_count = doc.readers.len();
+            let mut reader_entries: Vec<(u64, u64, &ReadHold, &SessionRecord)> = doc
+                .readers
+                .iter()
+                .filter_map(|(&session_id, hold)| {
+                    let rec = self.sessions.get(&session_id)?;
+                    let sort_seq = if rec.seq == 0 { u64::MAX } else { rec.seq };
+                    Some((sort_seq, session_id, hold, rec))
+                })
+                .collect();
+            reader_entries.sort_by_key(|&(sort_seq, session_id, _, _)| (sort_seq, session_id));
+            reader_entries.truncate(MAX_SNAPSHOT_DOC_PARTICIPANTS);
+            let readers: Vec<ReaderSnapshot> = reader_entries
+                .into_iter()
+                .map(|(_, session_id, hold, rec)| ReaderSnapshot {
+                    session_id,
+                    txn_id: rec.txn_id.map(|id| id.to_string()),
+                    kind: rec.kind,
+                    seq: (rec.seq != 0).then_some(rec.seq),
+                    state: session_snapshot_state(rec.state),
+                    woundable: rec.woundable,
+                    retained: hold.retained,
+                    active_leases: hold.active_leases,
+                })
+                .collect();
+
+            let waiter_count = doc.waiters.len();
+            let waiters: Vec<WaiterSnapshot> = doc
+                .waiters
+                .iter()
+                .take(MAX_SNAPSHOT_DOC_PARTICIPANTS)
+                .filter_map(|(&(seq, _arrival), waiter)| {
+                    let rec = self.sessions.get(&waiter.session_id)?;
+                    let waited_ms = u64::try_from(
+                        now.saturating_duration_since(waiter.enqueued_at)
+                            .as_millis(),
+                    )
+                    .unwrap_or(u64::MAX);
+                    Some(WaiterSnapshot {
+                        session_id: waiter.session_id,
+                        txn_id: rec.txn_id.map(|id| id.to_string()),
+                        kind: rec.kind,
+                        seq,
+                        mode: waiter.mode.into(),
+                        waited_ms,
+                    })
+                })
+                .collect();
+
+            contended_documents.push(ContendedDocumentSnapshot {
+                document: doc_ref.to_string(),
+                writer,
+                readers,
+                reader_count,
+                waiters,
+                waiter_count,
+            });
+        }
+
+        (contended_documents, total_contended, truncated)
+    }
+
+    #[cfg(test)]
+    pub(super) fn assert_contended_docs_consistent(&self) {
+        let expected: BTreeSet<DocumentRef> = self
+            .docs
+            .iter()
+            .filter(|(_, doc)| !doc.waiters.is_empty())
+            .map(|(doc_ref, _)| doc_ref.clone())
+            .collect();
+        assert_eq!(self.contended_docs, expected);
     }
 
     #[cfg(test)]
     pub(super) fn counts(&self) -> (usize, usize) {
         (self.docs.len(), self.sessions.len())
+    }
+}
+
+fn session_snapshot_state(state: SessionState) -> ContentionSessionState {
+    match state {
+        SessionState::Active => ContentionSessionState::Active,
+        SessionState::Committing => ContentionSessionState::Committing,
+        SessionState::Wounded | SessionState::TimedOut | SessionState::Expired => {
+            debug_assert!(false, "terminal session should not reside in LockTable");
+            ContentionSessionState::Committing
+        }
     }
 }
 

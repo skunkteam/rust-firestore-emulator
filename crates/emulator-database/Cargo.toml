@@ -6,7 +6,7 @@ edition = "2024"
 [dependencies]
 googleapis = { workspace = true }
 itertools = { workspace = true }
-serde = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
 string_cache = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt", "sync", "time"] }

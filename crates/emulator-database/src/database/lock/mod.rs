@@ -1,3 +1,4 @@
+mod contention;
 mod leases;
 mod table;
 #[cfg(test)]
@@ -19,13 +20,25 @@ use tokio::{
     time::{Instant, sleep, sleep_until},
 };
 
-use self::{
-    leases::WaiterGuard,
-    table::{AcquireOutcome, LockTable, LockTableGarbage, WoundEvent},
+pub use self::contention::{
+    ContendedDocumentSnapshot, ContentionEvent, ContentionEventKind, ContentionLockMode,
+    ContentionSessionState, ContentionSnapshot, ContentionSseEvent, ContentionSubscriberGuard,
+    ContentionSubscription, ContentionSummary, DatabaseContentionSnapshot, MAX_CONTENTION_HISTORY,
+    MAX_SNAPSHOT_CONTENDED_DOCS, MAX_SNAPSHOT_DOC_PARTICIPANTS, ReaderSnapshot, SessionKind,
+    WaiterSnapshot, WriterSnapshot,
 };
 pub(crate) use self::{
+    contention::ContentionBroadcaster,
     leases::{CommitSeal, ReadLease, WriteLease},
     table::ReadObservation,
+};
+use self::{
+    contention::ContentionHistory,
+    leases::WaiterGuard,
+    table::{
+        AcquireOutcome, CloseOutcome, ExpiredSessionOutcome, LockTable, LockTableGarbage,
+        WoundEvent,
+    },
 };
 use crate::{
     GenericDatabaseError,
@@ -175,6 +188,8 @@ pub(crate) struct LockManager {
     database: RootRef,
     timeouts: Timeouts,
     table: Mutex<LockTable>,
+    history: Mutex<ContentionHistory>,
+    broadcaster: Option<ContentionBroadcaster>,
     next_session_id: AtomicU64,
     next_seq: AtomicU64,
     cleared: AtomicBool,
@@ -183,11 +198,30 @@ pub(crate) struct LockManager {
 }
 
 impl LockManager {
+    #[cfg(test)]
     pub(crate) fn new(database: RootRef, timeouts: Timeouts) -> Self {
+        Self::new_inner(database, timeouts, None)
+    }
+
+    pub(crate) fn with_broadcaster(
+        database: RootRef,
+        timeouts: Timeouts,
+        broadcaster: ContentionBroadcaster,
+    ) -> Self {
+        Self::new_inner(database, timeouts, Some(broadcaster))
+    }
+
+    fn new_inner(
+        database: RootRef,
+        timeouts: Timeouts,
+        broadcaster: Option<ContentionBroadcaster>,
+    ) -> Self {
         Self {
             database,
             timeouts,
             table: Mutex::new(LockTable::default()),
+            history: Mutex::new(ContentionHistory::default()),
+            broadcaster,
             next_session_id: AtomicU64::new(1),
             next_seq: AtomicU64::new(1),
             cleared: AtomicBool::new(false),
@@ -204,6 +238,40 @@ impl LockManager {
         Arc::clone(&self.expiry_notify)
     }
 
+    pub(crate) fn contention_snapshot(&self) -> DatabaseContentionSnapshot {
+        let now = Instant::now();
+        let (contended_documents, total_contended_documents, truncated) = {
+            let table = self.table.lock().unwrap_or_else(PoisonError::into_inner);
+            table.contention_snapshot(now)
+        };
+        let (summary, recent_events) = {
+            let history = self.history.lock().unwrap_or_else(PoisonError::into_inner);
+            history.snapshot()
+        };
+        DatabaseContentionSnapshot {
+            database: self.database.clone(),
+            summary,
+            contended_documents,
+            total_contended_documents,
+            truncated,
+            recent_events,
+        }
+    }
+
+    pub(crate) fn clear_contention_history(&self) {
+        if self.is_cleared() {
+            return;
+        }
+        let mut history = self.history.lock().unwrap_or_else(PoisonError::into_inner);
+        if history.cleared {
+            return;
+        }
+        let had_data = history.clear();
+        if had_data && let Some(broadcaster) = &self.broadcaster {
+            broadcaster.send_changed_if_subscribed(&self.database);
+        }
+    }
+
     pub(crate) fn close_expired_sessions(&self, sessions: &[Arc<LockSession>]) {
         if !sessions
             .iter()
@@ -212,15 +280,191 @@ impl LockManager {
             return;
         }
         let mut garbage = LockTableGarbage::default();
+        let mut outcomes = Vec::new();
         {
             let mut table = self.table.lock().unwrap_or_else(PoisonError::into_inner);
             for session in sessions {
-                if session.shared.state_code() == STATE_ACTIVE {
-                    table.close_expired(session.session_id, &mut garbage);
+                if session.shared.state_code() == STATE_ACTIVE
+                    && let Some(outcome) = table.close_expired(session.session_id, &mut garbage)
+                {
+                    outcomes.push(outcome);
                 }
             }
         }
         drop(garbage);
+        self.record_expired_outcomes(&outcomes);
+    }
+
+    fn record_expired_outcomes(&self, outcomes: &[ExpiredSessionOutcome]) {
+        if self.is_cleared() || outcomes.is_empty() {
+            return;
+        }
+        let any_recorded = outcomes.iter().any(|o| o.had_resources);
+        let any_notify = any_recorded || outcomes.iter().any(|o| o.notify_state_change);
+        if any_recorded {
+            let mut history = self.history.lock().unwrap_or_else(PoisonError::into_inner);
+            if history.cleared {
+                return;
+            }
+            for outcome in outcomes {
+                if outcome.had_resources {
+                    history.record_expired(outcome);
+                }
+            }
+            if let Some(broadcaster) = &self.broadcaster {
+                broadcaster.send_changed_if_subscribed(&self.database);
+            }
+        } else if any_notify {
+            self.notify_contention_changed();
+        }
+    }
+
+    fn notify_contention_changed(&self) {
+        if self.is_cleared() {
+            return;
+        }
+        let Some(broadcaster) = &self.broadcaster else {
+            return;
+        };
+        if !broadcaster.has_subscribers() {
+            return;
+        }
+        let history = self.history.lock().unwrap_or_else(PoisonError::into_inner);
+        if history.cleared {
+            return;
+        }
+        broadcaster.send_changed_if_subscribed(&self.database);
+    }
+
+    fn record_wounds_and_maybe_notify(
+        &self,
+        wounds: &[WoundEvent],
+        wounder_session_id: u64,
+        wounder_txn_id: Option<TransactionId>,
+        wounder_kind: SessionKind,
+        wounder_seq: Option<u64>,
+        notify_state_change: bool,
+    ) {
+        if wounds.is_empty() {
+            if notify_state_change {
+                self.notify_contention_changed();
+            }
+            return;
+        }
+        if self.is_cleared() {
+            return;
+        }
+        let mut history = self.history.lock().unwrap_or_else(PoisonError::into_inner);
+        if history.cleared {
+            return;
+        }
+        for wound in wounds {
+            history.record_wound(
+                wound,
+                wounder_session_id,
+                wounder_txn_id,
+                wounder_kind,
+                wounder_seq,
+            );
+        }
+        if let Some(broadcaster) = &self.broadcaster {
+            broadcaster.send_changed_if_subscribed(&self.database);
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn record_timeout_and_notify(
+        &self,
+        kind: ContentionEventKind,
+        session_id: u64,
+        txn_id: Option<TransactionId>,
+        session_kind: SessionKind,
+        seq: Option<u64>,
+        doc_name: Option<String>,
+        wait_ms: u64,
+        attempt: Option<u32>,
+    ) {
+        if self.is_cleared() {
+            return;
+        }
+        let mut history = self.history.lock().unwrap_or_else(PoisonError::into_inner);
+        if history.cleared {
+            return;
+        }
+        history.record_timeout(
+            kind,
+            session_id,
+            txn_id,
+            session_kind,
+            seq,
+            doc_name,
+            wait_ms,
+            attempt,
+        );
+        if let Some(broadcaster) = &self.broadcaster {
+            broadcaster.send_changed_if_subscribed(&self.database);
+        }
+    }
+
+    pub(crate) fn record_upgrade_abort(
+        &self,
+        session_id: u64,
+        txn_id: Option<TransactionId>,
+        session_kind: SessionKind,
+        seq: Option<u64>,
+        doc_ref: &DocumentRef,
+    ) {
+        if self.is_cleared() {
+            return;
+        }
+        let mut history = self.history.lock().unwrap_or_else(PoisonError::into_inner);
+        if history.cleared {
+            return;
+        }
+        history.record_upgrade_abort(session_id, txn_id, session_kind, seq, doc_ref.to_string());
+        if let Some(broadcaster) = &self.broadcaster {
+            broadcaster.send_changed_if_subscribed(&self.database);
+        }
+    }
+
+    pub(crate) fn record_write_batch_retry(
+        &self,
+        session_id: u64,
+        seq: Option<u64>,
+        wounder_txn_id: Option<TransactionId>,
+        wounder_seq: u64,
+        attempt: u32,
+    ) {
+        if self.is_cleared() {
+            return;
+        }
+        let mut history = self.history.lock().unwrap_or_else(PoisonError::into_inner);
+        if history.cleared {
+            return;
+        }
+        history.record_write_batch_retry(session_id, seq, wounder_txn_id, wounder_seq, attempt);
+        if let Some(broadcaster) = &self.broadcaster {
+            broadcaster.send_changed_if_subscribed(&self.database);
+        }
+    }
+
+    pub(crate) fn record_write_batch_timeout(
+        &self,
+        session_id: u64,
+        seq: Option<u64>,
+        wait_ms: u64,
+        attempt: u32,
+    ) {
+        self.record_timeout_and_notify(
+            ContentionEventKind::WriteTimeout,
+            session_id,
+            None,
+            SessionKind::WriteBatch,
+            seq,
+            None,
+            wait_ms,
+            Some(attempt),
+        );
     }
 
     fn reap_and_next_expiry(&self) -> Option<Instant> {
@@ -233,6 +477,7 @@ impl LockManager {
     pub(crate) fn new_session(
         self: &Arc<Self>,
         txn_id: Option<TransactionId>,
+        kind: SessionKind,
         priority: LockPriority,
         can_wound: bool,
         woundable: bool,
@@ -263,6 +508,7 @@ impl LockManager {
                 session_id,
                 Arc::clone(&shared),
                 txn_id,
+                kind,
                 initial_seq,
                 can_wound,
                 woundable,
@@ -273,6 +519,7 @@ impl LockManager {
             manager: Arc::clone(self),
             session_id,
             txn_id,
+            kind,
             shared,
         })
     }
@@ -280,13 +527,22 @@ impl LockManager {
     pub(crate) fn abort_all(&self, reason: AbortReason) {
         if reason == AbortReason::DatabaseCleared {
             self.cleared.store(true, Ordering::Release);
+        } else if self.is_cleared() {
+            return;
         }
         let mut garbage = LockTableGarbage::default();
-        {
+        let had_contended = {
             let mut table = self.table.lock().unwrap_or_else(PoisonError::into_inner);
-            table.abort_all(reason, &mut garbage);
-        }
+            table.abort_all(reason, &mut garbage)
+        };
         drop(garbage);
+        if reason == AbortReason::DatabaseCleared {
+            let mut history = self.history.lock().unwrap_or_else(PoisonError::into_inner);
+            let _unused = history.clear();
+            history.cleared = true;
+        } else if had_contended && !self.is_cleared() {
+            self.notify_contention_changed();
+        }
         tracing::debug!(
             target: "emulator_database::lock",
             database = %self.database,
@@ -301,10 +557,9 @@ impl LockManager {
 
     #[cfg(test)]
     pub(crate) fn table_counts(&self) -> (usize, usize) {
-        self.table
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .counts()
+        let table = self.table.lock().unwrap_or_else(PoisonError::into_inner);
+        table.assert_contended_docs_consistent();
+        table.counts()
     }
 }
 
@@ -318,16 +573,24 @@ struct BatchWaiter {
 /// Per-transaction or single-operation lock session handle.
 #[derive(Debug)]
 pub(crate) struct LockSession {
-    manager:    Arc<LockManager>,
+    manager: Arc<LockManager>,
     session_id: u64,
-    txn_id:     Option<TransactionId>,
-    shared:     Arc<SessionSharedState>,
+    txn_id: Option<TransactionId>,
+    kind: SessionKind,
+    shared: Arc<SessionSharedState>,
 }
 
 impl LockSession {
-    #[cfg(test)]
     pub(crate) fn session_id(&self) -> u64 {
         self.session_id
+    }
+
+    pub(crate) fn txn_id(&self) -> Option<TransactionId> {
+        self.txn_id
+    }
+
+    pub(crate) fn kind(&self) -> SessionKind {
+        self.kind
     }
 
     pub(crate) fn root_seq(&self) -> Option<u64> {
@@ -404,8 +667,11 @@ impl LockSession {
             )
         };
         match res {
-            Ok(()) => {
+            Ok(notify) => {
                 lease.disarm();
+                if notify {
+                    self.manager.notify_contention_changed();
+                }
                 Ok(())
             }
             Err(err) => {
@@ -441,9 +707,12 @@ impl LockSession {
             table.retain_reads(self.session_id, &self.shared, &entries)
         };
         match res {
-            Ok(()) => {
+            Ok(notify) => {
                 for (lease, _) in entries {
                     lease.disarm();
+                }
+                if notify {
+                    self.manager.notify_contention_changed();
                 }
                 Ok(())
             }
@@ -459,11 +728,14 @@ impl LockSession {
             return;
         }
         let mut garbage = LockTableGarbage::default();
-        {
+        let outcome = {
             let mut table = self.lock_table();
-            table.close_session(self.session_id, None, STATE_CLOSED, &mut garbage);
-        }
+            table.close_session(self.session_id, None, STATE_CLOSED, &mut garbage)
+        };
         drop(garbage);
+        if outcome.notify_state_change {
+            self.manager.notify_contention_changed();
+        }
     }
 
     #[cfg(test)]
@@ -472,11 +744,15 @@ impl LockSession {
             return;
         }
         let mut garbage = LockTableGarbage::default();
-        {
+        let outcome = {
             let mut table = self.lock_table();
-            table.close_expired(self.session_id, &mut garbage);
-        }
+            table.close_expired(self.session_id, &mut garbage)
+        };
         drop(garbage);
+        if let Some(outcome) = outcome {
+            self.manager
+                .record_expired_outcomes(std::slice::from_ref(&outcome));
+        }
     }
 
     pub(crate) fn seal_for_commit(
@@ -504,9 +780,15 @@ impl LockSession {
             table.seal_for_commit(self.session_id, &self.shared, &writes, &mut garbage)
         };
         drop(garbage);
-        if let Err(err) = res {
-            drop(writes);
-            return Err(err);
+        let notify = match res {
+            Ok(notify) => notify,
+            Err(err) => {
+                drop(writes);
+                return Err(err);
+            }
+        };
+        if notify {
+            self.manager.notify_contention_changed();
         }
 
         tracing::debug!(
@@ -540,17 +822,38 @@ impl LockSession {
         };
         drop(garbage);
         match outcome? {
-            AcquireOutcome::Granted { wounds, .. } => {
+            AcquireOutcome::Granted {
+                wounds,
+                notify_contention,
+                ..
+            } => {
                 self.emit_wound_logs(&wounds);
+                self.manager.record_wounds_and_maybe_notify(
+                    &wounds,
+                    self.session_id,
+                    self.txn_id,
+                    self.kind,
+                    self.root_seq(),
+                    notify_contention,
+                );
                 Ok(ReadLease::new(Arc::clone(self), doc_ref.clone()))
             }
             AcquireOutcome::Wait {
                 wait_id,
                 rx,
                 wounds,
+                notify_contention,
                 ..
             } => {
                 self.emit_wound_logs(&wounds);
+                self.manager.record_wounds_and_maybe_notify(
+                    &wounds,
+                    self.session_id,
+                    self.txn_id,
+                    self.kind,
+                    self.root_seq(),
+                    notify_contention,
+                );
                 self.await_single_waiter(
                     doc_ref,
                     "read lock",
@@ -595,8 +898,17 @@ impl LockSession {
             AcquireOutcome::Granted {
                 observation,
                 wounds,
+                notify_contention,
             } => {
                 self.emit_wound_logs(&wounds);
+                self.manager.record_wounds_and_maybe_notify(
+                    &wounds,
+                    self.session_id,
+                    self.txn_id,
+                    self.kind,
+                    self.root_seq(),
+                    notify_contention,
+                );
                 let acquire_time = Timestamp::now();
                 Ok((
                     WriteLease::new(Arc::clone(self), doc_ref.clone(), acquire_time),
@@ -608,8 +920,17 @@ impl LockSession {
                 rx,
                 observation,
                 wounds,
+                notify_contention,
             } => {
                 self.emit_wound_logs(&wounds);
+                self.manager.record_wounds_and_maybe_notify(
+                    &wounds,
+                    self.session_id,
+                    self.txn_id,
+                    self.kind,
+                    self.root_seq(),
+                    notify_contention,
+                );
                 self.await_single_waiter(
                     doc_ref,
                     "write lock",
@@ -653,6 +974,14 @@ impl LockSession {
         drop(garbage);
         let batch = batch?;
         self.emit_wound_logs(&batch.wounds);
+        self.manager.record_wounds_and_maybe_notify(
+            &batch.wounds,
+            self.session_id,
+            self.txn_id,
+            self.kind,
+            self.root_seq(),
+            batch.notify_contention,
+        );
 
         let now_ts = Timestamp::now();
         let mut leases = BTreeMap::new();
@@ -713,12 +1042,15 @@ impl LockSession {
                 .wait_id();
             match rx_res {
                 Ok(Ok(())) => {
-                    let consumed = {
+                    let (consumed, notify) = {
                         let mut table = self.lock_table();
                         table.consume_wait_grant(self.session_id, &self.shared, wait_id)
                     };
                     if let Some(guard) = waiter.guard.take() {
                         guard.disarm();
+                    }
+                    if notify {
+                        self.manager.notify_contention_changed();
                     }
                     match consumed {
                         Ok(()) => {
@@ -757,12 +1089,25 @@ impl LockSession {
         if timed_out {
             // Strip the session in one lock first, then disarm remaining guards/leases so teardown
             // never triggers T + P individual Mutex<LockTable> re-acquisitions.
-            self.close_timed_out(AbortReason::WriteTimeout);
+            let close_outcome = self.close_timed_out(AbortReason::WriteTimeout);
             Self::disarm_batch(&mut waiters, &mut leases);
             let final_err = match self.check_active() {
                 Err(err) => err,
                 Ok(()) => CommitError::Aborted(AbortReason::WriteTimeout),
             };
+            let wait_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
+            if close_outcome.actually_closed {
+                self.manager.record_timeout_and_notify(
+                    ContentionEventKind::WriteTimeout,
+                    self.session_id,
+                    self.txn_id,
+                    self.kind,
+                    self.root_seq(),
+                    Some(last_waited_doc.to_string()),
+                    wait_ms,
+                    None,
+                );
+            }
             tracing::debug!(
                 target: "emulator_database::lock",
                 database = %self.manager.database,
@@ -770,7 +1115,7 @@ impl LockSession {
                 session_id = self.session_id,
                 root_seq = self.root_seq(),
                 doc_name = %last_waited_doc,
-                wait_ms = start.elapsed().as_millis() as u64,
+                wait_ms,
                 reason = %err_display(&final_err),
                 "batch write lock timed out"
             );
@@ -831,11 +1176,14 @@ impl LockSession {
 
         match awaited {
             Some(Ok(Ok(()))) => {
-                let consumed = {
+                let (consumed, notify) = {
                     let mut table = self.lock_table();
                     table.consume_wait_grant(self.session_id, &self.shared, guard.wait_id())
                 };
                 guard.disarm();
+                if notify {
+                    self.manager.notify_contention_changed();
+                }
                 match consumed {
                     Ok(()) => {
                         tracing::debug!(
@@ -884,11 +1232,29 @@ impl LockSession {
             }
             None => {
                 guard.disarm();
-                self.close_timed_out(timeout_reason);
+                let close_outcome = self.close_timed_out(timeout_reason);
                 let final_err = match self.check_active() {
                     Err(err) => err,
                     Ok(()) => CommitError::Aborted(timeout_reason),
                 };
+                let wait_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
+                if close_outcome.actually_closed {
+                    let event_kind = if is_read {
+                        ContentionEventKind::ReadTimeout
+                    } else {
+                        ContentionEventKind::WriteTimeout
+                    };
+                    self.manager.record_timeout_and_notify(
+                        event_kind,
+                        self.session_id,
+                        self.txn_id,
+                        self.kind,
+                        self.root_seq(),
+                        Some(doc_ref.to_string()),
+                        wait_ms,
+                        None,
+                    );
+                }
                 tracing::debug!(
                     target: "emulator_database::lock",
                     database = %self.manager.database,
@@ -897,7 +1263,7 @@ impl LockSession {
                     root_seq = self.root_seq(),
                     doc_name = %doc_ref,
                     lock_kind = kind,
-                    wait_ms = start.elapsed().as_millis() as u64,
+                    wait_ms,
                     reason = %err_display(&final_err),
                     "lock wait timed out"
                 );
@@ -986,35 +1352,52 @@ impl LockSession {
         if is_terminal_state(self.shared.state_code()) {
             return;
         }
-        self.lock_table()
-            .release_read_lease(self.session_id, doc_ref);
+        let notify = {
+            self.lock_table()
+                .release_read_lease(self.session_id, doc_ref)
+        };
+        if notify {
+            self.manager.notify_contention_changed();
+        }
     }
 
     pub(super) fn release_write_lease(&self, doc_ref: &DocumentRef) {
         if is_terminal_state(self.shared.state_code()) {
             return;
         }
-        self.lock_table()
-            .release_write_lease(self.session_id, doc_ref);
+        let notify = {
+            self.lock_table()
+                .release_write_lease(self.session_id, doc_ref)
+        };
+        if notify {
+            self.manager.notify_contention_changed();
+        }
     }
 
     pub(super) fn revoke_waiter(&self, wait_id: u64) {
         if is_terminal_state(self.shared.state_code()) {
             return;
         }
-        self.lock_table().revoke_waiter(self.session_id, wait_id);
+        let notify = { self.lock_table().revoke_waiter(self.session_id, wait_id) };
+        if notify {
+            self.manager.notify_contention_changed();
+        }
     }
 
-    fn close_timed_out(&self, reason: AbortReason) {
+    fn close_timed_out(&self, reason: AbortReason) -> CloseOutcome {
         if self.shared.state_code() != STATE_ACTIVE {
-            return;
+            return CloseOutcome {
+                actually_closed:     false,
+                notify_state_change: false,
+            };
         }
         let mut garbage = LockTableGarbage::default();
-        {
+        let outcome = {
             let mut table = self.lock_table();
-            table.close_session(self.session_id, Some(reason), STATE_TIMED_OUT, &mut garbage);
-        }
+            table.close_session(self.session_id, Some(reason), STATE_TIMED_OUT, &mut garbage)
+        };
         drop(garbage);
+        outcome
     }
 
     fn lock_table(&self) -> std::sync::MutexGuard<'_, LockTable> {

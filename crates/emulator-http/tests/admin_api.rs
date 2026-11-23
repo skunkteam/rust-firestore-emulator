@@ -1781,3 +1781,370 @@ async fn test_rest_unimplemented_request_options_and_new_database_admin_fields()
 
     Ok(())
 }
+
+#[gtest]
+#[tokio::test(start_paused = true)]
+async fn test_contention_get_delete_and_database_query_validation() -> Result<()> {
+    use emulator_database::{
+        read_consistency::ReadConsistency,
+        reference::{DocumentRef, RootRef},
+    };
+    use googleapis::google::firestore::v1::{Document, TransactionOptions, Value, Write, write};
+
+    let project = Box::leak(Box::new(FirestoreProject::new(FirestoreConfig::default())));
+    let router = RouterBuilder::new(project).build();
+
+    // 1. Empty project snapshot returns 200 `{ "databases": [] }`.
+    let (status, empty_snap) =
+        send_oneshot(&router, Method::GET, "/emulator/v1/contention", None).await?;
+    expect_eq!(status, StatusCode::OK);
+    expect_eq!(empty_snap, json!({ "databases": [] }));
+
+    // 2. Valid absent database returns empty without lazily creating the database.
+    let (status, absent_snap) = send_oneshot(
+        &router,
+        Method::GET,
+        "/emulator/v1/contention?database=projects%2Fp%2Fdatabases%2Fabsent",
+        None,
+    )
+    .await?;
+    expect_eq!(status, StatusCode::OK);
+    expect_eq!(absent_snap, json!({ "databases": [] }));
+    let (status, absent_del) = send_oneshot(
+        &router,
+        Method::DELETE,
+        "/emulator/v1/contention?database=projects/p/databases/absent",
+        None,
+    )
+    .await?;
+    expect_eq!(status, StatusCode::OK);
+    expect_eq!(absent_del, json!({}));
+    expect_true!(project.database_names().await.is_empty());
+
+    // 3. Malformed `database` query parameter returns 400 INVALID_ARGUMENT on GET and DELETE.
+    for bad_uri in [
+        "/emulator/v1/contention?database=",
+        "/emulator/v1/contention?database",
+        "/emulator/v1/contention?database=not-a-db",
+        "/emulator/v1/contention?database=projects/p/databases/(default)/documents/c/d",
+        "/emulator/v1/contention?database=projects/p/databases/a&database=projects/p/databases/b",
+        "/emulator/v1/contention?database=projects%ZZp",
+    ] {
+        for method in [Method::GET, Method::DELETE] {
+            let (status, err_json) = send_oneshot(&router, method, bad_uri, None).await?;
+            expect_eq!(status, StatusCode::BAD_REQUEST);
+            expect_eq!(err_json["error"]["status"], "INVALID_ARGUMENT");
+        }
+    }
+
+    // 4. Populate active contention + timeout history across two databases (`db-a` and `db-b`).
+    let root_a: RootRef = "projects/p/databases/db-a".parse()?;
+    let root_b: RootRef = "projects/p/databases/db-b".parse()?;
+    let db_a = project.database(&root_a).await;
+    let db_b = project.database(&root_b).await;
+
+    let doc_a: DocumentRef = "projects/p/databases/db-a/documents/c/d1".parse()?;
+    let doc_b: DocumentRef = "projects/p/databases/db-b/documents/c/d1".parse()?;
+
+    // Cause a write timeout on `db-b` so `db-b` has non-zero summary counter & event.
+    let b_hold = db_b.new_txn(TransactionOptions::READ_WRITE).await?;
+    let b_wait = db_b.new_txn(TransactionOptions::READ_WRITE).await?;
+    let _unused = db_b
+        .get_doc(&doc_b, ReadConsistency::Transaction(b_hold))
+        .await?;
+    let mut b_commit_task = tokio::spawn({
+        let db_b = db_b.clone();
+        let doc_b = doc_b.clone();
+        async move {
+            db_b.commit(
+                vec![Write {
+                    operation: Some(write::Operation::Update(Document {
+                        name: doc_b.to_string(),
+                        fields: std::collections::HashMap::from([(
+                            "k".to_string(),
+                            Value::integer(1),
+                        )]),
+                        ..Default::default()
+                    })),
+                    ..Default::default()
+                }],
+                Some(b_wait),
+            )
+            .await
+        }
+    });
+    tokio::task::yield_now().await;
+    tokio::time::advance(Duration::from_secs(2)).await;
+    let b_res = (&mut b_commit_task).await?;
+    expect_pred!(b_res.is_err());
+    db_b.rollback(b_hold).await?;
+
+    // Cause a write timeout on `db-a` (history=1), plus keep an active blocker + parked waiter!
+    let a_timeout_hold = db_a.new_txn(TransactionOptions::READ_WRITE).await?;
+    let a_timeout_wait = db_a.new_txn(TransactionOptions::READ_WRITE).await?;
+    let _unused = db_a
+        .get_doc(&doc_a, ReadConsistency::Transaction(a_timeout_hold))
+        .await?;
+    let a_to_task = tokio::spawn({
+        let db_a = db_a.clone();
+        let doc_a = doc_a.clone();
+        async move {
+            db_a.commit(
+                vec![Write {
+                    operation: Some(write::Operation::Update(Document {
+                        name: doc_a.to_string(),
+                        fields: std::collections::HashMap::from([(
+                            "k".to_string(),
+                            Value::integer(1),
+                        )]),
+                        ..Default::default()
+                    })),
+                    ..Default::default()
+                }],
+                Some(a_timeout_wait),
+            )
+            .await
+        }
+    });
+    tokio::task::yield_now().await;
+    tokio::time::advance(Duration::from_secs(2)).await;
+    let _unused = a_to_task.await?;
+    db_a.rollback(a_timeout_hold).await?;
+
+    let a_hold = db_a.new_txn(TransactionOptions::READ_WRITE).await?;
+    let a_wait = db_a.new_txn(TransactionOptions::READ_WRITE).await?;
+    let _unused = db_a
+        .get_doc(&doc_a, ReadConsistency::Transaction(a_hold))
+        .await?;
+    let a_wait_task = tokio::spawn({
+        let db_a = db_a.clone();
+        let doc_a = doc_a.clone();
+        async move {
+            db_a.commit(
+                vec![Write {
+                    operation: Some(write::Operation::Update(Document {
+                        name: doc_a.to_string(),
+                        fields: std::collections::HashMap::from([(
+                            "k".to_string(),
+                            Value::integer(2),
+                        )]),
+                        ..Default::default()
+                    })),
+                    ..Default::default()
+                }],
+                Some(a_wait),
+            )
+            .await
+        }
+    });
+    tokio::task::yield_now().await;
+    tokio::time::advance(Duration::from_millis(150)).await;
+
+    // 5. `GET /emulator/v1/contention` returns sorted snapshots for both databases.
+    let (status, all_snap) =
+        send_oneshot(&router, Method::GET, "/emulator/v1/contention", None).await?;
+    expect_eq!(status, StatusCode::OK);
+    let dbs = all_snap["databases"].as_array().expect("databases array");
+    expect_eq!(dbs.len(), 2);
+    expect_eq!(dbs[0]["database"], "projects/p/databases/db-a/documents");
+    expect_eq!(dbs[1]["database"], "projects/p/databases/db-b/documents");
+
+    expect_eq!(dbs[0]["summary"]["timeoutsTotal"], 1);
+    expect_eq!(dbs[0]["totalContendedDocuments"], 1);
+    expect_eq!(dbs[0]["truncated"], false);
+    let doc_snap = &dbs[0]["contendedDocuments"][0];
+    expect_eq!(doc_snap["document"], doc_a.to_string());
+    expect_eq!(doc_snap["readerCount"], 1);
+    expect_eq!(doc_snap["readers"][0]["kind"], "PESSIMISTIC_TXN");
+    expect_eq!(doc_snap["readers"][0]["state"], "ACTIVE");
+    expect_eq!(doc_snap["readers"][0]["retained"], true);
+    expect_eq!(doc_snap["readers"][0]["txnId"], a_hold.to_string());
+    expect_eq!(doc_snap["waiterCount"], 1);
+    expect_eq!(doc_snap["waiters"][0]["kind"], "PESSIMISTIC_TXN");
+    expect_eq!(doc_snap["waiters"][0]["mode"], "WRITE");
+    expect_eq!(doc_snap["waiters"][0]["waitedMs"], 150);
+    expect_eq!(doc_snap["waiters"][0]["txnId"], a_wait.to_string());
+
+    // 6. Filtered `GET` with encoded `?database=` and `/documents` normalization.
+    let (status, filtered_snap) = send_oneshot(
+        &router,
+        Method::GET,
+        "/emulator/v1/contention?database=projects%2Fp%2Fdatabases%2Fdb-a%2Fdocuments",
+        None,
+    )
+    .await?;
+    expect_eq!(status, StatusCode::OK);
+    let fdbs = filtered_snap["databases"].as_array().unwrap();
+    expect_eq!(fdbs.len(), 1);
+    expect_eq!(fdbs[0]["database"], "projects/p/databases/db-a/documents");
+
+    // 7. Scoped `DELETE` clears `db-a` history/counters ONLY, preserving active locks and `db-b`.
+    let (status, del_a) = send_oneshot(
+        &router,
+        Method::DELETE,
+        "/emulator/v1/contention?database=projects/p/databases/db-a",
+        None,
+    )
+    .await?;
+    expect_eq!(status, StatusCode::OK);
+    expect_eq!(del_a, json!({}));
+
+    let (status, after_del_a) =
+        send_oneshot(&router, Method::GET, "/emulator/v1/contention", None).await?;
+    expect_eq!(status, StatusCode::OK);
+    let dbs = after_del_a["databases"].as_array().unwrap();
+    expect_eq!(dbs[0]["summary"]["timeoutsTotal"], 0);
+    expect_eq!(dbs[0]["recentEvents"].as_array().unwrap().len(), 0);
+    expect_eq!(dbs[0]["totalContendedDocuments"], 1);
+    expect_eq!(dbs[0]["contendedDocuments"][0]["waiterCount"], 1);
+    expect_eq!(dbs[1]["summary"]["timeoutsTotal"], 1);
+
+    // 8. Unscoped `DELETE` clears `db-b` too while keeping `db-a`'s active locks intact.
+    let (status, del_all) =
+        send_oneshot(&router, Method::DELETE, "/emulator/v1/contention", None).await?;
+    expect_eq!(status, StatusCode::OK);
+    expect_eq!(del_all, json!({}));
+    let (status, after_del_all) =
+        send_oneshot(&router, Method::GET, "/emulator/v1/contention", None).await?;
+    expect_eq!(status, StatusCode::OK);
+    let dbs = after_del_all["databases"].as_array().unwrap();
+    expect_eq!(dbs[0]["totalContendedDocuments"], 1);
+    expect_eq!(dbs[1]["summary"]["timeoutsTotal"], 0);
+
+    // Clean up pending waiter cleanly.
+    db_a.rollback(a_hold).await?;
+    let _unused = a_wait_task.await?;
+
+    Ok(())
+}
+
+#[gtest]
+#[tokio::test(start_paused = true)]
+async fn test_contention_sse_events_resync_heartbeat_and_drop_cleanup() -> Result<()> {
+    use emulator_database::{
+        read_consistency::ReadConsistency,
+        reference::{DocumentRef, RootRef},
+    };
+    use googleapis::google::firestore::v1::{Document, TransactionOptions, Value, Write, write};
+
+    let project = Box::leak(Box::new(FirestoreProject::new(FirestoreConfig::default())));
+    let router = RouterBuilder::new(project).build();
+
+    // 1. Open SSE stream and verify subscriber count increments, then heartbeat fires at 15s.
+    expect_eq!(project.contention_subscriber_count(), 0);
+    let sse_res = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/emulator/v1/contention/events")
+                .body(Body::empty())?,
+        )
+        .await?;
+    expect_eq!(sse_res.status(), StatusCode::OK);
+    expect_eq!(project.contention_subscriber_count(), 1);
+    let mut sse_stream = sse_res.into_body().into_data_stream();
+
+    let before_hb = tokio::time::timeout(Duration::from_secs(14), sse_stream.next()).await;
+    expect_pred!(before_hb.is_err());
+    let hb_chunk = tokio::time::timeout(Duration::from_secs(2), sse_stream.next())
+        .await
+        .expect("contention SSE keep-alive heartbeat should fire at 15s")
+        .expect("contention SSE stream open")?;
+    expect_that!(
+        String::from_utf8_lossy(&hb_chunk).as_ref(),
+        contains_substring(": heartbeat")
+    );
+
+    // 2. Trigger lock contention and verify `event: contention` (`contention_changed`).
+    let root: RootRef = "projects/p/databases/(default)".parse()?;
+    let db = project.database(&root).await;
+    let doc_ref: DocumentRef = "projects/p/databases/(default)/documents/c/d1".parse()?;
+    let hold_txn = db.new_txn(TransactionOptions::READ_WRITE).await?;
+    let wait_txn = db.new_txn(TransactionOptions::READ_WRITE).await?;
+    let _unused = db
+        .get_doc(&doc_ref, ReadConsistency::Transaction(hold_txn))
+        .await?;
+    let wait_task = tokio::spawn({
+        let db = db.clone();
+        let doc_ref = doc_ref.clone();
+        async move {
+            db.commit(
+                vec![Write {
+                    operation: Some(write::Operation::Update(Document {
+                        name: doc_ref.to_string(),
+                        fields: std::collections::HashMap::from([(
+                            "k".to_string(),
+                            Value::integer(1),
+                        )]),
+                        ..Default::default()
+                    })),
+                    ..Default::default()
+                }],
+                Some(wait_txn),
+            )
+            .await
+        }
+    });
+    tokio::task::yield_now().await;
+
+    let ev_chunk = tokio::time::timeout(Duration::from_secs(2), sse_stream.next())
+        .await
+        .expect("contention_changed event")
+        .expect("stream item")?;
+    let ev_text = String::from_utf8_lossy(&ev_chunk);
+    expect_that!(ev_text.as_ref(), contains_substring("event: contention"));
+    expect_that!(
+        ev_text.as_ref(),
+        contains_substring("\"type\":\"contention_changed\"")
+    );
+    expect_that!(
+        ev_text.as_ref(),
+        contains_substring("\"database\":\"projects/p/databases/(default)/documents\"")
+    );
+
+    // 3. Clearing database emits `database_cleared` on contention SSE stream.
+    let (status, _) = send_oneshot(
+        &router,
+        Method::DELETE,
+        "/emulator/v1/projects/p/databases/(default)",
+        None,
+    )
+    .await?;
+    expect_eq!(status, StatusCode::OK);
+    let _unused = wait_task.await?;
+    let clear_chunk = tokio::time::timeout(Duration::from_secs(2), sse_stream.next())
+        .await
+        .expect("database_cleared event")
+        .expect("stream item")?;
+    let clear_text = String::from_utf8_lossy(&clear_chunk);
+    expect_that!(clear_text.as_ref(), contains_substring("event: contention"));
+    expect_that!(
+        clear_text.as_ref(),
+        contains_substring("\"type\":\"database_cleared\"")
+    );
+
+    // 4. Lagging beyond the 512-event broadcast buffer emits `event: resync`.
+    for i in 0..520u32 {
+        let lag_root: RootRef = format!("projects/p/databases/lag-{i}").parse()?;
+        let _lag_db = project.database(&lag_root).await;
+        project.clear_database(&lag_root).await;
+    }
+    let mut saw_resync = false;
+    while let Ok(Some(Ok(chunk))) =
+        tokio::time::timeout(Duration::from_millis(50), sse_stream.next()).await
+    {
+        let text = String::from_utf8_lossy(&chunk);
+        if text.contains("event: resync") && text.contains("\"type\":\"resync\"") {
+            saw_resync = true;
+            break;
+        }
+    }
+    expect_true!(saw_resync);
+
+    // 5. Dropping the SSE stream decrements the lock-free subscriber counter back to zero.
+    drop(sse_stream);
+    expect_eq!(project.contention_subscriber_count(), 0);
+
+    Ok(())
+}

@@ -13,7 +13,10 @@ use tokio_test::{assert_ready, assert_ready_ok, task::spawn};
 
 use crate::{
     FirestoreConfig, FirestoreDatabase, FirestoreProject, GenericDatabaseError,
-    database::{lock::LockPriority, transaction::TransactionId},
+    database::{
+        lock::{LockPriority, SessionKind},
+        transaction::TransactionId,
+    },
     document::DocumentMeta,
     query::{
         Direction, DistanceMeasure, FindNearest, Query, QueryBuilder,
@@ -92,9 +95,13 @@ fn check_matching_docs<'a, Id: Display>(
 
 fn is_locked(db: &FirestoreDatabase) -> impl Fn(&Arc<DocumentMeta>) -> bool + '_ {
     move |meta| {
-        let session = db
-            .locks
-            .new_session(None, LockPriority::NextSeq, false, false);
+        let session = db.locks.new_session(
+            None,
+            SessionKind::SingleWrite,
+            LockPriority::NextSeq,
+            false,
+            false,
+        );
         spawn(session.acquire_write(&meta.name))
             .poll_until_idle()
             .is_pending()

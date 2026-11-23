@@ -6,8 +6,10 @@ use tokio_stream::Stream;
 use tracing::{Level, debug, instrument};
 
 use crate::{
-    FirestoreDatabase, config::FirestoreConfig, error::Result, event::ProjectEvent,
-    listener::Listener, reference::RootRef, timeouts::Timeouts, utils::RwLockHashMapExt,
+    ContentionSnapshot, ContentionSseEvent, ContentionSubscription, DatabaseContentionSnapshot,
+    FirestoreDatabase, config::FirestoreConfig, database::lock::ContentionBroadcaster,
+    error::Result, event::ProjectEvent, listener::Listener, reference::RootRef, timeouts::Timeouts,
+    utils::RwLockHashMapExt,
 };
 
 const MAX_PROJECT_EVENT_BACKLOG: usize = 1024;
@@ -17,6 +19,7 @@ pub struct FirestoreProject {
     pub(crate) default_enterprise: bool,
     databases: RwLock<HashMap<RootRef, Arc<FirestoreDatabase>>>,
     events: broadcast::Sender<ProjectEvent>,
+    contention: ContentionBroadcaster,
 }
 
 // A lot of structs refer back to FirestoreProject, so make sure not to print them out in Debug to
@@ -52,6 +55,7 @@ impl FirestoreProject {
             default_enterprise: config.default_enterprise,
             databases: Default::default(),
             events: broadcast::channel(MAX_PROJECT_EVENT_BACKLOG).0,
+            contention: ContentionBroadcaster::new(),
         }
     }
 
@@ -61,6 +65,70 @@ impl FirestoreProject {
 
     pub fn subscribe_project_events(&self) -> broadcast::Receiver<ProjectEvent> {
         self.events.subscribe()
+    }
+
+    pub fn subscribe_contention_events(&self) -> ContentionSubscription {
+        self.contention.subscribe()
+    }
+
+    pub fn contention_subscriber_count(&self) -> usize {
+        self.contention.subscriber_count()
+    }
+
+    pub(crate) fn contention_broadcaster(&self) -> ContentionBroadcaster {
+        self.contention.clone()
+    }
+
+    pub async fn contention_snapshot(&self, database: Option<&RootRef>) -> ContentionSnapshot {
+        match database {
+            Some(root) => {
+                let db = {
+                    let databases = self.databases.read().await;
+                    databases.get(root).cloned()
+                };
+                let databases = db
+                    .map(|db| vec![db.locks.contention_snapshot()])
+                    .unwrap_or_default();
+                ContentionSnapshot { databases }
+            }
+            None => {
+                let dbs: Vec<Arc<FirestoreDatabase>> = {
+                    let databases = self.databases.read().await;
+                    databases.values().cloned().collect()
+                };
+                let mut snapshots: Vec<DatabaseContentionSnapshot> = dbs
+                    .into_iter()
+                    .map(|db| db.locks.contention_snapshot())
+                    .collect();
+                snapshots.sort_by(|a, b| a.database.cmp(&b.database));
+                ContentionSnapshot {
+                    databases: snapshots,
+                }
+            }
+        }
+    }
+
+    pub async fn clear_contention_history(&self, database: Option<&RootRef>) {
+        match database {
+            Some(root) => {
+                let db = {
+                    let databases = self.databases.read().await;
+                    databases.get(root).cloned()
+                };
+                if let Some(db) = db {
+                    db.locks.clear_contention_history();
+                }
+            }
+            None => {
+                let dbs: Vec<Arc<FirestoreDatabase>> = {
+                    let databases = self.databases.read().await;
+                    databases.values().cloned().collect()
+                };
+                for db in dbs {
+                    db.locks.clear_contention_history();
+                }
+            }
+        }
     }
 
     /// Drop the given database.
@@ -84,6 +152,10 @@ impl FirestoreProject {
         self.send_project_event(ProjectEvent::DatabaseCleared {
             database: name.clone(),
         });
+        self.contention
+            .send_if_subscribed(|| ContentionSseEvent::DatabaseCleared {
+                database: name.clone(),
+            });
         drop(database);
     }
 
@@ -221,5 +293,80 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[tokio::test]
+    async fn clear_database_emits_contention_database_cleared_and_suppresses_stale_emissions() {
+        use std::task::Poll;
+
+        use futures_util::poll;
+        use tokio::sync::broadcast::error::TryRecvError;
+
+        use crate::database::lock::{ContentionSseEvent, LockPriority, SessionKind};
+
+        let project: &'static FirestoreProject =
+            Box::leak(Box::new(FirestoreProject::new(FirestoreConfig::default())));
+        let root: RootRef = "projects/p/databases/(default)".parse().unwrap();
+        let db1 = project.database(&root).await;
+
+        let mut sub = project.subscribe_contention_events();
+        assert_eq!(project.contention_subscriber_count(), 1);
+
+        let d1: DocumentRef = "projects/p/databases/(default)/documents/c/d"
+            .parse()
+            .unwrap();
+        let holder = db1.locks.new_session(
+            None,
+            SessionKind::SingleWrite,
+            LockPriority::NextSeq,
+            false,
+            false,
+        );
+        let held = holder.acquire_write(&d1).await.unwrap();
+        let waiter = db1.locks.new_session(
+            None,
+            SessionKind::PointRead,
+            LockPriority::NextSeq,
+            false,
+            false,
+        );
+        let mut wait_fut = Box::pin(waiter.acquire_read(&d1));
+        assert!(matches!(poll!(&mut wait_fut), Poll::Pending));
+
+        assert_eq!(
+            sub.rx.try_recv().unwrap(),
+            ContentionSseEvent::ContentionChanged {
+                database: root.clone(),
+            }
+        );
+
+        project.clear_database(&root).await;
+        assert_eq!(
+            sub.rx.try_recv().unwrap(),
+            ContentionSseEvent::DatabaseCleared {
+                database: root.clone(),
+            }
+        );
+
+        // Waiter unblocked by DatabaseCleared; releasing/closing on cleared db1 must not emit stale
+        // SSE.
+        assert!(wait_fut.await.is_err());
+        drop(held);
+        holder.close();
+        waiter.close();
+        assert!(matches!(sub.rx.try_recv(), Err(TryRecvError::Empty)));
+
+        // Snapshot on absent cleared DB returns empty without creating a DB.
+        assert!(
+            project
+                .contention_snapshot(Some(&root))
+                .await
+                .databases
+                .is_empty()
+        );
+        assert!(matches!(sub.rx.try_recv(), Err(TryRecvError::Empty)));
+
+        drop(sub);
+        assert_eq!(project.contention_subscriber_count(), 0);
     }
 }

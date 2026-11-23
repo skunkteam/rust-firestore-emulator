@@ -530,7 +530,13 @@ mod tests {
         expect_false!(meta.read_latest_uncontended(DocumentContents::exists));
 
         let locks = Arc::new(LockManager::new(root, Timeouts::FAST));
-        let s = locks.new_session(None, LockPriority::NextSeq, true, true);
+        let s = locks.new_session(
+            None,
+            crate::database::lock::SessionKind::PessimisticTxn,
+            LockPriority::NextSeq,
+            true,
+            true,
+        );
         let w = s.acquire_write(&name).await.unwrap();
         expect_that!(
             meta.read_with_write_lease(&w, DocumentContents::exists),
@@ -555,7 +561,13 @@ mod tests {
         let snap = meta.read_mvcc_at(commit_ts).unwrap();
         expect_eq!(snap.fields["v"].as_integer(), Some(7));
 
-        let s2 = locks.new_session(None, LockPriority::NextSeq, true, true);
+        let s2 = locks.new_session(
+            None,
+            crate::database::lock::SessionKind::PessimisticTxn,
+            LockPriority::NextSeq,
+            true,
+            true,
+        );
         let r = s2.acquire_read(&name).await.unwrap();
         expect_that!(
             meta.read_with(&r, |c| c.current_version().unwrap().fields["v"]
