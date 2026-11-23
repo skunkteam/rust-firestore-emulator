@@ -1,7 +1,7 @@
 use std::{collections::HashMap, sync::Arc};
 
 use googleapis::google::{
-    firestore::v1::{Document, StructuredPipeline, Value},
+    firestore::v1::{Document, StructuredPipeline, Value, pipeline::Stage},
     protobuf::Timestamp,
 };
 use itertools::Itertools;
@@ -96,6 +96,50 @@ fn get_exact_expr_args<'a, const N: usize>(
     args.iter().collect_array().ok_or_else(|| {
         GenericDatabaseError::invalid_argument(format!("{what} expects {N} arguments"))
     })
+}
+
+/// Validates a single-argument stage with empty `options` and returns its positional argument.
+pub(super) fn single_arg_stage<'a>(stage: &'a Stage, expected_name: &str) -> Result<&'a Value> {
+    assert_eq!(stage.name, expected_name);
+    let options = &stage.options;
+    unimplemented_collection!(options);
+    let [arg] = get_exact_expr_args(&stage.args, expected_name)?;
+    Ok(arg)
+}
+
+/// Validates a single-argument stage whose argument must be a non-vector `MapValue`.
+pub(super) fn single_map_stage<'a>(
+    stage: &'a Stage,
+    expected_name: &str,
+) -> Result<&'a HashMap<String, Value>> {
+    single_arg_stage(stage, expected_name)?
+        .as_map()
+        .ok_or_else(|| {
+            GenericDatabaseError::invalid_argument(format!(
+                "{expected_name} stage expects a MapValue argument"
+            ))
+        })
+}
+
+/// Parses a non-negative integer count for stages such as `limit` and `offset`.
+pub(super) fn parse_non_negative_count(
+    stage: &Stage,
+    expected_name: &str,
+    label: &str,
+) -> Result<usize> {
+    let n = single_arg_stage(stage, expected_name)?
+        .as_integer()
+        .ok_or_else(|| {
+            GenericDatabaseError::invalid_argument(format!(
+                "{expected_name} stage expects an IntegerValue"
+            ))
+        })?;
+    if n < 0 {
+        return Err(GenericDatabaseError::invalid_argument(format!(
+            "{label} must be >= 0"
+        )));
+    }
+    Ok(usize::try_from(n).unwrap_or(usize::MAX))
 }
 
 /// Parses and validates projection/add-fields target paths deterministically, rejecting
@@ -309,5 +353,26 @@ mod tests {
             "filtered-to-empty snapshot read_time {empty_read_time:?} must precede concurrent \
              write {write_ts2:?}"
         );
+    }
+
+    #[test]
+    fn single_map_stage_rejects_vector_sentinel_maps() {
+        for stage_name in ["add_fields", "select", "distinct"] {
+            let err = single_map_stage(
+                &Stage {
+                    name:    stage_name.to_string(),
+                    args:    vec![Value::vector([1.0, 2.0])],
+                    options: HashMap::new(),
+                },
+                stage_name,
+            )
+            .unwrap_err();
+            assert_eq!(
+                err,
+                GenericDatabaseError::invalid_argument(format!(
+                    "{stage_name} stage expects a MapValue argument"
+                ))
+            );
+        }
     }
 }

@@ -5,30 +5,22 @@ use googleapis::google::{
     protobuf::Timestamp,
 };
 
+use super::single_arg_stage;
 use crate::{
     FirestoreDatabase, GenericDatabaseError,
     database::{query::QueryBuilder, reference::CollectionRef},
     error::Result,
-    pipeline::get_exact_expr_args,
     read_consistency::ReadConsistency,
     reference::RootRef,
-    unimplemented_collection,
 };
 
 pub(super) async fn execute(
     database: &Arc<FirestoreDatabase>,
     root_ref: &RootRef,
-    Stage {
-        name,
-        args,
-        options,
-    }: Stage,
+    stage: Stage,
     read_consistency: ReadConsistency,
 ) -> Result<(Timestamp, Vec<Document>)> {
-    assert_eq!(name, "collection");
-    unimplemented_collection!(options);
-
-    let [arg] = get_exact_expr_args(&args, "collection")?;
+    let arg = single_arg_stage(&stage, "collection")?;
 
     let collection_path = arg.as_reference().ok_or_else(|| {
         GenericDatabaseError::invalid_argument("collection stage expects a ReferenceValue argument")
