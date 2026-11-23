@@ -373,30 +373,38 @@ export async function clearContentionHistory() {
   }
   const myDbEpoch = getDbEpoch();
   const scope = state.contention.scope;
-  const activeRoot = getActiveRootPath(
-    state.activeProjectId,
-    state.activeDatabaseId
-  );
+  const targetProject = state.activeProjectId;
+  const targetDb = state.activeDatabaseId;
+  const activeRoot = getActiveRootPath(targetProject, targetDb);
   if (scope === "active" && !activeRoot) {
     return;
   }
   const queryDb = scope === "active" ? /** @type {string} */ (activeRoot) : undefined;
 
-  nextContentionSeq();
+  const mySeq = nextContentionSeq();
+  state.contention.loading = false;
   state.contention.clearing = true;
   state.contention.error = null;
   renderApp();
+
+  const isCurrentClearContext = () =>
+    myDbEpoch === getDbEpoch() &&
+    isCurrentContentionSeq(mySeq) &&
+    state.view === "contention" &&
+    state.contention.scope === scope;
 
   try {
     await clearContention(queryDb);
     if (myDbEpoch !== getDbEpoch()) return;
     notifyToast(
       queryDb
-        ? `Cleared contention history for ${state.activeProjectId}/${state.activeDatabaseId}`
+        ? `Cleared contention history for ${targetProject}/${targetDb}`
         : "Cleared contention history for all databases",
       "success"
     );
-    await refreshContention();
+    if (isCurrentClearContext()) {
+      await refreshContention();
+    }
   } catch (err) {
     if (myDbEpoch !== getDbEpoch()) return;
     const message =
@@ -405,7 +413,9 @@ export async function clearContentionHistory() {
         : err instanceof Error
           ? err.message
           : String(err);
-    state.contention.error = message;
+    if (isCurrentClearContext()) {
+      state.contention.error = message;
+    }
     notifyToast(`Failed to clear contention history: ${message}`, "error");
   } finally {
     if (myDbEpoch === getDbEpoch() && state.contention.clearing) {
@@ -531,6 +541,7 @@ export async function handleVisibilityChange() {
   }
   syncContentionLifecycle();
   if (
+    !state.ssePaused &&
     state.view === "contention" &&
     state.activeProjectId &&
     state.activeDatabaseId
@@ -625,6 +636,9 @@ export async function selectDatabase(
 
   if (dbChanged) {
     resetDatabaseCaches();
+    if (state.view === "contention") {
+      state.contention.loading = true;
+    }
   }
 
   syncUrl(replaceHistory);

@@ -102,12 +102,31 @@ export function updateWaiterElapsedDom(
     typeof fetchedOrState === "number" || fetchedOrState === null
       ? fetchedOrState
       : fetchedOrState.lastFetchedAtMs;
-  if (fetchedAtMs === null) return;
-  const elapsed = Math.max(0, nowMs - fetchedAtMs);
   const nodes = container.querySelectorAll("[data-wait-base-ms]");
+  if (fetchedAtMs === null) {
+    for (const el of nodes) {
+      const baseRaw = el.getAttribute?.("data-wait-base-ms");
+      const baseMs =
+        baseRaw !== null && baseRaw !== undefined && baseRaw.trim() !== ""
+          ? Number(baseRaw)
+          : NaN;
+      if (Number.isFinite(baseMs)) {
+        const label = formatWaitDuration(baseMs);
+        el.setAttribute?.("data-wait-ms", String(baseMs));
+        el.setAttribute?.("data-wait-label", label);
+        el.textContent = label;
+      } else {
+        el.textContent = el.getAttribute?.("data-wait-label") ?? "";
+      }
+    }
+    return;
+  }
+  const elapsed = Math.max(0, nowMs - fetchedAtMs);
   for (const el of nodes) {
     const baseRaw = el.getAttribute?.("data-wait-base-ms");
-    if (baseRaw === null || baseRaw === undefined) continue;
+    if (baseRaw === null || baseRaw === undefined || baseRaw.trim() === "") {
+      continue;
+    }
     const baseMs = Number(baseRaw);
     if (!Number.isFinite(baseMs)) continue;
     const totalMs = baseMs + elapsed;
@@ -141,6 +160,10 @@ function aggregateSummary(databases) {
 
 /**
  * Renders the Contention Visualizer workspace view.
+ *
+ * Callers MUST invoke {@link updateWaiterElapsedDom} immediately after rendering
+ * `renderContention` so `.wait-elapsed` elements (intentionally rendered without
+ * `lit-html` child expressions) have their text content reconciled with the DOM.
  *
  * @param {{
  *   projectId: string,
@@ -209,6 +232,9 @@ export function renderContention(props) {
         ? "error"
         : "idle";
 
+  const hasLoadError =
+    state.snapshot === null && !state.loading && Boolean(state.error);
+
   return html`
     <div class="contention-workspace">
       <div class="contention-toolbar">
@@ -272,12 +298,24 @@ export function renderContention(props) {
         : nothing}
 
       <div class="contention-summary-grid" aria-label="Contention summary">
-        ${renderSummaryCard("Wounds", totals.woundsTotal, "wound")}
-        ${renderSummaryCard("Timeouts", totals.timeoutsTotal, "timeout")}
-        ${renderSummaryCard("Upgrade Aborts", totals.upgradeAbortsTotal, "upgrade")}
+        ${renderSummaryCard(
+          "Wounds",
+          hasLoadError ? "—" : totals.woundsTotal,
+          "wound"
+        )}
+        ${renderSummaryCard(
+          "Timeouts",
+          hasLoadError ? "—" : totals.timeoutsTotal,
+          "timeout"
+        )}
+        ${renderSummaryCard(
+          "Upgrade Aborts",
+          hasLoadError ? "—" : totals.upgradeAbortsTotal,
+          "upgrade"
+        )}
         ${renderSummaryCard(
           "WriteBatch Retries",
-          totals.writeBatchRetriesTotal,
+          hasLoadError ? "—" : totals.writeBatchRetriesTotal,
           "retry"
         )}
       </div>
@@ -287,16 +325,33 @@ export function renderContention(props) {
           ? html`<div class="contention-empty-panel">
               Loading contention snapshot...
             </div>`
-          : displayedDbs.length === 0
-            ? renderEmptyDatabaseSnapshot(state.scope, activeRoot)
-            : displayedDbs.map((db) =>
-                renderDatabaseSection(
-                  db,
-                  state.scope === "all",
-                  elapsedSinceFetch,
-                  onOpenDocument
-                )
-              )}
+          : hasLoadError
+            ? html`
+                <section class="contention-panel">
+                  <div class="contention-empty-panel contention-error-state">
+                    <p class="contention-error-text">
+                      Failed to load contention snapshot: ${state.error}
+                    </p>
+                    <button
+                      type="button"
+                      class="btn btn-sm"
+                      @click=${onRefresh}
+                    >
+                      Retry
+                    </button>
+                  </div>
+                </section>
+              `
+            : displayedDbs.length === 0
+              ? renderEmptyDatabaseSnapshot(state.scope, activeRoot)
+              : displayedDbs.map((db) =>
+                  renderDatabaseSection(
+                    db,
+                    state.scope === "all",
+                    elapsedSinceFetch,
+                    onOpenDocument
+                  )
+                )}
       </div>
     </div>
   `;
@@ -304,7 +359,7 @@ export function renderContention(props) {
 
 /**
  * @param {string} label
- * @param {number} value
+ * @param {number | string} value
  * @param {string} tone
  * @returns {TemplateResult}
  */

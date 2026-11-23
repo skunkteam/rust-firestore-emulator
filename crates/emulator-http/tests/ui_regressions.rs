@@ -3271,6 +3271,79 @@ assert.equal(esThrowAttempts, 1, "synchronous EventSource throw must not retry i
 globalThis.EventSource = OrigEs;
 await app.switchView("explorer");
 
+// 12. Paused SSE suppresses automatic visibilitychange refreshContention while preserving manual Refresh.
+await app.switchView("contention");
+await app.toggleSsePaused();
+assert.equal(app.state.ssePaused, true);
+const fetchesWhilePausedBeforeVis = contentionFetches;
+mockVisibilityState = "hidden";
+for (const fn of docVisibilityListeners) {{
+  await fn();
+}}
+mockVisibilityState = "visible";
+for (const fn of docVisibilityListeners) {{
+  await fn();
+}}
+assert.equal(
+  contentionFetches,
+  fetchesWhilePausedBeforeVis,
+  "visibilitychange while ssePaused must not automatically refresh contention"
+);
+contentionStreams = streams.filter((s) => s.url === "/emulator/v1/contention/events");
+assert.equal(
+  contentionStreams.every((s) => s.closed),
+  true,
+  "visibilitychange while ssePaused must keep contention SSE closed"
+);
+const manualRefreshBtn = findClickHandler(app.renderWorkspace(), "Refresh");
+assert.ok(manualRefreshBtn, "expected manual Refresh button while SSE paused");
+await manualRefreshBtn();
+assert.equal(
+  contentionFetches,
+  fetchesWhilePausedBeforeVis + 1,
+  "manual Refresh must still fetch contention while ssePaused"
+);
+await app.toggleSsePaused();
+
+// 13. Switching DB via selectDatabase while in Contention view sets loading=true immediately so
+//     empty-state copy does not flash during getDatabase()/listCollectionIds() awaits.
+const db3Root = "projects/p/databases/db3/documents";
+const db3MetaDef = deferred();
+const db3ColsDef = deferred();
+fetchImpl = async (url) => {{
+  if (url === "/emulator/v1") return jsonResponse([rootPath, db2Root, db3Root]);
+  if (url === "/v1/projects/p/databases/db3") return db3MetaDef.promise;
+  if (url === "/v1/projects/p/databases/db3/documents:listCollectionIds") return db3ColsDef.promise;
+  if (url.startsWith("/emulator/v1/contention")) {{
+    return jsonResponse({{ databases: [] }});
+  }}
+  return origFetch(url);
+}};
+const selectDb3Promise = app.selectDatabase("p", "db3", [], true);
+assert.equal(app.state.contention.loading, true, "selectDatabase in contention view must set loading=true immediately");
+assert.equal(app.state.contention.snapshot, null);
+const pendingDbSwitchMarkup = renderTemplateMarkup(app.renderWorkspace());
+assert.ok(
+  pendingDbSwitchMarkup.includes("Loading contention snapshot..."),
+  "pending DB switch in contention view must show loading state"
+);
+assert.equal(
+  pendingDbSwitchMarkup.includes("No active lock contention"),
+  false,
+  "pending DB switch in contention view must not flash empty contention copy"
+);
+db3MetaDef.resolve(jsonResponse({{
+  name: "projects/p/databases/db3",
+  uid: "u3",
+  type: "FIRESTORE_NATIVE",
+  databaseEdition: "STANDARD",
+  concurrencyMode: "PESSIMISTIC",
+}}));
+db3ColsDef.resolve(jsonResponse({{ collectionIds: [] }}));
+await selectDb3Promise;
+assert.equal(app.state.contention.loading, false);
+await app.switchView("explorer");
+
 console.log("regression_contention_sse_lifecycle_and_routing passed");
 "#
     );
@@ -4015,6 +4088,41 @@ const emptyMarkup = renderTemplateMarkup(renderContention({{
 assert.ok(emptyMarkup.includes("No active lock contention"));
 assert.ok(emptyMarkup.includes("No contention events recorded."));
 
+// 6. When snapshot === null && !loading && error, render "—" in all 4 summary cards and explicit error + Retry in .contention-body.
+let retryClicks = 0;
+const initialErrTpl = renderContention({{
+  projectId: "p",
+  databaseId: "(default)",
+  state: {{
+    scope: "active",
+    snapshot: null,
+    loading: false,
+    clearing: false,
+    error: "[503 UNAVAILABLE] contention endpoint failed",
+    lastFetchedAtMs: null,
+    lastFetchedIso: null,
+  }},
+  sseStatus: "error",
+  ssePaused: false,
+  onChangeScope: () => {{}},
+  onRefresh: () => {{
+    retryClicks++;
+  }},
+  onClearHistory: () => {{}},
+  onOpenDocument: () => {{}},
+}});
+const initialErrMarkup = renderTemplateMarkup(initialErrTpl);
+const dashCardMatches = initialErrMarkup.match(/class="contention-stat-value mono">\u{{2014}}<\/strong>/gu) ?? [];
+assert.equal(dashCardMatches.length, 4, "all 4 summary cards must show em-dash when initial snapshot failed: " + initialErrMarkup);
+assert.equal(initialErrMarkup.includes(">0</strong>"), false, "summary cards must not show 0 when snapshot is null with error");
+assert.ok(initialErrMarkup.includes("Failed to load contention snapshot: [503 UNAVAILABLE] contention endpoint failed"));
+assert.equal(initialErrMarkup.includes("No active lock contention"), false, "error state must not render empty contention copy");
+assert.equal(initialErrMarkup.includes("No contention events recorded."), false);
+const retryBtn = findClickHandler(initialErrTpl, "Retry");
+assert.ok(retryBtn, "expected Retry button in .contention-body");
+retryBtn();
+assert.equal(retryClicks, 1);
+
 console.log("regression_contention_clear_history_open_doc_and_rendering passed");
 "#
     );
@@ -4024,6 +4132,22 @@ console.log("regression_contention_clear_history_open_doc_and_rendering passed")
 
 #[test]
 fn regression_contention_lit_html_waiter_rerender_and_tick() {
+    let repo_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let css =
+        fs::read_to_string(repo_root.join("ui/styles.css")).expect("failed to read ui/styles.css");
+    assert!(
+        css.contains(".wait-elapsed {"),
+        "expected .wait-elapsed CSS rule"
+    );
+    assert!(
+        !css.contains(".wait-elapsed:empty::before"),
+        "CSS must not own .wait-elapsed text via :empty::before"
+    );
+    assert!(
+        !css.contains("attr(data-wait-label)"),
+        "CSS must not duplicate data-wait-label text via content: attr(...)"
+    );
+
     let script = format!(
         r#"{NODE_BOOTSTRAP}
 class DomNode {{
@@ -4369,8 +4493,206 @@ waitNodes = container.querySelectorAll("[data-wait-base-ms]");
 assert.equal(waitNodes[0].getAttribute("data-wait-ms"), "2400");
 assert.equal(waitNodes[0].textContent, "2.4s");
 
+// Cycle 4: When lastFetchedAtMs is null, updateWaiterElapsedDom owns fallback reconciliation from data-wait-label
+// (resetting stale ticked text without CSS :empty::before).
+cState.snapshot = makeSnapshot(400);
+cState.lastFetchedAtMs = null;
+renderView();
+waitNodes = container.querySelectorAll("[data-wait-base-ms]");
+assert.equal(waitNodes.length, 1);
+assert.equal(waitNodes[0].getAttribute("data-wait-label"), "400ms");
+assert.equal(waitNodes[0].textContent, "400ms", "null lastFetchedAtMs must fall back to data-wait-label");
+
+// Also verify null fetchedOrState argument directly, non-numeric base fallback to data-wait-label, and missing label fallback.
+waitNodes[0].textContent = "stale";
+updateWaiterElapsedDom(container, null);
+assert.equal(waitNodes[0].textContent, "400ms");
+waitNodes[0].setAttribute("data-wait-base-ms", "");
+waitNodes[0].setAttribute("data-wait-label", "750ms");
+waitNodes[0].textContent = "stale";
+updateWaiterElapsedDom(container, null);
+assert.equal(waitNodes[0].textContent, "750ms");
+waitNodes[0].removeAttribute("data-wait-label");
+updateWaiterElapsedDom(container, null);
+assert.equal(waitNodes[0].textContent, "");
+
 Date.now = origDateNow;
 console.log("regression_contention_lit_html_waiter_rerender_and_tick passed");
+"#
+    );
+
+    run_node_ui_test(&script);
+}
+
+#[test]
+fn regression_contention_clear_history_loading_and_stale_error_guards() {
+    let script = format!(
+        r#"{NODE_BOOTSTRAP}
+const app = await import("./ui/app.js");
+
+const db1Root = "projects/p/databases/db1/documents";
+const db2Root = "projects/p/databases/db2/documents";
+
+let contentionGetHandler = async () => jsonResponse({{
+  databases: [{{
+    database: db1Root,
+    summary: {{ woundsTotal: 2, timeoutsTotal: 0, upgradeAbortsTotal: 0, writeBatchRetriesTotal: 0 }},
+    contendedDocuments: [],
+    totalContendedDocuments: 0,
+    truncated: false,
+    recentEvents: [],
+  }}],
+}});
+let contentionDeleteHandler = async () => jsonResponse({{}});
+let contentionGetCount = 0;
+
+fetchImpl = async (url, init) => {{
+  const method = init.method ?? "GET";
+  if (url === "/emulator/v1") return jsonResponse([db1Root, db2Root]);
+  if (url === "/v1/projects/p/databases/db1") {{
+    return jsonResponse({{
+      name: "projects/p/databases/db1",
+      uid: "u1",
+      type: "FIRESTORE_NATIVE",
+      databaseEdition: "STANDARD",
+      concurrencyMode: "PESSIMISTIC",
+    }});
+  }}
+  if (url === "/v1/projects/p/databases/db2") {{
+    return jsonResponse({{
+      name: "projects/p/databases/db2",
+      uid: "u2",
+      type: "FIRESTORE_NATIVE",
+      databaseEdition: "STANDARD",
+      concurrencyMode: "PESSIMISTIC",
+    }});
+  }}
+  if (url.endsWith(":listCollectionIds")) return jsonResponse({{ collectionIds: [] }});
+  if (url.startsWith("/emulator/v1/contention") && method === "DELETE") {{
+    return contentionDeleteHandler(url);
+  }}
+  if (url.startsWith("/emulator/v1/contention") && method === "GET") {{
+    contentionGetCount++;
+    return contentionGetHandler(url);
+  }}
+  throw new Error("unexpected url: " + method + " " + url);
+}};
+
+await app.init();
+await app.switchView("contention");
+assert.equal(app.state.contention.loading, false);
+
+// 1. Stale in-flight refreshContention() + failed clearContention() must NOT strand loading === true.
+const staleGetDef = deferred();
+const failDeleteDef = deferred();
+contentionGetHandler = () => staleGetDef.promise;
+contentionDeleteHandler = () => failDeleteDef.promise;
+
+const staleRefreshP = app.refreshContention();
+assert.equal(app.state.contention.loading, true);
+
+const clearFailP = app.clearContentionHistory();
+assert.equal(app.state.contention.loading, false, "clearContentionHistory must reset loading immediately after bumping seq");
+assert.equal(app.state.contention.clearing, true);
+
+staleGetDef.resolve(jsonResponse({{
+  databases: [{{
+    database: db1Root,
+    summary: {{ woundsTotal: 99, timeoutsTotal: 0, upgradeAbortsTotal: 0, writeBatchRetriesTotal: 0 }},
+    contendedDocuments: [],
+    totalContendedDocuments: 0,
+    truncated: false,
+    recentEvents: [],
+  }}],
+}}));
+await staleRefreshP;
+assert.equal(app.state.contention.loading, false);
+assert.equal(app.state.contention.snapshot.databases[0].summary.woundsTotal, 2, "stale refresh must be ignored");
+
+failDeleteDef.resolve(jsonResponse({{ error: {{ code: 500, status: "INTERNAL", message: "clear failed" }} }}, 500));
+await clearFailP;
+assert.equal(app.state.contention.loading, false, "failed clearContention after invalidated refresh must not strand loading");
+assert.equal(app.state.contention.clearing, false);
+assert.equal(app.state.contention.error, "[500 INTERNAL] clear failed");
+const afterFailMarkup = renderTemplateMarkup(app.renderWorkspace());
+assert.equal(afterFailMarkup.includes("Refreshing..."), false, "Refresh button must remain enabled after failed clear");
+
+// 2. Switching scope mid-clear prevents stale error from overwriting newer scope state and suppresses stale post-clear refresh.
+const scopeFailDelDef = deferred();
+contentionDeleteHandler = () => scopeFailDelDef.promise;
+contentionGetHandler = async () => jsonResponse({{
+  databases: [{{
+    database: db2Root,
+    summary: {{ woundsTotal: 5, timeoutsTotal: 1, upgradeAbortsTotal: 0, writeBatchRetriesTotal: 0 }},
+    contendedDocuments: [],
+    totalContendedDocuments: 0,
+    truncated: false,
+    recentEvents: [],
+  }}],
+}});
+
+const clearActiveP = app.clearContentionHistory();
+const allBtn = findClickHandler(app.renderWorkspace(), "All Databases");
+assert.ok(allBtn);
+await allBtn();
+assert.equal(app.state.contention.scope, "all");
+assert.equal(app.state.contention.error, null);
+assert.equal(app.state.contention.snapshot.databases[0].summary.woundsTotal, 5);
+
+scopeFailDelDef.resolve(jsonResponse({{ error: {{ code: 500, status: "INTERNAL", message: "stale active error" }} }}, 500));
+await clearActiveP;
+assert.equal(app.state.contention.error, null, "stale error from active scope must not overwrite all-scope state");
+assert.equal(app.state.contention.clearing, false);
+
+// Successful clear after scope switch must NOT fire post-clear refreshContention().
+const scopeOkDelDef = deferred();
+contentionDeleteHandler = () => scopeOkDelDef.promise;
+const clearAllP = app.clearContentionHistory();
+const activeBtn = findClickHandler(app.renderWorkspace(), "Active DB");
+assert.ok(activeBtn);
+await activeBtn();
+const getsAfterScopeSwitch = contentionGetCount;
+scopeOkDelDef.resolve(jsonResponse({{}}));
+await clearAllP;
+assert.equal(contentionGetCount, getsAfterScopeSwitch, "stale clear success after scope switch must not call refreshContention");
+
+// 3. Switching view mid-clear (to Explorer, and Explorer -> Contention) blocks stale error and post-clear refresh.
+const viewFailDelDef = deferred();
+contentionDeleteHandler = () => viewFailDelDef.promise;
+const clearViewFailP = app.clearContentionHistory();
+await app.switchView("explorer");
+viewFailDelDef.resolve(jsonResponse({{ error: {{ code: 500, status: "INTERNAL", message: "stale view error" }} }}, 500));
+await clearViewFailP;
+assert.equal(app.state.view, "explorer");
+assert.equal(app.state.contention.error, null, "failed clear after leaving contention view must not set error");
+assert.equal(app.state.contention.clearing, false);
+
+await app.switchView("contention");
+const viewCycleDelDef = deferred();
+contentionDeleteHandler = () => viewCycleDelDef.promise;
+const clearCycleP = app.clearContentionHistory();
+await app.switchView("explorer");
+await app.switchView("contention");
+const getsAfterReenter = contentionGetCount;
+viewCycleDelDef.resolve(jsonResponse({{ error: {{ code: 500, status: "INTERNAL", message: "stale cycle error" }} }}, 500));
+await clearCycleP;
+assert.equal(app.state.contention.error, null, "failed clear from prior view visit must not overwrite re-entered view error");
+assert.equal(contentionGetCount, getsAfterReenter);
+
+// 4. Switching DB mid-clear prevents stale error and stale toast on new DB.
+const dbSwitchDelDef = deferred();
+contentionDeleteHandler = () => dbSwitchDelDef.promise;
+const clearDb1P = app.clearContentionHistory();
+app.state.toasts = [];
+await app.selectDatabase("p", "db2", [], true);
+assert.equal(app.state.activeDatabaseId, "db2");
+dbSwitchDelDef.resolve(jsonResponse({{ error: {{ code: 500, status: "INTERNAL", message: "stale db1 error" }} }}, 500));
+await clearDb1P;
+assert.equal(app.state.contention.error, null, "failed clear from db1 must not overwrite db2 contention error");
+assert.equal(app.state.contention.clearing, false);
+assert.equal(app.state.toasts.length, 0, "failed clear from db1 must not toast after switching to db2");
+
+console.log("regression_contention_clear_history_loading_and_stale_error_guards passed");
 "#
     );
 

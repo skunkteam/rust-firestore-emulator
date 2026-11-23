@@ -1208,6 +1208,18 @@ input[type="checkbox"]:focus-visible {
   font-size: 12.5px;
 }
 
+.contention-error-state {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 10px;
+  color: #991b1b;
+}
+
+.contention-error-text {
+  margin: 0;
+}
+
 .contention-doc-list {
   display: flex;
   flex-direction: column;
@@ -1338,10 +1350,6 @@ input[type="checkbox"]:focus-visible {
   margin-left: auto;
   font-weight: 600;
   color: var(--warning);
-}
-
-.wait-elapsed:empty::before {
-  content: attr(data-wait-label);
 }
 
 .contention-event-list {
