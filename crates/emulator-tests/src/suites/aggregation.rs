@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use googleapis::{
     fields,
     google::firestore::v1::{Value, structured_query::field_filter::Operator},
@@ -6,7 +8,7 @@ use googletest::prelude::*;
 use tonic::Code;
 
 use crate::harness::{
-    builders::{AggregationSpec, QuerySpec, field_filter},
+    builders::{AggregationSpec, PipelineSpec, QuerySpec, field_filter, field_ref_val, fn_val},
     env::TestEnv,
     matchers::assert_status_code,
 };
@@ -139,7 +141,7 @@ async fn aggregation_count_sum_avg_across_empty_mixed_numeric_nan_and_mvcc_snaps
     assert!(nan_agg.fields.get("s").unwrap().is_nan());
     assert!(nan_agg.fields.get("a").unwrap().is_nan());
 
-    // 4. Integer overflow promotion in Sum (`i64::MAX + i64::MAX` -> `DoubleValue`)
+    // 4. Integer overflow promotion & intermediate-overflow cancellation in Standard Sum / Avg
     db.put("big/b1", fields!({ "v": i64::MAX })).await.unwrap();
     db.put("big/b2", fields!({ "v": i64::MAX })).await.unwrap();
     let overflow_agg = db
@@ -149,9 +151,121 @@ async fn aggregation_count_sum_avg_across_empty_mixed_numeric_nan_and_mvcc_snaps
         )
         .await
         .unwrap();
-    expect_that!(
-        overflow_agg.fields.get("s").and_then(Value::as_double),
-        some(gt(1.0e19))
+    expect_true!(
+        overflow_agg
+            .fields
+            .get("s")
+            .unwrap()
+            .storage_eq(&Value::double(18_446_744_073_709_551_616.0))
+    );
+
+    db.put("cancel_pos/d0", fields!({ "v": i64::MAX }))
+        .await
+        .unwrap();
+    db.put("cancel_pos/d1", fields!({ "v": 1_i64 }))
+        .await
+        .unwrap();
+    db.put("cancel_pos/d2", fields!({ "v": -1_i64 }))
+        .await
+        .unwrap();
+    let cancel_pos_agg = db
+        .aggregate(
+            QuerySpec::collection("cancel_pos"),
+            AggregationSpec::new().sum("s", "v"),
+        )
+        .await
+        .unwrap();
+    expect_true!(
+        cancel_pos_agg
+            .fields
+            .get("s")
+            .unwrap()
+            .storage_eq(&Value::integer(i64::MAX))
+    );
+
+    db.put("cancel_neg/d0", fields!({ "v": i64::MAX }))
+        .await
+        .unwrap();
+    db.put("cancel_neg/d1", fields!({ "v": i64::MAX }))
+        .await
+        .unwrap();
+    db.put("cancel_neg/d2", fields!({ "v": i64::MIN }))
+        .await
+        .unwrap();
+    db.put("cancel_neg/d3", fields!({ "v": i64::MIN }))
+        .await
+        .unwrap();
+    let cancel_neg_agg = db
+        .aggregate(
+            QuerySpec::collection("cancel_neg"),
+            AggregationSpec::new().sum("s", "v"),
+        )
+        .await
+        .unwrap();
+    expect_true!(
+        cancel_neg_agg
+            .fields
+            .get("s")
+            .unwrap()
+            .storage_eq(&Value::integer(-2))
+    );
+
+    db.put("single_round/d0", fields!({ "v": i64::MAX - 512 }))
+        .await
+        .unwrap();
+    db.put("single_round/d1", fields!({ "v": 1535_i64 }))
+        .await
+        .unwrap();
+    let single_round_agg = db
+        .aggregate(
+            QuerySpec::collection("single_round"),
+            AggregationSpec::new().sum("s", "v"),
+        )
+        .await
+        .unwrap();
+    expect_true!(
+        single_round_agg
+            .fields
+            .get("s")
+            .unwrap()
+            .storage_eq(&Value::double(9_223_372_036_854_775_808.0))
+    );
+
+    db.put("avg_cancel/d0", fields!({ "v": i64::MAX }))
+        .await
+        .unwrap();
+    db.put("avg_cancel/d1", fields!({ "v": 1_i64 }))
+        .await
+        .unwrap();
+    db.put("avg_cancel/d2", fields!({ "v": -i64::MAX }))
+        .await
+        .unwrap();
+    db.put("avg_cancel/d3", fields!({ "v": -1_i64 }))
+        .await
+        .unwrap();
+    db.put("avg_cancel/d4", fields!({ "v": 3_i64 }))
+        .await
+        .unwrap();
+    let avg_cancel_agg = db
+        .aggregate(
+            QuerySpec::collection("avg_cancel"),
+            AggregationSpec::new().sum("s", "v").avg("a", "v"),
+        )
+        .await
+        .unwrap();
+    expect_true!(
+        avg_cancel_agg
+            .fields
+            .get("s")
+            .unwrap()
+            .storage_eq(&Value::integer(3))
+    );
+    expect_true!(
+        avg_cancel_agg
+            .fields
+            .get("a")
+            .unwrap()
+            .storage_eq(&Value::double(0.6))
     );
 
     // 5. Invalid field path in Sum -> error_in_stream InvalidArgument
@@ -163,4 +277,179 @@ async fn aggregation_count_sum_avg_across_empty_mixed_numeric_nan_and_mvcc_snaps
         .await,
         Code::InvalidArgument,
     );
+}
+
+#[gtest]
+#[tokio::test]
+async fn enterprise_aggregation_and_pipeline_reject_sequential_i64_long_overflow() {
+    let mut db = TestEnv::enterprise().build_db();
+
+    // Order [i64::MAX, -1, 1] fits in i64 at every step -> succeeds in both RPCs.
+    db.put("neg_pos/d0", fields!({ "v": i64::MAX }))
+        .await
+        .unwrap();
+    db.put("neg_pos/d1", fields!({ "v": -1_i64 }))
+        .await
+        .unwrap();
+    db.put("neg_pos/d2", fields!({ "v": 1_i64 })).await.unwrap();
+
+    // Order [i64::MAX, 1, -1] overflows on step 2 -> InvalidArgument("Long overflow").
+    db.put("pos_neg/d0", fields!({ "v": i64::MAX }))
+        .await
+        .unwrap();
+    db.put("pos_neg/d1", fields!({ "v": 1_i64 })).await.unwrap();
+    db.put("pos_neg/d2", fields!({ "v": -1_i64 }))
+        .await
+        .unwrap();
+
+    // Leading double promotes accumulator before two i64::MAX values -> succeeds.
+    db.put("dbl_first/d0", fields!({ "v": 1.5_f64 }))
+        .await
+        .unwrap();
+    db.put("dbl_first/d1", fields!({ "v": i64::MAX }))
+        .await
+        .unwrap();
+    db.put("dbl_first/d2", fields!({ "v": i64::MAX }))
+        .await
+        .unwrap();
+
+    // Trailing double hits i64::MAX + i64::MAX before seeing double -> InvalidArgument.
+    db.put("dbl_last/d0", fields!({ "v": i64::MAX }))
+        .await
+        .unwrap();
+    db.put("dbl_last/d1", fields!({ "v": i64::MAX }))
+        .await
+        .unwrap();
+    db.put("dbl_last/d2", fields!({ "v": 1.5_f64 }))
+        .await
+        .unwrap();
+
+    // RunAggregationQuery (including unordered default __name__ scan order)
+    let ok_agg = db
+        .aggregate(
+            QuerySpec::collection("neg_pos"),
+            AggregationSpec::new().sum("s", "v").avg("a", "v"),
+        )
+        .await
+        .unwrap();
+    expect_true!(
+        ok_agg
+            .fields
+            .get("s")
+            .unwrap()
+            .storage_eq(&Value::integer(i64::MAX))
+    );
+    expect_true!(
+        ok_agg
+            .fields
+            .get("a")
+            .unwrap()
+            .storage_eq(&Value::double(i64::MAX as f64 / 3.0))
+    );
+
+    let ok_dbl = db
+        .aggregate(
+            QuerySpec::collection("dbl_first").order_asc("__name__"),
+            AggregationSpec::new().sum("s", "v").avg("a", "v"),
+        )
+        .await
+        .unwrap();
+    expect_true!(
+        ok_dbl
+            .fields
+            .get("s")
+            .unwrap()
+            .storage_eq(&Value::double(18_446_744_073_709_551_616.0))
+    );
+    expect_true!(
+        ok_dbl
+            .fields
+            .get("a")
+            .unwrap()
+            .storage_eq(&Value::double(18_446_744_073_709_551_616.0 / 3.0))
+    );
+
+    for col in ["pos_neg", "dbl_last"] {
+        assert_status_code(
+            db.aggregate(
+                QuerySpec::collection(col).order_asc("__name__"),
+                AggregationSpec::new().sum("s", "v"),
+            )
+            .await,
+            Code::InvalidArgument,
+        );
+        assert_status_code(
+            db.aggregate(
+                QuerySpec::collection(col).order_asc("__name__"),
+                AggregationSpec::new().avg("a", "v"),
+            )
+            .await,
+            Code::InvalidArgument,
+        );
+    }
+
+    // ExecutePipeline aggregate(sum/average) matches RunAggregationQuery
+    let pipe_aggs = HashMap::from([
+        ("s".to_string(), fn_val("sum", vec![field_ref_val("v")])),
+        ("a".to_string(), fn_val("average", vec![field_ref_val("v")])),
+    ]);
+    let ok_pipe = db
+        .pipeline(
+            PipelineSpec::collection("neg_pos")
+                .sort_asc("__name__")
+                .aggregate(pipe_aggs.clone(), Some(HashMap::new())),
+        )
+        .await
+        .unwrap();
+    expect_eq!(ok_pipe.results.len(), 1);
+    expect_true!(
+        ok_pipe.results[0]
+            .fields
+            .get("s")
+            .unwrap()
+            .storage_eq(&Value::integer(i64::MAX))
+    );
+    expect_true!(
+        ok_pipe.results[0]
+            .fields
+            .get("a")
+            .unwrap()
+            .storage_eq(&Value::double(i64::MAX as f64 / 3.0))
+    );
+
+    let ok_pipe_dbl = db
+        .pipeline(
+            PipelineSpec::collection("dbl_first")
+                .sort_asc("__name__")
+                .aggregate(pipe_aggs, Some(HashMap::new())),
+        )
+        .await
+        .unwrap();
+    expect_true!(
+        ok_pipe_dbl.results[0]
+            .fields
+            .get("s")
+            .unwrap()
+            .storage_eq(&Value::double(18_446_744_073_709_551_616.0))
+    );
+
+    for col in ["pos_neg", "dbl_last"] {
+        for (alias, op) in [("s", "sum"), ("a", "average")] {
+            assert_status_code(
+                db.pipeline(
+                    PipelineSpec::collection(col)
+                        .sort_asc("__name__")
+                        .aggregate(
+                            HashMap::from([(
+                                alias.to_string(),
+                                fn_val(op, vec![field_ref_val("v")]),
+                            )]),
+                            Some(HashMap::new()),
+                        ),
+                )
+                .await,
+                Code::InvalidArgument,
+            );
+        }
+    }
 }

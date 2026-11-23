@@ -178,6 +178,37 @@ impl Value {
         self.value_type_order() == other.value_type_order()
     }
 
+    /// Sums numeric values using Cloud Firestore Enterprise Edition's sequential
+    /// checked `i64` accumulation, returning `None` (`3 INVALID_ARGUMENT: Long overflow`)
+    /// if an integer addition overflows before a `DoubleValue` promotes the accumulator
+    /// to `f64`. Non-numeric values and unset `Value`s are skipped.
+    pub fn try_checked_sum(iter: impl IntoIterator<Item = Self>) -> Option<Self> {
+        use ValueType::*;
+        #[derive(Clone, Copy)]
+        enum Acc {
+            Int(i64),
+            Float(f64),
+        }
+
+        let mut acc = Acc::Int(0);
+        for vt in iter.into_iter().filter_map(|v| v.value_type) {
+            acc = match (acc, vt) {
+                (Acc::Int(a), IntegerValue(b)) => Acc::Int(a.checked_add(b)?),
+                (Acc::Int(a), DoubleValue(b)) => Acc::Float(a as f64 + b),
+                (Acc::Float(a), IntegerValue(b)) => Acc::Float(a + b as f64),
+                (Acc::Float(a), DoubleValue(b)) => Acc::Float(a + b),
+                (acc, _) => acc,
+            };
+        }
+        let value_type = match acc {
+            Acc::Int(a) => IntegerValue(a),
+            Acc::Float(a) => DoubleValue(a),
+        };
+        Some(Self {
+            value_type: Some(value_type),
+        })
+    }
+
     pub fn storage_eq(&self, other: &Self) -> bool {
         match (self.value_type.as_ref(), other.value_type.as_ref()) {
             (None, None) => true,
@@ -463,7 +494,7 @@ impl Add for Value {
 }
 
 // This is the implementation specific to: server side sum and avg aggregation with the following
-// rules:
+// rules (Standard Edition):
 //
 // * Only numeric values will be aggregated. All non-numeric values including `NULL` are skipped.
 //
@@ -472,10 +503,10 @@ impl Add for Value {
 //
 // * If the aggregated value set is empty, returns 0.
 //
-// * Returns a 64-bit integer if all aggregated numbers are integers and the sum result does not
-//   overflow. Otherwise, the result is returned as a double. Note that even if all the aggregated
-//   values are integers, the result is returned as a double if it cannot fit within a 64-bit signed
-//   integer. When this occurs, the returned value will lose precision.
+// * Returns a 64-bit integer if all aggregated numbers are integers and the exact integer sum fits
+//   within a 64-bit signed integer (regardless of intermediate 64-bit overflow). Otherwise, the
+//   result is returned as a double with single-rounding conversion from the accumulated integer
+//   sum.
 //
 // * When underflow occurs, floating-point aggregation is non-deterministic. This means that running
 //   the same query repeatedly without any changes to the underlying values could produce slightly
@@ -484,39 +515,67 @@ impl Add for Value {
 impl Sum for Value {
     fn sum<I: Iterator<Item = Self>>(iter: I) -> Self {
         use ValueType::*;
-        let value_type = iter
-            .filter_map(|v| v.value_type)
-            .fold(IntegerValue(0), |a, b| match (a, b) {
-                (IntegerValue(a), IntegerValue(b)) => a
-                    .checked_add(b)
-                    .map(IntegerValue)
-                    .unwrap_or_else(|| DoubleValue(a as f64 + b as f64)),
-                (IntegerValue(a), DoubleValue(b)) => DoubleValue(a as f64 + b),
-                (DoubleValue(a), IntegerValue(b)) => DoubleValue(a + b as f64),
-                (DoubleValue(a), DoubleValue(b)) => DoubleValue(a + b),
-                (a @ (DoubleValue(_) | IntegerValue(_)), _) => a,
-                (_, b @ (DoubleValue(_) | IntegerValue(_))) => b,
-                _ => IntegerValue(0),
-            });
+        let mut int_sum: i128 = 0;
+        let mut float_sum: f64 = 0.0;
+        let mut has_double = false;
+
+        for vt in iter.filter_map(|v| v.value_type) {
+            match vt {
+                IntegerValue(x) => match int_sum.checked_add(i128::from(x)) {
+                    Some(next) => int_sum = next,
+                    None => {
+                        has_double = true;
+                        float_sum += int_sum as f64 + x as f64;
+                        int_sum = 0;
+                    }
+                },
+                DoubleValue(x) => {
+                    has_double = true;
+                    float_sum += x;
+                }
+                _ => {}
+            }
+        }
+
+        let value_type = if has_double {
+            DoubleValue(int_sum as f64 + float_sum)
+        } else {
+            i64::try_from(int_sum)
+                .map(IntegerValue)
+                .unwrap_or_else(|_| DoubleValue(int_sum as f64))
+        };
         Self {
             value_type: Some(value_type),
         }
     }
 }
 
+fn cmp_named_args_options(
+    name_a: &str,
+    args_a: &[Value],
+    options_a: &HashMap<String, Value>,
+    name_b: &str,
+    args_b: &[Value],
+    options_b: &HashMap<String, Value>,
+) -> cmp::Ordering {
+    name_a
+        .cmp(name_b)
+        .then_with(|| args_a.cmp(args_b))
+        .then_with(|| options_a.iter().sorted().cmp(options_b.iter().sorted()))
+}
+
 impl Eq for Function {}
 
 impl Ord for Function {
     fn cmp(&self, other: &Self) -> cmp::Ordering {
-        self.name
-            .cmp(&other.name)
-            .then_with(|| self.args.cmp(&other.args))
-            .then_with(|| {
-                self.options
-                    .iter()
-                    .sorted()
-                    .cmp(other.options.iter().sorted())
-            })
+        cmp_named_args_options(
+            &self.name,
+            &self.args,
+            &self.options,
+            &other.name,
+            &other.args,
+            &other.options,
+        )
     }
 }
 
@@ -530,15 +589,14 @@ impl Eq for Stage {}
 
 impl Ord for Stage {
     fn cmp(&self, other: &Self) -> cmp::Ordering {
-        self.name
-            .cmp(&other.name)
-            .then_with(|| self.args.cmp(&other.args))
-            .then_with(|| {
-                self.options
-                    .iter()
-                    .sorted()
-                    .cmp(other.options.iter().sorted())
-            })
+        cmp_named_args_options(
+            &self.name,
+            &self.args,
+            &self.options,
+            &other.name,
+            &other.args,
+            &other.options,
+        )
     }
 }
 
@@ -1121,6 +1179,149 @@ mod tests {
         );
     }
 
+    #[gtest]
+    fn sum_handles_intermediate_overflow_cancellation_and_single_rounding() {
+        // Order-independent exact i128 accumulation prevents intermediate overflow promotion.
+        for vals in [
+            vec![
+                Value::integer(i64::MAX),
+                Value::integer(1),
+                Value::integer(-1),
+            ],
+            vec![
+                Value::integer(i64::MAX),
+                Value::integer(-1),
+                Value::integer(1),
+            ],
+            vec![
+                Value::integer(1),
+                Value::integer(i64::MAX),
+                Value::integer(-1),
+            ],
+        ] {
+            let sum: Value = vals.into_iter().sum();
+            expect_true!(sum.storage_eq(&Value::integer(i64::MAX)));
+        }
+
+        let min_cancel: Value = [
+            Value::integer(i64::MIN),
+            Value::integer(-1),
+            Value::integer(1),
+        ]
+        .into_iter()
+        .sum();
+        expect_true!(min_cancel.storage_eq(&Value::integer(i64::MIN)));
+
+        let exact_neg_two: Value = [
+            Value::integer(i64::MAX),
+            Value::integer(i64::MAX),
+            Value::integer(i64::MIN),
+            Value::integer(i64::MIN),
+        ]
+        .into_iter()
+        .sum();
+        expect_true!(exact_neg_two.storage_eq(&Value::integer(-2)));
+
+        // Final i64 overflow performs a single rounding from i128 to f64:
+        // (2^63 - 513) + 1535 = 2^63 + 1022 -> rounds to 2^63, unlike double-rounded
+        // (i64::MAX - 512) as f64 + 1535.0 == 2^63 + 2048.
+        let single_round: Value = [Value::integer(i64::MAX - 512), Value::integer(1535)]
+            .into_iter()
+            .sum();
+        expect_true!(single_round.storage_eq(&Value::double(9_223_372_036_854_775_808.0)));
+
+        // Mixed int + double preserves floating-point promotion and +0.0 sign rules.
+        let mixed_neg_zero: Value = [Value::integer(0), Value::double(-0.0)].into_iter().sum();
+        expect_true!(mixed_neg_zero.storage_eq(&Value::double(0.0)));
+    }
+
+    #[gtest]
+    fn try_checked_sum_matches_enterprise_sequential_overflow_semantics() {
+        expect_true!(
+            Value::try_checked_sum([])
+                .unwrap()
+                .storage_eq(&Value::integer(0))
+        );
+        expect_true!(
+            Value::try_checked_sum([
+                Value::null(),
+                Value::integer(i64::MAX),
+                Value::integer(-1),
+                Value::integer(1),
+            ])
+            .unwrap()
+            .storage_eq(&Value::integer(i64::MAX))
+        );
+        expect_true!(
+            Value::try_checked_sum([
+                Value::integer(i64::MAX),
+                Value::integer(1),
+                Value::integer(-1),
+            ])
+            .is_none()
+        );
+        expect_true!(
+            Value::try_checked_sum([
+                Value::integer(i64::MAX),
+                Value::integer(i64::MAX),
+                Value::double(1.5),
+            ])
+            .is_none()
+        );
+        expect_true!(
+            Value::try_checked_sum([
+                Value::double(1.5),
+                Value::integer(i64::MAX),
+                Value::integer(i64::MAX),
+            ])
+            .unwrap()
+            .storage_eq(&Value::double(18_446_744_073_709_551_616.0))
+        );
+        expect_true!(
+            Value::try_checked_sum([Value::integer(0), Value::double(-0.0)])
+                .unwrap()
+                .storage_eq(&Value::double(0.0))
+        );
+        expect_true!(
+            Value::try_checked_sum([Value::integer(i64::MIN), Value::integer(-1)]).is_none()
+        );
+    }
+
+    #[gtest]
+    fn function_and_stage_ord_compare_name_args_and_sorted_options() {
+        use crate::google::firestore::v1::{Function, pipeline::Stage};
+
+        let f1 = Function {
+            name:    "add".to_string(),
+            args:    vec![Value::integer(1)],
+            options: HashMap::from([
+                ("b".to_string(), Value::integer(2)),
+                ("a".to_string(), Value::integer(1)),
+            ]),
+        };
+        let f2 = Function {
+            name:    "add".to_string(),
+            args:    vec![Value::integer(1)],
+            options: HashMap::from([
+                ("a".to_string(), Value::integer(1)),
+                ("b".to_string(), Value::integer(3)),
+            ]),
+        };
+        expect_eq!(f1.cmp(&f2), Ordering::Less);
+
+        let s1 = Stage {
+            name:    f1.name.clone(),
+            args:    f1.args.clone(),
+            options: f1.options.clone(),
+        };
+        let s2 = Stage {
+            name:    f2.name.clone(),
+            args:    f2.args.clone(),
+            options: f2.options.clone(),
+        };
+        expect_eq!(s1.cmp(&s2), Ordering::Less);
+    }
+
     mod proptests {
         use std::{cmp::Ordering, collections::HashMap};
 
@@ -1280,19 +1481,27 @@ mod tests {
                 let overwritten = Value::string("not-a-number") + vb.clone();
                 prop_assert!(overwritten.storage_eq(&vb));
 
-                // Aggregation (`Sum`) promotes integer overflow to f64 while skipping non-numbers.
-                let summed: Value = [
+                // Aggregation (`Sum`) accumulates integers in i128 and single-rounds final overflow.
+                let seq = [
                     Value::null(),
-                    va,
+                    va.clone(),
                     Value::string("skip"),
-                    vb,
+                    vb.clone(),
                     Value::map(HashMap::new()),
-                ]
-                .into_iter()
-                .sum();
+                ];
+                let summed: Value = seq.clone().into_iter().sum();
+                let checked = Value::try_checked_sum(seq);
                 match a.checked_add(b) {
-                    Some(exact) => prop_assert!(summed.storage_eq(&Value::integer(exact))),
-                    None => prop_assert!(summed.storage_eq(&Value::double(a as f64 + b as f64))),
+                    Some(exact) => {
+                        prop_assert!(summed.storage_eq(&Value::integer(exact)));
+                        prop_assert!(checked.is_some_and(|v| v.storage_eq(&Value::integer(exact))));
+                    }
+                    None => {
+                        prop_assert!(summed.storage_eq(&Value::double(
+                            (i128::from(a) + i128::from(b)) as f64
+                        )));
+                        prop_assert!(checked.is_none());
+                    }
                 }
             }
         }
