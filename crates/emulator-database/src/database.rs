@@ -142,7 +142,7 @@ impl FirestoreDatabase {
         self.ensure_owns_root(&doc_ref.collection_ref.root_ref)
     }
 
-    #[instrument(level = Level::DEBUG, skip_all, err, fields(txn_id, found))]
+    #[instrument(level = Level::DEBUG, skip_all, err(level = Level::DEBUG), fields(txn_id, found))]
     pub async fn get_doc(
         &self,
         name: &DocumentRef,
@@ -306,7 +306,7 @@ impl FirestoreDatabase {
             .collect_vec()
     }
 
-    #[instrument(level = Level::DEBUG, skip_all, err)]
+    #[instrument(level = Level::DEBUG, skip_all, err(level = Level::DEBUG))]
     pub async fn run_query(&self, query: &mut Query) -> Result<(Timestamp, Vec<Document>)> {
         debug!(?query);
         let (read_time, result) = query.once(self).await?;
@@ -317,7 +317,7 @@ impl FirestoreDatabase {
         ))
     }
 
-    #[instrument(level = Level::DEBUG, skip_all, err)]
+    #[instrument(level = Level::DEBUG, skip_all, err(level = Level::DEBUG))]
     pub async fn run_aggregation_query(
         &self,
         parent: Ref,
@@ -453,7 +453,7 @@ impl FirestoreDatabase {
         Ok(result)
     }
 
-    #[instrument(level = Level::DEBUG, skip_all, err)]
+    #[instrument(level = Level::DEBUG, skip_all, err(level = Level::DEBUG))]
     pub async fn create_doc(
         self: &Arc<Self>,
         parent: &CollectionRef,
@@ -496,7 +496,7 @@ impl FirestoreDatabase {
         Ok(projection.project(&stored))
     }
 
-    #[instrument(level = Level::DEBUG, skip_all, err)]
+    #[instrument(level = Level::DEBUG, skip_all, err(level = Level::DEBUG))]
     pub async fn update_doc(
         self: &Arc<Self>,
         doc_ref: &DocumentRef,
@@ -528,7 +528,7 @@ impl FirestoreDatabase {
         })
     }
 
-    #[instrument(level = Level::DEBUG, skip_all, err)]
+    #[instrument(level = Level::DEBUG, skip_all, err(level = Level::DEBUG))]
     pub async fn delete_doc(
         self: &Arc<Self>,
         doc_ref: &DocumentRef,
@@ -544,7 +544,7 @@ impl FirestoreDatabase {
         Ok(())
     }
 
-    #[instrument(level = Level::DEBUG, skip_all, err)]
+    #[instrument(level = Level::DEBUG, skip_all, err(level = Level::DEBUG))]
     pub async fn delete_prefix(self: &Arc<Self>, prefix: &Ref) -> Result<usize> {
         self.ensure_owns_root(prefix.root())?;
         if self.is_cleared() {
@@ -575,7 +575,7 @@ impl FirestoreDatabase {
     }
 
     #[allow(clippy::too_many_arguments)]
-    #[instrument(level = Level::DEBUG, skip_all, err)]
+    #[instrument(level = Level::DEBUG, skip_all, err(level = Level::DEBUG))]
     pub async fn list_docs(
         &self,
         parent: Ref,

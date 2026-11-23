@@ -42,7 +42,7 @@ impl FirestoreDatabase {
     #[instrument(level = Level::DEBUG, skip_all, fields(
         count = writes.len(),
         txn_id,
-    ), err)]
+    ), err(level = Level::DEBUG))]
     pub async fn commit(
         self: &Arc<Self>,
         writes: Vec<Write>,
@@ -381,7 +381,7 @@ impl FirestoreDatabase {
         })
     }
 
-    #[instrument(level = Level::DEBUG, skip_all, err)]
+    #[instrument(level = Level::DEBUG, skip_all, err(level = Level::DEBUG))]
     fn stage_write(
         &self,
         write: ValidatedWrite,
