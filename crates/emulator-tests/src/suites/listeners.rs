@@ -17,7 +17,7 @@ use tokio_stream::wrappers::ReceiverStream;
 use tonic::Code;
 
 use crate::harness::{
-    builders::{QuerySpec, doc_path, field_filter},
+    builders::{QuerySpec, WriteBatchSpec, doc_path, field_filter},
     env::{DATABASE_ROOT, TestEnv},
     matchers::{assert_doc_wire_eq, assert_status_code, short_ids},
 };
@@ -713,4 +713,84 @@ async fn listen_query_target_with_offset_resets_when_skipped_doc_mutates() {
     let fb1 = fhandle.next_batch().await.unwrap();
     assert!(fb1.was_reset);
     expect_eq!(short_ids(&fb1.changed_docs), vec!["d3"]);
+}
+
+#[gtest]
+#[tokio::test]
+async fn listen_query_target_standard_multi_doc_batch_emits_deterministic_firestore_order() {
+    let mut db = TestEnv::new().build_db();
+
+    // 1. Single-collection multi-doc incremental updates with projection must arrive in exact
+    //    deterministic Firestore document order across repeated batches (independent of HashMap
+    //    iteration order) without triggering TargetChange::Reset.
+    let ids: Vec<String> = (0..12).map(|i| format!("d{i:02}")).collect();
+    for id in &ids {
+        db.put(
+            &format!("batch/{id}"),
+            fields!({ "v": 0i64, "hidden": "init" }),
+        )
+        .await
+        .unwrap();
+    }
+
+    let (mut handle, init) = db
+        .listen_query(QuerySpec::collection("batch").select(["v"]))
+        .await
+        .unwrap();
+    expect_eq!(short_ids(&init.changed_docs), ids);
+
+    for round in 1..=3i64 {
+        let mut batch = WriteBatchSpec::new().put("unrelated/noise", fields!({ "v": round }));
+        for id in ids.iter().rev() {
+            batch = batch.put(
+                &format!("batch/{id}"),
+                fields!({ "v": round, "hidden": "secret" }),
+            );
+        }
+        db.commit_writes(batch).await.unwrap();
+
+        let update = handle.next_batch().await.unwrap();
+        assert!(
+            !update.was_reset,
+            "in-place multi-doc batch update must not emit TargetChange::Reset"
+        );
+        expect_eq!(short_ids(&update.changed_docs), ids);
+        for (doc, id) in update.changed_docs.iter().zip(&ids) {
+            assert_doc_wire_eq(doc, &format!("batch/{id}"), &fields!({ "v": round }));
+        }
+    }
+    handle.close().await;
+
+    // 2. Collection-group multi-doc incremental batch must use segment-wise `cmp_firestore_order`
+    //    (`parents/doc/grp/x` < `parents/doc-1/grp/x` because segment `"doc"` < `"doc-1"` even
+    //    though `'/'` > `'-'` in raw ASCII).
+    let cg_paths = ["grp/a", "grp/z", "parents/doc/grp/x", "parents/doc-1/grp/x"];
+    for rel in cg_paths {
+        db.put(rel, fields!({ "v": 0i64 })).await.unwrap();
+    }
+    let (mut cg_handle, cg_init) = db
+        .listen_query(QuerySpec::collection_group("grp"))
+        .await
+        .unwrap();
+    let expected_names: Vec<String> = cg_paths.iter().map(|p| doc_path(p)).collect();
+    let init_names: Vec<String> = cg_init
+        .changed_docs
+        .iter()
+        .map(|d| d.name.clone())
+        .collect();
+    expect_eq!(init_names, expected_names);
+
+    let cg_batch = cg_paths.iter().rev().fold(WriteBatchSpec::new(), |b, rel| {
+        b.put(rel, fields!({ "v": 1i64 }))
+    });
+    db.commit_writes(cg_batch).await.unwrap();
+    let cg_update = cg_handle.next_batch().await.unwrap();
+    assert!(!cg_update.was_reset);
+    let update_names: Vec<String> = cg_update
+        .changed_docs
+        .iter()
+        .map(|d| d.name.clone())
+        .collect();
+    expect_eq!(update_names, expected_names);
+    cg_handle.close().await;
 }

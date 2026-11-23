@@ -1520,3 +1520,35 @@ async fn query_builder_validation_and_escaped_dot_sorting() -> Result<()> {
 
     Ok(())
 }
+
+#[gtest]
+fn collection_cache_guards_against_foreign_database_roots() -> Result<()> {
+    use crate::document::StoredDocumentVersion;
+
+    let root_a: RootRef = "projects/p/databases/db-a".parse()?;
+    let root_b: RootRef = "projects/p/databases/db-b".parse()?;
+    let col_a = CollectionRef::new(root_a, "items");
+    let col_b = CollectionRef::new(root_b, "items");
+
+    let make_doc = |col: CollectionRef| StoredDocumentVersion {
+        name: crate::reference::DocumentRef::new(col, "doc-1"),
+        create_time: Default::default(),
+        update_time: Default::default(),
+        fields: Default::default(),
+    };
+    let doc_a = make_doc(col_a.clone());
+    let doc_b = make_doc(col_b);
+
+    // Caching `true` for `db-a/items` must not bleed into `db-b/items`.
+    let mut query_own_first = QueryBuilder::from_collection(col_a.clone()).build()?;
+    assert!(query_own_first.includes_document(&doc_a)?);
+    assert!(!query_own_first.includes_document(&doc_b)?);
+
+    // Checking foreign `db-b/items` first must not poison `collection_cache` with `false` for
+    // `db-a/items`.
+    let mut query_foreign_first = QueryBuilder::from_collection(col_a).build()?;
+    assert!(!query_foreign_first.includes_document(&doc_b)?);
+    assert!(query_foreign_first.includes_document(&doc_a)?);
+
+    Ok(())
+}

@@ -72,35 +72,37 @@ impl TryFrom<i32> for DistanceMeasure {
     }
 }
 
-pub(crate) fn validate_query_vector(
+pub(crate) const MAX_FIND_NEAREST_LIMIT: usize = 1000;
+
+pub(crate) fn extract_vector_coords<M: Into<String>>(
     value: &Value,
-    measure: DistanceMeasure,
-    enterprise_edition: bool,
+    on_not_vector: impl FnOnce(&Value) -> M,
 ) -> Result<Vec<f64>> {
     let Some(ValueType::MapValue(map)) = value.value_type.as_ref() else {
-        return Err(GenericDatabaseError::invalid_argument(
-            "query_vector must be a valid VectorValue",
-        ));
+        return Err(GenericDatabaseError::invalid_argument(on_not_vector(value)));
     };
-    let coords: Vec<f64> = match classify_vector_map(&map.fields) {
-        VectorClassification::Valid(values) => values
+    match classify_vector_map(&map.fields) {
+        VectorClassification::Valid(values) => Ok(values
             .iter()
             .map(|v| match v.value_type {
                 Some(ValueType::DoubleValue(d)) => d,
                 _ => unreachable!("valid vector values only contain DoubleValue"),
             })
-            .collect(),
-        VectorClassification::Invalid(err) => {
-            return Err(GenericDatabaseError::invalid_argument(
-                err.as_error_message(),
-            ));
-        }
+            .collect()),
+        VectorClassification::Invalid(err) => Err(GenericDatabaseError::invalid_argument(
+            err.as_error_message(),
+        )),
         VectorClassification::NotVectorMap => {
-            return Err(GenericDatabaseError::invalid_argument(
-                "query_vector must be a valid VectorValue",
-            ));
+            Err(GenericDatabaseError::invalid_argument(on_not_vector(value)))
         }
-    };
+    }
+}
+
+pub(crate) fn validate_query_vector_for_measure(
+    coords: &[f64],
+    measure: DistanceMeasure,
+    enterprise_edition: bool,
+) -> Result<()> {
     if measure == DistanceMeasure::Cosine {
         compute_query_distance(
             DistanceMeasure::Cosine,
@@ -109,6 +111,16 @@ pub(crate) fn validate_query_vector(
             coords.iter().copied(),
         )?;
     }
+    Ok(())
+}
+
+pub(crate) fn validate_query_vector(
+    value: &Value,
+    measure: DistanceMeasure,
+    enterprise_edition: bool,
+) -> Result<Vec<f64>> {
+    let coords = extract_vector_coords(value, |_| "query_vector must be a valid VectorValue")?;
+    validate_query_vector_for_measure(&coords, measure, enterprise_edition)?;
     Ok(coords)
 }
 
@@ -487,6 +499,32 @@ mod tests {
             )
             .unwrap(),
             vec![0.0, 0.0]
+        );
+
+        assert_that!(
+            extract_vector_coords(&Value::integer(7), |_| "custom non-map error"),
+            err(eq(&GenericDatabaseError::invalid_argument(
+                "custom non-map error"
+            )))
+        );
+        assert_that!(
+            extract_vector_coords(
+                &Value::map(HashMap::from([("a".to_string(), Value::integer(1))])),
+                |_| "custom non-vector map error"
+            ),
+            err(eq(&GenericDatabaseError::invalid_argument(
+                "custom non-vector map error"
+            )))
+        );
+        assert_that!(
+            extract_vector_coords(&Value::vector([]), |_| "unused"),
+            err(eq(&GenericDatabaseError::invalid_argument(
+                "Cannot have a zero length vector."
+            )))
+        );
+        assert_eq!(
+            extract_vector_coords(&Value::vector([1.5, -2.5]), |_| "unused").unwrap(),
+            vec![1.5, -2.5]
         );
     }
 

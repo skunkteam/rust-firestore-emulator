@@ -9,8 +9,8 @@ use std::{
 
 use googleapis::google::{
     firestore::v1::{
-        DocumentChange, DocumentDelete, DocumentRemove, ListenRequest, ListenResponse, Target,
-        TargetChange, listen_request,
+        Document, DocumentChange, DocumentDelete, DocumentRemove, ListenRequest, ListenResponse,
+        Target, TargetChange, listen_request,
         listen_response::ResponseType,
         target::{self, query_target},
         target_change::TargetChangeType,
@@ -49,6 +49,72 @@ const TARGET_CHANGE_DEFAULT: TargetChange = TargetChange {
     resume_token: Vec::new(),
     read_time: None,
 };
+
+fn target_reset() -> ResponseType {
+    ResponseType::TargetChange(TargetChange {
+        target_change_type: TargetChangeType::Reset as _,
+        target_ids: vec![TARGET_ID],
+        ..TARGET_CHANGE_DEFAULT
+    })
+}
+
+fn document_change(document: Document) -> ResponseType {
+    ResponseType::DocumentChange(DocumentChange {
+        document: Some(document),
+        target_ids: vec![TARGET_ID],
+        removed_target_ids: vec![],
+    })
+}
+
+fn document_delete(document: &DocumentRef, read_time: Timestamp) -> ResponseType {
+    ResponseType::DocumentDelete(DocumentDelete {
+        document: document.to_string(),
+        removed_target_ids: vec![TARGET_ID],
+        read_time: Some(read_time),
+    })
+}
+
+fn document_remove(document: &DocumentRef, read_time: Timestamp) -> ResponseType {
+    ResponseType::DocumentRemove(DocumentRemove {
+        document: document.to_string(),
+        removed_target_ids: vec![TARGET_ID],
+        read_time: Some(read_time),
+    })
+}
+
+/// Accumulates `(doc_ref, item)` pairs without allocating or sorting when at most one item is
+/// collected; sorts deterministically by `DocumentRef::cmp_firestore_order` when `len > 1`.
+enum OrderedUpdates<'a, T> {
+    Empty,
+    One(&'a DocumentRef, T),
+    Many(Vec<(&'a DocumentRef, T)>),
+}
+
+impl<'a, T> OrderedUpdates<'a, T> {
+    fn push(&mut self, doc_ref: &'a DocumentRef, item: T) {
+        match std::mem::replace(self, Self::Empty) {
+            Self::Empty => *self = Self::One(doc_ref, item),
+            Self::One(first_ref, first_item) => {
+                *self = Self::Many(vec![(first_ref, first_item), (doc_ref, item)]);
+            }
+            Self::Many(mut items) => {
+                items.push((doc_ref, item));
+                *self = Self::Many(items);
+            }
+        }
+    }
+
+    fn into_sorted_vec<U>(self, mut map: impl FnMut(T) -> U) -> Vec<U> {
+        match self {
+            Self::Empty => Vec::new(),
+            Self::One(_, item) => vec![map(item)],
+            Self::Many(mut items) => {
+                items.sort_unstable_by(|(a, _), (b, _)| a.cmp_firestore_order(b));
+                items.into_iter().map(|(_, item)| map(item)).collect()
+            }
+        }
+    }
+}
 
 pub(crate) struct Listener {
     /// For debug purposes.
@@ -320,16 +386,8 @@ impl Listener {
         if send_initial {
             // Response: This is the current version, whether you like it or not.
             let msg = match doc {
-                Some(d) => ResponseType::DocumentChange(DocumentChange {
-                    document: Some(d.to_document()),
-                    target_ids: vec![TARGET_ID],
-                    removed_target_ids: vec![],
-                }),
-                None => ResponseType::DocumentDelete(DocumentDelete {
-                    document: name.to_string(),
-                    removed_target_ids: vec![TARGET_ID],
-                    read_time: Some(read_time),
-                }),
+                Some(d) => document_change(d.to_document()),
+                None => document_delete(&name, read_time),
             };
             self.send(msg).await?;
         }
@@ -485,16 +543,8 @@ impl DocumentTarget {
         self.last_read_time = update_time;
 
         let msg = match update.to_document() {
-            Some(d) => ResponseType::DocumentChange(DocumentChange {
-                document: Some(d),
-                target_ids: vec![TARGET_ID],
-                removed_target_ids: vec![],
-            }),
-            None => ResponseType::DocumentDelete(DocumentDelete {
-                document: update.name().to_string(),
-                removed_target_ids: vec![TARGET_ID],
-                read_time: Some(update_time),
-            }),
+            Some(d) => document_change(d),
+            None => document_delete(update.name(), update_time),
         };
         Ok(vec![msg])
     }
@@ -509,24 +559,10 @@ impl DocumentTarget {
             .await?;
         self.last_read_time = read_time;
 
-        let mut msgs = vec![ResponseType::TargetChange(TargetChange {
-            target_change_type: TargetChangeType::Reset as _,
-            target_ids: vec![TARGET_ID],
-            cause: None,
-            resume_token: vec![],
-            read_time: None,
-        })];
+        let mut msgs = vec![target_reset()];
         msgs.push(match doc {
-            Some(d) => ResponseType::DocumentChange(DocumentChange {
-                document: Some(d.to_document()),
-                target_ids: vec![TARGET_ID],
-                removed_target_ids: vec![],
-            }),
-            None => ResponseType::DocumentDelete(DocumentDelete {
-                document: self.name.to_string(),
-                removed_target_ids: vec![TARGET_ID],
-                read_time: Some(read_time),
-            }),
+            Some(d) => document_change(d.to_document()),
+            None => document_delete(&self.name, read_time),
         });
         Ok((read_time, msgs))
     }
@@ -558,63 +594,62 @@ impl QueryTarget {
             return Ok((self.last_reset_time, vec![]));
         }
 
-        let mut updates_to_apply = vec![];
         if self.query.has_find_nearest() {
-            let mut updates: Vec<_> = event.updates.values().collect();
-            updates.sort_by(|a, b| a.name().cmp_firestore_order(b.name()));
-            for update in updates {
-                let name = update.name();
-                let update_time = update.update_time();
-                match update.stored_document() {
-                    Some(doc) => {
-                        if self.query.matches_prefilters(doc) {
-                            if let Some(target) = self.doctargets_by_name.get_mut(name) {
-                                if target.last_read_time >= update_time {
-                                    continue;
-                                }
-                                target.last_read_time = update_time;
-                            } else {
-                                self.doctargets_by_name.insert(
-                                    name.clone(),
-                                    DocumentTarget {
-                                        name: name.clone(),
-                                        last_read_time: update_time,
-                                    },
-                                );
+            Ok((event.update_time, self.process_find_nearest_event(event)))
+        } else {
+            self.process_standard_event(database, event).await
+        }
+    }
+
+    fn process_find_nearest_event(&mut self, event: &DatabaseEvent) -> Vec<ResponseType> {
+        let mut updates_to_apply = OrderedUpdates::Empty;
+        for update in event.updates.values() {
+            let name = update.name();
+            let update_time = update.update_time();
+            match update.stored_document() {
+                Some(doc) => {
+                    if self.query.matches_prefilters(doc) {
+                        if let Some(target) = self.doctargets_by_name.get_mut(name) {
+                            if target.last_read_time >= update_time {
+                                continue;
                             }
-                            updates_to_apply.push(ResponseType::DocumentChange(DocumentChange {
-                                document: Some(self.query.project_base(doc)),
-                                target_ids: vec![TARGET_ID],
-                                removed_target_ids: vec![],
-                            }));
-                        } else if let Some(target) = self.doctargets_by_name.get(name)
-                            && target.last_read_time < update_time
-                        {
-                            self.doctargets_by_name.remove(name);
-                            updates_to_apply.push(ResponseType::DocumentRemove(DocumentRemove {
-                                document: name.to_string(),
-                                removed_target_ids: vec![TARGET_ID],
-                                read_time: Some(update_time),
-                            }));
+                            target.last_read_time = update_time;
+                        } else {
+                            self.doctargets_by_name.insert(
+                                name.clone(),
+                                DocumentTarget {
+                                    name: name.clone(),
+                                    last_read_time: update_time,
+                                },
+                            );
                         }
+                        updates_to_apply.push(name, document_change(self.query.project_base(doc)));
+                    } else if let Some(target) = self.doctargets_by_name.get(name)
+                        && target.last_read_time < update_time
+                    {
+                        self.doctargets_by_name.remove(name);
+                        updates_to_apply.push(name, document_remove(name, update_time));
                     }
-                    None => {
-                        if let Some(target) = self.doctargets_by_name.get(name)
-                            && target.last_read_time < update_time
-                        {
-                            self.doctargets_by_name.remove(name);
-                            updates_to_apply.push(ResponseType::DocumentDelete(DocumentDelete {
-                                document: name.to_string(),
-                                removed_target_ids: vec![TARGET_ID],
-                                read_time: Some(update_time),
-                            }));
-                        }
+                }
+                None => {
+                    if let Some(target) = self.doctargets_by_name.get(name)
+                        && target.last_read_time < update_time
+                    {
+                        self.doctargets_by_name.remove(name);
+                        updates_to_apply.push(name, document_delete(name, update_time));
                     }
                 }
             }
-            return Ok((event.update_time, updates_to_apply));
         }
+        updates_to_apply.into_sorted_vec(std::convert::identity)
+    }
 
+    async fn process_standard_event(
+        &mut self,
+        database: &FirestoreDatabase,
+        event: &DatabaseEvent,
+    ) -> Result<(Timestamp, Vec<ResponseType>)> {
+        let mut updates_to_apply = OrderedUpdates::Empty;
         let needs_reset = 'reset: {
             for update in event.updates.values() {
                 let name = update.name();
@@ -636,11 +671,7 @@ impl QueryTarget {
                 if target.last_read_time < update.update_time() {
                     target.last_read_time = update.update_time();
                     if let Some(doc) = doc {
-                        updates_to_apply.push(ResponseType::DocumentChange(DocumentChange {
-                            document: Some(self.query.project_base(doc)),
-                            target_ids: vec![TARGET_ID],
-                            removed_target_ids: vec![],
-                        }));
+                        updates_to_apply.push(name, doc);
                     }
                 }
             }
@@ -650,7 +681,11 @@ impl QueryTarget {
         if needs_reset {
             self.reset(database).await
         } else {
-            Ok((event.update_time, updates_to_apply))
+            Ok((
+                event.update_time,
+                updates_to_apply
+                    .into_sorted_vec(|doc| document_change(self.query.project_base(doc))),
+            ))
         }
     }
 
@@ -658,13 +693,7 @@ impl QueryTarget {
         &mut self,
         database: &FirestoreDatabase,
     ) -> Result<(Timestamp, Vec<ResponseType>)> {
-        let mut msgs = vec![ResponseType::TargetChange(TargetChange {
-            target_change_type: TargetChangeType::Reset as _,
-            target_ids: vec![TARGET_ID],
-            cause: None,
-            resume_token: vec![],
-            read_time: None,
-        })];
+        let mut msgs = vec![target_reset()];
 
         self.doctargets_by_name.clear();
         let (read_time, matches) = self.query.once(database).await?;
@@ -677,11 +706,7 @@ impl QueryTarget {
                     last_read_time: read_time,
                 },
             );
-            msgs.push(ResponseType::DocumentChange(DocumentChange {
-                document: Some(self.query.project(&m)),
-                target_ids: vec![TARGET_ID],
-                removed_target_ids: vec![],
-            }))
+            msgs.push(document_change(self.query.project(&m)));
         }
 
         Ok((read_time, msgs))

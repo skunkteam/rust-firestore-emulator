@@ -744,7 +744,7 @@ impl Query {
             consistency,
             collection_cache: Default::default(),
         });
-        query.validate()?;
+        query.validate_inner(false)?;
         Ok(query)
     }
 
@@ -768,6 +768,10 @@ impl Query {
     }
 
     fn validate(&mut self) -> Result<()> {
+        self.validate_inner(true)
+    }
+
+    fn validate_inner(&mut self, validate_find_nearest_spec: bool) -> Result<()> {
         let enterprise_edition = self.enterprise_edition;
         if matches!(self.parent, Ref::Collection(_)) {
             return Err(GenericDatabaseError::invalid_argument(
@@ -811,7 +815,11 @@ impl Query {
         }
 
         if let Some(spec) = &self.find_nearest {
-            spec.validate(enterprise_edition)?;
+            // `FindNearest::try_from_proto` already validated the spec; only `QueryBuilder::build`
+            // needs to validate programmatic `FindNearest` instances here.
+            if validate_find_nearest_spec {
+                spec.validate(enterprise_edition)?;
+            }
             if self.limit.is_some() {
                 return Err(GenericDatabaseError::invalid_argument(
                     "A query limit cannot be used with FindNearest",
@@ -1134,6 +1142,9 @@ impl Query {
 
     /// Check whether the given collection matches the FROM clause of the query.
     fn includes_collection(&mut self, collection: &CollectionRef) -> bool {
+        if &collection.root_ref != self.parent.root() {
+            return false;
+        }
         if let Some(&r) = self.collection_cache.get(&collection.collection_id) {
             return r;
         }
