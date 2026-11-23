@@ -33,7 +33,7 @@ pub(crate) use self::{
     table::ReadObservation,
 };
 use self::{
-    contention::ContentionHistory,
+    contention::{ContentionHistory, TimeoutRecord},
     leases::WaiterGuard,
     table::{
         AcquireOutcome, CloseOutcome, ExpiredSessionOutcome, LockTable, LockTableGarbage,
@@ -258,7 +258,7 @@ impl LockManager {
         }
     }
 
-    pub(crate) fn clear_contention_history(&self) {
+    fn update_history_and_notify(&self, update: impl FnOnce(&mut ContentionHistory) -> bool) {
         if self.is_cleared() {
             return;
         }
@@ -266,10 +266,15 @@ impl LockManager {
         if history.cleared {
             return;
         }
-        let had_data = history.clear();
-        if had_data && let Some(broadcaster) = &self.broadcaster {
+        if update(&mut history)
+            && let Some(broadcaster) = &self.broadcaster
+        {
             broadcaster.send_changed_if_subscribed(&self.database);
         }
+    }
+
+    pub(crate) fn clear_contention_history(&self) {
+        self.update_history_and_notify(ContentionHistory::clear);
     }
 
     pub(crate) fn close_expired_sessions(&self, sessions: &[Arc<LockSession>]) {
@@ -299,41 +304,28 @@ impl LockManager {
         if self.is_cleared() || outcomes.is_empty() {
             return;
         }
-        let any_recorded = outcomes.iter().any(|o| o.had_resources);
-        let any_notify = any_recorded || outcomes.iter().any(|o| o.notify_state_change);
-        if any_recorded {
-            let mut history = self.history.lock().unwrap_or_else(PoisonError::into_inner);
-            if history.cleared {
-                return;
-            }
-            for outcome in outcomes {
-                if outcome.had_resources {
-                    history.record_expired(outcome);
+        if outcomes.iter().any(|o| o.had_resources) {
+            self.update_history_and_notify(|history| {
+                for outcome in outcomes {
+                    if outcome.had_resources {
+                        history.record_expired(outcome);
+                    }
                 }
-            }
-            if let Some(broadcaster) = &self.broadcaster {
-                broadcaster.send_changed_if_subscribed(&self.database);
-            }
-        } else if any_notify {
+                true
+            });
+        } else if outcomes.iter().any(|o| o.notify_state_change) {
             self.notify_contention_changed();
         }
     }
 
     fn notify_contention_changed(&self) {
-        if self.is_cleared() {
-            return;
+        if self
+            .broadcaster
+            .as_ref()
+            .is_some_and(ContentionBroadcaster::has_subscribers)
+        {
+            self.update_history_and_notify(|_| true);
         }
-        let Some(broadcaster) = &self.broadcaster else {
-            return;
-        };
-        if !broadcaster.has_subscribers() {
-            return;
-        }
-        let history = self.history.lock().unwrap_or_else(PoisonError::into_inner);
-        if history.cleared {
-            return;
-        }
-        broadcaster.send_changed_if_subscribed(&self.database);
     }
 
     fn record_wounds_and_maybe_notify(
@@ -351,59 +343,25 @@ impl LockManager {
             }
             return;
         }
-        if self.is_cleared() {
-            return;
-        }
-        let mut history = self.history.lock().unwrap_or_else(PoisonError::into_inner);
-        if history.cleared {
-            return;
-        }
-        for wound in wounds {
-            history.record_wound(
-                wound,
-                wounder_session_id,
-                wounder_txn_id,
-                wounder_kind,
-                wounder_seq,
-            );
-        }
-        if let Some(broadcaster) = &self.broadcaster {
-            broadcaster.send_changed_if_subscribed(&self.database);
-        }
+        self.update_history_and_notify(|history| {
+            for wound in wounds {
+                history.record_wound(
+                    wound,
+                    wounder_session_id,
+                    wounder_txn_id,
+                    wounder_kind,
+                    wounder_seq,
+                );
+            }
+            true
+        });
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn record_timeout_and_notify(
-        &self,
-        kind: ContentionEventKind,
-        session_id: u64,
-        txn_id: Option<TransactionId>,
-        session_kind: SessionKind,
-        seq: Option<u64>,
-        doc_name: Option<String>,
-        wait_ms: u64,
-        attempt: Option<u32>,
-    ) {
-        if self.is_cleared() {
-            return;
-        }
-        let mut history = self.history.lock().unwrap_or_else(PoisonError::into_inner);
-        if history.cleared {
-            return;
-        }
-        history.record_timeout(
-            kind,
-            session_id,
-            txn_id,
-            session_kind,
-            seq,
-            doc_name,
-            wait_ms,
-            attempt,
-        );
-        if let Some(broadcaster) = &self.broadcaster {
-            broadcaster.send_changed_if_subscribed(&self.database);
-        }
+    fn record_timeout_and_notify(&self, record: TimeoutRecord) {
+        self.update_history_and_notify(|history| {
+            history.record_timeout(record);
+            true
+        });
     }
 
     pub(crate) fn record_upgrade_abort(
@@ -414,17 +372,16 @@ impl LockManager {
         seq: Option<u64>,
         doc_ref: &DocumentRef,
     ) {
-        if self.is_cleared() {
-            return;
-        }
-        let mut history = self.history.lock().unwrap_or_else(PoisonError::into_inner);
-        if history.cleared {
-            return;
-        }
-        history.record_upgrade_abort(session_id, txn_id, session_kind, seq, doc_ref.to_string());
-        if let Some(broadcaster) = &self.broadcaster {
-            broadcaster.send_changed_if_subscribed(&self.database);
-        }
+        self.update_history_and_notify(|history| {
+            history.record_upgrade_abort(
+                session_id,
+                txn_id,
+                session_kind,
+                seq,
+                doc_ref.to_string(),
+            );
+            true
+        });
     }
 
     pub(crate) fn record_write_batch_retry(
@@ -435,17 +392,10 @@ impl LockManager {
         wounder_seq: u64,
         attempt: u32,
     ) {
-        if self.is_cleared() {
-            return;
-        }
-        let mut history = self.history.lock().unwrap_or_else(PoisonError::into_inner);
-        if history.cleared {
-            return;
-        }
-        history.record_write_batch_retry(session_id, seq, wounder_txn_id, wounder_seq, attempt);
-        if let Some(broadcaster) = &self.broadcaster {
-            broadcaster.send_changed_if_subscribed(&self.database);
-        }
+        self.update_history_and_notify(|history| {
+            history.record_write_batch_retry(session_id, seq, wounder_txn_id, wounder_seq, attempt);
+            true
+        });
     }
 
     pub(crate) fn record_write_batch_timeout(
@@ -455,16 +405,16 @@ impl LockManager {
         wait_ms: u64,
         attempt: u32,
     ) {
-        self.record_timeout_and_notify(
-            ContentionEventKind::WriteTimeout,
+        self.record_timeout_and_notify(TimeoutRecord {
+            kind: ContentionEventKind::WriteTimeout,
             session_id,
-            None,
-            SessionKind::WriteBatch,
+            txn_id: None,
+            session_kind: SessionKind::WriteBatch,
             seq,
-            None,
+            doc_name: None,
             wait_ms,
-            Some(attempt),
-        );
+            attempt: (attempt > 0).then_some(attempt),
+        });
     }
 
     fn reap_and_next_expiry(&self) -> Option<Instant> {
@@ -950,10 +900,22 @@ impl LockSession {
         }
     }
 
+    #[cfg_attr(not(test), expect(dead_code))]
     pub(crate) async fn acquire_writes_all(
         self: &Arc<Self>,
         docs: &BTreeSet<DocumentRef>,
         deadline: Instant,
+    ) -> Result<BTreeMap<DocumentRef, WriteLease>, CommitError> {
+        self.acquire_writes_all_since(docs, Instant::now(), deadline, None)
+            .await
+    }
+
+    pub(crate) async fn acquire_writes_all_since(
+        self: &Arc<Self>,
+        docs: &BTreeSet<DocumentRef>,
+        batch_start: Instant,
+        deadline: Instant,
+        attempt: Option<u32>,
     ) -> Result<BTreeMap<DocumentRef, WriteLease>, CommitError> {
         self.check_active()?;
         if docs.is_empty() {
@@ -1095,18 +1057,18 @@ impl LockSession {
                 Err(err) => err,
                 Ok(()) => CommitError::Aborted(AbortReason::WriteTimeout),
             };
-            let wait_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
+            let wait_ms = u64::try_from(batch_start.elapsed().as_millis()).unwrap_or(u64::MAX);
             if close_outcome.actually_closed {
-                self.manager.record_timeout_and_notify(
-                    ContentionEventKind::WriteTimeout,
-                    self.session_id,
-                    self.txn_id,
-                    self.kind,
-                    self.root_seq(),
-                    Some(last_waited_doc.to_string()),
+                self.manager.record_timeout_and_notify(TimeoutRecord {
+                    kind: ContentionEventKind::WriteTimeout,
+                    session_id: self.session_id,
+                    txn_id: self.txn_id,
+                    session_kind: self.kind,
+                    seq: self.root_seq(),
+                    doc_name: Some(last_waited_doc.to_string()),
                     wait_ms,
-                    None,
-                );
+                    attempt,
+                });
             }
             tracing::debug!(
                 target: "emulator_database::lock",
@@ -1244,16 +1206,16 @@ impl LockSession {
                     } else {
                         ContentionEventKind::WriteTimeout
                     };
-                    self.manager.record_timeout_and_notify(
-                        event_kind,
-                        self.session_id,
-                        self.txn_id,
-                        self.kind,
-                        self.root_seq(),
-                        Some(doc_ref.to_string()),
+                    self.manager.record_timeout_and_notify(TimeoutRecord {
+                        kind: event_kind,
+                        session_id: self.session_id,
+                        txn_id: self.txn_id,
+                        session_kind: self.kind,
+                        seq: self.root_seq(),
+                        doc_name: Some(doc_ref.to_string()),
                         wait_ms,
-                        None,
-                    );
+                        attempt: None,
+                    });
                 }
                 tracing::debug!(
                     target: "emulator_database::lock",

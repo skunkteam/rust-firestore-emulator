@@ -185,7 +185,12 @@ impl FirestoreDatabase {
                 self.locks
                     .new_session(None, SessionKind::WriteBatch, priority, true, true);
             let sealed = match session
-                .acquire_writes_all(&validated.target_docs, deadline)
+                .acquire_writes_all_since(
+                    &validated.target_docs,
+                    batch_start,
+                    deadline,
+                    (wound_retries > 0).then_some(wound_retries),
+                )
                 .await
             {
                 Ok(write_leases) => Arc::clone(&session).seal_for_commit(write_leases),

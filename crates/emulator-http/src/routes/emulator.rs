@@ -140,6 +140,10 @@ fn parse_database_query(query: Option<&str>) -> Result<Option<RootRef>> {
                 RestError::bad_request(format!("Invalid database resource name: {val}"))
             })?;
             database = Some(root);
+        } else {
+            return Err(RestError::bad_request(format!(
+                "Unsupported query parameter: {key}"
+            )));
         }
     }
     Ok(database)

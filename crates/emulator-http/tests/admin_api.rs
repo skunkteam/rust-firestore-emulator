@@ -1821,7 +1821,7 @@ async fn test_contention_get_delete_and_database_query_validation() -> Result<()
     expect_eq!(absent_del, json!({}));
     expect_true!(project.database_names().await.is_empty());
 
-    // 3. Malformed `database` query parameter returns 400 INVALID_ARGUMENT on GET and DELETE.
+    // 3. Malformed or unrecognized query parameters return 400 INVALID_ARGUMENT on GET and DELETE.
     for bad_uri in [
         "/emulator/v1/contention?database=",
         "/emulator/v1/contention?database",
@@ -1834,6 +1834,27 @@ async fn test_contention_get_delete_and_database_query_validation() -> Result<()
             let (status, err_json) = send_oneshot(&router, method, bad_uri, None).await?;
             expect_eq!(status, StatusCode::BAD_REQUEST);
             expect_eq!(err_json["error"]["status"], "INVALID_ARGUMENT");
+        }
+    }
+    for (bad_uri, key) in [
+        ("/emulator/v1/contention?db=projects/p/databases/a", "db"),
+        (
+            "/emulator/v1/contention?databases=projects/p/databases/a",
+            "databases",
+        ),
+        (
+            "/emulator/v1/contention?database=projects/p/databases/a&extra=1",
+            "extra",
+        ),
+    ] {
+        for method in [Method::GET, Method::DELETE] {
+            let (status, err_json) = send_oneshot(&router, method, bad_uri, None).await?;
+            expect_eq!(status, StatusCode::BAD_REQUEST);
+            expect_eq!(err_json["error"]["status"], "INVALID_ARGUMENT");
+            expect_eq!(
+                err_json["error"]["message"],
+                format!("Unsupported query parameter: {key}")
+            );
         }
     }
 

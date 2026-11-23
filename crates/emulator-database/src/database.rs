@@ -1672,4 +1672,127 @@ mod tests {
             ContentionEventKind::UpgradeAbort
         );
     }
+
+    #[tokio::test(start_paused = true)]
+    async fn contention_commit_records_consistent_write_timeout_on_retried_write_batch() {
+        use std::time::Duration;
+
+        use futures_util::poll;
+        use tokio::time::advance;
+
+        use crate::database::lock::{ContentionEventKind, LockPriority, SessionKind};
+
+        let project: &'static FirestoreProject =
+            Box::leak(Box::new(FirestoreProject::new(FirestoreConfig::default())));
+        let root: RootRef = "projects/p/databases/(default)".parse().unwrap();
+        let db = project.database(&root).await;
+
+        let d_seq: DocumentRef = "projects/p/databases/(default)/documents/c/seq"
+            .parse()
+            .unwrap();
+        let d1: DocumentRef = "projects/p/databases/(default)/documents/c/d1"
+            .parse()
+            .unwrap();
+        let d2: DocumentRef = "projects/p/databases/(default)/documents/c/d2"
+            .parse()
+            .unwrap();
+
+        let mk_write = |doc_ref: &DocumentRef, val: i64| Write {
+            operation: Some(write::Operation::Update(Document {
+                name: doc_ref.to_string(),
+                fields: HashMap::from([("v".to_string(), Value::integer(val))]),
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+
+        // Case A: Retried WriteBatch (wound_retries == 1) times out while parked inside
+        // `acquire_writes_all_since` -> records cumulative `batch_start.elapsed()`,
+        // `attempt: Some(1)`, and `doc_name: Some(d2)`.
+        let older_a = db.new_txn(TransactionOptions::READ_WRITE).await.unwrap();
+        db.get_doc(&d_seq, ReadConsistency::Transaction(older_a))
+            .await
+            .unwrap();
+
+        let blocker = db.locks.new_session(
+            None,
+            SessionKind::SingleWrite,
+            LockPriority::NextSeq,
+            false,
+            false,
+        );
+        let held_d2 = blocker.acquire_write(&d2).await.unwrap();
+
+        let mut batch_parked = Box::pin(db.commit(vec![mk_write(&d1, 1), mk_write(&d2, 1)], None));
+        assert!(poll!(&mut batch_parked).is_pending());
+
+        // Advance 500ms, then wound attempt 0 -> retry #1 parks inside acquire_writes_all at
+        // t=500ms.
+        advance(Duration::from_millis(500)).await;
+        db.get_doc(&d1, ReadConsistency::Transaction(older_a))
+            .await
+            .unwrap();
+        assert!(poll!(&mut batch_parked).is_pending());
+        db.commit(vec![], Some(older_a)).await.unwrap();
+        tokio::task::yield_now().await;
+        assert!(poll!(&mut batch_parked).is_pending());
+        assert_eq!(
+            db.locks
+                .contention_snapshot()
+                .summary
+                .write_batch_retries_total,
+            1
+        );
+
+        // Advance the remaining 1500ms to deadline (t=2000ms) while parked on d2.
+        advance(Duration::from_millis(1500)).await;
+        let err = batch_parked.await.unwrap_err();
+        assert!(matches!(err, GenericDatabaseError::Aborted(_)));
+
+        drop(held_d2);
+        blocker.close();
+
+        let snap_parked = db.locks.contention_snapshot();
+        assert_eq!(snap_parked.summary.write_batch_retries_total, 1);
+        assert_eq!(snap_parked.summary.timeouts_total, 1);
+        let parked_to = &snap_parked.recent_events[0];
+        assert_eq!(parked_to.kind, ContentionEventKind::WriteTimeout);
+        assert_eq!(parked_to.session_kind, SessionKind::WriteBatch);
+        assert_eq!(parked_to.wait_ms, Some(2_000));
+        assert_eq!(parked_to.attempt, Some(1));
+        assert_eq!(parked_to.doc_name.as_deref(), Some(d2.to_string().as_str()));
+
+        // Case B: Unretried WriteBatch (wound_retries == 0) timing out inside acquire_writes_all
+        // keeps `attempt: None` while recording `wait_ms` and `doc_name`.
+        db.locks.clear_contention_history();
+        let blocker_b = db.locks.new_session(
+            None,
+            SessionKind::SingleWrite,
+            LockPriority::NextSeq,
+            false,
+            false,
+        );
+        let held_d2_b = blocker_b.acquire_write(&d2).await.unwrap();
+        let mut batch_initial = Box::pin(db.commit(vec![mk_write(&d1, 2), mk_write(&d2, 2)], None));
+        assert!(poll!(&mut batch_initial).is_pending());
+
+        advance(Duration::from_millis(2000)).await;
+        let err_b = batch_initial.await.unwrap_err();
+        assert!(matches!(err_b, GenericDatabaseError::Aborted(_)));
+        drop(held_d2_b);
+        blocker_b.close();
+
+        let snap_initial = db.locks.contention_snapshot();
+        assert_eq!(snap_initial.summary.write_batch_retries_total, 0);
+        assert_eq!(snap_initial.summary.timeouts_total, 1);
+        let initial_to = &snap_initial.recent_events[0];
+        assert_eq!(initial_to.kind, ContentionEventKind::WriteTimeout);
+        assert_eq!(initial_to.session_kind, SessionKind::WriteBatch);
+        assert_eq!(initial_to.wait_ms, Some(2_000));
+        assert_eq!(initial_to.attempt, None);
+        assert_eq!(
+            initial_to.doc_name.as_deref(),
+            Some(d2.to_string().as_str())
+        );
+    }
 }

@@ -130,8 +130,12 @@ pub struct ContendedDocumentSnapshot {
     pub document: String,
     pub writer: Option<WriterSnapshot>,
     pub readers: Vec<ReaderSnapshot>,
+    /// Total number of active/retained read holders before `readers` is capped at
+    /// [`MAX_SNAPSHOT_DOC_PARTICIPANTS`].
     pub reader_count: usize,
     pub waiters: Vec<WaiterSnapshot>,
+    /// Total number of queued waiters before `waiters` is capped at
+    /// [`MAX_SNAPSHOT_DOC_PARTICIPANTS`].
     pub waiter_count: usize,
 }
 
@@ -196,7 +200,12 @@ pub struct DatabaseContentionSnapshot {
     pub database: RootRef,
     pub summary: ContentionSummary,
     pub contended_documents: Vec<ContendedDocumentSnapshot>,
+    /// Total number of contended documents in the database before `contended_documents` is capped
+    /// at [`MAX_SNAPSHOT_CONTENDED_DOCS`].
     pub total_contended_documents: usize,
+    /// Whether `contended_documents` was truncated at the document level because
+    /// `total_contended_documents > MAX_SNAPSHOT_CONTENDED_DOCS` (does not reflect per-document
+    /// reader/waiter truncation at [`MAX_SNAPSHOT_DOC_PARTICIPANTS`]).
     pub truncated: bool,
     pub recent_events: Vec<ContentionEvent>,
 }
@@ -290,6 +299,18 @@ impl ContentionBroadcaster {
     }
 }
 
+/// Metadata describing a lock wait timeout recorded in [`ContentionHistory`].
+pub(super) struct TimeoutRecord {
+    pub(super) kind: ContentionEventKind,
+    pub(super) session_id: u64,
+    pub(super) txn_id: Option<TransactionId>,
+    pub(super) session_kind: SessionKind,
+    pub(super) seq: Option<u64>,
+    pub(super) doc_name: Option<String>,
+    pub(super) wait_ms: u64,
+    pub(super) attempt: Option<u32>,
+}
+
 /// Bounded per-database history ring and summary counters protected by its own leaf mutex.
 #[derive(Debug, Default)]
 pub(super) struct ContentionHistory {
@@ -333,26 +354,22 @@ impl ContentionHistory {
         self.push_event(event);
     }
 
-    #[allow(clippy::too_many_arguments)]
-    pub(super) fn record_timeout(
-        &mut self,
-        kind: ContentionEventKind,
-        session_id: u64,
-        txn_id: Option<TransactionId>,
-        session_kind: SessionKind,
-        seq: Option<u64>,
-        doc_name: Option<String>,
-        wait_ms: u64,
-        attempt: Option<u32>,
-    ) {
+    pub(super) fn record_timeout(&mut self, record: TimeoutRecord) {
         debug_assert!(matches!(
-            kind,
+            record.kind,
             ContentionEventKind::ReadTimeout | ContentionEventKind::WriteTimeout
         ));
         self.summary.timeouts_total += 1;
-        let mut event = ContentionEvent::new(kind, session_id, txn_id, session_kind, seq, doc_name);
-        event.wait_ms = Some(wait_ms);
-        event.attempt = attempt;
+        let mut event = ContentionEvent::new(
+            record.kind,
+            record.session_id,
+            record.txn_id,
+            record.session_kind,
+            record.seq,
+            record.doc_name,
+        );
+        event.wait_ms = Some(record.wait_ms);
+        event.attempt = record.attempt;
         self.push_event(event);
     }
 

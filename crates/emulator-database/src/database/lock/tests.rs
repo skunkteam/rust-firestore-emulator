@@ -2703,3 +2703,83 @@ async fn contention_snapshot_caps_ordering_ring_eviction_and_clear_preserves_act
     holder.close();
     expect_eq!(locks.table_counts(), (0, 0));
 }
+
+#[gtest]
+#[tokio::test(start_paused = true)]
+async fn contention_seal_for_commit_under_contention_emits_sse_and_transitions_writer_state() {
+    use tokio::sync::broadcast::error::TryRecvError;
+
+    let (locks, _broadcaster, mut sub) = mgr_with_broadcaster(Timeouts::FAST);
+    let d1 = doc("seal_contended");
+
+    let holder = locks.new_session(
+        Some(test_txn_id(10, 1)),
+        SessionKind::PessimisticTxn,
+        LockPriority::NextSeq,
+        true,
+        true,
+    );
+    let w_lease = holder.acquire_write(&d1).await.unwrap();
+
+    let waiter = locks.new_session(
+        Some(test_txn_id(20, 1)),
+        SessionKind::PessimisticTxn,
+        LockPriority::NextSeq,
+        true,
+        true,
+    );
+    let mut wait_fut = Box::pin(waiter.acquire_read(&d1));
+    assert!(poll!(&mut wait_fut).is_pending());
+    assert_eq!(
+        sub.rx.try_recv().unwrap(),
+        ContentionSseEvent::ContentionChanged {
+            database: db_root(),
+        }
+    );
+    assert!(matches!(sub.rx.try_recv(), Err(TryRecvError::Empty)));
+
+    let before = locks.contention_snapshot();
+    expect_eq!(before.total_contended_documents, 1);
+    let writer_before = before.contended_documents[0]
+        .writer
+        .as_ref()
+        .expect("active writer");
+    expect_eq!(writer_before.state, ContentionSessionState::Active);
+    expect_true!(writer_before.woundable);
+
+    let seal = Arc::clone(&holder)
+        .seal_for_commit(BTreeMap::from([(d1.clone(), w_lease)]))
+        .unwrap();
+    assert_eq!(
+        sub.rx.try_recv().unwrap(),
+        ContentionSseEvent::ContentionChanged {
+            database: db_root(),
+        }
+    );
+    assert!(matches!(sub.rx.try_recv(), Err(TryRecvError::Empty)));
+
+    let after = locks.contention_snapshot();
+    expect_eq!(after.total_contended_documents, 1);
+    let writer_after = after.contended_documents[0]
+        .writer
+        .as_ref()
+        .expect("committing writer");
+    expect_eq!(writer_after.state, ContentionSessionState::Committing);
+    expect_eq!(
+        serde_json::to_value(writer_after.state).unwrap(),
+        serde_json::json!("COMMITTING")
+    );
+    expect_false!(writer_after.woundable);
+
+    drop(seal);
+    assert_eq!(
+        sub.rx.try_recv().unwrap(),
+        ContentionSseEvent::ContentionChanged {
+            database: db_root(),
+        }
+    );
+    drop(wait_fut.await.unwrap());
+    waiter.close();
+    holder.close();
+    expect_eq!(locks.table_counts(), (0, 0));
+}
