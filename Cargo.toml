@@ -82,8 +82,10 @@ emulator-http = { workspace = true }
 emulator-tracing = { workspace = true }
 futures-util = { workspace = true }
 http = { workspace = true }
-tokio = { workspace = true, features = ["macros", "rt-multi-thread", "signal"] }
-tonic = { workspace = true, features = ["router", "server"] }
+hyper = { workspace = true, features = ["http1", "http2", "server"] }
+hyper-util = { workspace = true, features = ["http1", "http2", "server-auto", "server-graceful", "service", "tokio"] }
+tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+tonic = { workspace = true, features = ["router"] }
 tower = { workspace = true }
 tracing = { workspace = true }
 

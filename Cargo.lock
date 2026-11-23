@@ -409,6 +409,8 @@ dependencies = [
  "emulator-tracing",
  "futures-util",
  "http",
+ "hyper",
+ "hyper-util",
  "tikv-jemallocator",
  "tokio",
  "tonic",

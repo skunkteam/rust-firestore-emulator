@@ -1,7 +1,7 @@
 # emulator-tests Source (`src`)
 
 ## Overview
-Implements the centralized in-process black-box test harness (`harness/`) and hot-path / perimeter verification suites (`suites/`) for the Firestore emulator. Regular tests run entirely in-memory over `FirestoreClient::with_origin(emulator_grpc::service(project), ...)` and `RouterBuilder::new(project).add_dynamic_tracing(DefaultTracing::start()).build().oneshot(...)` with zero OS socket binds, except for two loopback TCP multiplexer tests in `suites/http_and_multiplex.rs`.
+Implements the centralized in-process black-box test harness (`harness/`) and hot-path / perimeter verification suites (`suites/`) for the Firestore emulator. Regular tests run entirely in-memory over `FirestoreClient::with_origin(emulator_grpc::service(project), ...)` and `RouterBuilder::new(project).add_dynamic_tracing(DefaultTracing::start()).build().oneshot(...)` with zero OS socket binds, except for the loopback TCP multiplexer and bounded-shutdown integration tests in `suites/http_and_multiplex.rs`.
 
 ## Interface
 - `[lib.rs]`: `#![cfg(test)]` crate root registering private `mod harness;` and `mod suites;`.
@@ -22,7 +22,7 @@ Implements the centralized in-process black-box test harness (`harness/`) and ho
 
 ## Side Effects
 - Leaks isolated `FirestoreProject` allocations per test (`Box::leak`) and initializes `DefaultTracing::start()` idempotently inside the test process.
-- `[suites/http_and_multiplex.rs:loopback_tcp_multiplexer_serves_grpc_and_http_on_same_port_and_shuts_down_cleanly]` and `[suites/http_and_multiplex.rs:loopback_tcp_multiplexer_routes_case_insensitive_grpc_content_type_and_rejects_grpc_web]` bind ephemeral `127.0.0.1:0` TCP sockets to verify `firestore_emulator::run` HTTP/2 gRPC + HTTP/1.1 REST multiplexing, case-insensitive `content-type` routing, `application/grpc-web` rejection, and graceful shutdown.
+- `[suites/http_and_multiplex.rs]` loopback tests (`loopback_tcp_multiplexer_serves_grpc_and_http_on_same_port_and_shuts_down_cleanly`, `loopback_tcp_multiplexer_routes_case_insensitive_grpc_content_type_and_rejects_grpc_web`, `loopback_tcp_multiplexer_shuts_down_cleanly_with_active_sse_and_listen_streams`, `loopback_tcp_multiplexer_exits_immediately_on_shutdown_when_idle_despite_long_grace`, `loopback_tcp_multiplexer_preserves_grace_window_and_exits_promptly_on_clean_disconnect`, `loopback_tcp_multiplexer_shuts_down_cleanly_with_stalled_raw_tcp_connections`, `loopback_tcp_multiplexer_aborts_blocked_http1_handler_on_lock_contention`, and `loopback_tcp_multiplexer_handles_zero_and_max_shutdown_grace`) bind ephemeral `127.0.0.1:0` TCP sockets to verify `firestore_emulator::run` / `run_with_shutdown_grace` HTTP/2 gRPC + HTTP/1.1 REST multiplexing, case-insensitive `content-type` routing, `application/grpc-web` rejection, bounded shutdown across active/stalled/lock-contended connections, and `Duration::ZERO` / `Duration::MAX` edge cases.
 
 ## Verification
 - Run: `cargo nextest run -p emulator-tests --profile ci`
