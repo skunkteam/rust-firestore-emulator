@@ -388,6 +388,33 @@ async fn enterprise_aggregation_and_pipeline_reject_sequential_i64_long_overflow
         );
     }
 
+    // Unordered `QuerySpec` scan normalization on an overflowing collection (`pos_neg`) and
+    // `Count`-only aggregation skipping the scan-order sort.
+    assert_status_code(
+        db.aggregate(
+            QuerySpec::collection("pos_neg"),
+            AggregationSpec::new().sum("s", "v"),
+        )
+        .await,
+        Code::InvalidArgument,
+    );
+    assert_status_code(
+        db.aggregate(
+            QuerySpec::collection("pos_neg"),
+            AggregationSpec::new().avg("a", "v"),
+        )
+        .await,
+        Code::InvalidArgument,
+    );
+    let count_only = db
+        .aggregate(
+            QuerySpec::collection("pos_neg"),
+            AggregationSpec::new().count("n"),
+        )
+        .await
+        .unwrap();
+    expect_eq!(count_only.fields.get("n"), Some(&Value::integer(3)));
+
     // ExecutePipeline aggregate(sum/average) matches RunAggregationQuery
     let pipe_aggs = HashMap::from([
         ("s".to_string(), fn_val("sum", vec![field_ref_val("v")])),
@@ -425,12 +452,20 @@ async fn enterprise_aggregation_and_pipeline_reject_sequential_i64_long_overflow
         )
         .await
         .unwrap();
+    expect_eq!(ok_pipe_dbl.results.len(), 1);
     expect_true!(
         ok_pipe_dbl.results[0]
             .fields
             .get("s")
             .unwrap()
             .storage_eq(&Value::double(18_446_744_073_709_551_616.0))
+    );
+    expect_true!(
+        ok_pipe_dbl.results[0]
+            .fields
+            .get("a")
+            .unwrap()
+            .storage_eq(&Value::double(18_446_744_073_709_551_616.0 / 3.0))
     );
 
     for col in ["pos_neg", "dbl_last"] {

@@ -312,9 +312,15 @@ impl FirestoreDatabase {
         let mut query = Query::from_structured(parent, query, consistency, enterprise)?;
         debug!(?query);
         let (read_time, mut docs) = query.once(self).await?;
-        if enterprise && is_unordered {
-            // Enterprise checked integer sums depend on scan order; normalize unordered scans to
-            // canonical `__name__` primary-key order matching Cloud Firestore.
+        let has_sum_or_avg = aggregations.iter().any(|agg| {
+            matches!(
+                agg.operator,
+                Some(aggregation::Operator::Sum(_) | aggregation::Operator::Avg(_))
+            )
+        });
+        if enterprise && is_unordered && has_sum_or_avg {
+            // Enterprise checked integer sums depend on scan order; sort by canonical `__name__`
+            // for deterministic primary-key scan order.
             docs.sort_by(|a, b| a.version.name.cmp_firestore_order(&b.version.name));
         }
         let result = aggregations

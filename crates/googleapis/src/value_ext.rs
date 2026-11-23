@@ -182,6 +182,11 @@ impl Value {
     /// checked `i64` accumulation, returning `None` (`3 INVALID_ARGUMENT: Long overflow`)
     /// if an integer addition overflows before a `DoubleValue` promotes the accumulator
     /// to `f64`. Non-numeric values and unset `Value`s are skipped.
+    ///
+    /// Returns `Some(Value::integer(0))` when the iterator has no numeric values
+    /// (mirroring `Sum for Value`), so callers implementing Enterprise Edition empty-set
+    /// `NULL` semantics (`run_aggregation_query` and `pipeline::aggregate`) must still
+    /// handle empty inputs explicitly.
     pub fn try_checked_sum(iter: impl IntoIterator<Item = Self>) -> Option<Self> {
         use ValueType::*;
         #[derive(Clone, Copy)]
