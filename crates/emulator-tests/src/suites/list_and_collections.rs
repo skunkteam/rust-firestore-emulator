@@ -524,6 +524,85 @@ async fn list_documents_boundary_mutations_mismatched_tokens_quoted_orders_and_s
         .unwrap();
     expect_eq!(short_ids(&tie_desc_p2.documents), vec!["t2", "t1"]);
 
+    // 5b. Multi-clause `order_by = "rank asc, other desc"` with tied `rank` and tied `other`
+    //     values (proves 3-element cursor roundtrips and implicit `__name__` inheriting `DESC`).
+    for (id, rank, other) in [
+        ("m1", 1i64, 20i64),
+        ("m2", 1, 20),
+        ("m3", 1, 20),
+        ("m4", 1, 10),
+        ("m7", 1, 10),
+        ("m5", 2, 30),
+        ("m6", 2, 30),
+    ] {
+        db.put(
+            &format!("multi_tied/{id}"),
+            fields!({ "rank": rank, "other": other }),
+        )
+        .await
+        .unwrap();
+    }
+    let multi_p1 = db
+        .list_docs(
+            "multi_tied",
+            2,
+            "",
+            "rank asc, other desc",
+            None,
+            false,
+            None,
+        )
+        .await
+        .unwrap();
+    expect_eq!(short_ids(&multi_p1.documents), vec!["m3", "m2"]);
+    assert!(!multi_p1.next_page_token.is_empty());
+
+    db.delete("multi_tied/m2", None).await.unwrap();
+    let multi_p2 = db
+        .list_docs(
+            "multi_tied",
+            2,
+            &multi_p1.next_page_token,
+            "rank asc, other desc",
+            None,
+            false,
+            None,
+        )
+        .await
+        .unwrap();
+    expect_eq!(short_ids(&multi_p2.documents), vec!["m1", "m7"]);
+    assert!(!multi_p2.next_page_token.is_empty());
+
+    let multi_p3 = db
+        .list_docs(
+            "multi_tied",
+            2,
+            &multi_p2.next_page_token,
+            "rank asc, other desc",
+            None,
+            false,
+            None,
+        )
+        .await
+        .unwrap();
+    expect_eq!(short_ids(&multi_p3.documents), vec!["m4", "m6"]);
+    assert!(!multi_p3.next_page_token.is_empty());
+
+    let multi_p4 = db
+        .list_docs(
+            "multi_tied",
+            2,
+            &multi_p3.next_page_token,
+            "rank asc, other desc",
+            None,
+            false,
+            None,
+        )
+        .await
+        .unwrap();
+    expect_eq!(short_ids(&multi_p4.documents), vec!["m5"]);
+    expect_eq!(multi_p4.next_page_token, "");
+
     // 6. Backtick-quoted comma order_by and invalid direction rejection.
     let comma_p1 = db
         .list_docs("paged", 2, "", "`a,b` desc", None, false, None)

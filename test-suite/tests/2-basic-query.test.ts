@@ -934,6 +934,60 @@ describe.each(editions)('$description', fs => {
                 });
                 expect(docIdsFromRaw(tieDescP2.documents)).toEqual(['t2', 't1']);
 
+                // Standard: multi-clause `orderBy: 'rank asc, other desc'` with tied `rank` and tied `other`
+                // values across page boundaries (proving 3-element cursors and implicit `__name__ DESC`).
+                const multiColId = 'multiOrderDocs';
+                const multiCol = parentDoc.collection(multiColId);
+                await Promise.all([
+                    multiCol.doc('m1').set(writeData({ rank: 1, other: 20 })),
+                    multiCol.doc('m2').set(writeData({ rank: 1, other: 20 })),
+                    multiCol.doc('m3').set(writeData({ rank: 1, other: 20 })),
+                    multiCol.doc('m4').set(writeData({ rank: 1, other: 10 })),
+                    multiCol.doc('m7').set(writeData({ rank: 1, other: 10 })),
+                    multiCol.doc('m5').set(writeData({ rank: 2, other: 30 })),
+                    multiCol.doc('m6').set(writeData({ rank: 2, other: 30 })),
+                ]);
+
+                const multiP1 = await listDocumentsPage(fs.firestore, {
+                    parent,
+                    collectionId: multiColId,
+                    pageSize: 2,
+                    orderBy: 'rank asc, other desc',
+                });
+                expect(docIdsFromRaw(multiP1.documents)).toEqual(['m3', 'm2']);
+                expect(multiP1.nextPageToken).not.toBe('');
+
+                await multiCol.doc('m2').delete();
+                const multiP2 = await listDocumentsPage(fs.firestore, {
+                    parent,
+                    collectionId: multiColId,
+                    pageSize: 2,
+                    orderBy: 'rank asc, other desc',
+                    pageToken: multiP1.nextPageToken,
+                });
+                expect(docIdsFromRaw(multiP2.documents)).toEqual(['m1', 'm7']);
+                expect(multiP2.nextPageToken).not.toBe('');
+
+                const multiP3 = await listDocumentsPage(fs.firestore, {
+                    parent,
+                    collectionId: multiColId,
+                    pageSize: 2,
+                    orderBy: 'rank asc, other desc',
+                    pageToken: multiP2.nextPageToken,
+                });
+                expect(docIdsFromRaw(multiP3.documents)).toEqual(['m4', 'm6']);
+                expect(multiP3.nextPageToken).not.toBe('');
+
+                const multiP4 = await listDocumentsPage(fs.firestore, {
+                    parent,
+                    collectionId: multiColId,
+                    pageSize: 2,
+                    orderBy: 'rank asc, other desc',
+                    pageToken: multiP3.nextPageToken,
+                });
+                expect(docIdsFromRaw(multiP4.documents)).toEqual(['m5']);
+                expect(multiP4.nextPageToken).toBe('');
+
                 // Standard: backtick-quoted comma field in orderBy and invalid direction -> 3 INVALID_ARGUMENT.
                 const commaP1 = await listDocumentsPage(fs.firestore, {
                     parent,

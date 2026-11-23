@@ -2,6 +2,7 @@ use std::{
     borrow::Cow,
     cmp,
     collections::{BTreeMap, HashMap, HashSet},
+    iter,
     ops::Deref,
     sync::Arc,
 };
@@ -878,7 +879,7 @@ impl Query {
         Ok(())
     }
 
-    pub fn order_by(&self) -> &[Order] {
+    pub(crate) fn order_by(&self) -> &[Order] {
         &self.order_by
     }
 
@@ -1040,6 +1041,16 @@ impl Query {
     /// Get the names of missing documents that match this query. A document is missing if it does
     /// not exist, but there are sub-documents nested underneath it.
     pub async fn missing_docs(&self, db: &FirestoreDatabase) -> Result<Vec<String>> {
+        self.missing_docs_after(db, None).await
+    }
+
+    /// Like [`Query::missing_docs`], optionally skipping candidate ancestor paths `<= after_cursor`
+    /// in Firestore reference order before locking or reading documents via `db.get_doc`.
+    pub(crate) async fn missing_docs_after(
+        &self,
+        db: &FirestoreDatabase,
+        after_cursor: Option<&str>,
+    ) -> Result<Vec<String>> {
         let not_supported = [
             (self.from.len() != 1).then_some("multiple 'from' selectors"),
             self.from
@@ -1080,6 +1091,21 @@ impl Query {
             let Some((document_id, _)) = rest.split_once('/') else {
                 continue;
             };
+            if let Some(cursor) = after_cursor {
+                let doc_segments = [
+                    "projects",
+                    parent.root_ref.project_id.as_str(),
+                    "databases",
+                    parent.root_ref.database_id.as_str(),
+                    "documents",
+                ]
+                .into_iter()
+                .chain(parent.collection_id.split('/'))
+                .chain(iter::once(document_id));
+                if !googleapis::cmp_reference_segments(doc_segments, cursor.split('/')).is_gt() {
+                    continue;
+                }
+            }
             if !col.has_doc().await? {
                 continue;
             }
@@ -1322,11 +1348,12 @@ pub struct Order {
 }
 
 impl Order {
-    pub fn field(&self) -> &FieldReference {
+    pub(crate) fn field(&self) -> &FieldReference {
         &self.field
     }
 
-    pub fn direction(&self) -> Direction {
+    #[cfg(test)]
+    pub(crate) fn direction(&self) -> Direction {
         self.direction
     }
 }

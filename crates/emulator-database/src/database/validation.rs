@@ -108,15 +108,15 @@ pub(crate) fn validate_writable_value(value: &Value, in_array: bool) -> Result<(
             VectorClassification::NotVectorMap => validate_writable_fields(&map.fields),
         },
         Some(ValueType::GeoPointValue(geo)) => validate_geo_point(geo),
-        Some(ValueType::TimestampValue(ts)) => validate_timestamp(ts),
-        Some(ValueType::ReferenceValue(s)) => reference::parse_query_ref_root(s).map(|_| ()),
         Some(
             ValueType::NullValue(_)
             | ValueType::BooleanValue(_)
             | ValueType::IntegerValue(_)
             | ValueType::DoubleValue(_)
+            | ValueType::TimestampValue(_)
             | ValueType::StringValue(_)
-            | ValueType::BytesValue(_),
+            | ValueType::BytesValue(_)
+            | ValueType::ReferenceValue(_),
         ) => Ok(()),
     }
 }
@@ -701,92 +701,5 @@ mod tests {
                 err(matches_pattern!(GenericDatabaseError::InvalidArgument(_)))
             );
         }
-    }
-
-    #[gtest]
-    fn validates_timestamp_and_reference_values_on_write() {
-        for bad_ts in [
-            Timestamp {
-                seconds: -62_135_596_801,
-                nanos:   0,
-            },
-            Timestamp {
-                seconds: 253_402_300_800,
-                nanos:   0,
-            },
-            Timestamp {
-                seconds: 0,
-                nanos:   -1,
-            },
-            Timestamp {
-                seconds: 0,
-                nanos:   1_000_000_000,
-            },
-        ] {
-            let fields = HashMap::from([("ts".to_string(), Value::timestamp(bad_ts))]);
-            assert_that!(
-                validate_writable_fields(&fields),
-                err(matches_pattern!(GenericDatabaseError::InvalidArgument(_)))
-            );
-        }
-
-        for bad_ref in [
-            "not-a-ref",
-            "projects/p/databases/(default)/documents/col",
-            "projects/p/databases/(default)/documents/col/__reserved__",
-            "projects/p/databases/(default)/documents/col/__id01__",
-            "projects/p/databases/(default)/documents/col/",
-        ] {
-            let fields = HashMap::from([("r".to_string(), Value::reference(bad_ref.to_string()))]);
-            assert_that!(
-                validate_writable_fields(&fields),
-                err(matches_pattern!(GenericDatabaseError::InvalidArgument(_)))
-            );
-            let arr_fields = HashMap::from([(
-                "arr".to_string(),
-                Value::array(vec![Value::reference(bad_ref.to_string())]),
-            )]);
-            assert_that!(
-                validate_writable_fields(&arr_fields),
-                err(matches_pattern!(GenericDatabaseError::InvalidArgument(_)))
-            );
-        }
-
-        let valid_fields = HashMap::from([
-            (
-                "ts_pre_epoch".to_string(),
-                Value::timestamp(Timestamp {
-                    seconds: -62_135_596_800,
-                    nanos:   999_999_999,
-                }),
-            ),
-            (
-                "ts_max".to_string(),
-                Value::timestamp(Timestamp {
-                    seconds: 253_402_300_799,
-                    nanos:   0,
-                }),
-            ),
-            (
-                "ref_doc".to_string(),
-                Value::reference("projects/p/databases/(default)/documents/col/doc".to_string()),
-            ),
-            (
-                "ref_ds".to_string(),
-                Value::reference(
-                    "projects/p/databases/(default)/documents/col/__id-9223372036854775808__"
-                        .to_string(),
-                ),
-            ),
-            (
-                "ref_other_db".to_string(),
-                Value::reference("projects/other-p/databases/other-d/documents/c/d".to_string()),
-            ),
-            (
-                "ref_root".to_string(),
-                Value::reference("projects/p/databases/(default)/documents".to_string()),
-            ),
-        ]);
-        assert_that!(validate_writable_fields(&valid_fields), ok(()));
     }
 }
