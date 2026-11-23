@@ -1,6 +1,9 @@
 use std::sync::Arc;
 
-use googleapis::google::firestore::v1::{Document, pipeline::Stage};
+use googleapis::google::{
+    firestore::v1::{Document, pipeline::Stage},
+    protobuf::Timestamp,
+};
 
 use crate::{
     FirestoreDatabase, GenericDatabaseError,
@@ -21,7 +24,7 @@ pub(super) async fn execute(
         options,
     }: Stage,
     read_consistency: ReadConsistency,
-) -> Result<Vec<Document>> {
+) -> Result<(Timestamp, Vec<Document>)> {
     assert_eq!(name, "collection");
     unimplemented_collection!(options);
 
@@ -46,7 +49,5 @@ pub(super) async fn execute(
         .consistency(read_consistency)
         .build()?;
 
-    let (_, docs) = database.run_query(&mut query).await?;
-
-    Ok(docs)
+    database.run_query(&mut query).await
 }

@@ -1,10 +1,18 @@
 use std::{collections::HashMap, sync::Arc};
 
-use googleapis::google::firestore::v1::{Document, StructuredPipeline};
+use googleapis::google::{
+    firestore::v1::{Document, StructuredPipeline, Value},
+    protobuf::Timestamp,
+};
+use itertools::Itertools;
 
 use crate::{
-    FirestoreDatabase, GenericDatabaseError, error::Result, read_consistency::ReadConsistency,
-    reference::RootRef, required_option, unimplemented, unimplemented_collection,
+    FirestoreDatabase, GenericDatabaseError,
+    database::field_path::{FieldPath, FieldReference},
+    error::Result,
+    read_consistency::ReadConsistency,
+    reference::RootRef,
+    required_option, unimplemented, unimplemented_collection,
 };
 
 mod add_fields;
@@ -21,17 +29,12 @@ mod remove_fields;
 mod select;
 mod sort;
 
-use googleapis::google::firestore::v1::Value;
-use itertools::Itertools;
-
-use crate::database::field_path::{FieldPath, FieldReference};
-
 pub async fn execute(
     database: &Arc<FirestoreDatabase>,
     root_ref: &RootRef,
     StructuredPipeline { pipeline, options }: StructuredPipeline,
     read_consistency: ReadConsistency,
-) -> Result<Vec<Document>> {
+) -> Result<(Timestamp, Vec<Document>)> {
     // These operators are only supported in Enterprise Edition.
     // We enforce this rule universally across the pipeline engine very early.
     if !database.enterprise_edition() {
@@ -49,7 +52,7 @@ pub async fn execute(
         .next()
         .ok_or_else(|| GenericDatabaseError::invalid_argument("pipeline stages cannot be empty"))?;
 
-    let mut current_docs = match first.name.as_str() {
+    let (read_time, mut current_docs) = match first.name.as_str() {
         "collection" => collection::execute(database, root_ref, first, read_consistency).await?,
         _ => unimplemented!(format!("pipeline stage {}", first.name)),
     };
@@ -70,7 +73,7 @@ pub async fn execute(
         };
     }
 
-    Ok(current_docs)
+    Ok((read_time, current_docs))
 }
 
 /// Extracts a value from a gRPC `Document` based on a resolved `FieldReference`.
@@ -127,9 +130,12 @@ pub(super) fn parse_projection_paths(
 
 #[cfg(test)]
 mod tests {
-    use googleapis::google::firestore::v1::{Function, pipeline::Stage, value::ValueType};
+    use googleapis::google::firestore::v1::{
+        Function, Pipeline, pipeline::Stage, value::ValueType,
+    };
 
     use super::*;
+    use crate::{FirestoreConfig, FirestoreProject, reference::DocumentRef};
 
     fn field_ref(path: &str) -> Value {
         Value {
@@ -190,5 +196,118 @@ mod tests {
         assert_eq!(selected[0].fields["name_absent"], Value::boolean(true));
         assert_eq!(selected[0].fields["eq_missing"], Value::boolean(true));
         assert_eq!(selected[0].fields["projected_name"], Value::null());
+    }
+
+    #[tokio::test]
+    async fn execute_propagates_snapshot_read_time_under_default_consistency_across_concurrent_writes()
+     {
+        let project: &'static FirestoreProject =
+            Box::leak(Box::new(FirestoreProject::new(FirestoreConfig {
+                default_enterprise: true,
+                ..Default::default()
+            })));
+        let root: RootRef = "projects/p/databases/(default)".parse().unwrap();
+        let db = project.database(&root).await;
+        let doc_ref: DocumentRef = "projects/p/databases/(default)/documents/c/d1"
+            .parse()
+            .unwrap();
+
+        db.update_doc(
+            &doc_ref,
+            HashMap::from([("v".to_string(), Value::integer(1))]),
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let collections_guard = db.collections.write().await;
+        let mut fut = Box::pin(execute(
+            &db,
+            &root,
+            StructuredPipeline {
+                pipeline: Some(Pipeline {
+                    stages: vec![Stage {
+                        name:    "collection".to_string(),
+                        args:    vec![Value::reference("/c".to_string())],
+                        options: HashMap::new(),
+                    }],
+                }),
+                options:  HashMap::new(),
+            },
+            ReadConsistency::Default,
+        ));
+        assert!(futures_util::poll!(&mut fut).is_pending());
+        drop(collections_guard);
+
+        let write_ts = db
+            .update_doc(
+                &doc_ref,
+                HashMap::from([("v".to_string(), Value::integer(2))]),
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .update_time
+            .unwrap();
+
+        let (read_time, docs) = fut.await.unwrap();
+        assert!(
+            read_time < write_ts,
+            "snapshot read_time {read_time:?} must precede concurrent write {write_ts:?}"
+        );
+        assert_eq!(docs.len(), 1);
+        assert_eq!(docs[0].fields.get("v"), Some(&Value::integer(1)));
+        assert!(docs[0].update_time.unwrap() <= read_time);
+
+        let collections_guard = db.collections.write().await;
+        let mut filtered_empty_fut = Box::pin(execute(
+            &db,
+            &root,
+            StructuredPipeline {
+                pipeline: Some(Pipeline {
+                    stages: vec![
+                        Stage {
+                            name:    "collection".to_string(),
+                            args:    vec![Value::reference("/c".to_string())],
+                            options: HashMap::new(),
+                        },
+                        Stage {
+                            name:    "where".to_string(),
+                            args:    vec![Value::boolean(false)],
+                            options: HashMap::new(),
+                        },
+                    ],
+                }),
+                options:  HashMap::new(),
+            },
+            ReadConsistency::Default,
+        ));
+        assert!(futures_util::poll!(&mut filtered_empty_fut).is_pending());
+        drop(collections_guard);
+
+        let write_ts2 = db
+            .update_doc(
+                &doc_ref,
+                HashMap::from([("v".to_string(), Value::integer(3))]),
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .update_time
+            .unwrap();
+
+        let (empty_read_time, empty_docs) = filtered_empty_fut.await.unwrap();
+        assert!(empty_docs.is_empty());
+        assert!(
+            empty_read_time < write_ts2,
+            "filtered-to-empty snapshot read_time {empty_read_time:?} must precede concurrent \
+             write {write_ts2:?}"
+        );
     }
 }

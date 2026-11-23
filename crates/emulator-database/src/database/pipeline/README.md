@@ -4,9 +4,9 @@
 Enterprise Edition pipeline execution engine (`StructuredPipeline`) that evaluates sequential document stream transformation stages (`collection`, `aggregate`, `where`, `limit`, `offset`, `sort`, `distinct`, `add_fields`, `select`, `remove_fields`, `find_nearest`) and expression/function trees over gRPC `Document` batches.
 
 ## Interface
-- `[mod.rs:execute]`: `pub async fn execute(database: &Arc<FirestoreDatabase>, root_ref: &RootRef, StructuredPipeline { pipeline, options }: StructuredPipeline, read_consistency: ReadConsistency) -> Result<Vec<Document>>`
+- `[mod.rs:execute]`: `pub async fn execute(database: &Arc<FirestoreDatabase>, root_ref: &RootRef, StructuredPipeline { pipeline, options }: StructuredPipeline, read_consistency: ReadConsistency) -> Result<(Timestamp, Vec<Document>)>` — evaluates `StructuredPipeline` stages and propagates the snapshot `read_time` from the source stage.
 - `[mod.rs:parse_projection_paths]`: `pub(super) fn parse_projection_paths<'a>(map: &'a MapValue) -> Result<Vec<(FieldPath, &'a Value)>>` — validates non-reserved `FieldPath` target aliases and rejects overlapping ancestor/descendant or duplicate alias paths for `add_fields`, `aggregate`, and `select` (`distinct` inserts raw alias keys directly).
-- `[collection.rs:execute]`: `pub(super) async fn execute(database: &Arc<FirestoreDatabase>, root_ref: &RootRef, stage: Stage, read_consistency: ReadConsistency) -> Result<Vec<Document>>`
+- `[collection.rs:execute]`: `pub(super) async fn execute(database: &Arc<FirestoreDatabase>, root_ref: &RootRef, stage: Stage, read_consistency: ReadConsistency) -> Result<(Timestamp, Vec<Document>)>`
 - `[add_fields.rs:execute]`: `pub(super) fn execute(stage: Stage, docs: Vec<Document>) -> Result<Vec<Document>>`
 - `[aggregate.rs:execute]`: `pub(super) fn execute(stage: Stage, docs: Vec<Document>) -> Result<Vec<Document>>`
 - `[distinct.rs:execute]`: `pub(super) fn execute(stage: Stage, docs: Vec<Document>) -> Result<Vec<Document>>`

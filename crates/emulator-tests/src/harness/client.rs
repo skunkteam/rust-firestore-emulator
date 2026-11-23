@@ -646,6 +646,20 @@ impl TestDb {
         self.pipeline_with_consistency(spec, None).await
     }
 
+    pub(crate) async fn pipeline_at_time(
+        &mut self,
+        spec: PipelineSpec,
+        read_time: Timestamp,
+    ) -> Result<PipelineOutput, Status> {
+        self.pipeline_with_consistency(
+            spec,
+            Some(execute_pipeline_request::ConsistencySelector::ReadTime(
+                read_time,
+            )),
+        )
+        .await
+    }
+
     pub(crate) async fn pipeline_in_txn(
         &mut self,
         spec: PipelineSpec,
