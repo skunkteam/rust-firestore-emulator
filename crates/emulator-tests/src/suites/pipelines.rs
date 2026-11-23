@@ -1,6 +1,10 @@
 use std::collections::HashMap;
 
-use googleapis::{fields, google::firestore::v1::Value, val};
+use googleapis::{
+    fields,
+    google::firestore::v1::{Pipeline, Value, value::ValueType},
+    val,
+};
 use googletest::prelude::*;
 use rstest::rstest;
 use tonic::Code;
@@ -389,6 +393,21 @@ async fn execute_pipeline_rejects_standard_edition_with_failed_precondition() {
 #[case::documents(PipelineSpec::empty().raw_stage("documents", vec![Value::reference("/orders/o1".to_string())]))]
 #[case::unknown_followup_stage(PipelineSpec::collection("orders").raw_stage("sample", vec![val!(1i64)]))]
 #[case::unknown_function(PipelineSpec::collection("orders").add_fields(HashMap::from([("x".to_string(), fn_val("regex_match", vec![val!("a")]))])))]
+#[case::pipeline_value_direct(PipelineSpec::collection("orders").add_fields(HashMap::from([(
+    "x".to_string(),
+    Value {
+        value_type: Some(ValueType::PipelineValue(Pipeline::default())),
+    },
+)])))]
+#[case::pipeline_value_inside_is_error(PipelineSpec::collection("orders").add_fields(HashMap::from([(
+    "x".to_string(),
+    fn_val(
+        "is_error",
+        vec![Value {
+            value_type: Some(ValueType::PipelineValue(Pipeline::default())),
+        }],
+    ),
+)])))]
 #[tokio::test]
 async fn execute_pipeline_returns_unimplemented_on_unsupported_stages_and_functions(
     #[case] spec: PipelineSpec,
