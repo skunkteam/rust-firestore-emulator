@@ -1852,9 +1852,16 @@ fn regression_list_collection_ids_pagination_and_guards() {
     let script = format!(
         r#"{NODE_BOOTSTRAP}
 const api = await import("./ui/api.js");
+const app = await import("./ui/app.js");
 
-// 1. Paginates across nextPageToken while sending exact {{}} on the initial request.
+const warns = [];
+const origWarn = console.warn;
+console.warn = (...args) => warns.push(args.map(String).join(" "));
+
+try {{
+// 1. Paginates across nextPageToken while sending exact {{}} on the initial request without warning.
 {{
+  warns.length = 0;
   const bodies = [];
   fetchImpl = async (url, init) => {{
     assert.equal(url, "/v1/projects/p/databases/(default)/documents:listCollectionIds");
@@ -1876,10 +1883,12 @@ const api = await import("./ui/api.js");
   const cols = await api.listCollectionIds("projects/p/databases/(default)/documents");
   assert.deepEqual(cols, ["c1", "c2", "c3", "c4"]);
   assert.deepEqual(bodies, ["{{}}", '{{"pageToken":"tok1"}}', '{{"pageToken":"tok2"}}']);
+  assert.equal(warns.length, 0, "normal pagination must not emit warnings");
 }}
 
-// 2. Duplicate nextPageToken stops cleanly instead of looping infinitely.
+// 2. Duplicate nextPageToken stops cleanly and emits console.warn instead of looping infinitely.
 {{
+  warns.length = 0;
   let calls = 0;
   fetchImpl = async (_url, init) => {{
     calls++;
@@ -1893,10 +1902,13 @@ const api = await import("./ui/api.js");
   const cols = await api.listCollectionIds("projects/p/databases/(default)/documents");
   assert.deepEqual(cols, ["a", "b"]);
   assert.equal(calls, 2);
+  assert.equal(warns.length, 1, "duplicate nextPageToken must emit console.warn");
+  assert.ok(warns[0].includes("duplicate nextPageToken"), "unexpected warn: " + warns[0]);
 }}
 
-// 3. Max page cap (1000 pages) guards against unbounded unique token chains.
+// 3. Max page cap (1000 pages) guards against unbounded unique token chains and warns iff nextPageToken remains.
 {{
+  warns.length = 0;
   let calls = 0;
   fetchImpl = async () => {{
     calls++;
@@ -1911,6 +1923,204 @@ const api = await import("./ui/api.js");
   assert.equal(cols.length, 1000);
   assert.equal(cols[0], "col_1");
   assert.equal(cols[999], "col_1000");
+  assert.equal(warns.length, 1, "hitting page cap with remaining nextPageToken must emit console.warn");
+  assert.ok(warns[0].includes("1000"), "unexpected warn: " + warns[0]);
+
+  // Exactly 1000 pages finishing with empty nextPageToken must NOT warn.
+  warns.length = 0;
+  calls = 0;
+  fetchImpl = async () => {{
+    calls++;
+    return jsonResponse({{
+      collectionIds: ["ok_" + calls],
+      nextPageToken: calls < 1000 ? "ok_tok_" + calls : "",
+    }});
+  }};
+  const exactCols = await api.listCollectionIds("projects/p/databases/(default)/documents");
+  assert.equal(calls, 1000);
+  assert.equal(exactCols.length, 1000);
+  assert.equal(warns.length, 0, "completing exactly on page 1000 without nextPageToken must not warn");
+}}
+
+// 4. shouldAbort and AbortSignal halt pagination immediately between pages without spurious warnings.
+{{
+  warns.length = 0;
+  let calls = 0;
+  let abortNow = false;
+  fetchImpl = async () => {{
+    calls++;
+    abortNow = true;
+    return jsonResponse({{ collectionIds: ["p1"], nextPageToken: "tok_next" }});
+  }};
+  const cols = await api.listCollectionIds("projects/p/databases/(default)/documents", {{
+    shouldAbort: () => abortNow,
+  }});
+  assert.equal(calls, 1, "shouldAbort must prevent fetching subsequent pages");
+  assert.deepEqual(cols, []);
+  assert.equal(warns.length, 0);
+
+  const ac = new AbortController();
+  let signalCalls = 0;
+  let seenSignal = null;
+  fetchImpl = async (_url, init) => {{
+    signalCalls++;
+    seenSignal = init.signal;
+    ac.abort();
+    return jsonResponse({{ collectionIds: ["s1"], nextPageToken: "tok_s2" }});
+  }};
+  const sigCols = await api.listCollectionIds("projects/p/databases/(default)/documents", {{
+    signal: ac.signal,
+  }});
+  assert.equal(signalCalls, 1, "aborted signal must halt after first page");
+  assert.equal(seenSignal, ac.signal, "listCollectionIds must forward signal to fetch");
+  assert.deepEqual(sigCols, []);
+
+  // Pre-aborted signal skips even the first fetch.
+  let preAbortedCalls = 0;
+  fetchImpl = async () => {{
+    preAbortedCalls++;
+    return jsonResponse({{ collectionIds: ["x"] }});
+  }};
+  const preCols = await api.listCollectionIds("projects/p/databases/(default)/documents", {{
+    signal: ac.signal,
+  }});
+  assert.equal(preAbortedCalls, 0);
+  assert.deepEqual(preCols, []);
+}}
+
+// 5. selectDatabase, loadDocumentLevel, and handleSseBatch abort stale paginated listCollectionIds on DB/doc switch.
+{{
+  // 5a. selectDatabase DB switch aborts multi-page root listCollectionIds before page 2.
+  const db1Page1Def = deferred();
+  let db1ColPages = 0;
+  fetchImpl = async (url, init) => {{
+    if (url === "/v1/projects/p1/databases/db1") {{
+      return jsonResponse({{
+        name: "projects/p1/databases/db1",
+        uid: "u1",
+        type: "FIRESTORE_NATIVE",
+        databaseEdition: "STANDARD",
+        concurrencyMode: "PESSIMISTIC",
+      }});
+    }}
+    if (url === "/v1/projects/p1/databases/db1/documents:listCollectionIds") {{
+      db1ColPages++;
+      const body = JSON.parse(init.body ?? "{{}}");
+      if (!body.pageToken) return db1Page1Def.promise;
+      throw new Error("stale db1 page 2 must never be requested");
+    }}
+    if (url === "/v1/projects/p2/databases/db2") {{
+      return jsonResponse({{
+        name: "projects/p2/databases/db2",
+        uid: "u2",
+        type: "FIRESTORE_NATIVE",
+        databaseEdition: "STANDARD",
+        concurrencyMode: "PESSIMISTIC",
+      }});
+    }}
+    if (url === "/v1/projects/p2/databases/db2/documents:listCollectionIds") {{
+      return jsonResponse({{ collectionIds: ["fresh_col"] }});
+    }}
+    if (url === "/emulator/v1") {{
+      return jsonResponse(["projects/p1/databases/db1/documents", "projects/p2/databases/db2/documents"]);
+    }}
+    throw new Error("unexpected url in 5a: " + url);
+  }};
+
+  const pSelect1 = app.selectDatabase("p1", "db1", [], true);
+  await new Promise((r) => setTimeout(r, 0));
+  const pSelect2 = app.selectDatabase("p2", "db2", [], true);
+  db1Page1Def.resolve(jsonResponse({{ collectionIds: ["c1"], nextPageToken: "page2" }}));
+  await Promise.all([pSelect1, pSelect2]);
+  assert.equal(db1ColPages, 1);
+  assert.deepEqual(app.state.rootCollections, ["fresh_col"]);
+
+  // 5b. loadDocumentLevel doc switch (navEpoch bump) aborts paginated subcollection load before page 2.
+  const docAPath = "projects/p2/databases/db2/documents/fresh_col/docA";
+  const docBPath = "projects/p2/databases/db2/documents/fresh_col/docB";
+  const docAPage1Def = deferred();
+  let docAColPages = 0;
+  fetchImpl = async (url, init) => {{
+    if (url === `/v1/${{docAPath}}` || url === `/v1/${{docBPath}}`) {{
+      return jsonResponse({{ name: url.slice(4), fields: {{}} }});
+    }}
+    if (url === `/v1/${{docAPath}}:listCollectionIds`) {{
+      docAColPages++;
+      const body = JSON.parse(init.body ?? "{{}}");
+      if (!body.pageToken) return docAPage1Def.promise;
+      throw new Error("stale docA subcollection page 2 must never be requested");
+    }}
+    if (url === `/v1/${{docBPath}}:listCollectionIds`) {{
+      return jsonResponse({{ collectionIds: ["subB"] }});
+    }}
+    if (url.startsWith("/v1/projects/p2/databases/db2/documents/fresh_col?")) {{
+      return jsonResponse({{ documents: [] }});
+    }}
+    throw new Error("unexpected url in 5b: " + url);
+  }};
+
+  app.state.segments = ["fresh_col", "docA"];
+  const pDocA = app.loadDocumentLevel(docAPath, "docA", true);
+  await new Promise((r) => setTimeout(r, 0));
+  // Simulate switching to docB via Explorer segment selection (bumps navEpoch).
+  const {{ bumpNavEpoch }} = await import("./ui/state.js");
+  app.state.segments = ["fresh_col", "docB"];
+  bumpNavEpoch();
+  const pDocB = app.loadDocumentLevel(docBPath, "docB", true);
+  docAPage1Def.resolve(jsonResponse({{ collectionIds: ["subA1"], nextPageToken: "sub_page2" }}));
+  await Promise.all([pDocA, pDocB]);
+  assert.equal(docAColPages, 1);
+  assert.equal(app.state.documentLevels.get(docAPath).loading, false);
+  assert.deepEqual(app.state.documentLevels.get(docAPath).subcollections, []);
+  assert.deepEqual(app.state.documentLevels.get(docBPath).subcollections, ["subB"]);
+
+  // 5c. handleSseBatch aborts paginated root listCollectionIds when active DB switches mid-pagination.
+  const ssePage1Def = deferred();
+  let sseDb2ColPages = 0;
+  fetchImpl = async (url, init) => {{
+    if (url === "/emulator/v1") {{
+      return jsonResponse(["projects/p2/databases/db2/documents", "projects/p3/databases/db3/documents"]);
+    }}
+    if (url === "/v1/projects/p2/databases/db2") {{
+      return jsonResponse({{
+        name: "projects/p2/databases/db2",
+        uid: "u2",
+        type: "FIRESTORE_NATIVE",
+        databaseEdition: "STANDARD",
+        concurrencyMode: "PESSIMISTIC",
+      }});
+    }}
+    if (url === "/v1/projects/p2/databases/db2/documents:listCollectionIds") {{
+      sseDb2ColPages++;
+      const body = JSON.parse(init.body ?? "{{}}");
+      if (!body.pageToken) return ssePage1Def.promise;
+      throw new Error("stale SSE db2 page 2 must never be requested");
+    }}
+    if (url === "/v1/projects/p3/databases/db3") {{
+      return jsonResponse({{
+        name: "projects/p3/databases/db3",
+        uid: "u3",
+        type: "FIRESTORE_NATIVE",
+        databaseEdition: "STANDARD",
+        concurrencyMode: "PESSIMISTIC",
+      }});
+    }}
+    if (url === "/v1/projects/p3/databases/db3/documents:listCollectionIds") {{
+      return jsonResponse({{ collectionIds: ["db3_col"] }});
+    }}
+    throw new Error("unexpected url in 5c: " + url);
+  }};
+
+  const pSse = app.handleSseBatch([{{ type: "resync" }}]);
+  await new Promise((r) => setTimeout(r, 0));
+  const pSelect3 = app.selectDatabase("p3", "db3", [], true);
+  ssePage1Def.resolve(jsonResponse({{ collectionIds: ["stale_p2"], nextPageToken: "tok_sse_2" }}));
+  await Promise.all([pSse, pSelect3]);
+  assert.equal(sseDb2ColPages, 1);
+  assert.deepEqual(app.state.rootCollections, ["db3_col"]);
+}}
+}} finally {{
+  console.warn = origWarn;
 }}
 
 console.log("regression_list_collection_ids_pagination_and_guards passed");
@@ -2082,6 +2292,141 @@ console.log("regression_sse_unpause_reconnect_resync_and_cleared_db_non_recreati
 }
 
 #[test]
+fn regression_sse_resync_error_and_inflight_select_database_guard() {
+    let script = format!(
+        r#"{NODE_BOOTSTRAP}
+const app = await import("./ui/app.js");
+
+const db1Root = "projects/p/databases/db1/documents";
+const dbNewRoot = "projects/p/databases/db_new/documents";
+let failDbList = false;
+
+fetchImpl = async (url) => {{
+  if (url === "/emulator/v1") {{
+    if (failDbList) {{
+      return jsonResponse({{ error: {{ code: 503, status: "UNAVAILABLE", message: "db list down" }} }}, 503);
+    }}
+    return jsonResponse([db1Root]);
+  }}
+  if (url === "/v1/projects/p/databases/db1") {{
+    if (failDbList) {{
+      throw new Error("must not call getDatabase when refreshDatabaseList failed");
+    }}
+    return jsonResponse({{
+      name: "projects/p/databases/db1",
+      uid: "u1",
+      type: "FIRESTORE_NATIVE",
+      databaseEdition: "STANDARD",
+      concurrencyMode: "PESSIMISTIC",
+    }});
+  }}
+  if (url === "/v1/projects/p/databases/db1/documents:listCollectionIds") {{
+    if (failDbList) {{
+      throw new Error("must not call listCollectionIds when refreshDatabaseList failed");
+    }}
+    return jsonResponse({{ collectionIds: ["users"] }});
+  }}
+  throw new Error("unexpected url: " + url);
+}};
+
+await app.selectDatabase("p", "db1", [], true);
+assert.equal(app.state.activeDatabaseId, "db1");
+assert.ok(app.state.activeDbMeta);
+assert.deepEqual(app.state.rootCollections, ["users"]);
+
+// 1. Transient /emulator/v1 error during resync notifies error toast and preserves active DB state.
+failDbList = true;
+app.state.toasts = [];
+await app.handleSseBatch([{{ type: "resync" }}]);
+assert.equal(app.state.activeProjectId, "p");
+assert.equal(app.state.activeDatabaseId, "db1");
+assert.ok(app.state.activeDbMeta, "activeDbMeta must not be cleared on refreshDatabaseList error");
+assert.deepEqual(app.state.rootCollections, ["users"]);
+assert.equal(app.state.databases.length, 1);
+assert.ok(
+  app.state.toasts.some((t) => t.tone === "error" && t.text.includes("db list down")),
+  "expected error toast on refreshDatabaseList failure"
+);
+
+// Also verify enqueueSseBatch (via toggleSsePaused unpause) surfaces the error toast cleanly without clobbering state.
+app.state.toasts = [];
+app.state.ssePaused = true;
+await app.toggleSsePaused();
+assert.equal(app.state.activeDatabaseId, "db1");
+assert.ok(
+  app.state.toasts.some((t) => t.tone === "error" && t.text.includes("db list down")),
+  "expected error toast when unpause resync fails"
+);
+
+// 2. In-flight selectDatabase for a newly created DB must NOT be mistaken for a cleared DB on SSE resync.
+failDbList = false;
+const dbNewMetaDef = deferred();
+const dbNewColsDef = deferred();
+let dbNewGetCount = 0;
+let includeDbNewInList = false;
+
+fetchImpl = async (url) => {{
+  if (url === "/emulator/v1") {{
+    return jsonResponse(includeDbNewInList ? [db1Root, dbNewRoot] : [db1Root]);
+  }}
+  if (url === "/v1/projects/p/databases/db_new") {{
+    dbNewGetCount++;
+    return dbNewMetaDef.promise;
+  }}
+  if (url === "/v1/projects/p/databases/db_new/documents:listCollectionIds") {{
+    return dbNewColsDef.promise;
+  }}
+  throw new Error("unexpected url in inflight check: " + url);
+}};
+
+app.state.toasts = [];
+const selectPromise = app.selectDatabase("p", "db_new", [], true);
+assert.equal(app.state.rootLoading, true);
+assert.equal(app.state.activeDbMeta, null);
+
+await app.handleSseBatch([{{ type: "resync" }}]);
+assert.equal(app.state.activeProjectId, "p");
+assert.equal(app.state.activeDatabaseId, "db_new");
+assert.equal(globalThis.window.location.pathname, "/projects/p/databases/db_new/documents");
+assert.equal(dbNewGetCount, 1, "handleSseBatch must not duplicate getDatabase while rootLoading is true");
+assert.equal(
+  app.state.toasts.some((t) => t.text.includes("was cleared")),
+  false,
+  "in-flight selectDatabase must never emit cleared-DB toast"
+);
+
+includeDbNewInList = true;
+dbNewMetaDef.resolve(jsonResponse({{
+  name: "projects/p/databases/db_new",
+  uid: "u_new",
+  type: "FIRESTORE_NATIVE",
+  databaseEdition: "ENTERPRISE",
+  concurrencyMode: "OPTIMISTIC",
+}}));
+dbNewColsDef.resolve(jsonResponse({{ collectionIds: ["items"] }}));
+await selectPromise;
+
+assert.equal(app.state.rootLoading, false);
+assert.equal(app.state.activeDatabaseId, "db_new");
+assert.equal(app.state.activeDbMeta.name, "projects/p/databases/db_new");
+assert.deepEqual(app.state.rootCollections, ["items"]);
+
+// 3. Even when rootLoading is false, null activeDbMeta (e.g. failed initial DB load) is not treated as cleared.
+app.state.activeDbMeta = null;
+app.state.toasts = [];
+includeDbNewInList = false;
+await app.handleSseBatch([{{ type: "resync" }}]);
+assert.equal(app.state.activeDatabaseId, "db_new");
+assert.equal(app.state.toasts.some((t) => t.text.includes("was cleared")), false);
+
+console.log("regression_sse_resync_error_and_inflight_select_database_guard passed");
+"#
+    );
+
+    run_node_ui_test(&script);
+}
+
+#[test]
 fn regression_load_collection_column_preserves_pagination_on_refresh() {
     let script = format!(
         r#"{NODE_BOOTSTRAP}
@@ -2184,6 +2529,22 @@ console.log("regression_uint8_to_base64_chunked_large_arrays passed");
     run_node_ui_test(&script);
 }
 
+fn extract_css_rule_block<'a>(css: &'a str, selector: &str) -> &'a str {
+    let needle = format!("\n{selector} {{");
+    let start = if css.starts_with(&format!("{selector} {{")) {
+        0
+    } else {
+        css.find(&needle)
+            .map(|idx| idx + 1)
+            .unwrap_or_else(|| panic!("missing CSS rule block for `{selector}`"))
+    };
+    let rest = &css[start..];
+    let end = rest
+        .find('}')
+        .unwrap_or_else(|| panic!("unterminated CSS rule block for `{selector}`"));
+    &rest[..=end]
+}
+
 #[test]
 fn regression_a11y_miller_columns_forms_and_icon_labels() {
     let repo_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
@@ -2191,22 +2552,22 @@ fn regression_a11y_miller_columns_forms_and_icon_labels() {
         fs::read_to_string(repo_root.join("ui/styles.css")).expect("failed to read ui/styles.css");
 
     // Preserve bug_web_ui_8 CSS invariants and verify button reset + ellipsis + :focus-visible
-    // rules.
-    assert!(css.contains(".miller-col") && css.contains("overflow: hidden;"));
-    assert!(css.contains(".col-header > span") && css.contains("min-width: 0;"));
-    assert!(
-        css.contains(".col-item")
-            && css.contains("border: none;")
-            && css.contains("background: transparent;")
-            && css.contains("width: 100%;")
-            && css.contains("text-align: left;")
-    );
-    assert!(
-        css.contains(".item-label")
-            && css.contains("min-width: 0;")
-            && css.contains("text-overflow: ellipsis;")
-    );
-    assert!(css.contains(":focus-visible"));
+    // rules against the exact selector blocks.
+    let miller_col_rule = extract_css_rule_block(&css, ".miller-col");
+    assert!(miller_col_rule.contains("overflow: hidden;"));
+    let col_header_span_rule = extract_css_rule_block(&css, ".col-header > span");
+    assert!(col_header_span_rule.contains("min-width: 0;"));
+    let col_item_rule = extract_css_rule_block(&css, ".col-item");
+    assert!(col_item_rule.contains("border: none;"));
+    assert!(col_item_rule.contains("background: transparent;"));
+    assert!(col_item_rule.contains("width: 100%;"));
+    assert!(col_item_rule.contains("min-width: 0;"));
+    assert!(col_item_rule.contains("text-align: left;"));
+    let item_label_rule = extract_css_rule_block(&css, ".item-label");
+    assert!(item_label_rule.contains("min-width: 0;"));
+    assert!(item_label_rule.contains("overflow: hidden;"));
+    assert!(item_label_rule.contains("text-overflow: ellipsis;"));
+    assert!(css.contains(".col-item:focus-visible"));
 
     let script = format!(
         r#"{NODE_BOOTSTRAP}
@@ -2347,12 +2708,13 @@ assert.ok(queryMarkup.includes('for="query-limit"') && queryMarkup.includes('id=
 assert.ok(queryMarkup.includes('aria-label="Remove filter 1"'));
 assert.ok(queryMarkup.includes('aria-label="Remove sort order 1"'));
 
-// 4. Topbar database selector & toast dismiss button have descriptive aria-labels.
+// 4. Topbar database selector & toast dismiss button have descriptive aria-labels, and .sse-badge omits redundant aria-pressed.
 app.state.databases = [{{ projectId: "p", databaseId: "(default)", rootPath }}];
 app.state.toasts = [{{ id: 1, text: "Saved", tone: "success" }}];
 const topbarMarkup = renderTemplateMarkup(app.renderTopbar());
 const toastsMarkup = renderTemplateMarkup(app.renderToasts());
 assert.ok(topbarMarkup.includes('aria-label="Select database"'));
+assert.equal(topbarMarkup.includes("aria-pressed"), false, ".sse-badge dynamic label must not pair aria-pressed");
 assert.ok(toastsMarkup.includes('aria-label="Dismiss notification"'));
 
 console.log("regression_a11y_miller_columns_forms_and_icon_labels passed");
@@ -2368,7 +2730,7 @@ fn regression_a11y_modals_aria_labels_escape_focus_and_backdrop() {
         r#"{NODE_BOOTSTRAP}
 const app = await import("./ui/app.js");
 const {{ createEditorSession }} = await import("./ui/components/editor.js");
-const {{ handleModalKeydown }} = await import("./ui/components/modals.js");
+const {{ getModalFocusableElements, handleModalKeydown }} = await import("./ui/components/modals.js");
 
 // 1. All 5 modal kinds expose role="dialog", aria-modal="true", aria-labelledby matching title id,
 //    aria-label="Close dialog", and unique for/id label associations on every control.
@@ -2442,11 +2804,16 @@ for (const fx of modalFixtures) {{
   assert.ok(markup.includes(`aria-labelledby="${{fx.titleId}}"`), `${{fx.kind}} missing aria-labelledby`);
   assert.ok(markup.includes(`<h2 id="${{fx.titleId}}"`), `${{fx.kind}} missing matching heading id`);
   assert.ok(markup.includes('aria-label="Close dialog"'), `${{fx.kind}} missing Close dialog aria-label`);
+  assert.equal(markup.includes('aria-label="Close dialog" disabled'), false, `${{fx.kind}} idle Close dialog must not be disabled`);
   assert.equal(/<label(?![^>]*\bfor=)/.test(markup), false, `${{fx.kind}} has unassociated <label>`);
   for (const id of fx.expectedForIds) {{
     assert.ok(markup.includes(`for="${{id}}"`), `${{fx.kind}} missing for=${{id}}`);
     assert.ok(markup.includes(`id="${{id}}"`), `${{fx.kind}} missing id=${{id}}`);
   }}
+  fx.modal.busy = true;
+  const busyMarkup = renderTemplateMarkup(app.renderModal());
+  assert.ok(busyMarkup.includes('aria-label="Close dialog" disabled'), `${{fx.kind}} busy Close dialog must be disabled`);
+  fx.modal.busy = false;
 }}
 
 // 2. Safe backdrop dismissal: drag-release from inside modal onto backdrop MUST NOT dismiss.
@@ -2513,6 +2880,13 @@ for (const fx of modalFixtures) {{
   assert.ok(app.state.modal !== null, "Escape must not close busy modal");
   assert.equal(preventedBusy, false);
 
+  // IME composition Escape (isComposing: true) must NOT dismiss an idle modal.
+  app.state.modal.busy = false;
+  let preventedComposing = false;
+  docKeydownListeners[0]({{ key: "Escape", isComposing: true, preventDefault() {{ preventedComposing = true; }} }});
+  assert.ok(app.state.modal !== null, "isComposing Escape must not close modal");
+  assert.equal(preventedComposing, false);
+
   // Idle modal closes on Escape, detaches keydown listener, and restores previousFocus.
   app.state.modal.busy = false;
   let preventedIdle = false;
@@ -2575,6 +2949,40 @@ for (const fx of modalFixtures) {{
     assert.equal(modPrevented, false, mod + "+Tab must not be intercepted");
   }}
   assert.equal(mockActiveElement, el3);
+
+  // [hidden] elements and non-focusable elements are excluded by getModalFocusableElements.
+  const hiddenEl = {{ hasAttribute: (attr) => attr === "hidden", focus() {{}} }};
+  const noFocusEl = {{ hasAttribute: () => false }};
+  const hiddenCheckDialog = {{
+    querySelectorAll: () => [hiddenEl, el1, noFocusEl, el2],
+  }};
+  assert.deepEqual(
+    getModalFocusableElements(hiddenCheckDialog),
+    [el1, el2],
+    "getModalFocusableElements must filter out [hidden] and non-focusable elements"
+  );
+  assert.deepEqual(getModalFocusableElements({{}}), []);
+
+  // When focusables.length === 0 (e.g. only [hidden] elements), Tab prevents default and focuses dialogEl.
+  let emptyDialogFocusCalls = 0;
+  const emptyDialogEl = {{
+    querySelectorAll: () => [hiddenEl],
+    focus() {{ emptyDialogFocusCalls++; mockActiveElement = this; }},
+  }};
+  const emptyContainerEl = {{
+    querySelector: (sel) => (sel === '[role="dialog"]' ? emptyDialogEl : null),
+  }};
+  mockActiveElement = outsideEl;
+  let emptyTabPrevented = false;
+  handleModalKeydown(
+    {{ key: "Tab", shiftKey: false, preventDefault() {{ emptyTabPrevented = true; }} }},
+    app.state,
+    emptyContainerEl,
+    () => {{}}
+  );
+  assert.equal(emptyTabPrevented, true, "Tab with zero focusables must preventDefault");
+  assert.equal(emptyDialogFocusCalls, 1, "Tab with zero focusables must focus dialog container");
+  assert.equal(mockActiveElement, emptyDialogEl);
 
   // Detached trigger element (isConnected: false) must not receive focus on close.
   app.state.modal = null;

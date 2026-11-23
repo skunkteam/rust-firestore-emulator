@@ -187,7 +187,8 @@ export async function selectDatabase(
     const [meta, cols] = await Promise.all([
       getDatabase(projectId, databaseId),
       listCollectionIds(
-        `projects/${projectId}/databases/${databaseId}/documents`
+        `projects/${projectId}/databases/${databaseId}/documents`,
+        { shouldAbort: () => myDbEpoch !== getDbEpoch() }
       ),
     ]);
     if (myDbEpoch !== getDbEpoch()) return;
@@ -403,6 +404,7 @@ export async function loadDocumentLevel(
   const projectId = state.activeProjectId;
   const databaseId = state.activeDatabaseId;
   const seq = nextDocSeq(docPath);
+  const myNavEpoch = getNavEpoch();
 
   let level = state.documentLevels.get(docPath);
   if (!level) {
@@ -431,9 +433,18 @@ export async function loadDocumentLevel(
           throw err;
         }
       ),
-      listCollectionIds(docPath),
+      listCollectionIds(docPath, {
+        shouldAbort: () =>
+          expectedDbEpoch !== getDbEpoch() ||
+          !isCurrentDocSeq(docPath, seq) ||
+          myNavEpoch !== getNavEpoch(),
+      }),
     ]);
-    if (expectedDbEpoch !== getDbEpoch() || !isCurrentDocSeq(docPath, seq)) {
+    if (
+      expectedDbEpoch !== getDbEpoch() ||
+      !isCurrentDocSeq(docPath, seq) ||
+      myNavEpoch !== getNavEpoch()
+    ) {
       return;
     }
 
@@ -472,7 +483,11 @@ export async function loadDocumentLevel(
       }
     }
   } catch (err) {
-    if (expectedDbEpoch !== getDbEpoch() || !isCurrentDocSeq(docPath, seq)) {
+    if (
+      expectedDbEpoch !== getDbEpoch() ||
+      !isCurrentDocSeq(docPath, seq) ||
+      myNavEpoch !== getNavEpoch()
+    ) {
       return;
     }
     notifyToast(
@@ -551,13 +566,25 @@ export async function handleSseBatch(events) {
   }
 
   if (shouldRefreshDbList) {
-    const applied = await refreshDatabaseList();
+    let applied = false;
+    try {
+      applied = await refreshDatabaseList();
+    } catch (err) {
+      if (myDbEpoch !== getDbEpoch()) return;
+      fullResyncActiveDb = false;
+      notifyToast(
+        `Failed to refresh database list: ${err instanceof Error ? err.message : String(err)}`,
+        "error"
+      );
+    }
     if (myDbEpoch !== getDbEpoch()) return;
     if (
       applied &&
       fullResyncActiveDb &&
       activeRoot &&
       !clearedActiveDb &&
+      !state.rootLoading &&
+      state.activeDbMeta !== null &&
       !state.databases.some((db) => db.rootPath === activeRoot)
     ) {
       // Clear cached state WITHOUT calling getDatabase(), which would lazily recreate the cleared DB!
@@ -579,6 +606,7 @@ export async function handleSseBatch(events) {
 
   if (
     clearedActiveDb ||
+    state.rootLoading ||
     myDbEpoch !== getDbEpoch() ||
     !state.activeProjectId ||
     !state.activeDatabaseId ||
@@ -610,7 +638,12 @@ export async function handleSseBatch(events) {
 
   if (fullResyncActiveDb || changedPaths.size > 0) {
     try {
-      const cols = await listCollectionIds(activeRoot);
+      const cols = await listCollectionIds(activeRoot, {
+        shouldAbort: () =>
+          myDbEpoch !== getDbEpoch() ||
+          getActiveRootPath(state.activeProjectId, state.activeDatabaseId) !==
+            activeRoot,
+      });
       if (
         myDbEpoch !== getDbEpoch() ||
         getActiveRootPath(state.activeProjectId, state.activeDatabaseId) !==
@@ -1030,7 +1063,6 @@ export function renderTopbar() {
           type="button"
           class="sse-badge"
           title="Click to pause or resume live SSE updates"
-          aria-pressed=${String(state.ssePaused)}
           @click=${toggleSsePaused}
         >
           <span class="sse-dot ${dotClass}"></span>

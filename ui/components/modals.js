@@ -108,7 +108,7 @@ export function getModalFocusableElements(dialogEl) {
  */
 export function handleModalKeydown(e, state, containerEl, onClose) {
   const m = state.modal;
-  if (!m) return;
+  if (!m || e.isComposing) return;
   if (e.key === "Escape") {
     if (!m.busy) {
       e.preventDefault?.();
@@ -160,6 +160,7 @@ export function handleModalKeydown(e, state, containerEl, onClose) {
  *   cardClass?: string,
  *   titleId: string,
  *   title: string,
+ *   busy: boolean,
  *   error: string | null,
  *   close: () => void,
  *   body: TemplateResult,
@@ -187,6 +188,7 @@ function renderDialogShell(p) {
             type="button"
             class="btn btn-sm btn-ghost"
             aria-label="Close dialog"
+            ?disabled=${p.busy}
             @click=${p.close}
           >
             ✕
@@ -272,6 +274,7 @@ function renderOpenDbModal(m, state, callbacks, close) {
   return renderDialogShell({
     titleId: "modal-title-open-db",
     title: "Open or Create Database",
+    busy: m.busy,
     error: m.error,
     close,
     body: html`
@@ -387,7 +390,9 @@ function renderCreateDocModal(m, state, callbacks, close) {
         state.activeDatabaseId
       );
       if (match && rootPath) {
-        const cols = await listCollectionIds(rootPath);
+        const cols = await listCollectionIds(rootPath, {
+          shouldAbort: () => myDbEpoch !== getDbEpoch(),
+        });
         if (myDbEpoch !== getDbEpoch()) return;
         state.rootCollections = cols;
         state.segments = match[1].split("/");
@@ -413,6 +418,7 @@ function renderCreateDocModal(m, state, callbacks, close) {
     title: m.lockCollection
       ? `Add Document to "${m.collectionId}"`
       : "Start Collection & Create First Document",
+    busy: m.busy,
     error: m.error,
     close,
     body: html`
@@ -521,7 +527,9 @@ async function refreshExplorerAfterDelete(
     state.segments = state.segments.slice(0, targetSegs.length - 1);
   }
   const myNavEpoch = bumpNavEpoch();
-  const cols = await listCollectionIds(rootPath);
+  const cols = await listCollectionIds(rootPath, {
+    shouldAbort: () => myDbEpoch !== getDbEpoch(),
+  });
   if (myDbEpoch !== getDbEpoch()) return false;
   state.rootCollections = cols;
   syncBrowserUrl(state.activeProjectId, state.activeDatabaseId, state.segments);
@@ -576,6 +584,7 @@ function renderDeleteDocModal(m, state, callbacks, close) {
   return renderDialogShell({
     titleId: "modal-title-delete-doc",
     title: "Delete Document",
+    busy: m.busy,
     error: m.error,
     close,
     body: html`
@@ -658,6 +667,7 @@ function renderDeleteColModal(m, state, callbacks, close) {
   return renderDialogShell({
     titleId: "modal-title-delete-col",
     title: "Delete Collection",
+    busy: m.busy,
     error: m.error,
     close,
     body: html`
@@ -736,6 +746,7 @@ function renderClearDbModal(m, state, callbacks, close) {
   return renderDialogShell({
     titleId: "modal-title-clear-db",
     title: "Clear Entire Database",
+    busy: m.busy,
     error: m.error,
     close,
     body: html`
