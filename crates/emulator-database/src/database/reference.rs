@@ -61,6 +61,60 @@ pub(crate) fn is_datastore_numeric_id(s: &str) -> bool {
         })
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum InvalidSegmentReason {
+    Empty,
+    ContainsSlash,
+    DotSegment,
+    TooLong,
+    ReservedName,
+}
+
+/// Validates a single collection or document ID segment according to Firestore resource-name
+/// rules. Returns `Ok(true)` if the segment is the Datastore sentinel `__id0__`.
+fn validate_segment(seg: &str, allow_datastore_id: bool) -> Result<bool, InvalidSegmentReason> {
+    if seg.is_empty() {
+        return Err(InvalidSegmentReason::Empty);
+    }
+    if seg.contains('/') {
+        return Err(InvalidSegmentReason::ContainsSlash);
+    }
+    if seg == "." || seg == ".." {
+        return Err(InvalidSegmentReason::DotSegment);
+    }
+    if seg.len() > 1500 {
+        return Err(InvalidSegmentReason::TooLong);
+    }
+    if is_reserved_name(seg) {
+        if allow_datastore_id && is_datastore_numeric_id(seg) {
+            return Ok(seg == "__id0__");
+        }
+        return Err(InvalidSegmentReason::ReservedName);
+    }
+    Ok(false)
+}
+
+pub(crate) fn validate_document_id_segment(document_id: &str) -> crate::error::Result<()> {
+    match validate_segment(document_id, false) {
+        Ok(_) => Ok(()),
+        Err(InvalidSegmentReason::Empty) => Err(GenericDatabaseError::invalid_argument(
+            "document_id is required",
+        )),
+        Err(InvalidSegmentReason::ContainsSlash) => Err(GenericDatabaseError::invalid_argument(
+            "document_id cannot contain '/'",
+        )),
+        Err(InvalidSegmentReason::DotSegment) => Err(GenericDatabaseError::invalid_argument(
+            "document_id cannot be '.' or '..'",
+        )),
+        Err(InvalidSegmentReason::TooLong) => Err(GenericDatabaseError::invalid_argument(
+            "document_id cannot exceed 1500 bytes",
+        )),
+        Err(InvalidSegmentReason::ReservedName) => Err(GenericDatabaseError::invalid_argument(
+            format!("document_id cannot be a reserved name: {document_id}"),
+        )),
+    }
+}
+
 fn parse_resource_path(
     s: &str,
     allow_datastore_id: bool,
@@ -92,16 +146,9 @@ fn parse_resource_path(
         if idx > 0 {
             slash_count += 1;
         }
-        if seg.is_empty() || seg == "." || seg == ".." || seg.len() > 1500 {
-            return None;
-        }
-        if is_reserved_name(seg) {
-            if idx % 2 == 0 || !(allow_datastore_id && is_datastore_numeric_id(seg)) {
-                return None;
-            }
-            if seg == "__id0__" {
-                has_zero_datastore_id = true;
-            }
+        match validate_segment(seg, allow_datastore_id && idx % 2 == 1) {
+            Ok(is_zero_id) => has_zero_datastore_id |= is_zero_id,
+            Err(_) => return None,
         }
     }
     Some((

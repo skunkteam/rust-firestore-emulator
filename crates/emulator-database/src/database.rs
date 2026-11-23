@@ -257,44 +257,6 @@ impl FirestoreDatabase {
         Ok(result)
     }
 
-    /// Get all the document IDs that reside directly under the given parent.
-    /// This also includes empty documents with nested collections. This means
-    /// that:
-    /// - the IDs will not contain a `/`
-    /// - IDs may point to documents that do not exist.
-    #[instrument(level = Level::DEBUG, skip_all)]
-    pub async fn get_document_ids(&self, parent: &CollectionRef) -> Result<BTreeSet<String>> {
-        self.ensure_owns_root(&parent.root_ref)?;
-        if self.is_cleared() {
-            return Err(AbortReason::DatabaseCleared.into());
-        }
-        // Cannot use `filter_map` because of the `await`.
-        let mut result = BTreeSet::new();
-        let col = self
-            .collections
-            .read()
-            .await
-            .get(&parent.collection_id)
-            .cloned();
-        if let Some(col) = col {
-            for doc in col.docs().await {
-                if doc.read_latest_uncontended(DocumentContents::exists) {
-                    result.insert(doc.name.document_id.to_string());
-                }
-            }
-        }
-        for col in self.get_all_collections().await {
-            let Some(path) = col.name.strip_collection_prefix(parent) else {
-                continue;
-            };
-            let id = path.split('/').next().unwrap();
-            if !result.contains(id) && col.has_doc().await? {
-                result.insert(id.to_string());
-            }
-        }
-        Ok(result)
-    }
-
     /// Get all collections asap collected into a [`Vec`] in order to keep the read lock time
     /// minimal.
     async fn get_all_collections(&self) -> Vec<Arc<Collection>> {
@@ -461,17 +423,8 @@ impl FirestoreDatabase {
         fields: HashMap<String, Value>,
         mask: Option<DocumentMask>,
     ) -> Result<Document> {
-        if document_id.is_empty() {
-            return Err(GenericDatabaseError::invalid_argument(
-                "document_id is required",
-            ));
-        }
-        if document_id.contains('/') {
-            return Err(GenericDatabaseError::invalid_argument(
-                "document_id cannot contain '/'",
-            ));
-        }
-        let doc_ref: DocumentRef = format!("{parent}/{document_id}").parse()?;
+        reference::validate_document_id_segment(document_id)?;
+        let doc_ref = DocumentRef::new(parent.clone(), document_id);
         let projection = mask.map(Projection::try_from).transpose()?;
         let (_, stored) = self
             .write_with_version(Write {
@@ -854,21 +807,7 @@ impl FirestoreDatabase {
     }
 
     pub fn set_enterprise_edition(&self, enterprise_edition: bool) {
-        let events = self
-            .events
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if self
-            .enterprise_edition
-            .swap(enterprise_edition, atomic::Ordering::Relaxed)
-            != enterprise_edition
-            && events.is_some()
-        {
-            self.project
-                .send_project_event(ProjectEvent::DatabaseConfigChanged {
-                    database: self.name.clone(),
-                });
-        }
+        self.update_config(Some(enterprise_edition), None);
     }
 
     pub fn optimistic_concurrency(&self) -> bool {
@@ -876,36 +815,25 @@ impl FirestoreDatabase {
     }
 
     pub fn set_optimistic_concurrency(&self, optimistic_concurrency: bool) {
-        let events = self
-            .events
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if self
-            .optimistic_concurrency
-            .swap(optimistic_concurrency, atomic::Ordering::Relaxed)
-            != optimistic_concurrency
-            && events.is_some()
-        {
-            self.project
-                .send_project_event(ProjectEvent::DatabaseConfigChanged {
-                    database: self.name.clone(),
-                });
-        }
+        self.update_config(None, Some(optimistic_concurrency));
     }
 
     pub fn set_config(&self, enterprise_edition: bool, optimistic_concurrency: bool) {
+        self.update_config(Some(enterprise_edition), Some(optimistic_concurrency));
+    }
+
+    fn update_config(&self, enterprise: Option<bool>, optimistic: Option<bool>) {
         let events = self
             .events
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let enterprise_changed = self
-            .enterprise_edition
-            .swap(enterprise_edition, atomic::Ordering::Relaxed)
-            != enterprise_edition;
-        let optimistic_changed = self
-            .optimistic_concurrency
-            .swap(optimistic_concurrency, atomic::Ordering::Relaxed)
-            != optimistic_concurrency;
+        let enterprise_changed = enterprise
+            .is_some_and(|val| self.enterprise_edition.swap(val, atomic::Ordering::Relaxed) != val);
+        let optimistic_changed = optimistic.is_some_and(|val| {
+            self.optimistic_concurrency
+                .swap(val, atomic::Ordering::Relaxed)
+                != val
+        });
         if (enterprise_changed || optimistic_changed) && events.is_some() {
             self.project
                 .send_project_event(ProjectEvent::DatabaseConfigChanged {
@@ -1161,7 +1089,7 @@ impl Drop for FirestoreDatabase {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::{BTreeSet, HashMap};
+    use std::collections::HashMap;
 
     use googleapis::google::firestore::v1::{Document, TransactionOptions, Value, Write, write};
 
@@ -1169,7 +1097,7 @@ mod tests {
     use crate::{FirestoreConfig, FirestoreProject, reference::CollectionRef};
 
     #[tokio::test]
-    async fn get_document_ids_excludes_deleted_and_probed_missing_documents() {
+    async fn create_doc_validates_document_id_edge_cases() {
         let project: &'static FirestoreProject =
             Box::leak(Box::new(FirestoreProject::new(FirestoreConfig::default())));
         let root: RootRef = "projects/p/databases/(default)".parse().unwrap();
@@ -1178,56 +1106,107 @@ mod tests {
             .parse()
             .unwrap();
 
-        db.create_doc(
-            &col,
-            "alice",
-            HashMap::from([("v".to_string(), Value::integer(1))]),
-            None,
-        )
-        .await
-        .unwrap();
-        db.create_doc(
-            &col,
-            "bob",
-            HashMap::from([("v".to_string(), Value::integer(2))]),
-            None,
-        )
-        .await
-        .unwrap();
-
-        // Probe a non-existent document and delete `bob`.
-        let ghost: DocumentRef = "projects/p/databases/(default)/documents/users/ghost"
-            .parse()
-            .unwrap();
-        assert!(
-            db.get_doc(&ghost, ReadConsistency::Default)
+        let over_1500_ascii = "a".repeat(1501);
+        // 751 2-byte UTF-8 chars = 1502 bytes (exceeds 1500-byte limit despite <1500 chars).
+        let over_1500_utf8 = "é".repeat(751);
+        for bad_id in [
+            "",
+            "a/b",
+            "a/b/c",
+            ".",
+            "..",
+            over_1500_ascii.as_str(),
+            over_1500_utf8.as_str(),
+            "__a__",
+            "__name__",
+            "__id1__",
+            "__reserved__",
+        ] {
+            let err = db
+                .create_doc(
+                    &col,
+                    bad_id,
+                    HashMap::from([("v".to_string(), Value::integer(1))]),
+                    None,
+                )
                 .await
-                .unwrap()
-                .is_none()
-        );
-        let bob: DocumentRef = "projects/p/databases/(default)/documents/users/bob"
-            .parse()
-            .unwrap();
-        db.delete_doc(&bob, None).await.unwrap();
+                .unwrap_err();
+            assert_eq!(
+                err.grpc_code(),
+                tonic::Code::InvalidArgument,
+                "expected InvalidArgument for document_id={bad_id:?}, got {err:?}"
+            );
+        }
 
-        // Phantom doc `diana` has an existing subcollection document, so it should be included.
-        let sub_col: CollectionRef = "projects/p/databases/(default)/documents/users/diana/notes"
-            .parse()
-            .unwrap();
-        db.create_doc(
-            &sub_col,
-            "n1",
-            HashMap::from([("v".to_string(), Value::integer(3))]),
-            None,
-        )
-        .await
-        .unwrap();
+        // Valid boundary cases: exact 1500 bytes, "...", 4 underscores ("____"), and partial
+        // double-underscore prefixes/suffixes.
+        let exact_1500 = "b".repeat(1500);
+        for good_id in [
+            "alice",
+            "...",
+            "____",
+            "__leading",
+            "trailing__",
+            &exact_1500,
+        ] {
+            let doc = db
+                .create_doc(
+                    &col,
+                    good_id,
+                    HashMap::from([("v".to_string(), Value::integer(1))]),
+                    None,
+                )
+                .await
+                .unwrap_or_else(|e| panic!("expected valid document_id={good_id:?}, got {e:?}"));
+            assert_eq!(doc.name, format!("{col}/{good_id}"));
+        }
+    }
 
-        let ids = db.get_document_ids(&col).await.unwrap();
-        assert_eq!(
-            ids,
-            BTreeSet::from(["alice".to_string(), "diana".to_string()])
-        );
+    #[tokio::test]
+    async fn update_config_emits_single_event_only_on_actual_change_when_active() {
+        let project: &'static FirestoreProject =
+            Box::leak(Box::new(FirestoreProject::new(FirestoreConfig::default())));
+        let root: RootRef = "projects/p/databases/(default)".parse().unwrap();
+        let db = project.database(&root).await;
+        let mut rx = project.subscribe_project_events();
+
+        // No-op config updates must not emit DatabaseConfigChanged.
+        db.set_enterprise_edition(false);
+        db.set_optimistic_concurrency(false);
+        db.set_config(false, false);
+        assert!(rx.try_recv().is_err());
+
+        // Single-flag updates emit one event each.
+        db.set_enterprise_edition(true);
+        assert!(db.enterprise_edition());
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(ProjectEvent::DatabaseConfigChanged { database }) if database == root
+        ));
+        assert!(rx.try_recv().is_err());
+
+        db.set_optimistic_concurrency(true);
+        assert!(db.optimistic_concurrency());
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(ProjectEvent::DatabaseConfigChanged { database }) if database == root
+        ));
+        assert!(rx.try_recv().is_err());
+
+        // Changing both flags via set_config emits a single DatabaseConfigChanged event.
+        db.set_config(false, false);
+        assert!(!db.enterprise_edition());
+        assert!(!db.optimistic_concurrency());
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(ProjectEvent::DatabaseConfigChanged { database }) if database == root
+        ));
+        assert!(rx.try_recv().is_err());
+
+        // Once cleared, config updates must not emit stale DatabaseConfigChanged events.
+        db.mark_cleared();
+        db.set_config(true, true);
+        assert!(rx.try_recv().is_err());
     }
 
     #[tokio::test(start_paused = true)]

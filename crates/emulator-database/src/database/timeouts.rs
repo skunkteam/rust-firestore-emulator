@@ -30,7 +30,7 @@ impl Timeouts {
         txn_max:  Duration::from_secs(270),
     };
 
-    /// Must faster lock timeouts (than [`CLOUD`](Self::CLOUD)).
+    /// Much faster lock timeouts (than [`CLOUD`](Self::CLOUD)).
     ///
     /// Reduced to 2 second write locks and 5 second read locks for faster unit-tests.
     pub(crate) const FAST: Timeouts = Timeouts {
