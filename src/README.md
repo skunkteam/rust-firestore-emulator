@@ -9,7 +9,7 @@ Root binary and library entry point for the `firestore-emulator` crate. Initiali
 - `[src/lib.rs:run]`: `pub async fn run(project: &'static FirestoreProject, listener: TcpListener, shutdown: impl Future<Output = ()> + Send + 'static, tracing: &'static impl Tracing) -> Result<()>` — Configures and runs the multiplexed HTTP/1.1 + HTTP/2 server on `listener` until `shutdown` resolves, delegating to `run_with_shutdown_grace` with `DEFAULT_SHUTDOWN_GRACE`.
 - `[src/lib.rs:run_with_shutdown_grace]`: `pub async fn run_with_shutdown_grace(project: &'static FirestoreProject, listener: TcpListener, shutdown: impl Future<Output = ()> + Send + 'static, shutdown_grace: Duration, tracing: &'static impl Tracing) -> Result<()>` — Runs the multiplexed server via `hyper_util::server::conn::auto::Builder`, `GracefulShutdown`, and a connection `tokio::task::JoinSet`, bounding shutdown drain to `shutdown_grace`.
 - `[src/lib.rs:ShutdownExecutor]`: Crate-private `hyper::rt::Executor` wrapping spawned HTTP/2 stream futures with `tokio::sync::watch` cancellation and an `mpsc::Sender<()>` drop guard so forced shutdown cancels blocked stream handlers and awaits destructor completion.
-- `[src/main.rs:main]`: Binary entry point (`#[tokio::main] async fn main() -> Result<(), CliError>`) that starts `DefaultTracing`, parses CLI `Args`, leaks `FirestoreProject` for `'static` lifetime, binds `TcpListener`, and awaits `run` until `tokio::signal::ctrl_c`.
+- `[src/main.rs:main]`: Binary entry point (`#[tokio::main] async fn main() -> Result<(), CliError>`) that starts `DefaultTracing`, parses CLI `Args`, leaks `FirestoreProject` for `'static` lifetime, binds `TcpListener`, eagerly installs the shutdown signal handler (`SIGINT` / `ctrl_c` and `SIGTERM` on Unix; `ctrl_c` on non-Unix), and awaits `run` until shutdown is signaled.
 - `[src/main.rs:CliError]`: Binary-private CLI error wrapper formatting optional context, chained `Error::source` causes, and optional actionable suggestions via `Display`/`Debug`.
 - `[Cargo.toml:features]`: Root crate features `default = ["ui"]` and `ui = ["emulator-http/ui"]` toggling embedded/disk Web UI serving on the HTTP service.
 - `[src/main.rs:Args]`: `clap::Parser` CLI configuration struct supporting:
@@ -28,7 +28,7 @@ Root binary and library entry point for the `firestore-emulator` crate. Initiali
 
 ## Side Effects
 - `[src/main.rs:GLOBAL_ALLOC]`: Sets `tikv_jemallocator::Jemalloc` as the process-wide `#[global_allocator]` on Linux (`#[cfg(target_os = "linux")]`).
-- `[src/main.rs:main]`: Initializes global tracing subscribers (`DefaultTracing::start()`), intentionally leaks `Box<FirestoreProject>` (`Box::leak`), registers an OS `ctrl_c` signal listener, and binds a TCP socket (`TcpListener::bind(host_port)`).
+- `[src/main.rs:main]`: Initializes global tracing subscribers (`DefaultTracing::start()`), intentionally leaks `Box<FirestoreProject>` (`Box::leak`), binds a TCP socket (`TcpListener::bind(host_port)`), and eagerly registers OS shutdown signal listeners (`SIGTERM` and `SIGINT`/`ctrl_c` on Unix; `ctrl_c` on non-Unix) before calling `run`.
 - `[src/lib.rs:run_with_shutdown_grace]`: Enables `TCP_NODELAY` on each accepted `TcpStream`, spawns per-connection tasks into `JoinSet` and per-HTTP/2-stream tasks via `ShutdownExecutor`, serves concurrent HTTP/1.1 and HTTP/2 network connections, and writes startup/shutdown status to `tracing::info!` or `stderr` (`eprintln!`).
 
 ## Verification
