@@ -173,6 +173,10 @@ describe.each(editions)('$description - query with allDescendants', fs => {
                 }
             });
 
+            // Note: Each parent collection in `createData()` has only a single direct leaf document
+            // (`children/child`, `children/child/children/grandchild`, `siblings/sibling`,
+            // `siblings/sibling/children/nibling`), so Enterprise parent-collection ascending scan order
+            // matches `__name__ ASC` for `limit`, `offset`, and `withConverter` below.
             test.concurrent('limit', async () => {
                 const { query, child } = await prepareQuery();
                 const querySnap = query.limit(1).get();

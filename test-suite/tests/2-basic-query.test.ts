@@ -478,6 +478,10 @@ describe.each(editions)('$description', fs => {
         });
 
         describe('paginating results', () => {
+            // On Enterprise Edition, single-collection scans do not implicitly order by `__name__`.
+            // In the `collection group` suite above, each document is created under its own unique parent
+            // document (1 leaf per parent), and Enterprise scans parent paths ascending, so implicit
+            // order happens to match `orderBy('path')` here even though leaves under a shared parent are unordered.
             fs.enterprise && description === 'collection'
                 ? test('document should not implicitly be ordered by name', async () => {
                       const implicit = await getData(collection);

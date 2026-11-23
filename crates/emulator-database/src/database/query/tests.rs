@@ -403,20 +403,80 @@ async fn implicit_order_by_matches_firestore_semantics() -> Result<()> {
         vec!["document-3", "document-2", "document-1"]
     );
 
-    // 2. Enterprise Edition `all_descendants` with `orderBy('tie', 'desc')` appends `__name__ DESC`
-    let q_ent_desc = QueryBuilder::from(
-        database.name.clone().into(),
-        vec![CollectionSelector {
-            collection_id:   col.to_string(),
-            all_descendants: true,
-        }],
-    )
-    .enterprise_edition(true)
-    .order_by("tie".parse()?, Direction::Descending)
-    .build()?;
+    // 2. Enterprise Edition `all_descendants` does NOT synthesize implicit `__name__` ordering
+    //    (matching live Cloud Firestore): `order_by` remains unchanged, extra cursor values are
+    //    rejected, and explicit `(tie DESC, __name__ ASC/DESC)` cursors obey their direction.
+    let ent_from = vec![CollectionSelector {
+        collection_id:   col.to_string(),
+        all_descendants: true,
+    }];
+    let q_ent_no_order = QueryBuilder::from(database.name.clone().into(), ent_from.clone())
+        .enterprise_edition(true)
+        .build()?;
+    assert!(q_ent_no_order.order_by().is_empty());
+
+    let q_ent_desc = QueryBuilder::from(database.name.clone().into(), ent_from.clone())
+        .enterprise_edition(true)
+        .order_by("tie".parse()?, Direction::Descending)
+        .build()?;
+    assert_eq!(q_ent_desc.order_by().len(), 1);
+    let mut ent_desc_ids = ids_of(q_ent_desc)?;
+    ent_desc_ids.sort();
+    assert_eq!(ent_desc_ids, vec!["document-1", "document-2", "document-3"]);
+
+    let doc2_ref = format!("{}/{col}/document-2", database.name);
+    assert_that!(
+        QueryBuilder::from(database.name.clone().into(), ent_from.clone())
+            .enterprise_edition(true)
+            .order_by("tie".parse()?, Direction::Descending)
+            .start_at(Cursor {
+                values: vec![Value::integer(5), Value::reference(doc2_ref.clone())],
+                before: true,
+            })
+            .build(),
+        err(eq(&GenericDatabaseError::invalid_argument(
+            "Cursor has too many values."
+        )))
+    );
+    assert_that!(
+        QueryBuilder::from(database.name.clone().into(), ent_from.clone())
+            .enterprise_edition(true)
+            .start_at(Cursor {
+                values: vec![Value::reference(doc2_ref.clone())],
+                before: true,
+            })
+            .build(),
+        err(eq(&GenericDatabaseError::invalid_argument(
+            "Cursor has too many values."
+        )))
+    );
+
+    let q_ent_explicit_desc = QueryBuilder::from(database.name.clone().into(), ent_from.clone())
+        .enterprise_edition(true)
+        .order_by("tie".parse()?, Direction::Descending)
+        .order_by("__name__".parse()?, Direction::Descending)
+        .start_at(Cursor {
+            values: vec![Value::integer(5), Value::reference(doc2_ref.clone())],
+            before: true,
+        })
+        .build()?;
     assert_eq!(
-        ids_of(q_ent_desc)?,
-        vec!["document-3", "document-2", "document-1"]
+        ids_of(q_ent_explicit_desc)?,
+        vec!["document-2", "document-1"]
+    );
+
+    let q_ent_explicit_asc = QueryBuilder::from(database.name.clone().into(), ent_from)
+        .enterprise_edition(true)
+        .order_by("tie".parse()?, Direction::Descending)
+        .order_by("__name__".parse()?, Direction::Ascending)
+        .start_at(Cursor {
+            values: vec![Value::integer(5), Value::reference(doc2_ref)],
+            before: true,
+        })
+        .build()?;
+    assert_eq!(
+        ids_of(q_ent_explicit_asc)?,
+        vec!["document-2", "document-3"]
     );
 
     // 3. `WHERE __name__ > ... AND a > 0` orders by `a ASC, __name__ ASC`, not `__name__` first

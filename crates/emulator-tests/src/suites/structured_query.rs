@@ -1656,9 +1656,10 @@ async fn structured_query_implicit_order_by_and_cursor_tie_breakers() {
         vec!["x3", "x1", "x2"]
     );
 
-    // 6. Enterprise Edition: direct collection with `orderBy('tie', DESC)` does NOT synthesize
-    //    `__name__` (so a 2-value cursor is rejected), whereas `collection_group` DOES append
-    //    `__name__ DESC` (`all_descendants: true`).
+    // 6. Enterprise Edition: neither direct collections nor `collection_group` (`all_descendants`)
+    //    synthesize implicit `__name__` ordering (verified against live Cloud Firestore): extra
+    //    cursor values are rejected unless `__name__` is explicitly ordered, and explicit
+    //    `__name__` direction controls tie-breaking.
     let mut edb = TestEnv::enterprise().build_db();
     edb.put("items/p1", fields!({ "tie": 1i64 })).await.unwrap();
     edb.put("items/p2", fields!({ "tie": 1i64 })).await.unwrap();
@@ -1682,9 +1683,58 @@ async fn structured_query_implicit_order_by_and_cursor_tie_breakers() {
         .await;
     assert_status_code(ent_direct_cursor, Code::InvalidArgument);
 
+    let ent_cg_2val_cursor = edb
+        .query(
+            QuerySpec::collection_group("grp")
+                .order_desc("tie")
+                .start_at(
+                    vec![
+                        val!(1i64),
+                        Value {
+                            value_type: Some(ValueType::ReferenceValue(doc_path("roots/r2/grp/d"))),
+                        },
+                    ],
+                    false,
+                ),
+        )
+        .await;
+    assert_status_code(ent_cg_2val_cursor, Code::InvalidArgument);
+
+    let ent_cg_no_order_cursor = edb
+        .query(QuerySpec::collection_group("grp").start_at(
+            vec![Value {
+                value_type: Some(ValueType::ReferenceValue(doc_path("roots/r1/grp/c"))),
+            }],
+            true,
+        ))
+        .await;
+    assert_status_code(ent_cg_no_order_cursor, Code::InvalidArgument);
+
     let ent_cg = edb
         .query(QuerySpec::collection_group("grp").order_desc("tie"))
         .await
         .unwrap();
-    expect_eq!(short_ids(&ent_cg.documents), vec!["d", "c"]);
+    let mut ent_cg_ids = short_ids(&ent_cg.documents);
+    ent_cg_ids.sort();
+    expect_eq!(ent_cg_ids, vec!["c", "d"]);
+
+    let ent_cg_explicit_desc = edb
+        .query(
+            QuerySpec::collection_group("grp")
+                .order_desc("tie")
+                .order_desc("__name__"),
+        )
+        .await
+        .unwrap();
+    expect_eq!(short_ids(&ent_cg_explicit_desc.documents), vec!["d", "c"]);
+
+    let ent_cg_explicit_asc = edb
+        .query(
+            QuerySpec::collection_group("grp")
+                .order_desc("tie")
+                .order_asc("__name__"),
+        )
+        .await
+        .unwrap();
+    expect_eq!(short_ids(&ent_cg_explicit_asc.documents), vec!["c", "d"]);
 }

@@ -856,20 +856,12 @@ impl Query {
                 }
             }
 
-            let last_dir = self
-                .order_by
-                .last()
-                .map_or(Direction::Ascending, |o| o.direction);
-
             if !enterprise_edition {
+                let last_dir = self
+                    .order_by
+                    .last()
+                    .map_or(Direction::Ascending, |o| o.direction);
                 self.synthesize_standard_order_by(last_dir);
-            } else if self.from.iter().any(|selector| selector.all_descendants)
-                && !self.order_by.iter().any(|o| o.field.is_document_name())
-            {
-                self.order_by.push(Order {
-                    field:     FieldReference::DocumentName,
-                    direction: last_dir,
-                });
             }
         }
 
