@@ -99,7 +99,7 @@ fn get_exact_expr_args<'a, const N: usize>(
 }
 
 /// Validates a single-argument stage with empty `options` and returns its positional argument.
-pub(super) fn single_arg_stage<'a>(stage: &'a Stage, expected_name: &str) -> Result<&'a Value> {
+fn single_arg_stage<'a>(stage: &'a Stage, expected_name: &str) -> Result<&'a Value> {
     assert_eq!(stage.name, expected_name);
     let options = &stage.options;
     unimplemented_collection!(options);
@@ -108,7 +108,7 @@ pub(super) fn single_arg_stage<'a>(stage: &'a Stage, expected_name: &str) -> Res
 }
 
 /// Validates a single-argument stage whose argument must be a non-vector `MapValue`.
-pub(super) fn single_map_stage<'a>(
+fn single_map_stage<'a>(
     stage: &'a Stage,
     expected_name: &str,
 ) -> Result<&'a HashMap<String, Value>> {
@@ -122,11 +122,7 @@ pub(super) fn single_map_stage<'a>(
 }
 
 /// Parses a non-negative integer count for stages such as `limit` and `offset`.
-pub(super) fn parse_non_negative_count(
-    stage: &Stage,
-    expected_name: &str,
-    label: &str,
-) -> Result<usize> {
+fn parse_non_negative_count(stage: &Stage, expected_name: &str, label: &str) -> Result<usize> {
     let n = single_arg_stage(stage, expected_name)?
         .as_integer()
         .ok_or_else(|| {
