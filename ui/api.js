@@ -148,22 +148,42 @@ export async function clearDatabase(projectId, databaseId) {
   });
 }
 
+const MAX_LIST_COLLECTION_PAGES = 1000;
+
 /**
  * Lists direct child collection IDs under a database root or document path.
  * @param {string} parentPath
  * @returns {Promise<string[]>}
  */
 export async function listCollectionIds(parentPath) {
-  /** @type {{ collectionIds?: string[] }} */
-  const res = await requestJson(
-    `/v1/${encodeResourcePath(parentPath)}:listCollectionIds`,
-    {
+  const url = `/v1/${encodeResourcePath(parentPath)}:listCollectionIds`;
+  /** @type {string[]} */
+  const collectionIds = [];
+  /** @type {Set<string>} */
+  const seenTokens = new Set();
+  let pageToken = "";
+
+  for (let page = 0; page < MAX_LIST_COLLECTION_PAGES; page++) {
+    /** @type {{ collectionIds?: string[], nextPageToken?: string }} */
+    const res = await requestJson(url, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({}),
+      body: JSON.stringify(pageToken ? { pageToken } : {}),
+    });
+    if (Array.isArray(res.collectionIds)) {
+      for (const id of res.collectionIds) {
+        collectionIds.push(id);
+      }
     }
-  );
-  return res.collectionIds ?? [];
+    const nextToken = res.nextPageToken ?? "";
+    if (!nextToken || seenTokens.has(nextToken)) {
+      break;
+    }
+    seenTokens.add(nextToken);
+    pageToken = nextToken;
+  }
+
+  return collectionIds;
 }
 
 /**

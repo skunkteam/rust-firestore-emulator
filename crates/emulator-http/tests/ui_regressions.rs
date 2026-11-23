@@ -1751,3 +1751,340 @@ for (const coreRule of ["no-debugger", "no-unreachable", "no-constant-condition"
 "#;
     run_node_ui_test(eslint_check);
 }
+
+#[test]
+fn regression_list_collection_ids_pagination_and_guards() {
+    let script = format!(
+        r#"{NODE_BOOTSTRAP}
+const api = await import("./ui/api.js");
+
+// 1. Paginates across nextPageToken while sending exact {{}} on the initial request.
+{{
+  const bodies = [];
+  fetchImpl = async (url, init) => {{
+    assert.equal(url, "/v1/projects/p/databases/(default)/documents:listCollectionIds");
+    assert.equal(init.method, "POST");
+    bodies.push(init.body);
+    const req = JSON.parse(init.body);
+    if (!req.pageToken) {{
+      return jsonResponse({{ collectionIds: ["c1", "c2"], nextPageToken: "tok1" }});
+    }}
+    if (req.pageToken === "tok1") {{
+      return jsonResponse({{ collectionIds: ["c3"], nextPageToken: "tok2" }});
+    }}
+    if (req.pageToken === "tok2") {{
+      return jsonResponse({{ collectionIds: ["c4"] }});
+    }}
+    throw new Error("unexpected pageToken: " + req.pageToken);
+  }};
+
+  const cols = await api.listCollectionIds("projects/p/databases/(default)/documents");
+  assert.deepEqual(cols, ["c1", "c2", "c3", "c4"]);
+  assert.deepEqual(bodies, ["{{}}", '{{"pageToken":"tok1"}}', '{{"pageToken":"tok2"}}']);
+}}
+
+// 2. Duplicate nextPageToken stops cleanly instead of looping infinitely.
+{{
+  let calls = 0;
+  fetchImpl = async (_url, init) => {{
+    calls++;
+    const req = JSON.parse(init.body);
+    if (!req.pageToken) {{
+      return jsonResponse({{ collectionIds: ["a"], nextPageToken: "dup" }});
+    }}
+    return jsonResponse({{ collectionIds: ["b"], nextPageToken: "dup" }});
+  }};
+
+  const cols = await api.listCollectionIds("projects/p/databases/(default)/documents");
+  assert.deepEqual(cols, ["a", "b"]);
+  assert.equal(calls, 2);
+}}
+
+// 3. Max page cap (1000 pages) guards against unbounded unique token chains.
+{{
+  let calls = 0;
+  fetchImpl = async () => {{
+    calls++;
+    return jsonResponse({{
+      collectionIds: ["col_" + calls],
+      nextPageToken: "tok_" + calls,
+    }});
+  }};
+
+  const cols = await api.listCollectionIds("projects/p/databases/(default)/documents");
+  assert.equal(calls, 1000);
+  assert.equal(cols.length, 1000);
+  assert.equal(cols[0], "col_1");
+  assert.equal(cols[999], "col_1000");
+}}
+
+console.log("regression_list_collection_ids_pagination_and_guards passed");
+"#
+    );
+
+    run_node_ui_test(&script);
+}
+
+#[test]
+fn regression_sse_unpause_reconnect_resync_and_cleared_db_non_recreation() {
+    let script = format!(
+        r#"{NODE_BOOTSTRAP}
+let lastEs = null;
+globalThis.EventSource = class {{
+  constructor(url) {{
+    this.url = url;
+    this.listeners = new Map();
+    lastEs = this;
+  }}
+  addEventListener(type, fn) {{
+    const list = this.listeners.get(type) ?? [];
+    list.push(fn);
+    this.listeners.set(type, list);
+  }}
+  emit(type, data) {{
+    for (const fn of this.listeners.get(type) ?? []) {{
+      fn(data);
+    }}
+  }}
+  close() {{}}
+}};
+
+const app = await import("./ui/app.js");
+
+const db1Root = "projects/p/databases/db1/documents";
+const db2Root = "projects/p/databases/db2/documents";
+let databases = [db1Root];
+let db1Docs = ["alice"];
+const getDbCalls = [];
+let db1ListCalls = 0;
+
+fetchImpl = async (url) => {{
+  if (url === "/emulator/v1") {{
+    return jsonResponse(databases);
+  }}
+  if (url === "/v1/projects/p/databases/db1") {{
+    getDbCalls.push("db1");
+    return jsonResponse({{
+      name: "projects/p/databases/db1",
+      uid: "u1",
+      type: "FIRESTORE_NATIVE",
+      databaseEdition: "STANDARD",
+      concurrencyMode: "PESSIMISTIC",
+    }});
+  }}
+  if (url === "/v1/projects/p/databases/db2") {{
+    getDbCalls.push("db2");
+    return jsonResponse({{
+      name: "projects/p/databases/db2",
+      uid: "u2",
+      type: "FIRESTORE_NATIVE",
+      databaseEdition: "ENTERPRISE",
+      concurrencyMode: "OPTIMISTIC",
+    }});
+  }}
+  if (url === "/v1/projects/p/databases/db1/documents:listCollectionIds") {{
+    return jsonResponse({{ collectionIds: ["users"] }});
+  }}
+  if (url === "/v1/projects/p/databases/db2/documents:listCollectionIds") {{
+    return jsonResponse({{ collectionIds: ["orders"] }});
+  }}
+  if (url.startsWith("/v1/projects/p/databases/db1/documents/users?")) {{
+    db1ListCalls++;
+    return jsonResponse({{
+      documents: db1Docs.map((id) => ({{
+        name: `${{db1Root}}/users/${{id}}`,
+        createTime: "2026-01-01T00:00:00Z",
+        updateTime: "2026-01-01T00:00:00Z",
+      }})),
+    }});
+  }}
+  throw new Error("unexpected url: " + url);
+}};
+
+globalThis.window.location.pathname = "/projects/p/databases/db1/documents/users";
+await app.init();
+assert.ok(lastEs, "EventSource must be connected on init");
+assert.equal(getDbCalls.length, 1);
+assert.equal(db1ListCalls, 1);
+
+// 1. Initial "open" during/after init() must NOT trigger an extra resync.
+lastEs.emit("open");
+await app.flushSseQueue();
+assert.equal(getDbCalls.length, 1, "initial open must not trigger resync");
+assert.equal(db1ListCalls, 1, "initial open must not re-list collection");
+
+// 2. Transition "error" -> "live" must enqueue a full active-DB resync via sseQueue.
+db1Docs = ["alice", "bob"];
+lastEs.emit("error");
+assert.equal(app.state.sseStatus, "error");
+lastEs.emit("open");
+assert.equal(app.state.sseStatus, "live");
+await app.flushSseQueue();
+
+assert.equal(getDbCalls.length, 2, "reconnect error -> live must refresh metadata");
+assert.equal(db1ListCalls, 2, "reconnect error -> live must refresh expanded column");
+assert.deepEqual(
+  app.state.collectionColumns.get(`${{db1Root}}/users`).documents.map((d) => d.id),
+  ["alice", "bob"]
+);
+
+// 3. Pausing must NOT trigger resync, and reconnect while paused must be ignored.
+const pauseBtn = findClickHandler(app.renderTopbar(), "Live");
+assert.ok(pauseBtn);
+await pauseBtn();
+assert.equal(app.state.ssePaused, true);
+
+db1Docs = ["alice", "bob", "carol"];
+lastEs.emit("error");
+lastEs.emit("open");
+await app.flushSseQueue();
+assert.equal(db1ListCalls, 2, "paused state must suppress resync on reconnect");
+
+// 4. Unpausing (true -> false) triggers full resync via sseQueue when DB still exists.
+const resumeBtn = findClickHandler(app.renderTopbar(), "Live Paused");
+assert.ok(resumeBtn);
+await resumeBtn();
+assert.equal(app.state.ssePaused, false);
+assert.deepEqual(
+  app.state.collectionColumns.get(`${{db1Root}}/users`).documents.map((d) => d.id),
+  ["alice", "bob", "carol"]
+);
+
+// 5. Cleared-DB non-recreation on fullResyncActiveDb:
+//    (a) When active DB disappeared and another DB exists, clear active state and auto-select remaining DB without getDatabase(db1).
+const getDbCountBeforeSwitch = getDbCalls.length;
+databases = [db2Root];
+await app.handleSseBatch([{{ type: "resync" }}]);
+assert.equal(
+  getDbCalls.slice(getDbCountBeforeSwitch).includes("db1"),
+  false,
+  "must never call getDatabase(db1) when db1 is absent after resync"
+);
+assert.equal(app.state.activeDatabaseId, "db2");
+assert.deepEqual(app.state.rootCollections, ["orders"]);
+
+//    (b) When active DB disappeared on unpause and NO DBs remain, clear active state without recreating db2.
+const pauseBtn2 = findClickHandler(app.renderTopbar(), "Live");
+await pauseBtn2();
+databases = [];
+const getDbCountBeforeClear = getDbCalls.length;
+const resumeBtn2 = findClickHandler(app.renderTopbar(), "Live Paused");
+await resumeBtn2();
+assert.equal(
+  getDbCalls.length,
+  getDbCountBeforeClear,
+  "must never call getDatabase(db2) when db2 is absent on unpause resync"
+);
+assert.equal(app.state.activeProjectId, null);
+assert.equal(app.state.activeDatabaseId, null);
+assert.equal(globalThis.window.location.pathname, "/");
+
+console.log("regression_sse_unpause_reconnect_resync_and_cleared_db_non_recreation passed");
+"#
+    );
+
+    run_node_ui_test(&script);
+}
+
+#[test]
+fn regression_load_collection_column_preserves_pagination_on_refresh() {
+    let script = format!(
+        r#"{NODE_BOOTSTRAP}
+const app = await import("./ui/app.js");
+
+const colPath = "projects/p/databases/(default)/documents/items";
+const parentPath = "projects/p/databases/(default)/documents";
+const allDocs = Array.from({{ length: 450 }}, (_, i) => ({{
+  name: `${{colPath}}/doc-${{String(i).padStart(3, "0")}}`,
+  createTime: "2026-01-01T00:00:00Z",
+  updateTime: "2026-01-01T00:00:00Z",
+}}));
+
+let clampLimit = 0;
+const requestedPages = [];
+
+fetchImpl = async (url) => {{
+  const parsed = new URL(url, "http://localhost");
+  const pageSize = Number(parsed.searchParams.get("pageSize") ?? "0");
+  const pageToken = parsed.searchParams.get("pageToken") ?? "";
+  requestedPages.push({{ pageSize, pageToken }});
+
+  let start = 0;
+  if (pageToken) {{
+    const idx = allDocs.findIndex((d) => d.name.endsWith("/" + pageToken));
+    start = idx >= 0 ? idx + 1 : allDocs.length;
+  }}
+  const effectiveSize = clampLimit > 0 ? Math.min(pageSize, clampLimit) : pageSize;
+  const slice = allDocs.slice(start, start + effectiveSize);
+  const hasMore = start + slice.length < allDocs.length;
+  const nextPageToken = hasMore && slice.length > 0
+    ? slice[slice.length - 1].name.split("/").pop()
+    : "";
+  return jsonResponse({{ documents: slice, nextPageToken }});
+}};
+
+// 1. Initial load fetches 200 docs, then Load more appends 200 more (total 400).
+await app.loadCollectionColumn(colPath, parentPath, "items", false);
+let colState = app.state.collectionColumns.get(colPath);
+assert.equal(colState.documents.length, 200);
+assert.equal(colState.nextPageToken, "doc-199");
+
+await app.loadCollectionColumn(colPath, parentPath, "items", true);
+assert.equal(colState.documents.length, 400);
+assert.equal(colState.nextPageToken, "doc-399");
+
+// 2. Non-append SSE refresh with unclamped server preserves all 400 documents in 1 request.
+requestedPages.length = 0;
+await app.loadCollectionColumn(colPath, parentPath, "items", false);
+assert.deepEqual(requestedPages, [{{ pageSize: 400, pageToken: "" }}]);
+assert.equal(colState.documents.length, 400);
+assert.equal(colState.documents[399].id, "doc-399");
+assert.equal(colState.nextPageToken, "doc-399");
+
+// 3. Non-append SSE refresh when server clamps responses to 150 docs follows nextPageToken up to 400.
+clampLimit = 150;
+requestedPages.length = 0;
+await app.loadCollectionColumn(colPath, parentPath, "items", false);
+assert.deepEqual(requestedPages, [
+  {{ pageSize: 400, pageToken: "" }},
+  {{ pageSize: 250, pageToken: "doc-149" }},
+  {{ pageSize: 100, pageToken: "doc-299" }},
+]);
+assert.equal(colState.documents.length, 400);
+assert.equal(colState.documents[0].id, "doc-000");
+assert.equal(colState.documents[399].id, "doc-399");
+assert.equal(colState.nextPageToken, "doc-399");
+
+console.log("regression_load_collection_column_preserves_pagination_on_refresh passed");
+"#
+    );
+
+    run_node_ui_test(&script);
+}
+
+#[test]
+fn regression_uint8_to_base64_chunked_large_arrays() {
+    let script = format!(
+        r#"{NODE_BOOTSTRAP}
+const {{ uint8ToBase64, encodeBytes }} = await import("./ui/values.js");
+
+for (const size of [0, 1, 0x7fff, 0x8000, 0x8001, 0x10000, 100000]) {{
+  const bytes = new Uint8Array(size);
+  for (let i = 0; i < size; i++) {{
+    bytes[i] = (i * 31 + 7) & 0xff;
+  }}
+  const expected = Buffer.from(bytes).toString("base64");
+  assert.equal(uint8ToBase64(bytes), expected, "mismatch for size " + size);
+}}
+
+const largeText = "a".repeat(70000);
+const encoded = encodeBytes(largeText, "utf8");
+assert.equal(encoded.valid, true);
+assert.equal(encoded.base64, Buffer.from(largeText, "utf8").toString("base64"));
+
+console.log("regression_uint8_to_base64_chunked_large_arrays passed");
+"#
+    );
+
+    run_node_ui_test(&script);
+}

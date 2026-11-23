@@ -53,6 +53,7 @@ import {
 
 /** @typedef {import('./api.js').EmulatorSseEvent} EmulatorSseEvent */
 /** @typedef {import('./components/explorer.js').DocumentLevelState} DocumentLevelState */
+/** @typedef {import('./values.js').FirestoreDocument} FirestoreDocument */
 /** @typedef {import('./lit-html.js').TemplateResult} TemplateResult */
 
 export { state, parseBrowserRoute };
@@ -73,6 +74,44 @@ const emulatorVersion = String(
 
 /** @type {Promise<void>} */
 let sseQueue = Promise.resolve();
+/** @type {{ close: () => void } | null} */
+let activeEventStream = null;
+
+const MAX_COLLECTION_COLUMN_PAGES = 1000;
+
+/**
+ * Enqueues an SSE event batch onto the serialized `sseQueue`.
+ * @param {EmulatorSseEvent[]} batch
+ * @returns {Promise<void>}
+ */
+function enqueueSseBatch(batch) {
+  sseQueue = sseQueue
+    .then(() => handleSseBatch(batch))
+    .catch(() => {});
+  return sseQueue;
+}
+
+/**
+ * Returns the tail promise of the serialized SSE processing queue.
+ * @returns {Promise<void>}
+ */
+export function flushSseQueue() {
+  return sseQueue;
+}
+
+/**
+ * Toggles live SSE update pausing, triggering a full active-DB resync when unpaused.
+ * @returns {Promise<void>}
+ */
+export function toggleSsePaused() {
+  const wasPaused = state.ssePaused;
+  state.ssePaused = !wasPaused;
+  renderApp();
+  if (wasPaused && !state.ssePaused) {
+    return enqueueSseBatch([{ type: "resync" }]);
+  }
+  return Promise.resolve();
+}
 
 /**
  * @param {string} text
@@ -220,6 +259,19 @@ export async function hydrateVisiblePath(
 }
 
 /**
+ * @param {FirestoreDocument[]} docs
+ * @returns {Array<{ id: string, fullName: string, phantom: boolean }>}
+ */
+function mapColumnDocuments(docs) {
+  return docs.map((doc) => {
+    const fullName = doc.name ?? "";
+    const id = fullName.slice(fullName.lastIndexOf("/") + 1);
+    const phantom = !doc.createTime && !doc.updateTime;
+    return { id, fullName, phantom };
+  });
+}
+
+/**
  * @param {string} colPath
  * @param {string} parentPath
  * @param {string} colId
@@ -254,25 +306,65 @@ export async function loadCollectionColumn(
   renderApp();
 
   try {
-    const res = await listDocuments(parentPath, colId, {
-      showMissing: true,
-      maskFieldPaths: ["__name__"],
-      pageSize: 200,
-      pageToken: appendPage ? colState.nextPageToken : undefined,
-    });
-    if (expectedDbEpoch !== getDbEpoch() || !isCurrentColSeq(colPath, seq)) {
-      return;
+    if (appendPage) {
+      const res = await listDocuments(parentPath, colId, {
+        showMissing: true,
+        maskFieldPaths: ["__name__"],
+        pageSize: 200,
+        pageToken: colState.nextPageToken,
+      });
+      if (expectedDbEpoch !== getDbEpoch() || !isCurrentColSeq(colPath, seq)) {
+        return;
+      }
+      const mapped = mapColumnDocuments(res.documents);
+      colState.documents = [...colState.documents, ...mapped];
+      colState.nextPageToken = res.nextPageToken;
+    } else {
+      const priorCount = colState.documents.length;
+      /** @type {Set<string>} */
+      const seenTokens = new Set();
+      /** @type {Array<{ id: string, fullName: string, phantom: boolean }>} */
+      const collected = [];
+      /** @type {string | undefined} */
+      let pageToken = undefined;
+      let nextToken = "";
+
+      for (let page = 0; page < MAX_COLLECTION_COLUMN_PAGES; page++) {
+        const pageSize =
+          page === 0
+            ? Math.max(200, priorCount)
+            : Math.max(1, priorCount - collected.length);
+        const res = await listDocuments(parentPath, colId, {
+          showMissing: true,
+          maskFieldPaths: ["__name__"],
+          pageSize,
+          pageToken,
+        });
+        if (
+          expectedDbEpoch !== getDbEpoch() ||
+          !isCurrentColSeq(colPath, seq)
+        ) {
+          return;
+        }
+        const mapped = mapColumnDocuments(res.documents);
+        for (const doc of mapped) {
+          collected.push(doc);
+        }
+        nextToken = res.nextPageToken;
+        if (!nextToken || seenTokens.has(nextToken) || mapped.length === 0) {
+          nextToken = "";
+          break;
+        }
+        if (collected.length >= priorCount) {
+          break;
+        }
+        seenTokens.add(nextToken);
+        pageToken = nextToken;
+      }
+
+      colState.documents = collected;
+      colState.nextPageToken = nextToken;
     }
-    const mapped = res.documents.map((doc) => {
-      const fullName = doc.name ?? "";
-      const id = fullName.slice(fullName.lastIndexOf("/") + 1);
-      const phantom = !doc.createTime && !doc.updateTime;
-      return { id, fullName, phantom };
-    });
-    colState.documents = appendPage
-      ? [...colState.documents, ...mapped]
-      : mapped;
-    colState.nextPageToken = res.nextPageToken;
   } catch (err) {
     if (expectedDbEpoch !== getDbEpoch() || !isCurrentColSeq(colPath, seq)) {
       return;
@@ -457,6 +549,21 @@ export async function handleSseBatch(events) {
   if (shouldRefreshDbList) {
     const applied = await refreshDatabaseList();
     if (myDbEpoch !== getDbEpoch()) return;
+    if (
+      applied &&
+      fullResyncActiveDb &&
+      activeRoot &&
+      !clearedActiveDb &&
+      !state.databases.some((db) => db.rootPath === activeRoot)
+    ) {
+      // Clear cached state WITHOUT calling getDatabase(), which would lazily recreate the cleared DB!
+      myDbEpoch = bumpDbEpoch();
+      bumpNavEpoch();
+      clearedActiveDb = true;
+      clearActiveDatabaseState();
+      syncUrl(true);
+      notifyToast(`Database ${activeRoot} was cleared`, "info");
+    }
     // If no active DB is selected and a DB now exists, auto-select the first one cleanly.
     if (applied && !state.activeProjectId && state.databases.length > 0) {
       const first = state.databases[0];
@@ -762,7 +869,11 @@ export function openCreateDocumentModal(
   renderApp();
 }
 
-function renderTopbar() {
+/**
+ * Renders the top navigation bar.
+ * @returns {TemplateResult}
+ */
+export function renderTopbar() {
   const activeKey =
     state.activeProjectId && state.activeDatabaseId
       ? `projects/${state.activeProjectId}/databases/${state.activeDatabaseId}/documents`
@@ -914,10 +1025,7 @@ function renderTopbar() {
           type="button"
           class="sse-badge"
           title="Click to pause or resume live SSE updates"
-          @click=${() => {
-            state.ssePaused = !state.ssePaused;
-            renderApp();
-          }}
+          @click=${toggleSsePaused}
         >
           <span class="sse-dot ${dotClass}"></span>
           <span>${sseLabel}</span>
@@ -1089,51 +1197,60 @@ function renderApp() {
   if (toastRootEl) render(renderToasts(), toastRootEl);
 }
 
+let popstateBound = false;
+
 /**
  * Initializes event listeners, SSE streaming, and initial database/route hydration.
  */
 export async function init() {
+  state.sseStatus = "live";
   renderApp();
 
-  connectEventStream(
+  activeEventStream?.close();
+  activeEventStream = connectEventStream(
     (batch) => {
-      sseQueue = sseQueue
-        .then(() => handleSseBatch(batch))
-        .catch(() => {});
+      void enqueueSseBatch(batch);
     },
     (status) => {
+      const prevStatus = state.sseStatus;
       state.sseStatus = status;
       renderApp();
+      if (prevStatus === "error" && status === "live") {
+        void enqueueSseBatch([{ type: "resync" }]);
+      }
     }
   );
 
-  window.addEventListener("popstate", () => {
-    const route = parseBrowserRoute(window.location.pathname);
-    if (route) {
-      if (
-        route.projectId === state.activeProjectId &&
-        route.databaseId === state.activeDatabaseId
-      ) {
-        state.segments = [...route.segments];
-        bumpNavEpoch();
-        renderApp();
-        if (state.segments.length > 0) {
-          void hydrateVisiblePath();
+  if (!popstateBound) {
+    popstateBound = true;
+    window.addEventListener("popstate", () => {
+      const route = parseBrowserRoute(window.location.pathname);
+      if (route) {
+        if (
+          route.projectId === state.activeProjectId &&
+          route.databaseId === state.activeDatabaseId
+        ) {
+          state.segments = [...route.segments];
+          bumpNavEpoch();
+          renderApp();
+          if (state.segments.length > 0) {
+            void hydrateVisiblePath();
+          }
+        } else {
+          void selectDatabase(
+            route.projectId,
+            route.databaseId,
+            route.segments,
+            true
+          );
         }
       } else {
-        void selectDatabase(
-          route.projectId,
-          route.databaseId,
-          route.segments,
-          true
-        );
+        state.segments = [];
+        bumpNavEpoch();
+        renderApp();
       }
-    } else {
-      state.segments = [];
-      bumpNavEpoch();
-      renderApp();
-    }
-  });
+    });
+  }
 
   try {
     await refreshDatabaseList();
