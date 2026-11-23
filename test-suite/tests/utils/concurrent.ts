@@ -37,9 +37,12 @@ export class ConcurrentTest {
         return -1;
     }
 
+    private advanceCursor(procName: string | undefined, matchIdx: number) {
+        this.cursors.set(procName, Math.max(this.cursors.get(procName) ?? 0, matchIdx + 1));
+    }
+
     async when(...what: string[]) {
         const procName = this.processName.getStore();
-        const timeoutErr = new Error('timeout');
         if (this.runFailed) {
             throw new Error(`${procName} aborted because a sibling process failed`);
         }
@@ -48,10 +51,11 @@ export class ConcurrentTest {
         const cursor = this.cursors.get(procName) ?? 0;
         let matchIdx = this.findMatchingEventIndex(cursor, what);
         if (matchIdx !== -1) {
-            this.cursors.set(procName, matchIdx + 1);
+            this.advanceCursor(procName, matchIdx);
             return;
         }
 
+        const timeoutErr = new Error('timeout');
         const ac = new AbortController();
         this.activeWaits.add(ac);
         const timeoutPromise = time(this.timeout, undefined, { signal: ac.signal }).catch((e: unknown) => e);
@@ -78,7 +82,7 @@ export class ConcurrentTest {
                         })
                         .or(errorAfterTime$),
             });
-            this.cursors.set(procName, matchIdx + 1);
+            this.advanceCursor(procName, matchIdx);
         } finally {
             this.activeWaits.delete(ac);
             if (!ac.signal.aborted) {

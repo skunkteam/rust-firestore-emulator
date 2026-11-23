@@ -1,6 +1,6 @@
 import type { Firestore, Query, VectorQuery } from '@google-cloud/firestore';
 import type { EventEmitter } from 'events';
-import { connection } from './firestore';
+import { connection } from './env';
 
 export interface RawProtoValue {
     nullValue?: 'NULL_VALUE' | null;
@@ -92,14 +92,40 @@ export async function callRawUnaryRpc<TReq extends object, TRes = unknown>(
     return client.request<TReq, TRes>(rpc, req, tag);
 }
 
+const CORE_ERROR_KEYS = new Set(['message', 'name', 'stack', 'cause']);
+
 export function normalizeStreamError(err: unknown): Error {
     if (err instanceof Error) {
         return err;
     }
     if (typeof err === 'object' && err !== null) {
-        const obj = err as { message?: unknown; details?: unknown };
-        const msg = typeof obj.message === 'string' ? obj.message : typeof obj.details === 'string' ? obj.details : String(err);
-        return Object.assign(new Error(msg, { cause: err }), err);
+        const obj = err as Record<string, unknown>;
+        let msg: string;
+        if (typeof obj.message === 'string' && obj.message.length > 0) {
+            msg = obj.message;
+        } else if (typeof obj.details === 'string' && obj.details.length > 0) {
+            msg = obj.details;
+        } else {
+            try {
+                msg = JSON.stringify(err) ?? 'Unknown stream error';
+            } catch {
+                msg = 'Unserializable stream error';
+            }
+        }
+        const normalized = new Error(msg, { cause: err });
+        if (!Array.isArray(err)) {
+            for (const [key, value] of Object.entries(obj)) {
+                if (!CORE_ERROR_KEYS.has(key) && key !== '__proto__') {
+                    Object.defineProperty(normalized, key, {
+                        value,
+                        enumerable: true,
+                        writable: true,
+                        configurable: true,
+                    });
+                }
+            }
+        }
+        return normalized;
     }
     return new Error(String(err), { cause: err });
 }

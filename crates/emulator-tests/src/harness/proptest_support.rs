@@ -56,8 +56,8 @@ pub(crate) fn arb_field_name() -> impl Strategy<Value = &'static str> {
 /// epochs), edge-case strings, and non-nested arrays (`[[...]]` is forbidden by Firestore).
 pub(crate) fn arb_value() -> impl Strategy<Value = Value> {
     let arb_i64 = prop_oneof![
-        -1_000i64..=1_000i64,
-        select(
+        3 => -1_000i64..=1_000i64,
+        1 => select(
             &[
                 i64::MIN,
                 i64::MAX,
@@ -72,16 +72,21 @@ pub(crate) fn arb_value() -> impl Strategy<Value = Value> {
     ];
 
     let arb_f64_non_nan = prop_oneof![
-        (-500i32..=500i32).prop_map(|n| f64::from(n) * 0.25),
-        Just(0.0),
-        Just(-0.0),
-        Just(f64::INFINITY),
-        Just(f64::NEG_INFINITY),
+        6 => (-500i32..=500i32).prop_map(|n| f64::from(n) * 0.25),
+        1 => Just(0.0),
+        1 => Just(-0.0),
+        1 => Just(f64::INFINITY),
+        1 => Just(f64::NEG_INFINITY),
+        2 => select(&[f64::MIN_POSITIVE, 5e-324_f64, f64::MIN, f64::MAX][..]),
     ];
 
     // Emit canonical `f64::NAN` only (never `-f64::NAN` or payload NaNs) so ProtoJSON roundtrips
     // remain bit-identical under `Value::fields_storage_eq`.
-    let arb_double = prop_oneof![arb_f64_non_nan.clone(), Just(f64::NAN)].prop_map(Value::from);
+    let arb_double = prop_oneof![
+        9 => arb_f64_non_nan.clone(),
+        1 => Just(f64::NAN),
+    ]
+    .prop_map(Value::from);
 
     let arb_timestamp = (
         prop_oneof![
@@ -127,27 +132,78 @@ pub(crate) fn arb_value() -> impl Strategy<Value = Value> {
 
     let vector = prop::collection::vec(arb_f64_non_nan, 1..=4).prop_map(Value::vector);
 
-    let map_of_scalars = prop::collection::hash_map(
+    let nested_map = prop::collection::hash_map(
         arb_field_name().prop_map(str::to_string),
-        prop_oneof![scalar.clone(), vector.clone()],
+        prop_oneof![
+            4 => scalar.clone(),
+            1 => vector.clone(),
+        ],
         0..4,
     )
     .prop_map(Value::from);
 
-    let non_array = prop_oneof![scalar, vector, map_of_scalars];
+    let non_array = prop_oneof![
+        4 => scalar,
+        1 => vector,
+        1 => nested_map,
+    ];
 
     prop_oneof![
-        non_array.clone(),
-        prop::collection::vec(non_array.clone(), 0..4).prop_map(Value::from),
-        prop::collection::hash_map(
+        3 => non_array.clone(),
+        1 => prop::collection::vec(non_array.clone(), 0..4).prop_map(Value::from),
+        1 => prop::collection::hash_map(
             arb_field_name().prop_map(str::to_string),
             prop_oneof![
-                non_array.clone(),
-                prop::collection::vec(non_array, 0..3).prop_map(Value::from),
+                3 => non_array.clone(),
+                1 => prop::collection::vec(non_array, 0..3).prop_map(Value::from),
             ],
             0..4,
         )
         .prop_map(Value::from),
+    ]
+}
+
+/// Generates query operand values weighted toward common elements emitted inside `arb_value`
+/// alongside arbitrary storable `Value`s so `alpha` filters exercise both match hits and complex
+/// cross-type boundaries.
+pub(crate) fn arb_alpha_filter_value() -> impl Strategy<Value = Value> {
+    prop_oneof![
+        1 => Just(Value::null()),
+        1 => any::<bool>().prop_map(Value::from),
+        2 => (-4i64..=4i64).prop_map(Value::from),
+        2 => prop_oneof![
+            (-4i32..=4i32).prop_map(|n| Value::from(f64::from(n) * 0.25)),
+            Just(Value::from(0.0)),
+            Just(Value::from(-0.0)),
+            Just(Value::from(f64::NAN)),
+            Just(Value::from(f64::INFINITY)),
+            Just(Value::from(f64::NEG_INFINITY)),
+        ],
+        2 => select(&["", "amber", "cobalt", "crimson", "jade"][..]).prop_map(Value::from),
+        1 => arb_doc_id().prop_map(|id| Value::reference(format!("{DOCUMENTS_ROOT}/ref_col/{id}"))),
+        2 => arb_value(),
+    ]
+}
+
+/// Generates `num` cursor bounds mixing `IntegerValue` and `DoubleValue` (including fractional
+/// `.5` values, `5.0`/`5.5`, `-0.0`, `±Infinity`, and `NaN`) to test cross-type cursor slicing.
+pub(crate) fn arb_cursor_num() -> impl Strategy<Value = Value> {
+    prop_oneof![
+        3 => (-55i64..=55i64).prop_map(Value::integer),
+        3 => (-110i32..=110i32).prop_map(|n| Value::double(f64::from(n) * 0.5)),
+        1 => select(
+            &[
+                -0.0_f64,
+                0.0_f64,
+                5.0_f64,
+                5.5_f64,
+                -5.5_f64,
+                f64::NEG_INFINITY,
+                f64::INFINITY,
+                f64::NAN,
+            ][..],
+        )
+        .prop_map(Value::double),
     ]
 }
 
@@ -176,26 +232,67 @@ pub(crate) fn arb_doc_fields() -> impl Strategy<Value = HashMap<String, Value>> 
         })
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub(crate) enum GeneratedQueryKind {
     NumGreaterOrEqual(i64),
     NumLessThan(i64),
     TagEquals(&'static str),
     TagNotEquals(&'static str),
+    EnterpriseTagNotEqualsMissingIncluded(&'static str),
     TagIn(&'static str, Option<&'static str>),
     FlagEquals(bool),
     AlphaIsNull,
     AlphaIsNan,
+    ArrayContains(Value),
+    AlphaEquals(Value),
+    AlphaLessThan(Value),
+    AlphaGreaterOrEqual(Value),
+    AlphaIn(Vec<Value>),
+    AlphaOrderBy { descending: bool },
 }
 
 impl GeneratedQueryKind {
-    pub(crate) fn to_query_spec(self, col: &str, limit: Option<usize>, offset: usize) -> QuerySpec {
+    /// Returns `true` for query shapes valid only in Enterprise Edition (e.g., `!=` without
+    /// ordering on the inequality field, which includes documents missing the field).
+    pub(crate) fn is_enterprise_only(&self) -> bool {
+        matches!(self, Self::EnterpriseTagNotEqualsMissingIncluded(_))
+    }
+
+    /// Returns `true` when Standard Edition and Enterprise Edition `StructuredQuery` must yield
+    /// identical matching documents (i.e., not Enterprise-only and not matching top-level
+    /// `null`/`NaN` equality or range comparisons).
+    pub(crate) fn same_across_editions(&self) -> bool {
+        match self {
+            Self::EnterpriseTagNotEqualsMissingIncluded(_) => false,
+            Self::ArrayContains(v) | Self::AlphaEquals(v) | Self::AlphaGreaterOrEqual(v) => {
+                !v.is_null() && !v.is_nan()
+            }
+            Self::AlphaIn(vals) => !vals.iter().any(|v| v.is_null() || v.is_nan()),
+            Self::NumGreaterOrEqual(_)
+            | Self::NumLessThan(_)
+            | Self::TagEquals(_)
+            | Self::TagNotEquals(_)
+            | Self::TagIn(..)
+            | Self::FlagEquals(_)
+            | Self::AlphaIsNull
+            | Self::AlphaIsNan
+            | Self::AlphaLessThan(_)
+            | Self::AlphaOrderBy { .. } => true,
+        }
+    }
+
+    pub(crate) fn to_query_spec(
+        &self,
+        col: &str,
+        limit: Option<usize>,
+        offset: usize,
+    ) -> QuerySpec {
         let mut spec = match self {
             Self::NumGreaterOrEqual(threshold) => QuerySpec::collection(col)
                 .where_filter(field_filter(
                     "num",
                     field_filter::Operator::GreaterThanOrEqual,
-                    threshold,
+                    *threshold,
                 ))
                 .order_asc("num")
                 .order_asc("__name__"),
@@ -203,29 +300,32 @@ impl GeneratedQueryKind {
                 .where_filter(field_filter(
                     "num",
                     field_filter::Operator::LessThan,
-                    threshold,
+                    *threshold,
                 ))
                 .order_desc("num")
                 .order_desc("__name__"),
             Self::TagEquals(tag) => QuerySpec::collection(col)
-                .where_filter(field_filter("tag", field_filter::Operator::Equal, tag))
+                .where_filter(field_filter("tag", field_filter::Operator::Equal, *tag))
                 .order_asc("num")
                 .order_asc("__name__"),
             Self::TagNotEquals(tag) => QuerySpec::collection(col)
-                .where_filter(field_filter("tag", field_filter::Operator::NotEqual, tag))
+                .where_filter(field_filter("tag", field_filter::Operator::NotEqual, *tag))
                 .order_asc("tag")
+                .order_asc("__name__"),
+            Self::EnterpriseTagNotEqualsMissingIncluded(tag) => QuerySpec::collection(col)
+                .where_filter(field_filter("tag", field_filter::Operator::NotEqual, *tag))
                 .order_asc("__name__"),
             Self::TagIn(first, second) => {
                 let values = match second {
-                    Some(second) => vec![Value::from(first), Value::from(second)],
-                    None => vec![Value::from(first)],
+                    Some(second) => vec![Value::from(*first), Value::from(*second)],
+                    None => vec![Value::from(*first)],
                 };
                 QuerySpec::collection(col)
                     .where_filter(field_filter("tag", field_filter::Operator::In, values))
                     .order_asc("__name__")
             }
             Self::FlagEquals(flag) => QuerySpec::collection(col)
-                .where_filter(field_filter("flag", field_filter::Operator::Equal, flag))
+                .where_filter(field_filter("flag", field_filter::Operator::Equal, *flag))
                 .order_asc("num")
                 .order_asc("__name__"),
             Self::AlphaIsNull => QuerySpec::collection(col)
@@ -234,22 +334,70 @@ impl GeneratedQueryKind {
             Self::AlphaIsNan => QuerySpec::collection(col)
                 .where_filter(unary_filter("alpha", unary_filter::Operator::IsNan))
                 .order_asc("__name__"),
+            Self::ArrayContains(val) => QuerySpec::collection(col)
+                .where_filter(field_filter(
+                    "alpha",
+                    field_filter::Operator::ArrayContains,
+                    val.clone(),
+                ))
+                .order_asc("__name__"),
+            Self::AlphaEquals(val) => QuerySpec::collection(col)
+                .where_filter(field_filter(
+                    "alpha",
+                    field_filter::Operator::Equal,
+                    val.clone(),
+                ))
+                .order_asc("__name__"),
+            Self::AlphaLessThan(val) => QuerySpec::collection(col)
+                .where_filter(field_filter(
+                    "alpha",
+                    field_filter::Operator::LessThan,
+                    val.clone(),
+                ))
+                .order_desc("alpha")
+                .order_desc("__name__"),
+            Self::AlphaGreaterOrEqual(val) => QuerySpec::collection(col)
+                .where_filter(field_filter(
+                    "alpha",
+                    field_filter::Operator::GreaterThanOrEqual,
+                    val.clone(),
+                ))
+                .order_asc("alpha")
+                .order_asc("__name__"),
+            Self::AlphaIn(vals) => QuerySpec::collection(col)
+                .where_filter(field_filter(
+                    "alpha",
+                    field_filter::Operator::In,
+                    Value::array(vals.clone()),
+                ))
+                .order_asc("__name__"),
+            Self::AlphaOrderBy { descending } => {
+                if *descending {
+                    QuerySpec::collection(col)
+                        .order_desc("alpha")
+                        .order_desc("__name__")
+                } else {
+                    QuerySpec::collection(col)
+                        .order_asc("alpha")
+                        .order_asc("__name__")
+                }
+            }
         };
         if offset > 0 {
-            spec = spec.offset(offset as i32);
+            spec = spec.offset(i32::try_from(offset).expect("offset fits in i32"));
         }
         if let Some(lim) = limit {
-            spec = spec.limit(lim as i32);
+            spec = spec.limit(i32::try_from(lim).expect("limit fits in i32"));
         }
         spec
     }
 
     pub(crate) fn to_pipeline_spec(
-        self,
+        &self,
         col: &str,
         limit: Option<usize>,
         offset: usize,
-    ) -> PipelineSpec {
+    ) -> Option<PipelineSpec> {
         let present =
             |field: &str| fn_val("not", vec![fn_val("is_absent", vec![field_ref_val(field)])]);
         let mut spec = match self {
@@ -260,7 +408,7 @@ impl GeneratedQueryKind {
                         present("num"),
                         fn_val(
                             "greater_than_or_equal",
-                            vec![field_ref_val("num"), t.into()],
+                            vec![field_ref_val("num"), (*t).into()],
                         ),
                     ],
                 ))
@@ -271,7 +419,7 @@ impl GeneratedQueryKind {
                     "and",
                     vec![
                         present("num"),
-                        fn_val("less_than", vec![field_ref_val("num"), t.into()]),
+                        fn_val("less_than", vec![field_ref_val("num"), (*t).into()]),
                     ],
                 ))
                 .sort_desc("__name__")
@@ -281,7 +429,7 @@ impl GeneratedQueryKind {
                     "and",
                     vec![
                         present("num"),
-                        fn_val("equal", vec![field_ref_val("tag"), tag.into()]),
+                        fn_val("equal", vec![field_ref_val("tag"), (*tag).into()]),
                     ],
                 ))
                 .sort_asc("__name__")
@@ -291,21 +439,27 @@ impl GeneratedQueryKind {
                     "and",
                     vec![
                         present("tag"),
-                        fn_val("not_equal", vec![field_ref_val("tag"), tag.into()]),
+                        fn_val("not_equal", vec![field_ref_val("tag"), (*tag).into()]),
                     ],
                 ))
                 .sort_asc("__name__")
                 .sort_asc("tag"),
+            Self::EnterpriseTagNotEqualsMissingIncluded(tag) => PipelineSpec::collection(col)
+                .where_expr(fn_val(
+                    "not_equal",
+                    vec![field_ref_val("tag"), (*tag).into()],
+                ))
+                .sort_asc("__name__"),
             Self::TagIn(first, second) => {
                 let pred = match second {
                     Some(second) => fn_val(
                         "or",
                         vec![
-                            fn_val("equal", vec![field_ref_val("tag"), first.into()]),
-                            fn_val("equal", vec![field_ref_val("tag"), second.into()]),
+                            fn_val("equal", vec![field_ref_val("tag"), (*first).into()]),
+                            fn_val("equal", vec![field_ref_val("tag"), (*second).into()]),
                         ],
                     ),
-                    None => fn_val("equal", vec![field_ref_val("tag"), first.into()]),
+                    None => fn_val("equal", vec![field_ref_val("tag"), (*first).into()]),
                 };
                 PipelineSpec::collection(col)
                     .where_expr(pred)
@@ -316,7 +470,7 @@ impl GeneratedQueryKind {
                     "and",
                     vec![
                         present("num"),
-                        fn_val("equal", vec![field_ref_val("flag"), flag.into()]),
+                        fn_val("equal", vec![field_ref_val("flag"), (*flag).into()]),
                     ],
                 ))
                 .sort_asc("__name__")
@@ -330,14 +484,66 @@ impl GeneratedQueryKind {
                     vec![field_ref_val("alpha"), Value::double(f64::NAN)],
                 ))
                 .sort_asc("__name__"),
+            // Pipeline `array_contains` is not yet implemented in `pipeline::function`.
+            Self::ArrayContains(_) => return None,
+            Self::AlphaEquals(val) => PipelineSpec::collection(col)
+                .where_expr(fn_val("equal", vec![field_ref_val("alpha"), val.clone()]))
+                .sort_asc("__name__"),
+            Self::AlphaLessThan(val) => PipelineSpec::collection(col)
+                .where_expr(fn_val(
+                    "and",
+                    vec![
+                        present("alpha"),
+                        fn_val("less_than", vec![field_ref_val("alpha"), val.clone()]),
+                    ],
+                ))
+                .sort_desc("__name__")
+                .sort_desc("alpha"),
+            Self::AlphaGreaterOrEqual(val) => PipelineSpec::collection(col)
+                .where_expr(fn_val(
+                    "and",
+                    vec![
+                        present("alpha"),
+                        fn_val(
+                            "greater_than_or_equal",
+                            vec![field_ref_val("alpha"), val.clone()],
+                        ),
+                    ],
+                ))
+                .sort_asc("__name__")
+                .sort_asc("alpha"),
+            Self::AlphaIn(vals) => {
+                let pred = if vals.len() == 1 {
+                    fn_val("equal", vec![field_ref_val("alpha"), vals[0].clone()])
+                } else {
+                    fn_val(
+                        "or",
+                        vals.iter()
+                            .cloned()
+                            .map(|v| fn_val("equal", vec![field_ref_val("alpha"), v]))
+                            .collect(),
+                    )
+                };
+                PipelineSpec::collection(col)
+                    .where_expr(pred)
+                    .sort_asc("__name__")
+            }
+            Self::AlphaOrderBy { descending } => {
+                let base = PipelineSpec::collection(col).where_expr(present("alpha"));
+                if *descending {
+                    base.sort_desc("__name__").sort_desc("alpha")
+                } else {
+                    base.sort_asc("__name__").sort_asc("alpha")
+                }
+            }
         };
         if offset > 0 {
-            spec = spec.offset(offset as i64);
+            spec = spec.offset(i64::try_from(offset).expect("offset fits in i64"));
         }
         if let Some(lim) = limit {
-            spec = spec.limit(lim as i64);
+            spec = spec.limit(i64::try_from(lim).expect("limit fits in i64"));
         }
-        spec
+        Some(spec)
     }
 }
 
@@ -348,11 +554,21 @@ pub(crate) fn arb_query_kind() -> impl Strategy<Value = GeneratedQueryKind> {
         (-50i64..=50i64).prop_map(GeneratedQueryKind::NumLessThan),
         arb_tag.clone().prop_map(GeneratedQueryKind::TagEquals),
         arb_tag.clone().prop_map(GeneratedQueryKind::TagNotEquals),
+        arb_tag
+            .clone()
+            .prop_map(GeneratedQueryKind::EnterpriseTagNotEqualsMissingIncluded),
         (arb_tag.clone(), prop::option::of(arb_tag))
             .prop_map(|(a, b)| GeneratedQueryKind::TagIn(a, b)),
         any::<bool>().prop_map(GeneratedQueryKind::FlagEquals),
         Just(GeneratedQueryKind::AlphaIsNull),
         Just(GeneratedQueryKind::AlphaIsNan),
+        arb_alpha_filter_value().prop_map(GeneratedQueryKind::ArrayContains),
+        arb_alpha_filter_value().prop_map(GeneratedQueryKind::AlphaEquals),
+        arb_alpha_filter_value().prop_map(GeneratedQueryKind::AlphaLessThan),
+        arb_alpha_filter_value().prop_map(GeneratedQueryKind::AlphaGreaterOrEqual),
+        prop::collection::vec(arb_alpha_filter_value(), 1..=3)
+            .prop_map(GeneratedQueryKind::AlphaIn),
+        any::<bool>().prop_map(|descending| GeneratedQueryKind::AlphaOrderBy { descending }),
     ]
 }
 
