@@ -3,11 +3,7 @@
 import { html, nothing, render } from "./lit-html.js";
 import {
   ApiError,
-  clearDatabase,
   connectEventStream,
-  createDocument,
-  deleteCollection,
-  deleteDocument,
   getDatabase,
   getDocument,
   listCollectionIds,
@@ -23,32 +19,48 @@ import {
   computeChangedFieldMask,
   createEditorSession,
   extractSessionFields,
-  renderHybridEditor,
   syncSessionWithDocument,
 } from "./components/editor.js";
 import { renderExplorer } from "./components/explorer.js";
+import {
+  getModalFocusableElements,
+  handleModalKeydown,
+  renderModal as renderModalView,
+} from "./components/modals.js";
 import {
   buildStructuredQueryFromVisual,
   createQueryRunnerState,
   renderQueryRunner,
 } from "./components/query.js";
+import {
+  getActiveRootPath,
+  parseBrowserRoute,
+  syncBrowserUrl,
+} from "./router.js";
+import {
+  bumpDbEpoch,
+  bumpNavEpoch,
+  clearActiveDatabaseState,
+  dismissToast,
+  getDbEpoch,
+  getNavEpoch,
+  isCurrentColSeq,
+  isCurrentDbListSeq,
+  isCurrentDocSeq,
+  nextColSeq,
+  nextDbListSeq,
+  nextDocSeq,
+  pushToast,
+  resetDatabaseCaches,
+  state,
+} from "./state.js";
 
-/** @typedef {import('./api.js').DatabaseMetadata} DatabaseMetadata */
 /** @typedef {import('./api.js').EmulatorSseEvent} EmulatorSseEvent */
-/** @typedef {import('./components/explorer.js').CollectionColumnState} CollectionColumnState */
 /** @typedef {import('./components/explorer.js').DocumentLevelState} DocumentLevelState */
-/** @typedef {import('./components/editor.js').EditorSession} EditorSession */
+/** @typedef {import('./values.js').FirestoreDocument} FirestoreDocument */
 /** @typedef {import('./lit-html.js').TemplateResult} TemplateResult */
 
-/**
- * @typedef {
- *   | { kind: 'open_db', projectId: string, databaseId: string, edition: 'STANDARD' | 'ENTERPRISE', busy: boolean, error: string | null }
- *   | { kind: 'create_doc', parentPath: string, collectionId: string, lockCollection: boolean, docId: string, lockDocId: boolean, session: EditorSession, busy: boolean, error: string | null }
- *   | { kind: 'delete_doc', docPath: string, recursive: boolean, hasSubcollections: boolean, busy: boolean, error: string | null }
- *   | { kind: 'delete_col', colPath: string, colId: string, busy: boolean, error: string | null }
- *   | { kind: 'clear_db', projectId: string, databaseId: string, busy: boolean, error: string | null }
- * } ActiveModal
- */
+export { state, parseBrowserRoute };
 
 /** @type {HTMLElement | null} */
 const topbarEl = document.getElementById("topbar");
@@ -64,178 +76,65 @@ const emulatorVersion = String(
     .EMULATOR_VERSION ?? "dev"
 );
 
-export const state = {
-  /** @type {Array<{ projectId: string, databaseId: string, rootPath: string }>} */
-  databases: [],
-  /** @type {string | null} */
-  activeProjectId: null,
-  /** @type {string | null} */
-  activeDatabaseId: null,
-  /** @type {DatabaseMetadata | null} */
-  activeDbMeta: null,
-
-  /** @type {'explorer' | 'query'} */
-  view: "explorer",
-
-  /** @type {string[]} */
-  rootCollections: [],
-  rootLoading: false,
-  /** @type {string[]} */
-  segments: [],
-
-  /** @type {Map<string, CollectionColumnState>} */
-  collectionColumns: new Map(),
-  /** @type {Map<string, DocumentLevelState>} */
-  documentLevels: new Map(),
-
-  queryState: createQueryRunnerState(),
-
-  /** @type {'live' | 'error'} */
-  sseStatus: "live",
-  ssePaused: false,
-
-  /** @type {ActiveModal | null} */
-  modal: null,
-
-  /** @type {Array<{ id: number, text: string, tone: 'info' | 'success' | 'error' }>} */
-  toasts: [],
-};
-
-let nextToastId = 1;
-let dbEpoch = 0;
-let navEpoch = 0;
-let dbListSeq = 0;
-/** @type {Map<string, number>} */
-const colRequestSeq = new Map();
-/** @type {Map<string, number>} */
-const docRequestSeq = new Map();
 /** @type {Promise<void>} */
 let sseQueue = Promise.resolve();
+/** @type {{ close: () => void } | null} */
+let activeEventStream = null;
+
+const MAX_COLLECTION_COLUMN_PAGES = 1000;
 
 /**
- * @returns {string | null}
+ * Enqueues an SSE event batch onto the serialized `sseQueue`.
+ * @param {EmulatorSseEvent[]} batch
+ * @returns {Promise<void>}
  */
-function getActiveRootPath() {
-  return state.activeProjectId && state.activeDatabaseId
-    ? `projects/${state.activeProjectId}/databases/${state.activeDatabaseId}/documents`
-    : null;
+function enqueueSseBatch(batch) {
+  sseQueue = sseQueue
+    .then(() => handleSseBatch(batch))
+    .catch(() => {});
+  return sseQueue;
 }
 
 /**
- * @param {string} seg
- * @returns {boolean}
+ * Returns the tail promise of the serialized SSE processing queue.
+ * @returns {Promise<void>}
  */
-function isValidPathSegment(seg) {
-  return Boolean(seg) && seg !== "." && seg !== ".." && !seg.includes("/");
+export function flushSseQueue() {
+  return sseQueue;
 }
 
 /**
- * @param {string} rootPath
- * @param {string} resourcePath
- * @returns {string[] | null}
+ * Toggles live SSE update pausing, triggering a full active-DB resync when unpaused.
+ * @returns {Promise<void>}
  */
-function relativeSegments(rootPath, resourcePath) {
-  if (!resourcePath.startsWith(`${rootPath}/`)) return null;
-  return resourcePath.slice(rootPath.length + 1).split("/");
-}
-
-/**
- * @param {string[]} full
- * @param {string[]} prefix
- * @returns {boolean}
- */
-function startsWithSegments(full, prefix) {
-  return prefix.length <= full.length && prefix.every((s, idx) => full[idx] === s);
-}
-
-/**
- * @param {string} prefix
- */
-function pruneCachesWithPrefix(prefix) {
-  const slashPrefix = `${prefix}/`;
-  for (const key of state.collectionColumns.keys()) {
-    if (key === prefix || key.startsWith(slashPrefix)) {
-      state.collectionColumns.delete(key);
-      colRequestSeq.delete(key);
-    }
+export function toggleSsePaused() {
+  const wasPaused = state.ssePaused;
+  state.ssePaused = !wasPaused;
+  renderApp();
+  if (wasPaused && !state.ssePaused) {
+    return enqueueSseBatch([{ type: "resync" }]);
   }
-  for (const key of state.documentLevels.keys()) {
-    if (key === prefix || key.startsWith(slashPrefix)) {
-      state.documentLevels.delete(key);
-      docRequestSeq.delete(key);
-    }
-  }
+  return Promise.resolve();
 }
 
 /**
  * @param {string} text
  * @param {'info' | 'success' | 'error'} [tone]
  */
-function pushToast(text, tone = "info") {
-  const id = nextToastId++;
-  state.toasts.push({ id, text, tone });
-  renderApp();
-  setTimeout(() => {
-    state.toasts = state.toasts.filter((t) => t.id !== id);
-    renderApp();
-  }, 4200);
+function notifyToast(text, tone = "info") {
+  pushToast(text, tone, renderApp);
 }
 
 /**
- * Parses `/projects/{p}/databases/{d}/documents[/...]` from a browser pathname.
- * Returns `null` for non-matching routes, malformed percent-encoding, or invalid segments.
- * @param {string} pathname
- * @returns {{ projectId: string, databaseId: string, segments: string[] } | null}
- */
-export function parseBrowserRoute(pathname) {
-  const stripped = pathname.replace(/\/+$/, "");
-  if (!stripped) return null;
-  const m =
-    /^\/projects\/([^/]+)\/databases\/([^/]+)\/documents(?:\/(.*))?$/.exec(
-      stripped
-    );
-  if (!m) return null;
-  try {
-    const projectId = decodeURIComponent(m[1]);
-    const databaseId = decodeURIComponent(m[2]);
-    if (!isValidPathSegment(projectId) || !isValidPathSegment(databaseId)) {
-      return null;
-    }
-    /** @type {string[]} */
-    const tail = [];
-    if (m[3] !== undefined) {
-      for (const rawSeg of m[3].split("/")) {
-        const seg = decodeURIComponent(rawSeg);
-        if (!isValidPathSegment(seg)) {
-          return null;
-        }
-        tail.push(seg);
-      }
-    }
-    return { projectId, databaseId, segments: tail };
-  } catch {
-    return null;
-  }
-}
-
-/**
- * Syncs the browser address bar with the current active database and segments.
  * @param {boolean} [replace]
  */
-function syncBrowserUrl(replace = false) {
-  let nextPath = "/";
-  if (state.activeProjectId && state.activeDatabaseId) {
-    const base = `/projects/${encodeURIComponent(state.activeProjectId)}/databases/${encodeURIComponent(state.activeDatabaseId)}/documents`;
-    const tail = state.segments.map((s) => encodeURIComponent(s)).join("/");
-    nextPath = tail ? `${base}/${tail}` : base;
-  }
-  if (window.location.pathname !== nextPath) {
-    if (replace) {
-      window.history.replaceState(null, "", nextPath);
-    } else {
-      window.history.pushState(null, "", nextPath);
-    }
-  }
+function syncUrl(replace = false) {
+  syncBrowserUrl(
+    state.activeProjectId,
+    state.activeDatabaseId,
+    state.segments,
+    replace
+  );
 }
 
 /**
@@ -243,9 +142,9 @@ function syncBrowserUrl(replace = false) {
  * @returns {Promise<boolean>} True if this request applied its result (not superseded by a newer call).
  */
 async function refreshDatabaseList() {
-  const seq = ++dbListSeq;
+  const seq = nextDbListSeq();
   const rawList = await listDatabases();
-  if (seq !== dbListSeq) return false;
+  if (!isCurrentDbListSeq(seq)) return false;
   const parsed = rawList
     .map(parseRootRef)
     .filter((item) => item !== null)
@@ -269,23 +168,17 @@ export async function selectDatabase(
 ) {
   const dbChanged =
     state.activeProjectId !== projectId || state.activeDatabaseId !== databaseId;
-  const myDbEpoch = dbChanged ? ++dbEpoch : dbEpoch;
-  const myNavEpoch = ++navEpoch;
+  const myDbEpoch = dbChanged ? bumpDbEpoch() : getDbEpoch();
+  const myNavEpoch = bumpNavEpoch();
   state.activeProjectId = projectId;
   state.activeDatabaseId = databaseId;
   state.segments = [...initialSegments];
 
   if (dbChanged) {
-    state.activeDbMeta = null;
-    state.rootCollections = [];
-    state.collectionColumns.clear();
-    state.documentLevels.clear();
-    colRequestSeq.clear();
-    docRequestSeq.clear();
-    state.queryState = createQueryRunnerState();
+    resetDatabaseCaches();
   }
 
-  syncBrowserUrl(replaceHistory);
+  syncUrl(replaceHistory);
   renderApp();
 
   try {
@@ -294,29 +187,30 @@ export async function selectDatabase(
     const [meta, cols] = await Promise.all([
       getDatabase(projectId, databaseId),
       listCollectionIds(
-        `projects/${projectId}/databases/${databaseId}/documents`
+        `projects/${projectId}/databases/${databaseId}/documents`,
+        { shouldAbort: () => myDbEpoch !== getDbEpoch() }
       ),
     ]);
-    if (myDbEpoch !== dbEpoch) return;
+    if (myDbEpoch !== getDbEpoch()) return;
     state.activeDbMeta = meta;
     state.rootCollections = cols;
     await refreshDatabaseList();
   } catch (err) {
-    if (myDbEpoch !== dbEpoch) return;
-    pushToast(
+    if (myDbEpoch !== getDbEpoch()) return;
+    notifyToast(
       `Failed to load database: ${err instanceof Error ? err.message : String(err)}`,
       "error"
     );
   } finally {
-    if (myDbEpoch === dbEpoch) {
+    if (myDbEpoch === getDbEpoch()) {
       state.rootLoading = false;
       renderApp();
     }
   }
 
   if (
-    myDbEpoch === dbEpoch &&
-    myNavEpoch === navEpoch &&
+    myDbEpoch === getDbEpoch() &&
+    myNavEpoch === getNavEpoch() &&
     initialSegments.length > 0
   ) {
     await hydrateVisiblePath(myDbEpoch, myNavEpoch, initialSegments);
@@ -330,15 +224,17 @@ export async function selectDatabase(
  * @param {string[]} [segmentsSnapshot]
  */
 export async function hydrateVisiblePath(
-  expectedDbEpoch = dbEpoch,
-  expectedNavEpoch = navEpoch,
+  expectedDbEpoch = getDbEpoch(),
+  expectedNavEpoch = getNavEpoch(),
   segmentsSnapshot = [...state.segments]
 ) {
   if (!state.activeProjectId || !state.activeDatabaseId) return;
   const rootPath = `projects/${state.activeProjectId}/databases/${state.activeDatabaseId}/documents`;
 
   for (let i = 0; i < segmentsSnapshot.length; i += 2) {
-    if (expectedDbEpoch !== dbEpoch || expectedNavEpoch !== navEpoch) return;
+    if (expectedDbEpoch !== getDbEpoch() || expectedNavEpoch !== getNavEpoch()) {
+      return;
+    }
     const colId = segmentsSnapshot[i];
     const parentSegments = segmentsSnapshot.slice(0, i);
     const colSegments = segmentsSnapshot.slice(0, i + 1);
@@ -355,7 +251,9 @@ export async function hydrateVisiblePath(
       false,
       expectedDbEpoch
     );
-    if (expectedDbEpoch !== dbEpoch || expectedNavEpoch !== navEpoch) return;
+    if (expectedDbEpoch !== getDbEpoch() || expectedNavEpoch !== getNavEpoch()) {
+      return;
+    }
 
     if (segmentsSnapshot.length > i + 1) {
       const docId = segmentsSnapshot[i + 1];
@@ -363,6 +261,19 @@ export async function hydrateVisiblePath(
       await loadDocumentLevel(docPath, docId, true, expectedDbEpoch);
     }
   }
+}
+
+/**
+ * @param {FirestoreDocument[]} docs
+ * @returns {Array<{ id: string, fullName: string, phantom: boolean }>}
+ */
+function mapColumnDocuments(docs) {
+  return docs.map((doc) => {
+    const fullName = doc.name ?? "";
+    const id = fullName.slice(fullName.lastIndexOf("/") + 1);
+    const phantom = !doc.createTime && !doc.updateTime;
+    return { id, fullName, phantom };
+  });
 }
 
 /**
@@ -377,11 +288,10 @@ export async function loadCollectionColumn(
   parentPath,
   colId,
   appendPage,
-  expectedDbEpoch = dbEpoch
+  expectedDbEpoch = getDbEpoch()
 ) {
-  if (expectedDbEpoch !== dbEpoch) return;
-  const seq = (colRequestSeq.get(colPath) ?? 0) + 1;
-  colRequestSeq.set(colPath, seq);
+  if (expectedDbEpoch !== getDbEpoch()) return;
+  const seq = nextColSeq(colPath);
 
   let colState = state.collectionColumns.get(colPath);
   if (!colState) {
@@ -401,35 +311,75 @@ export async function loadCollectionColumn(
   renderApp();
 
   try {
-    const res = await listDocuments(parentPath, colId, {
-      showMissing: true,
-      maskFieldPaths: ["__name__"],
-      pageSize: 200,
-      pageToken: appendPage ? colState.nextPageToken : undefined,
-    });
-    if (expectedDbEpoch !== dbEpoch || colRequestSeq.get(colPath) !== seq) {
-      return;
+    if (appendPage) {
+      const res = await listDocuments(parentPath, colId, {
+        showMissing: true,
+        maskFieldPaths: ["__name__"],
+        pageSize: 200,
+        pageToken: colState.nextPageToken,
+      });
+      if (expectedDbEpoch !== getDbEpoch() || !isCurrentColSeq(colPath, seq)) {
+        return;
+      }
+      const mapped = mapColumnDocuments(res.documents);
+      colState.documents = [...colState.documents, ...mapped];
+      colState.nextPageToken = res.nextPageToken;
+    } else {
+      const priorCount = colState.documents.length;
+      /** @type {Set<string>} */
+      const seenTokens = new Set();
+      /** @type {Array<{ id: string, fullName: string, phantom: boolean }>} */
+      const collected = [];
+      /** @type {string | undefined} */
+      let pageToken = undefined;
+      let nextToken = "";
+
+      for (let page = 0; page < MAX_COLLECTION_COLUMN_PAGES; page++) {
+        const pageSize =
+          page === 0
+            ? Math.max(200, priorCount)
+            : Math.max(1, priorCount - collected.length);
+        const res = await listDocuments(parentPath, colId, {
+          showMissing: true,
+          maskFieldPaths: ["__name__"],
+          pageSize,
+          pageToken,
+        });
+        if (
+          expectedDbEpoch !== getDbEpoch() ||
+          !isCurrentColSeq(colPath, seq)
+        ) {
+          return;
+        }
+        const mapped = mapColumnDocuments(res.documents);
+        for (const doc of mapped) {
+          collected.push(doc);
+        }
+        nextToken = res.nextPageToken;
+        if (!nextToken || seenTokens.has(nextToken) || mapped.length === 0) {
+          nextToken = "";
+          break;
+        }
+        if (collected.length >= priorCount) {
+          break;
+        }
+        seenTokens.add(nextToken);
+        pageToken = nextToken;
+      }
+
+      colState.documents = collected;
+      colState.nextPageToken = nextToken;
     }
-    const mapped = res.documents.map((doc) => {
-      const fullName = doc.name ?? "";
-      const id = fullName.slice(fullName.lastIndexOf("/") + 1);
-      const phantom = !doc.createTime && !doc.updateTime;
-      return { id, fullName, phantom };
-    });
-    colState.documents = appendPage
-      ? [...colState.documents, ...mapped]
-      : mapped;
-    colState.nextPageToken = res.nextPageToken;
   } catch (err) {
-    if (expectedDbEpoch !== dbEpoch || colRequestSeq.get(colPath) !== seq) {
+    if (expectedDbEpoch !== getDbEpoch() || !isCurrentColSeq(colPath, seq)) {
       return;
     }
-    pushToast(
+    notifyToast(
       `Failed to list ${colId}: ${err instanceof Error ? err.message : String(err)}`,
       "error"
     );
   } finally {
-    if (expectedDbEpoch === dbEpoch && colRequestSeq.get(colPath) === seq) {
+    if (expectedDbEpoch === getDbEpoch() && isCurrentColSeq(colPath, seq)) {
       colState.loading = false;
       renderApp();
     }
@@ -447,14 +397,14 @@ export async function loadDocumentLevel(
   docPath,
   docId,
   preserveDirty,
-  expectedDbEpoch = dbEpoch
+  expectedDbEpoch = getDbEpoch()
 ) {
-  if (expectedDbEpoch !== dbEpoch) return;
+  if (expectedDbEpoch !== getDbEpoch()) return;
   if (!state.activeProjectId || !state.activeDatabaseId) return;
   const projectId = state.activeProjectId;
   const databaseId = state.activeDatabaseId;
-  const seq = (docRequestSeq.get(docPath) ?? 0) + 1;
-  docRequestSeq.set(docPath, seq);
+  const seq = nextDocSeq(docPath);
+  const myNavEpoch = getNavEpoch();
 
   let level = state.documentLevels.get(docPath);
   if (!level) {
@@ -483,9 +433,18 @@ export async function loadDocumentLevel(
           throw err;
         }
       ),
-      listCollectionIds(docPath),
+      listCollectionIds(docPath, {
+        shouldAbort: () =>
+          expectedDbEpoch !== getDbEpoch() ||
+          !isCurrentDocSeq(docPath, seq) ||
+          myNavEpoch !== getNavEpoch(),
+      }),
     ]);
-    if (expectedDbEpoch !== dbEpoch || docRequestSeq.get(docPath) !== seq) {
+    if (
+      expectedDbEpoch !== getDbEpoch() ||
+      !isCurrentDocSeq(docPath, seq) ||
+      myNavEpoch !== getNavEpoch()
+    ) {
       return;
     }
 
@@ -524,15 +483,19 @@ export async function loadDocumentLevel(
       }
     }
   } catch (err) {
-    if (expectedDbEpoch !== dbEpoch || docRequestSeq.get(docPath) !== seq) {
+    if (
+      expectedDbEpoch !== getDbEpoch() ||
+      !isCurrentDocSeq(docPath, seq) ||
+      myNavEpoch !== getNavEpoch()
+    ) {
       return;
     }
-    pushToast(
+    notifyToast(
       `Failed to load document ${docId}: ${err instanceof Error ? err.message : String(err)}`,
       "error"
     );
   } finally {
-    if (expectedDbEpoch === dbEpoch && docRequestSeq.get(docPath) === seq) {
+    if (expectedDbEpoch === getDbEpoch() && isCurrentDocSeq(docPath, seq)) {
       level.loading = false;
       renderApp();
     }
@@ -553,8 +516,11 @@ export async function handleSseBatch(events) {
   /** @type {Set<string>} */
   const changedPaths = new Set();
 
-  let myDbEpoch = dbEpoch;
-  const activeRoot = getActiveRootPath();
+  let myDbEpoch = getDbEpoch();
+  const activeRoot = getActiveRootPath(
+    state.activeProjectId,
+    state.activeDatabaseId
+  );
 
   for (const ev of events) {
     if (ev.type === "resync") {
@@ -575,21 +541,12 @@ export async function handleSseBatch(events) {
       }
       if (ev.database && ev.database === activeRoot) {
         // Clear cached state WITHOUT calling /v1/projects/... so we never re-create the cleared database!
-        myDbEpoch = ++dbEpoch;
-        navEpoch++;
+        myDbEpoch = bumpDbEpoch();
+        bumpNavEpoch();
         clearedActiveDb = true;
-        state.activeProjectId = null;
-        state.activeDatabaseId = null;
-        state.activeDbMeta = null;
-        state.rootCollections = [];
-        state.segments = [];
-        state.collectionColumns.clear();
-        state.documentLevels.clear();
-        colRequestSeq.clear();
-        docRequestSeq.clear();
-        state.queryState = createQueryRunnerState();
-        syncBrowserUrl(true);
-        pushToast(`Database ${ev.database} was cleared`, "info");
+        clearActiveDatabaseState();
+        syncUrl(true);
+        notifyToast(`Database ${ev.database} was cleared`, "info");
       }
       continue;
     }
@@ -609,8 +566,35 @@ export async function handleSseBatch(events) {
   }
 
   if (shouldRefreshDbList) {
-    const applied = await refreshDatabaseList();
-    if (myDbEpoch !== dbEpoch) return;
+    let applied = false;
+    try {
+      applied = await refreshDatabaseList();
+    } catch (err) {
+      if (myDbEpoch !== getDbEpoch()) return;
+      fullResyncActiveDb = false;
+      notifyToast(
+        `Failed to refresh database list: ${err instanceof Error ? err.message : String(err)}`,
+        "error"
+      );
+    }
+    if (myDbEpoch !== getDbEpoch()) return;
+    if (
+      applied &&
+      fullResyncActiveDb &&
+      activeRoot &&
+      !clearedActiveDb &&
+      !state.rootLoading &&
+      state.activeDbMeta !== null &&
+      !state.databases.some((db) => db.rootPath === activeRoot)
+    ) {
+      // Clear cached state WITHOUT calling getDatabase(), which would lazily recreate the cleared DB!
+      myDbEpoch = bumpDbEpoch();
+      bumpNavEpoch();
+      clearedActiveDb = true;
+      clearActiveDatabaseState();
+      syncUrl(true);
+      notifyToast(`Database ${activeRoot} was cleared`, "info");
+    }
     // If no active DB is selected and a DB now exists, auto-select the first one cleanly.
     if (applied && !state.activeProjectId && state.databases.length > 0) {
       const first = state.databases[0];
@@ -622,11 +606,13 @@ export async function handleSseBatch(events) {
 
   if (
     clearedActiveDb ||
-    myDbEpoch !== dbEpoch ||
+    state.rootLoading ||
+    myDbEpoch !== getDbEpoch() ||
     !state.activeProjectId ||
     !state.activeDatabaseId ||
     !activeRoot ||
-    getActiveRootPath() !== activeRoot
+    getActiveRootPath(state.activeProjectId, state.activeDatabaseId) !==
+      activeRoot
   ) {
     return;
   }
@@ -637,7 +623,13 @@ export async function handleSseBatch(events) {
         state.activeProjectId,
         state.activeDatabaseId
       );
-      if (myDbEpoch !== dbEpoch || getActiveRootPath() !== activeRoot) return;
+      if (
+        myDbEpoch !== getDbEpoch() ||
+        getActiveRootPath(state.activeProjectId, state.activeDatabaseId) !==
+          activeRoot
+      ) {
+        return;
+      }
       state.activeDbMeta = meta;
     } catch {
       // Ignore transient error
@@ -646,17 +638,28 @@ export async function handleSseBatch(events) {
 
   if (fullResyncActiveDb || changedPaths.size > 0) {
     try {
-      const cols = await listCollectionIds(activeRoot);
-      if (myDbEpoch !== dbEpoch || getActiveRootPath() !== activeRoot) return;
+      const cols = await listCollectionIds(activeRoot, {
+        shouldAbort: () =>
+          myDbEpoch !== getDbEpoch() ||
+          getActiveRootPath(state.activeProjectId, state.activeDatabaseId) !==
+            activeRoot,
+      });
+      if (
+        myDbEpoch !== getDbEpoch() ||
+        getActiveRootPath(state.activeProjectId, state.activeDatabaseId) !==
+          activeRoot
+      ) {
+        return;
+      }
       state.rootCollections = cols;
     } catch {
       // Ignore
     }
 
-    const myNavEpoch = navEpoch;
+    const myNavEpoch = getNavEpoch();
     const segmentsSnapshot = [...state.segments];
     for (let i = 0; i < segmentsSnapshot.length; i += 2) {
-      if (myDbEpoch !== dbEpoch || myNavEpoch !== navEpoch) return;
+      if (myDbEpoch !== getDbEpoch() || myNavEpoch !== getNavEpoch()) return;
       const colId = segmentsSnapshot[i];
       const parentSegments = segmentsSnapshot.slice(0, i);
       const colSegments = segmentsSnapshot.slice(0, i + 1);
@@ -673,7 +676,7 @@ export async function handleSseBatch(events) {
       if (affectsCollection) {
         await loadCollectionColumn(colPath, parentPath, colId, false, myDbEpoch);
       }
-      if (myDbEpoch !== dbEpoch || myNavEpoch !== navEpoch) return;
+      if (myDbEpoch !== getDbEpoch() || myNavEpoch !== getNavEpoch()) return;
 
       if (segmentsSnapshot.length > i + 1) {
         const docId = segmentsSnapshot[i + 1];
@@ -687,7 +690,7 @@ export async function handleSseBatch(events) {
         }
       }
     }
-    if (myDbEpoch === dbEpoch) {
+    if (myDbEpoch === getDbEpoch()) {
       renderApp();
     }
   }
@@ -712,7 +715,7 @@ export async function saveDocumentFromInspector(docLevel) {
   session.saveError = null;
   renderApp();
 
-  const myDbEpoch = dbEpoch;
+  const myDbEpoch = getDbEpoch();
 
   try {
     const cleanFields = session.cleanDoc?.fields ?? {};
@@ -734,17 +737,14 @@ export async function saveDocumentFromInspector(docLevel) {
       updateMask,
       session.cleanDoc?.updateTime ?? null
     );
-    if (myDbEpoch !== dbEpoch) return;
-    docRequestSeq.set(
-      docLevel.docPath,
-      (docRequestSeq.get(docLevel.docPath) ?? 0) + 1
-    );
+    if (myDbEpoch !== getDbEpoch()) return;
+    nextDocSeq(docLevel.docPath);
     docLevel.loading = false;
     docLevel.exists = true;
     syncSessionWithDocument(session, updated);
-    pushToast(`Saved ${docLevel.docId}`, "success");
+    notifyToast(`Saved ${docLevel.docId}`, "success");
   } catch (err) {
-    if (myDbEpoch !== dbEpoch) return;
+    if (myDbEpoch !== getDbEpoch()) return;
     session.saving = false;
     session.saveError = err instanceof Error ? err.message : String(err);
   }
@@ -826,7 +826,7 @@ export async function toggleDatabaseSetting(which) {
   }
   const targetProject = state.activeProjectId;
   const targetDb = state.activeDatabaseId;
-  const myDbEpoch = dbEpoch;
+  const myDbEpoch = getDbEpoch();
   try {
     const patch =
       which === "edition"
@@ -846,7 +846,7 @@ export async function toggleDatabaseSetting(which) {
           };
     const updatedMeta = await patchDatabase(targetProject, targetDb, patch);
     if (
-      myDbEpoch !== dbEpoch ||
+      myDbEpoch !== getDbEpoch() ||
       state.activeProjectId !== targetProject ||
       state.activeDatabaseId !== targetDb
     ) {
@@ -855,8 +855,8 @@ export async function toggleDatabaseSetting(which) {
     state.activeDbMeta = updatedMeta;
     renderApp();
   } catch (err) {
-    if (myDbEpoch !== dbEpoch) return;
-    pushToast(
+    if (myDbEpoch !== getDbEpoch()) return;
+    notifyToast(
       `Failed to update database config: ${err instanceof Error ? err.message : String(err)}`,
       "error"
     );
@@ -906,7 +906,11 @@ export function openCreateDocumentModal(
   renderApp();
 }
 
-function renderTopbar() {
+/**
+ * Renders the top navigation bar.
+ * @returns {TemplateResult}
+ */
+export function renderTopbar() {
   const activeKey =
     state.activeProjectId && state.activeDatabaseId
       ? `projects/${state.activeProjectId}/databases/${state.activeDatabaseId}/documents`
@@ -934,8 +938,8 @@ function renderTopbar() {
             if (state.activeProjectId && state.activeDatabaseId) {
               state.view = "explorer";
               state.segments = [];
-              navEpoch++;
-              syncBrowserUrl();
+              bumpNavEpoch();
+              syncUrl();
               renderApp();
             }
           }}
@@ -949,6 +953,7 @@ function renderTopbar() {
           ? html`
               <select
                 class="select mono"
+                aria-label="Select database"
                 .value=${activeKey}
                 @change=${(/** @type {Event} */ e) => {
                   const val = /** @type {HTMLSelectElement} */ (e.target).value;
@@ -1058,10 +1063,7 @@ function renderTopbar() {
           type="button"
           class="sse-badge"
           title="Click to pause or resume live SSE updates"
-          @click=${() => {
-            state.ssePaused = !state.ssePaused;
-            renderApp();
-          }}
+          @click=${toggleSsePaused}
         >
           <span class="sse-dot ${dotClass}"></span>
           <span>${sseLabel}</span>
@@ -1071,6 +1073,10 @@ function renderTopbar() {
   `;
 }
 
+/**
+ * Renders the active workspace view (empty hero, Query Runner, or Explorer).
+ * @returns {TemplateResult}
+ */
 export function renderWorkspace() {
   if (!state.activeProjectId || !state.activeDatabaseId) {
     return html`
@@ -1105,8 +1111,8 @@ export function renderWorkspace() {
         if (m) {
           state.view = "explorer";
           state.segments = m[1].split("/");
-          navEpoch++;
-          syncBrowserUrl();
+          bumpNavEpoch();
+          syncUrl();
           renderApp();
           void hydrateVisiblePath();
         }
@@ -1124,8 +1130,8 @@ export function renderWorkspace() {
     documentLevels: state.documentLevels,
     onSelectSegments: (nextSegments) => {
       state.segments = nextSegments;
-      navEpoch++;
-      syncBrowserUrl();
+      bumpNavEpoch();
+      syncUrl();
       renderApp();
       void hydrateVisiblePath();
     },
@@ -1185,511 +1191,25 @@ export function renderWorkspace() {
   });
 }
 
+/**
+ * Renders the currently active modal dialog, or `nothing` when no modal is open.
+ * @returns {TemplateResult | symbol}
+ */
 export function renderModal() {
-  const m = state.modal;
-  if (!m) return nothing;
-
-  const close = () => {
-    if (m.busy) return;
-    state.modal = null;
-    renderApp();
-  };
-
-  if (m.kind === "open_db") {
-    const submit = async () => {
-      const p = m.projectId.trim();
-      const d = m.databaseId.trim();
-      if (!isValidPathSegment(p) || !isValidPathSegment(d)) {
-        m.error =
-          "Enter valid non-empty Project ID and Database ID (no '/', '.', or '..')";
-        renderApp();
-        return;
-      }
-      m.busy = true;
-      m.error = null;
-      renderApp();
-      try {
-        await patchDatabase(p, d, { databaseEdition: m.edition });
-        state.modal = null;
-        await selectDatabase(p, d, []);
-        pushToast(`Opened database ${p}/${d}`, "success");
-      } catch (err) {
-        m.busy = false;
-        m.error = err instanceof Error ? err.message : String(err);
-        renderApp();
-      }
-    };
-
-    return html`
-      <div class="modal-backdrop" @click=${close}>
-        <div
-          class="modal-card modal-sm"
-          @click=${(/** @type {Event} */ e) => e.stopPropagation()}
-        >
-          <div class="modal-header">
-            <span>Open or Create Database</span>
-            <button type="button" class="btn btn-sm btn-ghost" @click=${close}>
-              ✕
-            </button>
-          </div>
-          <div class="modal-body">
-            ${m.error ? html`<div class="error-banner">${m.error}</div>` : nothing}
-            <div class="form-field">
-              <label>Project ID</label>
-              <input
-                type="text"
-                class="input mono"
-                .value=${m.projectId}
-                @input=${(/** @type {Event} */ e) => {
-                  m.projectId = /** @type {HTMLInputElement} */ (e.target).value;
-                }}
-              />
-            </div>
-            <div class="form-field">
-              <label>Database ID</label>
-              <input
-                type="text"
-                class="input mono"
-                .value=${m.databaseId}
-                @input=${(/** @type {Event} */ e) => {
-                  m.databaseId = /** @type {HTMLInputElement} */ (e.target).value;
-                }}
-              />
-            </div>
-            <div class="form-field">
-              <label>Edition</label>
-              <select
-                class="select"
-                .value=${m.edition}
-                @change=${(/** @type {Event} */ e) => {
-                  m.edition = /** @type {'STANDARD' | 'ENTERPRISE'} */ (
-                    /** @type {HTMLSelectElement} */ (e.target).value
-                  );
-                }}
-              >
-                <option value="STANDARD">STANDARD (Pessimistic Concurrency)</option>
-                <option value="ENTERPRISE">ENTERPRISE (Optimistic Concurrency)</option>
-              </select>
-            </div>
-          </div>
-          <div class="modal-footer">
-            <button type="button" class="btn" ?disabled=${m.busy} @click=${close}>
-              Cancel
-            </button>
-            <button
-              type="button"
-              class="btn btn-primary"
-              ?disabled=${m.busy}
-              @click=${submit}
-            >
-              ${m.busy ? "Opening..." : "Open Database"}
-            </button>
-          </div>
-        </div>
-      </div>
-    `;
-  }
-
-  if (m.kind === "create_doc") {
-    const submit = async () => {
-      const colId = m.collectionId.trim();
-      const docId = m.docId.trim() || generateAutoId();
-      if (!isValidPathSegment(colId)) {
-        m.error =
-          "Collection ID must be a valid non-empty segment (no '/', '.', or '..')";
-        renderApp();
-        return;
-      }
-      if (!isValidPathSegment(docId)) {
-        m.error = "Document ID cannot contain '/' or be '.' / '..'";
-        renderApp();
-        return;
-      }
-      const extracted = extractSessionFields(m.session);
-      if (!extracted.valid || !extracted.fields) {
-        m.error = extracted.error ?? "Fix field validation errors";
-        renderApp();
-        return;
-      }
-
-      m.busy = true;
-      m.error = null;
-      renderApp();
-
-      const myDbEpoch = dbEpoch;
-      try {
-        const created = await createDocument(
-          m.parentPath,
-          colId,
-          docId,
-          extracted.fields
-        );
-        if (myDbEpoch !== dbEpoch) {
-          state.modal = null;
-          renderApp();
-          return;
-        }
-        state.modal = null;
-        const fullName = created.name ?? "";
-        const match =
-          /^projects\/[^/]+\/databases\/[^/]+\/documents\/(.+)$/.exec(fullName);
-        if (match && state.activeProjectId && state.activeDatabaseId) {
-          const cols = await listCollectionIds(
-            `projects/${state.activeProjectId}/databases/${state.activeDatabaseId}/documents`
-          );
-          if (myDbEpoch !== dbEpoch) return;
-          state.rootCollections = cols;
-          state.segments = match[1].split("/");
-          const myNavEpoch = ++navEpoch;
-          syncBrowserUrl();
-          await hydrateVisiblePath(myDbEpoch, myNavEpoch);
-        }
-        pushToast(`Created ${colId}/${docId}`, "success");
-      } catch (err) {
-        m.busy = false;
-        m.error = err instanceof Error ? err.message : String(err);
-      }
-      renderApp();
-    };
-
-    return html`
-      <div class="modal-backdrop" @click=${close}>
-        <div
-          class="modal-card"
-          @click=${(/** @type {Event} */ e) => e.stopPropagation()}
-        >
-          <div class="modal-header">
-            <span>
-              ${m.lockCollection
-                ? `Add Document to "${m.collectionId}"`
-                : "Start Collection & Create First Document"}
-            </span>
-            <button type="button" class="btn btn-sm btn-ghost" @click=${close}>
-              ✕
-            </button>
-          </div>
-          <div class="modal-body">
-            ${m.error ? html`<div class="error-banner">${m.error}</div>` : nothing}
-            ${!m.lockCollection
-              ? html`
-                  <div class="form-field">
-                    <label>Collection ID</label>
-                    <input
-                      type="text"
-                      class="input mono"
-                      placeholder="e.g. users"
-                      .value=${m.collectionId}
-                      @input=${(/** @type {Event} */ e) => {
-                        m.collectionId = /** @type {HTMLInputElement} */ (
-                          e.target
-                        ).value;
-                      }}
-                    />
-                  </div>
-                `
-              : nothing}
-
-            <div class="form-row">
-              <div class="form-field" style="flex: 1 1 auto;">
-                <label>Document ID</label>
-                <input
-                  type="text"
-                  class="input mono"
-                  ?disabled=${m.lockDocId}
-                  placeholder="20-char auto-ID or custom ID"
-                  .value=${m.docId}
-                  @input=${(/** @type {Event} */ e) => {
-                    m.docId = /** @type {HTMLInputElement} */ (e.target).value;
-                  }}
-                />
-              </div>
-              ${!m.lockDocId
-                ? html`
-                    <button
-                      type="button"
-                      class="btn"
-                      @click=${() => {
-                        m.docId = generateAutoId();
-                        renderApp();
-                      }}
-                    >
-                      Auto-ID
-                    </button>
-                  `
-                : nothing}
-            </div>
-
-            <div style="border: 1px solid var(--border); border-radius: 8px; overflow: hidden;">
-              ${renderHybridEditor({
-                session: m.session,
-                onChange: renderApp,
-                embeddedInModal: true,
-              })}
-            </div>
-          </div>
-          <div class="modal-footer">
-            <button type="button" class="btn" ?disabled=${m.busy} @click=${close}>
-              Cancel
-            </button>
-            <button
-              type="button"
-              class="btn btn-primary"
-              ?disabled=${m.busy}
-              @click=${submit}
-            >
-              ${m.busy ? "Creating..." : "Save Document"}
-            </button>
-          </div>
-        </div>
-      </div>
-    `;
-  }
-
-  if (m.kind === "delete_doc") {
-    const confirmDelete = async () => {
-      m.busy = true;
-      m.error = null;
-      renderApp();
-      const myDbEpoch = dbEpoch;
-      try {
-        await deleteDocument(m.docPath, m.recursive);
-        if (myDbEpoch !== dbEpoch) {
-          state.modal = null;
-          renderApp();
-          return;
-        }
-        state.documentLevels.delete(m.docPath);
-        docRequestSeq.delete(m.docPath);
-        if (m.recursive) {
-          pruneCachesWithPrefix(m.docPath);
-        }
-        state.modal = null;
-        if (state.activeProjectId && state.activeDatabaseId) {
-          const rootPath = `projects/${state.activeProjectId}/databases/${state.activeDatabaseId}/documents`;
-          const docSegs = relativeSegments(rootPath, m.docPath);
-          if (
-            (m.recursive || !m.hasSubcollections) &&
-            docSegs &&
-            startsWithSegments(state.segments, docSegs)
-          ) {
-            state.segments = state.segments.slice(0, docSegs.length - 1);
-          }
-          const myNavEpoch = ++navEpoch;
-          const cols = await listCollectionIds(rootPath);
-          if (myDbEpoch !== dbEpoch) return;
-          state.rootCollections = cols;
-          syncBrowserUrl();
-          await hydrateVisiblePath(myDbEpoch, myNavEpoch);
-        }
-        pushToast("Document deleted", "success");
-      } catch (err) {
-        m.busy = false;
-        m.error = err instanceof Error ? err.message : String(err);
-      }
-      renderApp();
-    };
-
-    return html`
-      <div class="modal-backdrop" @click=${close}>
-        <div
-          class="modal-card modal-sm"
-          @click=${(/** @type {Event} */ e) => e.stopPropagation()}
-        >
-          <div class="modal-header">
-            <span>Delete Document</span>
-            <button type="button" class="btn btn-sm btn-ghost" @click=${close}>
-              ✕
-            </button>
-          </div>
-          <div class="modal-body">
-            ${m.error ? html`<div class="error-banner">${m.error}</div>` : nothing}
-            <p style="margin: 0;">
-              Delete document <strong class="mono">${m.docPath}</strong>?
-            </p>
-            <label style="display: flex; align-items: center; gap: 8px; cursor: pointer;">
-              <input
-                type="checkbox"
-                .checked=${m.recursive}
-                @change=${(/** @type {Event} */ e) => {
-                  m.recursive = /** @type {HTMLInputElement} */ (
-                    e.target
-                  ).checked;
-                  renderApp();
-                }}
-              />
-              <span>Also delete all nested subcollections recursively</span>
-            </label>
-          </div>
-          <div class="modal-footer">
-            <button type="button" class="btn" ?disabled=${m.busy} @click=${close}>
-              Cancel
-            </button>
-            <button
-              type="button"
-              class="btn btn-danger"
-              ?disabled=${m.busy}
-              @click=${confirmDelete}
-            >
-              ${m.busy ? "Deleting..." : "Delete"}
-            </button>
-          </div>
-        </div>
-      </div>
-    `;
-  }
-
-  if (m.kind === "delete_col") {
-    const confirmDelete = async () => {
-      m.busy = true;
-      m.error = null;
-      renderApp();
-      const myDbEpoch = dbEpoch;
-      try {
-        await deleteCollection(m.colPath);
-        if (myDbEpoch !== dbEpoch) {
-          state.modal = null;
-          renderApp();
-          return;
-        }
-        pruneCachesWithPrefix(m.colPath);
-        state.modal = null;
-        if (state.activeProjectId && state.activeDatabaseId) {
-          const rootPath = `projects/${state.activeProjectId}/databases/${state.activeDatabaseId}/documents`;
-          const colSegs = relativeSegments(rootPath, m.colPath);
-          if (colSegs && startsWithSegments(state.segments, colSegs)) {
-            state.segments = state.segments.slice(0, colSegs.length - 1);
-          }
-          const myNavEpoch = ++navEpoch;
-          const cols = await listCollectionIds(rootPath);
-          if (myDbEpoch !== dbEpoch) return;
-          state.rootCollections = cols;
-          syncBrowserUrl();
-          await hydrateVisiblePath(myDbEpoch, myNavEpoch);
-        }
-        pushToast(`Deleted collection ${m.colId}`, "success");
-      } catch (err) {
-        m.busy = false;
-        m.error = err instanceof Error ? err.message : String(err);
-      }
-      renderApp();
-    };
-
-    return html`
-      <div class="modal-backdrop" @click=${close}>
-        <div
-          class="modal-card modal-sm"
-          @click=${(/** @type {Event} */ e) => e.stopPropagation()}
-        >
-          <div class="modal-header">
-            <span>Delete Collection</span>
-            <button type="button" class="btn btn-sm btn-ghost" @click=${close}>
-              ✕
-            </button>
-          </div>
-          <div class="modal-body">
-            ${m.error ? html`<div class="error-banner">${m.error}</div>` : nothing}
-            <p style="margin: 0;">
-              Recursively delete all documents and subcollections inside
-              <strong class="mono">${m.colId}</strong>?
-            </p>
-          </div>
-          <div class="modal-footer">
-            <button type="button" class="btn" ?disabled=${m.busy} @click=${close}>
-              Cancel
-            </button>
-            <button
-              type="button"
-              class="btn btn-danger"
-              ?disabled=${m.busy}
-              @click=${confirmDelete}
-            >
-              ${m.busy ? "Deleting..." : "Delete Collection"}
-            </button>
-          </div>
-        </div>
-      </div>
-    `;
-  }
-
-  // clear_db
-  const confirmClearDb = async () => {
-    m.busy = true;
-    m.error = null;
-    renderApp();
-    try {
-      await clearDatabase(m.projectId, m.databaseId);
-      const myDbEpoch = ++dbEpoch;
-      navEpoch++;
-      const clearedRoot = `projects/${m.projectId}/databases/${m.databaseId}/documents`;
-      state.databases = state.databases.filter(
-        (db) => db.rootPath !== clearedRoot
-      );
-      state.modal = null;
-      state.activeProjectId = null;
-      state.activeDatabaseId = null;
-      state.activeDbMeta = null;
-      state.rootCollections = [];
-      state.segments = [];
-      state.collectionColumns.clear();
-      state.documentLevels.clear();
-      colRequestSeq.clear();
-      docRequestSeq.clear();
-      state.queryState = createQueryRunnerState();
-      const applied = await refreshDatabaseList();
-      if (myDbEpoch !== dbEpoch) return;
-      if (applied && !state.activeProjectId && state.databases.length > 0) {
-        const next = state.databases[0];
-        await selectDatabase(next.projectId, next.databaseId, [], true);
-      } else if (!state.activeProjectId) {
-        syncBrowserUrl(true);
-      }
-      pushToast(`Cleared database ${m.projectId}/${m.databaseId}`, "success");
-    } catch (err) {
-      m.busy = false;
-      m.error = err instanceof Error ? err.message : String(err);
-    }
-    renderApp();
-  };
-
-  return html`
-    <div class="modal-backdrop" @click=${close}>
-      <div
-        class="modal-card modal-sm"
-        @click=${(/** @type {Event} */ e) => e.stopPropagation()}
-      >
-        <div class="modal-header">
-          <span>Clear Entire Database</span>
-          <button type="button" class="btn btn-sm btn-ghost" @click=${close}>
-            ✕
-          </button>
-        </div>
-        <div class="modal-body">
-          ${m.error ? html`<div class="error-banner">${m.error}</div>` : nothing}
-          <p style="margin: 0;">
-            Wipe all collections and documents in
-            <strong class="mono">${m.projectId}/${m.databaseId}</strong>? This
-            cannot be undone.
-          </p>
-        </div>
-        <div class="modal-footer">
-          <button type="button" class="btn" ?disabled=${m.busy} @click=${close}>
-            Cancel
-          </button>
-          <button
-            type="button"
-            class="btn btn-danger"
-            ?disabled=${m.busy}
-            @click=${confirmClearDb}
-          >
-            ${m.busy ? "Clearing..." : "Clear Database"}
-          </button>
-        </div>
-      </div>
-    </div>
-  `;
+  return renderModalView(state, {
+    onRerender: renderApp,
+    onSelectDatabase: selectDatabase,
+    onHydrateVisiblePath: hydrateVisiblePath,
+    onRefreshDatabaseList: refreshDatabaseList,
+    onToast: notifyToast,
+  });
 }
 
-function renderToasts() {
+/**
+ * Renders active toast notifications.
+ * @returns {TemplateResult}
+ */
+export function renderToasts() {
   return html`
     ${state.toasts.map(
       (t) => html`
@@ -1699,8 +1219,9 @@ function renderToasts() {
             type="button"
             class="btn btn-sm btn-ghost"
             style="color: inherit; padding: 0 4px;"
+            aria-label="Dismiss notification"
             @click=${() => {
-              state.toasts = state.toasts.filter((x) => x.id !== t.id);
+              dismissToast(t.id);
               renderApp();
             }}
           >
@@ -1712,55 +1233,156 @@ function renderToasts() {
   `;
 }
 
+let wasModalOpen = false;
+/** @type {Element | null} */
+let previousModalFocus = null;
+/** @type {((e: KeyboardEvent) => void) | null} */
+let modalKeydownListener = null;
+
+function closeActiveModal() {
+  if (!state.modal || state.modal.busy) return;
+  state.modal = null;
+  renderApp();
+}
+
+/**
+ * Manages modal Escape/Tab keyboard listener, initial focus, and focus restoration.
+ * @param {boolean} wasOpenBefore
+ * @param {Element | null} prevActiveBeforeRender
+ */
+function syncModalAccessibility(wasOpenBefore, prevActiveBeforeRender) {
+  const isOpenNow = state.modal !== null;
+  if (!wasOpenBefore && isOpenNow) {
+    previousModalFocus = prevActiveBeforeRender;
+    if (
+      typeof document !== "undefined" &&
+      typeof document?.addEventListener === "function" &&
+      !modalKeydownListener
+    ) {
+      modalKeydownListener = (e) => {
+        handleModalKeydown(e, state, modalRootEl, closeActiveModal);
+      };
+      document.addEventListener("keydown", modalKeydownListener);
+    }
+    const focusEntry = () => {
+      if (!state.modal) return;
+      const dialogEl =
+        typeof modalRootEl?.querySelector === "function"
+          ? modalRootEl.querySelector('[role="dialog"]')
+          : null;
+      if (!dialogEl) return;
+      const initialField =
+        typeof dialogEl.querySelector === "function"
+          ? dialogEl.querySelector(
+              'input:not([disabled]):not([type="hidden"]), select:not([disabled]), textarea:not([disabled])'
+            )
+          : null;
+      const fallback = getModalFocusableElements(dialogEl)[0] ?? dialogEl;
+      const target = /** @type {Partial<HTMLElement>} */ (
+        initialField ?? fallback
+      );
+      if (typeof target?.focus === "function") {
+        target.focus();
+      }
+    };
+    if (typeof requestAnimationFrame === "function") {
+      requestAnimationFrame(focusEntry);
+    } else {
+      focusEntry();
+    }
+  } else if (wasOpenBefore && !isOpenNow) {
+    if (
+      typeof document !== "undefined" &&
+      typeof document?.removeEventListener === "function" &&
+      modalKeydownListener
+    ) {
+      document.removeEventListener("keydown", modalKeydownListener);
+      modalKeydownListener = null;
+    }
+    const toRestore = /** @type {(Element & Partial<HTMLElement>) | null} */ (
+      previousModalFocus
+    );
+    previousModalFocus = null;
+    if (
+      toRestore &&
+      typeof toRestore.focus === "function" &&
+      toRestore.isConnected !== false
+    ) {
+      toRestore.focus();
+    }
+  }
+  wasModalOpen = isOpenNow;
+}
+
 function renderApp() {
+  const prevActive =
+    !wasModalOpen &&
+    state.modal !== null &&
+    typeof document !== "undefined" &&
+    document
+      ? (document.activeElement ?? null)
+      : null;
   if (topbarEl) render(renderTopbar(), topbarEl);
   if (workspaceEl) render(renderWorkspace(), workspaceEl);
   if (modalRootEl) render(renderModal(), modalRootEl);
   if (toastRootEl) render(renderToasts(), toastRootEl);
+  syncModalAccessibility(wasModalOpen, prevActive);
 }
 
+let popstateBound = false;
+
+/**
+ * Initializes event listeners, SSE streaming, and initial database/route hydration.
+ */
 export async function init() {
+  state.sseStatus = "live";
   renderApp();
 
-  connectEventStream(
+  activeEventStream?.close();
+  activeEventStream = connectEventStream(
     (batch) => {
-      sseQueue = sseQueue
-        .then(() => handleSseBatch(batch))
-        .catch(() => {});
+      void enqueueSseBatch(batch);
     },
     (status) => {
+      const prevStatus = state.sseStatus;
       state.sseStatus = status;
       renderApp();
+      if (prevStatus === "error" && status === "live") {
+        void enqueueSseBatch([{ type: "resync" }]);
+      }
     }
   );
 
-  window.addEventListener("popstate", () => {
-    const route = parseBrowserRoute(window.location.pathname);
-    if (route) {
-      if (
-        route.projectId === state.activeProjectId &&
-        route.databaseId === state.activeDatabaseId
-      ) {
-        state.segments = [...route.segments];
-        navEpoch++;
-        renderApp();
-        if (state.segments.length > 0) {
-          void hydrateVisiblePath();
+  if (!popstateBound) {
+    popstateBound = true;
+    window.addEventListener("popstate", () => {
+      const route = parseBrowserRoute(window.location.pathname);
+      if (route) {
+        if (
+          route.projectId === state.activeProjectId &&
+          route.databaseId === state.activeDatabaseId
+        ) {
+          state.segments = [...route.segments];
+          bumpNavEpoch();
+          renderApp();
+          if (state.segments.length > 0) {
+            void hydrateVisiblePath();
+          }
+        } else {
+          void selectDatabase(
+            route.projectId,
+            route.databaseId,
+            route.segments,
+            true
+          );
         }
       } else {
-        void selectDatabase(
-          route.projectId,
-          route.databaseId,
-          route.segments,
-          true
-        );
+        state.segments = [];
+        bumpNavEpoch();
+        renderApp();
       }
-    } else {
-      state.segments = [];
-      navEpoch++;
-      renderApp();
-    }
-  });
+    });
+  }
 
   try {
     await refreshDatabaseList();
@@ -1779,7 +1401,7 @@ export async function init() {
       renderApp();
     }
   } catch (err) {
-    pushToast(
+    notifyToast(
       `Failed to initialize UI: ${err instanceof Error ? err.message : String(err)}`,
       "error"
     );

@@ -211,6 +211,21 @@ textarea {
   box-shadow: 0 0 0 2px rgba(37, 99, 235, 0.14);
 }
 
+button:focus-visible,
+a:focus-visible,
+[tabindex]:focus-visible,
+input[type="checkbox"]:focus-visible {
+  outline: 2px solid var(--primary);
+  outline-offset: 2px;
+}
+
+.col-item:focus-visible,
+.crumb:focus-visible,
+.segmented button:focus-visible {
+  outline: 2px solid var(--primary);
+  outline-offset: -2px;
+}
+
 .input-error {
   border-color: var(--danger) !important;
   background: #fffafa;
@@ -462,7 +477,17 @@ textarea {
   list-style: none;
 }
 
+.col-list > li {
+  min-width: 0;
+}
+
 .col-item {
+  width: 100%;
+  min-width: 0;
+  border: none;
+  background: transparent;
+  text-align: left;
+  font: inherit;
   display: flex;
   align-items: center;
   justify-content: space-between;
@@ -496,9 +521,15 @@ textarea {
 }
 
 .item-label {
+  flex: 1 1 auto;
+  min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.col-item > span:not(.item-label) {
+  flex-shrink: 0;
 }
 
 .phantom-pill {
@@ -916,6 +947,12 @@ textarea {
   justify-content: space-between;
   font-weight: 700;
   font-size: 15px;
+}
+
+.modal-title {
+  margin: 0;
+  font-size: inherit;
+  font-weight: inherit;
 }
 
 .modal-body {

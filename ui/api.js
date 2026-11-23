@@ -148,22 +148,63 @@ export async function clearDatabase(projectId, databaseId) {
   });
 }
 
+const MAX_LIST_COLLECTION_PAGES = 1000;
+
 /**
  * Lists direct child collection IDs under a database root or document path.
  * @param {string} parentPath
+ * @param {{ signal?: AbortSignal, shouldAbort?: () => boolean }} [opts]
  * @returns {Promise<string[]>}
  */
-export async function listCollectionIds(parentPath) {
-  /** @type {{ collectionIds?: string[] }} */
-  const res = await requestJson(
-    `/v1/${encodeResourcePath(parentPath)}:listCollectionIds`,
-    {
+export async function listCollectionIds(parentPath, opts = {}) {
+  const { signal, shouldAbort } = opts;
+  const isAborted = () => Boolean(signal?.aborted || shouldAbort?.());
+  const url = `/v1/${encodeResourcePath(parentPath)}:listCollectionIds`;
+  /** @type {string[]} */
+  const collectionIds = [];
+  /** @type {Set<string>} */
+  const seenTokens = new Set();
+  let pageToken = "";
+
+  for (let page = 0; page < MAX_LIST_COLLECTION_PAGES; page++) {
+    if (isAborted()) {
+      break;
+    }
+    /** @type {{ collectionIds?: string[], nextPageToken?: string }} */
+    const res = await requestJson(url, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({}),
+      body: JSON.stringify(pageToken ? { pageToken } : {}),
+      ...(signal ? { signal } : {}),
+    });
+    if (isAborted()) {
+      break;
     }
-  );
-  return res.collectionIds ?? [];
+    if (Array.isArray(res.collectionIds)) {
+      for (const id of res.collectionIds) {
+        collectionIds.push(id);
+      }
+    }
+    const nextToken = res.nextPageToken ?? "";
+    if (!nextToken) {
+      break;
+    }
+    if (seenTokens.has(nextToken)) {
+      console.warn(
+        `listCollectionIds(${parentPath}): duplicate nextPageToken "${nextToken}"; stopping pagination early.`
+      );
+      break;
+    }
+    seenTokens.add(nextToken);
+    pageToken = nextToken;
+    if (page === MAX_LIST_COLLECTION_PAGES - 1) {
+      console.warn(
+        `listCollectionIds(${parentPath}): reached max page cap (${MAX_LIST_COLLECTION_PAGES}) with remaining nextPageToken; stopping pagination early.`
+      );
+    }
+  }
+
+  return collectionIds;
 }
 
 /**

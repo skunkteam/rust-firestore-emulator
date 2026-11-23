@@ -42,6 +42,8 @@ const NODE_BOOTSTRAP: &str = r#"
 import assert from "node:assert/strict";
 
 const popstateListeners = [];
+const docKeydownListeners = [];
+let mockActiveElement = null;
 let fetchImpl = async () => {
   throw new Error("unexpected fetch call");
 };
@@ -49,6 +51,21 @@ let fetchImpl = async () => {
 globalThis.document = {
   createTreeWalker: () => ({ currentNode: null, nextNode: () => null }),
   getElementById: () => null,
+  get activeElement() {
+    return mockActiveElement;
+  },
+  set activeElement(el) {
+    mockActiveElement = el;
+  },
+  addEventListener(type, fn) {
+    if (type === "keydown") docKeydownListeners.push(fn);
+  },
+  removeEventListener(type, fn) {
+    if (type === "keydown") {
+      const idx = docKeydownListeners.indexOf(fn);
+      if (idx >= 0) docKeydownListeners.splice(idx, 1);
+    }
+  },
 };
 globalThis.window = {
   EMULATOR_VERSION: "test",
@@ -157,6 +174,84 @@ function findClickHandler(node, labelText) {
       }
       const nested = findClickHandler(v, labelText);
       if (nested) return nested;
+    }
+  }
+  return null;
+}
+
+function renderTemplateMarkup(node) {
+  const LIT_NOTHING = Symbol.for("lit-nothing");
+  if (node == null || node === LIT_NOTHING || typeof node === "symbol") return "";
+  if (typeof node === "string" || typeof node === "number" || typeof node === "boolean") {
+    return String(node);
+  }
+  if (Array.isArray(node)) {
+    return node.map(renderTemplateMarkup).join("");
+  }
+  if (typeof node === "object" && Array.isArray(node.strings) && Array.isArray(node.values)) {
+    let out = "";
+    for (let i = 0; i < node.strings.length; i++) {
+      let chunk = node.strings[i];
+      if (i < node.values.length) {
+        const val = node.values[i];
+        const boolMatch = /\s+\?([A-Za-z0-9_:-]+)=$/.exec(chunk);
+        if (boolMatch) {
+          chunk = chunk.slice(0, boolMatch.index) + (val && val !== LIT_NOTHING ? ` ${boolMatch[1]}` : "");
+          out += chunk;
+          continue;
+        }
+        if (val === LIT_NOTHING) {
+          const attrMatch = /\s+[A-Za-z0-9_:-]+=$/.exec(chunk);
+          if (attrMatch) {
+            chunk = chunk.slice(0, attrMatch.index);
+          }
+          out += chunk;
+          continue;
+        }
+        out += chunk;
+        if (typeof val === "function") {
+          out += "[fn]";
+        } else if (typeof val === "string" && /=\s*$/.test(chunk)) {
+          out += JSON.stringify(val);
+        } else {
+          out += renderTemplateMarkup(val);
+        }
+      } else {
+        out += chunk;
+      }
+    }
+    return out;
+  }
+  return "";
+}
+
+function findElementEventHandlers(node, classSubstr) {
+  if (!node || typeof node !== "object") return null;
+  if (Array.isArray(node)) {
+    for (const item of node) {
+      const hit = findElementEventHandlers(item, classSubstr);
+      if (hit) return hit;
+    }
+    return null;
+  }
+  if (Array.isArray(node.strings) && Array.isArray(node.values)) {
+    for (let i = 0; i < node.strings.length; i++) {
+      if (node.strings[i].includes(classSubstr)) {
+        const handlers = {};
+        for (let k = i; k < node.values.length; k++) {
+          const s = node.strings[k];
+          if (k > i && s.includes(">")) break;
+          const m = /@([a-z]+)=\s*$/.exec(s);
+          if (m && typeof node.values[k] === "function") {
+            handlers[m[1]] = node.values[k];
+          }
+        }
+        if (Object.keys(handlers).length > 0) return handlers;
+      }
+    }
+    for (const v of node.values) {
+      const hit = findElementEventHandlers(v, classSubstr);
+      if (hit) return hit;
     }
   }
   return null;
@@ -1750,4 +1845,1165 @@ for (const coreRule of ["no-debugger", "no-unreachable", "no-constant-condition"
 }
 "#;
     run_node_ui_test(eslint_check);
+}
+
+#[test]
+fn regression_list_collection_ids_pagination_and_guards() {
+    let script = format!(
+        r#"{NODE_BOOTSTRAP}
+const api = await import("./ui/api.js");
+const app = await import("./ui/app.js");
+
+const warns = [];
+const origWarn = console.warn;
+console.warn = (...args) => warns.push(args.map(String).join(" "));
+
+try {{
+// 1. Paginates across nextPageToken while sending exact {{}} on the initial request without warning.
+{{
+  warns.length = 0;
+  const bodies = [];
+  fetchImpl = async (url, init) => {{
+    assert.equal(url, "/v1/projects/p/databases/(default)/documents:listCollectionIds");
+    assert.equal(init.method, "POST");
+    bodies.push(init.body);
+    const req = JSON.parse(init.body);
+    if (!req.pageToken) {{
+      return jsonResponse({{ collectionIds: ["c1", "c2"], nextPageToken: "tok1" }});
+    }}
+    if (req.pageToken === "tok1") {{
+      return jsonResponse({{ collectionIds: ["c3"], nextPageToken: "tok2" }});
+    }}
+    if (req.pageToken === "tok2") {{
+      return jsonResponse({{ collectionIds: ["c4"] }});
+    }}
+    throw new Error("unexpected pageToken: " + req.pageToken);
+  }};
+
+  const cols = await api.listCollectionIds("projects/p/databases/(default)/documents");
+  assert.deepEqual(cols, ["c1", "c2", "c3", "c4"]);
+  assert.deepEqual(bodies, ["{{}}", '{{"pageToken":"tok1"}}', '{{"pageToken":"tok2"}}']);
+  assert.equal(warns.length, 0, "normal pagination must not emit warnings");
+}}
+
+// 2. Duplicate nextPageToken stops cleanly and emits console.warn instead of looping infinitely.
+{{
+  warns.length = 0;
+  let calls = 0;
+  fetchImpl = async (_url, init) => {{
+    calls++;
+    const req = JSON.parse(init.body);
+    if (!req.pageToken) {{
+      return jsonResponse({{ collectionIds: ["a"], nextPageToken: "dup" }});
+    }}
+    return jsonResponse({{ collectionIds: ["b"], nextPageToken: "dup" }});
+  }};
+
+  const cols = await api.listCollectionIds("projects/p/databases/(default)/documents");
+  assert.deepEqual(cols, ["a", "b"]);
+  assert.equal(calls, 2);
+  assert.equal(warns.length, 1, "duplicate nextPageToken must emit console.warn");
+  assert.ok(warns[0].includes("duplicate nextPageToken"), "unexpected warn: " + warns[0]);
+}}
+
+// 3. Max page cap (1000 pages) guards against unbounded unique token chains and warns iff nextPageToken remains.
+{{
+  warns.length = 0;
+  let calls = 0;
+  fetchImpl = async () => {{
+    calls++;
+    return jsonResponse({{
+      collectionIds: ["col_" + calls],
+      nextPageToken: "tok_" + calls,
+    }});
+  }};
+
+  const cols = await api.listCollectionIds("projects/p/databases/(default)/documents");
+  assert.equal(calls, 1000);
+  assert.equal(cols.length, 1000);
+  assert.equal(cols[0], "col_1");
+  assert.equal(cols[999], "col_1000");
+  assert.equal(warns.length, 1, "hitting page cap with remaining nextPageToken must emit console.warn");
+  assert.ok(warns[0].includes("1000"), "unexpected warn: " + warns[0]);
+
+  // Exactly 1000 pages finishing with empty nextPageToken must NOT warn.
+  warns.length = 0;
+  calls = 0;
+  fetchImpl = async () => {{
+    calls++;
+    return jsonResponse({{
+      collectionIds: ["ok_" + calls],
+      nextPageToken: calls < 1000 ? "ok_tok_" + calls : "",
+    }});
+  }};
+  const exactCols = await api.listCollectionIds("projects/p/databases/(default)/documents");
+  assert.equal(calls, 1000);
+  assert.equal(exactCols.length, 1000);
+  assert.equal(warns.length, 0, "completing exactly on page 1000 without nextPageToken must not warn");
+}}
+
+// 4. shouldAbort and AbortSignal halt pagination immediately between pages without spurious warnings.
+{{
+  warns.length = 0;
+  let calls = 0;
+  let abortNow = false;
+  fetchImpl = async () => {{
+    calls++;
+    abortNow = true;
+    return jsonResponse({{ collectionIds: ["p1"], nextPageToken: "tok_next" }});
+  }};
+  const cols = await api.listCollectionIds("projects/p/databases/(default)/documents", {{
+    shouldAbort: () => abortNow,
+  }});
+  assert.equal(calls, 1, "shouldAbort must prevent fetching subsequent pages");
+  assert.deepEqual(cols, []);
+  assert.equal(warns.length, 0);
+
+  const ac = new AbortController();
+  let signalCalls = 0;
+  let seenSignal = null;
+  fetchImpl = async (_url, init) => {{
+    signalCalls++;
+    seenSignal = init.signal;
+    ac.abort();
+    return jsonResponse({{ collectionIds: ["s1"], nextPageToken: "tok_s2" }});
+  }};
+  const sigCols = await api.listCollectionIds("projects/p/databases/(default)/documents", {{
+    signal: ac.signal,
+  }});
+  assert.equal(signalCalls, 1, "aborted signal must halt after first page");
+  assert.equal(seenSignal, ac.signal, "listCollectionIds must forward signal to fetch");
+  assert.deepEqual(sigCols, []);
+
+  // Pre-aborted signal skips even the first fetch.
+  let preAbortedCalls = 0;
+  fetchImpl = async () => {{
+    preAbortedCalls++;
+    return jsonResponse({{ collectionIds: ["x"] }});
+  }};
+  const preCols = await api.listCollectionIds("projects/p/databases/(default)/documents", {{
+    signal: ac.signal,
+  }});
+  assert.equal(preAbortedCalls, 0);
+  assert.deepEqual(preCols, []);
+}}
+
+// 5. selectDatabase, loadDocumentLevel, and handleSseBatch abort stale paginated listCollectionIds on DB/doc switch.
+{{
+  // 5a. selectDatabase DB switch aborts multi-page root listCollectionIds before page 2.
+  const db1Page1Def = deferred();
+  let db1ColPages = 0;
+  fetchImpl = async (url, init) => {{
+    if (url === "/v1/projects/p1/databases/db1") {{
+      return jsonResponse({{
+        name: "projects/p1/databases/db1",
+        uid: "u1",
+        type: "FIRESTORE_NATIVE",
+        databaseEdition: "STANDARD",
+        concurrencyMode: "PESSIMISTIC",
+      }});
+    }}
+    if (url === "/v1/projects/p1/databases/db1/documents:listCollectionIds") {{
+      db1ColPages++;
+      const body = JSON.parse(init.body ?? "{{}}");
+      if (!body.pageToken) return db1Page1Def.promise;
+      throw new Error("stale db1 page 2 must never be requested");
+    }}
+    if (url === "/v1/projects/p2/databases/db2") {{
+      return jsonResponse({{
+        name: "projects/p2/databases/db2",
+        uid: "u2",
+        type: "FIRESTORE_NATIVE",
+        databaseEdition: "STANDARD",
+        concurrencyMode: "PESSIMISTIC",
+      }});
+    }}
+    if (url === "/v1/projects/p2/databases/db2/documents:listCollectionIds") {{
+      return jsonResponse({{ collectionIds: ["fresh_col"] }});
+    }}
+    if (url === "/emulator/v1") {{
+      return jsonResponse(["projects/p1/databases/db1/documents", "projects/p2/databases/db2/documents"]);
+    }}
+    throw new Error("unexpected url in 5a: " + url);
+  }};
+
+  const pSelect1 = app.selectDatabase("p1", "db1", [], true);
+  await new Promise((r) => setTimeout(r, 0));
+  const pSelect2 = app.selectDatabase("p2", "db2", [], true);
+  db1Page1Def.resolve(jsonResponse({{ collectionIds: ["c1"], nextPageToken: "page2" }}));
+  await Promise.all([pSelect1, pSelect2]);
+  assert.equal(db1ColPages, 1);
+  assert.deepEqual(app.state.rootCollections, ["fresh_col"]);
+
+  // 5b. loadDocumentLevel doc switch (navEpoch bump) aborts paginated subcollection load before page 2.
+  const docAPath = "projects/p2/databases/db2/documents/fresh_col/docA";
+  const docBPath = "projects/p2/databases/db2/documents/fresh_col/docB";
+  const docAPage1Def = deferred();
+  let docAColPages = 0;
+  fetchImpl = async (url, init) => {{
+    if (url === `/v1/${{docAPath}}` || url === `/v1/${{docBPath}}`) {{
+      return jsonResponse({{ name: url.slice(4), fields: {{}} }});
+    }}
+    if (url === `/v1/${{docAPath}}:listCollectionIds`) {{
+      docAColPages++;
+      const body = JSON.parse(init.body ?? "{{}}");
+      if (!body.pageToken) return docAPage1Def.promise;
+      throw new Error("stale docA subcollection page 2 must never be requested");
+    }}
+    if (url === `/v1/${{docBPath}}:listCollectionIds`) {{
+      return jsonResponse({{ collectionIds: ["subB"] }});
+    }}
+    if (url.startsWith("/v1/projects/p2/databases/db2/documents/fresh_col?")) {{
+      return jsonResponse({{ documents: [] }});
+    }}
+    throw new Error("unexpected url in 5b: " + url);
+  }};
+
+  app.state.segments = ["fresh_col", "docA"];
+  const pDocA = app.loadDocumentLevel(docAPath, "docA", true);
+  await new Promise((r) => setTimeout(r, 0));
+  // Simulate switching to docB via Explorer segment selection (bumps navEpoch).
+  const {{ bumpNavEpoch }} = await import("./ui/state.js");
+  app.state.segments = ["fresh_col", "docB"];
+  bumpNavEpoch();
+  const pDocB = app.loadDocumentLevel(docBPath, "docB", true);
+  docAPage1Def.resolve(jsonResponse({{ collectionIds: ["subA1"], nextPageToken: "sub_page2" }}));
+  await Promise.all([pDocA, pDocB]);
+  assert.equal(docAColPages, 1);
+  assert.equal(app.state.documentLevels.get(docAPath).loading, false);
+  assert.deepEqual(app.state.documentLevels.get(docAPath).subcollections, []);
+  assert.deepEqual(app.state.documentLevels.get(docBPath).subcollections, ["subB"]);
+
+  // 5c. handleSseBatch aborts paginated root listCollectionIds when active DB switches mid-pagination.
+  const ssePage1Def = deferred();
+  let sseDb2ColPages = 0;
+  fetchImpl = async (url, init) => {{
+    if (url === "/emulator/v1") {{
+      return jsonResponse(["projects/p2/databases/db2/documents", "projects/p3/databases/db3/documents"]);
+    }}
+    if (url === "/v1/projects/p2/databases/db2") {{
+      return jsonResponse({{
+        name: "projects/p2/databases/db2",
+        uid: "u2",
+        type: "FIRESTORE_NATIVE",
+        databaseEdition: "STANDARD",
+        concurrencyMode: "PESSIMISTIC",
+      }});
+    }}
+    if (url === "/v1/projects/p2/databases/db2/documents:listCollectionIds") {{
+      sseDb2ColPages++;
+      const body = JSON.parse(init.body ?? "{{}}");
+      if (!body.pageToken) return ssePage1Def.promise;
+      throw new Error("stale SSE db2 page 2 must never be requested");
+    }}
+    if (url === "/v1/projects/p3/databases/db3") {{
+      return jsonResponse({{
+        name: "projects/p3/databases/db3",
+        uid: "u3",
+        type: "FIRESTORE_NATIVE",
+        databaseEdition: "STANDARD",
+        concurrencyMode: "PESSIMISTIC",
+      }});
+    }}
+    if (url === "/v1/projects/p3/databases/db3/documents:listCollectionIds") {{
+      return jsonResponse({{ collectionIds: ["db3_col"] }});
+    }}
+    throw new Error("unexpected url in 5c: " + url);
+  }};
+
+  const pSse = app.handleSseBatch([{{ type: "resync" }}]);
+  await new Promise((r) => setTimeout(r, 0));
+  const pSelect3 = app.selectDatabase("p3", "db3", [], true);
+  ssePage1Def.resolve(jsonResponse({{ collectionIds: ["stale_p2"], nextPageToken: "tok_sse_2" }}));
+  await Promise.all([pSse, pSelect3]);
+  assert.equal(sseDb2ColPages, 1);
+  assert.deepEqual(app.state.rootCollections, ["db3_col"]);
+}}
+}} finally {{
+  console.warn = origWarn;
+}}
+
+console.log("regression_list_collection_ids_pagination_and_guards passed");
+"#
+    );
+
+    run_node_ui_test(&script);
+}
+
+#[test]
+fn regression_sse_unpause_reconnect_resync_and_cleared_db_non_recreation() {
+    let script = format!(
+        r#"{NODE_BOOTSTRAP}
+let lastEs = null;
+globalThis.EventSource = class {{
+  constructor(url) {{
+    this.url = url;
+    this.listeners = new Map();
+    lastEs = this;
+  }}
+  addEventListener(type, fn) {{
+    const list = this.listeners.get(type) ?? [];
+    list.push(fn);
+    this.listeners.set(type, list);
+  }}
+  emit(type, data) {{
+    for (const fn of this.listeners.get(type) ?? []) {{
+      fn(data);
+    }}
+  }}
+  close() {{}}
+}};
+
+const app = await import("./ui/app.js");
+
+const db1Root = "projects/p/databases/db1/documents";
+const db2Root = "projects/p/databases/db2/documents";
+let databases = [db1Root];
+let db1Docs = ["alice"];
+const getDbCalls = [];
+let db1ListCalls = 0;
+
+fetchImpl = async (url) => {{
+  if (url === "/emulator/v1") {{
+    return jsonResponse(databases);
+  }}
+  if (url === "/v1/projects/p/databases/db1") {{
+    getDbCalls.push("db1");
+    return jsonResponse({{
+      name: "projects/p/databases/db1",
+      uid: "u1",
+      type: "FIRESTORE_NATIVE",
+      databaseEdition: "STANDARD",
+      concurrencyMode: "PESSIMISTIC",
+    }});
+  }}
+  if (url === "/v1/projects/p/databases/db2") {{
+    getDbCalls.push("db2");
+    return jsonResponse({{
+      name: "projects/p/databases/db2",
+      uid: "u2",
+      type: "FIRESTORE_NATIVE",
+      databaseEdition: "ENTERPRISE",
+      concurrencyMode: "OPTIMISTIC",
+    }});
+  }}
+  if (url === "/v1/projects/p/databases/db1/documents:listCollectionIds") {{
+    return jsonResponse({{ collectionIds: ["users"] }});
+  }}
+  if (url === "/v1/projects/p/databases/db2/documents:listCollectionIds") {{
+    return jsonResponse({{ collectionIds: ["orders"] }});
+  }}
+  if (url.startsWith("/v1/projects/p/databases/db1/documents/users?")) {{
+    db1ListCalls++;
+    return jsonResponse({{
+      documents: db1Docs.map((id) => ({{
+        name: `${{db1Root}}/users/${{id}}`,
+        createTime: "2026-01-01T00:00:00Z",
+        updateTime: "2026-01-01T00:00:00Z",
+      }})),
+    }});
+  }}
+  throw new Error("unexpected url: " + url);
+}};
+
+globalThis.window.location.pathname = "/projects/p/databases/db1/documents/users";
+await app.init();
+assert.ok(lastEs, "EventSource must be connected on init");
+assert.equal(getDbCalls.length, 1);
+assert.equal(db1ListCalls, 1);
+
+// 1. Initial "open" during/after init() must NOT trigger an extra resync.
+lastEs.emit("open");
+await app.flushSseQueue();
+assert.equal(getDbCalls.length, 1, "initial open must not trigger resync");
+assert.equal(db1ListCalls, 1, "initial open must not re-list collection");
+
+// 2. Transition "error" -> "live" must enqueue a full active-DB resync via sseQueue.
+db1Docs = ["alice", "bob"];
+lastEs.emit("error");
+assert.equal(app.state.sseStatus, "error");
+lastEs.emit("open");
+assert.equal(app.state.sseStatus, "live");
+await app.flushSseQueue();
+
+assert.equal(getDbCalls.length, 2, "reconnect error -> live must refresh metadata");
+assert.equal(db1ListCalls, 2, "reconnect error -> live must refresh expanded column");
+assert.deepEqual(
+  app.state.collectionColumns.get(`${{db1Root}}/users`).documents.map((d) => d.id),
+  ["alice", "bob"]
+);
+
+// 3. Pausing must NOT trigger resync, and reconnect while paused must be ignored.
+const pauseBtn = findClickHandler(app.renderTopbar(), "Live");
+assert.ok(pauseBtn);
+await pauseBtn();
+assert.equal(app.state.ssePaused, true);
+
+db1Docs = ["alice", "bob", "carol"];
+lastEs.emit("error");
+lastEs.emit("open");
+await app.flushSseQueue();
+assert.equal(db1ListCalls, 2, "paused state must suppress resync on reconnect");
+
+// 4. Unpausing (true -> false) triggers full resync via sseQueue when DB still exists.
+const resumeBtn = findClickHandler(app.renderTopbar(), "Live Paused");
+assert.ok(resumeBtn);
+await resumeBtn();
+assert.equal(app.state.ssePaused, false);
+assert.deepEqual(
+  app.state.collectionColumns.get(`${{db1Root}}/users`).documents.map((d) => d.id),
+  ["alice", "bob", "carol"]
+);
+
+// 5. Cleared-DB non-recreation on fullResyncActiveDb:
+//    (a) When active DB disappeared and another DB exists, clear active state and auto-select remaining DB without getDatabase(db1).
+const getDbCountBeforeSwitch = getDbCalls.length;
+databases = [db2Root];
+await app.handleSseBatch([{{ type: "resync" }}]);
+assert.equal(
+  getDbCalls.slice(getDbCountBeforeSwitch).includes("db1"),
+  false,
+  "must never call getDatabase(db1) when db1 is absent after resync"
+);
+assert.equal(app.state.activeDatabaseId, "db2");
+assert.deepEqual(app.state.rootCollections, ["orders"]);
+
+//    (b) When active DB disappeared on unpause and NO DBs remain, clear active state without recreating db2.
+const pauseBtn2 = findClickHandler(app.renderTopbar(), "Live");
+await pauseBtn2();
+databases = [];
+const getDbCountBeforeClear = getDbCalls.length;
+const resumeBtn2 = findClickHandler(app.renderTopbar(), "Live Paused");
+await resumeBtn2();
+assert.equal(
+  getDbCalls.length,
+  getDbCountBeforeClear,
+  "must never call getDatabase(db2) when db2 is absent on unpause resync"
+);
+assert.equal(app.state.activeProjectId, null);
+assert.equal(app.state.activeDatabaseId, null);
+assert.equal(globalThis.window.location.pathname, "/");
+
+console.log("regression_sse_unpause_reconnect_resync_and_cleared_db_non_recreation passed");
+"#
+    );
+
+    run_node_ui_test(&script);
+}
+
+#[test]
+fn regression_sse_resync_error_and_inflight_select_database_guard() {
+    let script = format!(
+        r#"{NODE_BOOTSTRAP}
+const app = await import("./ui/app.js");
+
+const db1Root = "projects/p/databases/db1/documents";
+const dbNewRoot = "projects/p/databases/db_new/documents";
+let failDbList = false;
+
+fetchImpl = async (url) => {{
+  if (url === "/emulator/v1") {{
+    if (failDbList) {{
+      return jsonResponse({{ error: {{ code: 503, status: "UNAVAILABLE", message: "db list down" }} }}, 503);
+    }}
+    return jsonResponse([db1Root]);
+  }}
+  if (url === "/v1/projects/p/databases/db1") {{
+    if (failDbList) {{
+      throw new Error("must not call getDatabase when refreshDatabaseList failed");
+    }}
+    return jsonResponse({{
+      name: "projects/p/databases/db1",
+      uid: "u1",
+      type: "FIRESTORE_NATIVE",
+      databaseEdition: "STANDARD",
+      concurrencyMode: "PESSIMISTIC",
+    }});
+  }}
+  if (url === "/v1/projects/p/databases/db1/documents:listCollectionIds") {{
+    if (failDbList) {{
+      throw new Error("must not call listCollectionIds when refreshDatabaseList failed");
+    }}
+    return jsonResponse({{ collectionIds: ["users"] }});
+  }}
+  throw new Error("unexpected url: " + url);
+}};
+
+await app.selectDatabase("p", "db1", [], true);
+assert.equal(app.state.activeDatabaseId, "db1");
+assert.ok(app.state.activeDbMeta);
+assert.deepEqual(app.state.rootCollections, ["users"]);
+
+// 1. Transient /emulator/v1 error during resync notifies error toast and preserves active DB state.
+failDbList = true;
+app.state.toasts = [];
+await app.handleSseBatch([{{ type: "resync" }}]);
+assert.equal(app.state.activeProjectId, "p");
+assert.equal(app.state.activeDatabaseId, "db1");
+assert.ok(app.state.activeDbMeta, "activeDbMeta must not be cleared on refreshDatabaseList error");
+assert.deepEqual(app.state.rootCollections, ["users"]);
+assert.equal(app.state.databases.length, 1);
+assert.ok(
+  app.state.toasts.some((t) => t.tone === "error" && t.text.includes("db list down")),
+  "expected error toast on refreshDatabaseList failure"
+);
+
+// Also verify enqueueSseBatch (via toggleSsePaused unpause) surfaces the error toast cleanly without clobbering state.
+app.state.toasts = [];
+app.state.ssePaused = true;
+await app.toggleSsePaused();
+assert.equal(app.state.activeDatabaseId, "db1");
+assert.ok(
+  app.state.toasts.some((t) => t.tone === "error" && t.text.includes("db list down")),
+  "expected error toast when unpause resync fails"
+);
+
+// 2. In-flight selectDatabase for a newly created DB must NOT be mistaken for a cleared DB on SSE resync.
+failDbList = false;
+const dbNewMetaDef = deferred();
+const dbNewColsDef = deferred();
+let dbNewGetCount = 0;
+let includeDbNewInList = false;
+
+fetchImpl = async (url) => {{
+  if (url === "/emulator/v1") {{
+    return jsonResponse(includeDbNewInList ? [db1Root, dbNewRoot] : [db1Root]);
+  }}
+  if (url === "/v1/projects/p/databases/db_new") {{
+    dbNewGetCount++;
+    return dbNewMetaDef.promise;
+  }}
+  if (url === "/v1/projects/p/databases/db_new/documents:listCollectionIds") {{
+    return dbNewColsDef.promise;
+  }}
+  throw new Error("unexpected url in inflight check: " + url);
+}};
+
+app.state.toasts = [];
+const selectPromise = app.selectDatabase("p", "db_new", [], true);
+assert.equal(app.state.rootLoading, true);
+assert.equal(app.state.activeDbMeta, null);
+
+await app.handleSseBatch([{{ type: "resync" }}]);
+assert.equal(app.state.activeProjectId, "p");
+assert.equal(app.state.activeDatabaseId, "db_new");
+assert.equal(globalThis.window.location.pathname, "/projects/p/databases/db_new/documents");
+assert.equal(dbNewGetCount, 1, "handleSseBatch must not duplicate getDatabase while rootLoading is true");
+assert.equal(
+  app.state.toasts.some((t) => t.text.includes("was cleared")),
+  false,
+  "in-flight selectDatabase must never emit cleared-DB toast"
+);
+
+includeDbNewInList = true;
+dbNewMetaDef.resolve(jsonResponse({{
+  name: "projects/p/databases/db_new",
+  uid: "u_new",
+  type: "FIRESTORE_NATIVE",
+  databaseEdition: "ENTERPRISE",
+  concurrencyMode: "OPTIMISTIC",
+}}));
+dbNewColsDef.resolve(jsonResponse({{ collectionIds: ["items"] }}));
+await selectPromise;
+
+assert.equal(app.state.rootLoading, false);
+assert.equal(app.state.activeDatabaseId, "db_new");
+assert.equal(app.state.activeDbMeta.name, "projects/p/databases/db_new");
+assert.deepEqual(app.state.rootCollections, ["items"]);
+
+// 3. Even when rootLoading is false, null activeDbMeta (e.g. failed initial DB load) is not treated as cleared.
+app.state.activeDbMeta = null;
+app.state.toasts = [];
+includeDbNewInList = false;
+await app.handleSseBatch([{{ type: "resync" }}]);
+assert.equal(app.state.activeDatabaseId, "db_new");
+assert.equal(app.state.toasts.some((t) => t.text.includes("was cleared")), false);
+
+console.log("regression_sse_resync_error_and_inflight_select_database_guard passed");
+"#
+    );
+
+    run_node_ui_test(&script);
+}
+
+#[test]
+fn regression_load_collection_column_preserves_pagination_on_refresh() {
+    let script = format!(
+        r#"{NODE_BOOTSTRAP}
+const app = await import("./ui/app.js");
+
+const colPath = "projects/p/databases/(default)/documents/items";
+const parentPath = "projects/p/databases/(default)/documents";
+const allDocs = Array.from({{ length: 450 }}, (_, i) => ({{
+  name: `${{colPath}}/doc-${{String(i).padStart(3, "0")}}`,
+  createTime: "2026-01-01T00:00:00Z",
+  updateTime: "2026-01-01T00:00:00Z",
+}}));
+
+let clampLimit = 0;
+const requestedPages = [];
+
+fetchImpl = async (url) => {{
+  const parsed = new URL(url, "http://localhost");
+  const pageSize = Number(parsed.searchParams.get("pageSize") ?? "0");
+  const pageToken = parsed.searchParams.get("pageToken") ?? "";
+  requestedPages.push({{ pageSize, pageToken }});
+
+  let start = 0;
+  if (pageToken) {{
+    const idx = allDocs.findIndex((d) => d.name.endsWith("/" + pageToken));
+    start = idx >= 0 ? idx + 1 : allDocs.length;
+  }}
+  const effectiveSize = clampLimit > 0 ? Math.min(pageSize, clampLimit) : pageSize;
+  const slice = allDocs.slice(start, start + effectiveSize);
+  const hasMore = start + slice.length < allDocs.length;
+  const nextPageToken = hasMore && slice.length > 0
+    ? slice[slice.length - 1].name.split("/").pop()
+    : "";
+  return jsonResponse({{ documents: slice, nextPageToken }});
+}};
+
+// 1. Initial load fetches 200 docs, then Load more appends 200 more (total 400).
+await app.loadCollectionColumn(colPath, parentPath, "items", false);
+let colState = app.state.collectionColumns.get(colPath);
+assert.equal(colState.documents.length, 200);
+assert.equal(colState.nextPageToken, "doc-199");
+
+await app.loadCollectionColumn(colPath, parentPath, "items", true);
+assert.equal(colState.documents.length, 400);
+assert.equal(colState.nextPageToken, "doc-399");
+
+// 2. Non-append SSE refresh with unclamped server preserves all 400 documents in 1 request.
+requestedPages.length = 0;
+await app.loadCollectionColumn(colPath, parentPath, "items", false);
+assert.deepEqual(requestedPages, [{{ pageSize: 400, pageToken: "" }}]);
+assert.equal(colState.documents.length, 400);
+assert.equal(colState.documents[399].id, "doc-399");
+assert.equal(colState.nextPageToken, "doc-399");
+
+// 3. Non-append SSE refresh when server clamps responses to 150 docs follows nextPageToken up to 400.
+clampLimit = 150;
+requestedPages.length = 0;
+await app.loadCollectionColumn(colPath, parentPath, "items", false);
+assert.deepEqual(requestedPages, [
+  {{ pageSize: 400, pageToken: "" }},
+  {{ pageSize: 250, pageToken: "doc-149" }},
+  {{ pageSize: 100, pageToken: "doc-299" }},
+]);
+assert.equal(colState.documents.length, 400);
+assert.equal(colState.documents[0].id, "doc-000");
+assert.equal(colState.documents[399].id, "doc-399");
+assert.equal(colState.nextPageToken, "doc-399");
+
+console.log("regression_load_collection_column_preserves_pagination_on_refresh passed");
+"#
+    );
+
+    run_node_ui_test(&script);
+}
+
+#[test]
+fn regression_uint8_to_base64_chunked_large_arrays() {
+    let script = format!(
+        r#"{NODE_BOOTSTRAP}
+const {{ uint8ToBase64, encodeBytes }} = await import("./ui/values.js");
+
+for (const size of [0, 1, 0x7fff, 0x8000, 0x8001, 0x10000, 100000]) {{
+  const bytes = new Uint8Array(size);
+  for (let i = 0; i < size; i++) {{
+    bytes[i] = (i * 31 + 7) & 0xff;
+  }}
+  const expected = Buffer.from(bytes).toString("base64");
+  assert.equal(uint8ToBase64(bytes), expected, "mismatch for size " + size);
+}}
+
+const largeText = "a".repeat(70000);
+const encoded = encodeBytes(largeText, "utf8");
+assert.equal(encoded.valid, true);
+assert.equal(encoded.base64, Buffer.from(largeText, "utf8").toString("base64"));
+
+console.log("regression_uint8_to_base64_chunked_large_arrays passed");
+"#
+    );
+
+    run_node_ui_test(&script);
+}
+
+fn extract_css_rule_block<'a>(css: &'a str, selector: &str) -> &'a str {
+    let needle = format!("\n{selector} {{");
+    let start = if css.starts_with(&format!("{selector} {{")) {
+        0
+    } else {
+        css.find(&needle)
+            .map(|idx| idx + 1)
+            .unwrap_or_else(|| panic!("missing CSS rule block for `{selector}`"))
+    };
+    let rest = &css[start..];
+    let end = rest
+        .find('}')
+        .unwrap_or_else(|| panic!("unterminated CSS rule block for `{selector}`"));
+    &rest[..=end]
+}
+
+#[test]
+fn regression_a11y_miller_columns_forms_and_icon_labels() {
+    let repo_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let css =
+        fs::read_to_string(repo_root.join("ui/styles.css")).expect("failed to read ui/styles.css");
+
+    // Preserve bug_web_ui_8 CSS invariants and verify button reset + ellipsis + :focus-visible
+    // rules against the exact selector blocks.
+    let miller_col_rule = extract_css_rule_block(&css, ".miller-col");
+    assert!(miller_col_rule.contains("overflow: hidden;"));
+    let col_header_span_rule = extract_css_rule_block(&css, ".col-header > span");
+    assert!(col_header_span_rule.contains("min-width: 0;"));
+    let col_item_rule = extract_css_rule_block(&css, ".col-item");
+    assert!(col_item_rule.contains("border: none;"));
+    assert!(col_item_rule.contains("background: transparent;"));
+    assert!(col_item_rule.contains("width: 100%;"));
+    assert!(col_item_rule.contains("min-width: 0;"));
+    assert!(col_item_rule.contains("text-align: left;"));
+    let item_label_rule = extract_css_rule_block(&css, ".item-label");
+    assert!(item_label_rule.contains("min-width: 0;"));
+    assert!(item_label_rule.contains("overflow: hidden;"));
+    assert!(item_label_rule.contains("text-overflow: ellipsis;"));
+    assert!(css.contains(".col-item:focus-visible"));
+
+    let script = format!(
+        r#"{NODE_BOOTSTRAP}
+const app = await import("./ui/app.js");
+const {{ renderExplorer }} = await import("./ui/components/explorer.js");
+const {{ createEditorSession, renderHybridEditor }} = await import("./ui/components/editor.js");
+const {{ createQueryRunnerState, renderQueryRunner }} = await import("./ui/components/query.js");
+
+const rootPath = "projects/p/databases/(default)/documents";
+const usersColPath = `${{rootPath}}/users`;
+const aliceDocPath = `${{usersColPath}}/alice`;
+const postsColPath = `${{aliceDocPath}}/posts`;
+const post1DocPath = `${{postsColPath}}/p1`;
+
+const collectionColumns = new Map([
+  [usersColPath, {{
+    collectionPath: usersColPath,
+    collectionId: "users",
+    parentPath: rootPath,
+    documents: [
+      {{ id: "alice", fullName: aliceDocPath, phantom: false }},
+      {{ id: "ghost", fullName: `${{usersColPath}}/ghost`, phantom: true }},
+    ],
+    nextPageToken: "",
+    filterText: "",
+    loading: false,
+  }}],
+  [postsColPath, {{
+    collectionPath: postsColPath,
+    collectionId: "posts",
+    parentPath: aliceDocPath,
+    documents: [
+      {{ id: "p1", fullName: post1DocPath, phantom: false }},
+    ],
+    nextPageToken: "",
+    filterText: "",
+    loading: false,
+  }}],
+]);
+
+const session = createEditorSession(post1DocPath, "p", "(default)", {{
+  name: post1DocPath,
+  fields: {{ title: {{ stringValue: "Hello" }} }},
+}});
+
+const documentLevels = new Map([
+  [aliceDocPath, {{
+    docPath: aliceDocPath,
+    docId: "alice",
+    exists: true,
+    loading: false,
+    subcollections: ["posts", "tags"],
+    editorSession: null,
+  }}],
+  [post1DocPath, {{
+    docPath: post1DocPath,
+    docId: "p1",
+    exists: true,
+    loading: false,
+    subcollections: [],
+    editorSession: session,
+  }}],
+]);
+
+// 1. Explorer uses semantic <button type="button" class="col-item ..."> inside <li> across all 3 columns,
+//    sets aria-current="true" ONLY on selected items, and sets descriptive aria-labels on icon-only controls.
+let selectedPath = null;
+const explorerTpl = renderExplorer({{
+  projectId: "p",
+  databaseId: "(default)",
+  rootCollections: ["users", "orders"],
+  rootLoading: false,
+  segments: ["users", "alice", "posts", "p1"],
+  collectionColumns,
+  documentLevels,
+  onSelectSegments: (s) => {{ selectedPath = s; }},
+  onOpenStartCollection: () => {{}},
+  onOpenAddDocument: () => {{}},
+  onOpenDeleteCollection: () => {{}},
+  onOpenDeleteDocument: () => {{}},
+  onOpenQueryCollection: () => {{}},
+  onLoadMoreDocuments: () => {{}},
+  onSaveDocument: () => {{}},
+  onFilterChange: () => {{}},
+  onRerender: () => {{}},
+}});
+const explorerMarkup = renderTemplateMarkup(explorerTpl);
+
+assert.equal(explorerMarkup.includes('<li class="col-item'), false, "<li> must wrap <button class=col-item>");
+assert.ok(explorerMarkup.includes('<nav aria-label="Breadcrumb" class="breadcrumbs">'));
+assert.ok(explorerMarkup.includes('aria-current="page"'));
+assert.ok(explorerMarkup.includes('aria-label="Delete collection users"'));
+assert.ok(explorerMarkup.includes('aria-label="Delete collection posts"'));
+
+// Count aria-current="true" occurrences on col-item buttons: selected root "users", selected doc "alice",
+// selected ancestor subcol "posts", selected leaf doc "p1" => 4 selected col-item buttons!
+const currentTrueMatches = explorerMarkup.match(/aria-current="true"/g) ?? [];
+assert.equal(currentTrueMatches.length, 4, "expected aria-current=true on all 4 selected Miller items");
+
+// findClickHandler compatibility is preserved with <button type="button" class="col-item">.
+const clickOrders = findClickHandler(explorerTpl, "orders");
+assert.ok(clickOrders, "findClickHandler must still match <button class=col-item>");
+clickOrders();
+assert.deepEqual(selectedPath, ["orders"]);
+
+// 2. Editor icon-only remove field button has descriptive aria-label.
+const editorMarkup = renderTemplateMarkup(renderHybridEditor({{
+  session,
+  onChange: () => {{}},
+}}));
+assert.ok(editorMarkup.includes('aria-label="Remove field title"'));
+
+// 3. Query Runner has proper label for/id associations and icon-only aria-labels.
+const qState = createQueryRunnerState("users");
+qState.filters.push({{
+  id: 1,
+  fieldPath: "age",
+  op: "EQUAL",
+  valueType: "integerValue",
+  valueText: "21",
+  latText: "0",
+  lngText: "0",
+}});
+qState.orders.push({{ id: 2, fieldPath: "age", direction: "ASCENDING" }});
+const queryMarkup = renderTemplateMarkup(renderQueryRunner({{
+  projectId: "p",
+  databaseId: "(default)",
+  knownCollections: ["users"],
+  state: qState,
+  onRerender: () => {{}},
+  onExecuteQuery: () => {{}},
+  onOpenResultDocument: () => {{}},
+}}));
+assert.ok(queryMarkup.includes('for="query-parent-subpath"') && queryMarkup.includes('id="query-parent-subpath"'));
+assert.ok(queryMarkup.includes('for="query-collection-id"') && queryMarkup.includes('id="query-collection-id"'));
+assert.ok(queryMarkup.includes('for="query-all-descendants"') && queryMarkup.includes('id="query-all-descendants"'));
+assert.ok(queryMarkup.includes('for="query-limit"') && queryMarkup.includes('id="query-limit"'));
+assert.ok(queryMarkup.includes('aria-label="Remove filter 1"'));
+assert.ok(queryMarkup.includes('aria-label="Remove sort order 1"'));
+
+// 4. Topbar database selector & toast dismiss button have descriptive aria-labels, and .sse-badge omits redundant aria-pressed.
+app.state.databases = [{{ projectId: "p", databaseId: "(default)", rootPath }}];
+app.state.toasts = [{{ id: 1, text: "Saved", tone: "success" }}];
+const topbarMarkup = renderTemplateMarkup(app.renderTopbar());
+const toastsMarkup = renderTemplateMarkup(app.renderToasts());
+assert.ok(topbarMarkup.includes('aria-label="Select database"'));
+assert.equal(topbarMarkup.includes("aria-pressed"), false, ".sse-badge dynamic label must not pair aria-pressed");
+assert.ok(toastsMarkup.includes('aria-label="Dismiss notification"'));
+
+console.log("regression_a11y_miller_columns_forms_and_icon_labels passed");
+"#
+    );
+
+    run_node_ui_test(&script);
+}
+
+#[test]
+fn regression_a11y_modals_aria_labels_escape_focus_and_backdrop() {
+    let script = format!(
+        r#"{NODE_BOOTSTRAP}
+const app = await import("./ui/app.js");
+const {{ createEditorSession }} = await import("./ui/components/editor.js");
+const {{ getModalFocusableElements, handleModalKeydown }} = await import("./ui/components/modals.js");
+
+// 1. All 5 modal kinds expose role="dialog", aria-modal="true", aria-labelledby matching title id,
+//    aria-label="Close dialog", and unique for/id label associations on every control.
+const modalFixtures = [
+  {{
+    kind: "open_db",
+    modal: {{ kind: "open_db", projectId: "p", databaseId: "(default)", edition: "STANDARD", busy: false, error: null }},
+    titleId: "modal-title-open-db",
+    expectedForIds: ["modal-open-db-project", "modal-open-db-database", "modal-open-db-edition"],
+  }},
+  {{
+    kind: "create_doc",
+    modal: {{
+      kind: "create_doc",
+      parentPath: "projects/p/databases/(default)/documents",
+      collectionId: "",
+      lockCollection: false,
+      docId: "d1",
+      lockDocId: false,
+      session: createEditorSession("", "p", "(default)", null),
+      busy: false,
+      error: null,
+    }},
+    titleId: "modal-title-create-doc",
+    expectedForIds: ["modal-create-doc-collection", "modal-create-doc-id"],
+  }},
+  {{
+    kind: "delete_doc",
+    modal: {{
+      kind: "delete_doc",
+      docPath: "projects/p/databases/(default)/documents/users/alice",
+      recursive: false,
+      hasSubcollections: true,
+      busy: false,
+      error: null,
+    }},
+    titleId: "modal-title-delete-doc",
+    expectedForIds: ["modal-delete-doc-recursive"],
+  }},
+  {{
+    kind: "delete_col",
+    modal: {{
+      kind: "delete_col",
+      colPath: "projects/p/databases/(default)/documents/users",
+      colId: "users",
+      busy: false,
+      error: null,
+    }},
+    titleId: "modal-title-delete-col",
+    expectedForIds: [],
+  }},
+  {{
+    kind: "clear_db",
+    modal: {{
+      kind: "clear_db",
+      projectId: "p",
+      databaseId: "(default)",
+      busy: false,
+      error: null,
+    }},
+    titleId: "modal-title-clear-db",
+    expectedForIds: [],
+  }},
+];
+
+for (const fx of modalFixtures) {{
+  app.state.modal = fx.modal;
+  const markup = renderTemplateMarkup(app.renderModal());
+  assert.ok(markup.includes('role="dialog"'), `${{fx.kind}} missing role=dialog`);
+  assert.ok(markup.includes('aria-modal="true"'), `${{fx.kind}} missing aria-modal=true`);
+  assert.ok(markup.includes(`aria-labelledby="${{fx.titleId}}"`), `${{fx.kind}} missing aria-labelledby`);
+  assert.ok(markup.includes(`<h2 id="${{fx.titleId}}"`), `${{fx.kind}} missing matching heading id`);
+  assert.ok(markup.includes('aria-label="Close dialog"'), `${{fx.kind}} missing Close dialog aria-label`);
+  assert.equal(markup.includes('aria-label="Close dialog" disabled'), false, `${{fx.kind}} idle Close dialog must not be disabled`);
+  assert.equal(/<label(?![^>]*\bfor=)/.test(markup), false, `${{fx.kind}} has unassociated <label>`);
+  for (const id of fx.expectedForIds) {{
+    assert.ok(markup.includes(`for="${{id}}"`), `${{fx.kind}} missing for=${{id}}`);
+    assert.ok(markup.includes(`id="${{id}}"`), `${{fx.kind}} missing id=${{id}}`);
+  }}
+  fx.modal.busy = true;
+  const busyMarkup = renderTemplateMarkup(app.renderModal());
+  assert.ok(busyMarkup.includes('aria-label="Close dialog" disabled'), `${{fx.kind}} busy Close dialog must be disabled`);
+  fx.modal.busy = false;
+}}
+
+// 2. Safe backdrop dismissal: drag-release from inside modal onto backdrop MUST NOT dismiss.
+{{
+  app.state.modal = {{
+    kind: "clear_db",
+    projectId: "p",
+    databaseId: "(default)",
+    busy: false,
+    error: null,
+  }};
+  const handlers = findElementEventHandlers(app.renderModal(), "modal-backdrop");
+  assert.ok(handlers?.mousedown && handlers?.click, "expected mousedown & click on .modal-backdrop");
+
+  const backdropEl = {{ kind: "backdrop" }};
+  const innerCardEl = {{ kind: "card" }};
+
+  // Drag from inside modal out to backdrop -> must remain open.
+  handlers.mousedown({{ target: innerCardEl, currentTarget: backdropEl }});
+  handlers.click({{ target: backdropEl, currentTarget: backdropEl }});
+  assert.ok(app.state.modal !== null, "drag-release onto backdrop must not dismiss modal");
+
+  // Press on backdrop and release inside card -> must remain open.
+  handlers.mousedown({{ target: backdropEl, currentTarget: backdropEl }});
+  handlers.click({{ target: innerCardEl, currentTarget: backdropEl }});
+  assert.ok(app.state.modal !== null, "press on backdrop released inside card must not dismiss modal");
+
+  // While busy, direct click on backdrop must NOT dismiss.
+  app.state.modal.busy = true;
+  handlers.mousedown({{ target: backdropEl, currentTarget: backdropEl }});
+  handlers.click({{ target: backdropEl, currentTarget: backdropEl }});
+  assert.ok(app.state.modal !== null, "busy modal must not dismiss on backdrop click");
+
+  // Direct press and release on backdrop when not busy MUST dismiss.
+  app.state.modal.busy = false;
+  handlers.mousedown({{ target: backdropEl, currentTarget: backdropEl }});
+  handlers.click({{ target: backdropEl, currentTarget: backdropEl }});
+  assert.equal(app.state.modal, null, "direct backdrop click must close modal");
+}}
+
+// 3. Guarded Escape close (respecting !m.busy), keydown listener cleanup, and previousFocus restoration.
+{{
+  app.state.modal = null;
+  const triggerBtn = {{
+    isConnected: true,
+    focusCalls: 0,
+    focus() {{
+      this.focusCalls++;
+      mockActiveElement = this;
+    }},
+  }};
+  mockActiveElement = triggerBtn;
+
+  const openModalBtn = findClickHandler(app.renderTopbar(), "+ Open / Create Database");
+  assert.ok(openModalBtn);
+  openModalBtn();
+  assert.equal(app.state.modal?.kind, "open_db");
+  assert.equal(docKeydownListeners.length, 1, "opening modal registers document keydown listener");
+
+  // Busy modal ignores Escape.
+  app.state.modal.busy = true;
+  let preventedBusy = false;
+  docKeydownListeners[0]({{ key: "Escape", preventDefault() {{ preventedBusy = true; }} }});
+  assert.ok(app.state.modal !== null, "Escape must not close busy modal");
+  assert.equal(preventedBusy, false);
+
+  // IME composition Escape (isComposing: true) must NOT dismiss an idle modal.
+  app.state.modal.busy = false;
+  let preventedComposing = false;
+  docKeydownListeners[0]({{ key: "Escape", isComposing: true, preventDefault() {{ preventedComposing = true; }} }});
+  assert.ok(app.state.modal !== null, "isComposing Escape must not close modal");
+  assert.equal(preventedComposing, false);
+
+  // Idle modal closes on Escape, detaches keydown listener, and restores previousFocus.
+  app.state.modal.busy = false;
+  let preventedIdle = false;
+  docKeydownListeners[0]({{ key: "Escape", preventDefault() {{ preventedIdle = true; }} }});
+  assert.equal(preventedIdle, true);
+  assert.equal(app.state.modal, null);
+  assert.equal(docKeydownListeners.length, 0, "closing modal removes document keydown listener");
+  assert.equal(triggerBtn.focusCalls, 1, "closing modal restores focus to trigger button");
+}}
+
+// 4. Tab and Shift+Tab focus wrap within the dialog container.
+{{
+  const el1 = {{ focusCount: 0, hasAttribute: () => false, focus() {{ this.focusCount++; mockActiveElement = this; }} }};
+  const el2 = {{ focusCount: 0, hasAttribute: () => false, focus() {{ this.focusCount++; mockActiveElement = this; }} }};
+  const el3 = {{ focusCount: 0, hasAttribute: () => false, focus() {{ this.focusCount++; mockActiveElement = this; }} }};
+  const outsideEl = {{ focus() {{ mockActiveElement = this; }} }};
+  const focusables = [el1, el2, el3];
+  const dialogEl = {{
+    contains: (target) => focusables.includes(target),
+    querySelectorAll: () => focusables,
+    focus() {{ mockActiveElement = this; }},
+  }};
+  const containerEl = {{
+    querySelector: (sel) => (sel === '[role="dialog"]' ? dialogEl : null),
+  }};
+
+  app.state.modal = {{ kind: "delete_col", colPath: "p/d/c", colId: "c", busy: false, error: null }};
+
+  // Tab on last element wraps to first.
+  mockActiveElement = el3;
+  let tabLastPrevented = false;
+  handleModalKeydown({{ key: "Tab", shiftKey: false, preventDefault() {{ tabLastPrevented = true; }} }}, app.state, containerEl, () => {{}});
+  assert.equal(tabLastPrevented, true);
+  assert.equal(mockActiveElement, el1);
+
+  // Shift+Tab on first element wraps to last.
+  let shiftTabFirstPrevented = false;
+  handleModalKeydown({{ key: "Tab", shiftKey: true, preventDefault() {{ shiftTabFirstPrevented = true; }} }}, app.state, containerEl, () => {{}});
+  assert.equal(shiftTabFirstPrevented, true);
+  assert.equal(mockActiveElement, el3);
+
+  // Tab on middle element lets native focus advance without preventDefault.
+  mockActiveElement = el2;
+  let tabMiddlePrevented = false;
+  handleModalKeydown({{ key: "Tab", shiftKey: false, preventDefault() {{ tabMiddlePrevented = true; }} }}, app.state, containerEl, () => {{}});
+  assert.equal(tabMiddlePrevented, false);
+
+  // Tab when focus is outside dialog pulls focus to first element inside dialog.
+  mockActiveElement = outsideEl;
+  let tabOutsidePrevented = false;
+  handleModalKeydown({{ key: "Tab", shiftKey: false, preventDefault() {{ tabOutsidePrevented = true; }} }}, app.state, containerEl, () => {{}});
+  assert.equal(tabOutsidePrevented, true);
+  assert.equal(mockActiveElement, el1);
+
+  // Modified Tab shortcuts (Ctrl/Meta/Alt+Tab) are ignored by focus wrap.
+  mockActiveElement = el3;
+  for (const mod of ["ctrlKey", "metaKey", "altKey"]) {{
+    let modPrevented = false;
+    handleModalKeydown({{ key: "Tab", [mod]: true, preventDefault() {{ modPrevented = true; }} }}, app.state, containerEl, () => {{}});
+    assert.equal(modPrevented, false, mod + "+Tab must not be intercepted");
+  }}
+  assert.equal(mockActiveElement, el3);
+
+  // [hidden] elements and non-focusable elements are excluded by getModalFocusableElements.
+  const hiddenEl = {{ hasAttribute: (attr) => attr === "hidden", focus() {{}} }};
+  const noFocusEl = {{ hasAttribute: () => false }};
+  const hiddenCheckDialog = {{
+    querySelectorAll: () => [hiddenEl, el1, noFocusEl, el2],
+  }};
+  assert.deepEqual(
+    getModalFocusableElements(hiddenCheckDialog),
+    [el1, el2],
+    "getModalFocusableElements must filter out [hidden] and non-focusable elements"
+  );
+  assert.deepEqual(getModalFocusableElements({{}}), []);
+
+  // When focusables.length === 0 (e.g. only [hidden] elements), Tab prevents default and focuses dialogEl.
+  let emptyDialogFocusCalls = 0;
+  const emptyDialogEl = {{
+    querySelectorAll: () => [hiddenEl],
+    focus() {{ emptyDialogFocusCalls++; mockActiveElement = this; }},
+  }};
+  const emptyContainerEl = {{
+    querySelector: (sel) => (sel === '[role="dialog"]' ? emptyDialogEl : null),
+  }};
+  mockActiveElement = outsideEl;
+  let emptyTabPrevented = false;
+  handleModalKeydown(
+    {{ key: "Tab", shiftKey: false, preventDefault() {{ emptyTabPrevented = true; }} }},
+    app.state,
+    emptyContainerEl,
+    () => {{}}
+  );
+  assert.equal(emptyTabPrevented, true, "Tab with zero focusables must preventDefault");
+  assert.equal(emptyDialogFocusCalls, 1, "Tab with zero focusables must focus dialog container");
+  assert.equal(mockActiveElement, emptyDialogEl);
+
+  // Detached trigger element (isConnected: false) must not receive focus on close.
+  app.state.modal = null;
+  const detachedTrigger = {{
+    isConnected: false,
+    focusCalls: 0,
+    focus() {{
+      this.focusCalls++;
+    }},
+  }};
+  mockActiveElement = detachedTrigger;
+  const openBtn2 = findClickHandler(app.renderTopbar(), "+ Open / Create Database");
+  openBtn2();
+  docKeydownListeners[0]({{ key: "Escape", preventDefault() {{}} }});
+  assert.equal(app.state.modal, null);
+  assert.equal(detachedTrigger.focusCalls, 0, "disconnected trigger must not be refocused");
+}}
+
+console.log("regression_a11y_modals_aria_labels_escape_focus_and_backdrop passed");
+"#
+    );
+
+    run_node_ui_test(&script);
 }

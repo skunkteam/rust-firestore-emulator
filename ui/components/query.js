@@ -439,8 +439,9 @@ export function renderQueryRunner(props) {
         </div>
 
         <div class="form-field">
-          <label>Parent Document Path (optional — leave empty for database root)</label>
+          <label for="query-parent-subpath">Parent Document Path (optional — leave empty for database root)</label>
           <input
+            id="query-parent-subpath"
             type="text"
             class="input mono"
             placeholder="e.g. rooms/room-1"
@@ -460,10 +461,11 @@ export function renderQueryRunner(props) {
           ? html`
               <div class="query-section">
                 <div class="query-section-title">
-                  <span>Collection Source</span>
+                  <label for="query-collection-id">Collection Source</label>
                 </div>
                 <div class="query-row">
                   <input
+                    id="query-collection-id"
                     type="text"
                     list="known-collections-list"
                     class="input mono"
@@ -483,8 +485,9 @@ export function renderQueryRunner(props) {
                     )}
                   </datalist>
                 </div>
-                <label style="display: flex; align-items: center; gap: 6px; font-size: 12.5px;">
+                <label for="query-all-descendants" style="display: flex; align-items: center; gap: 6px; font-size: 12.5px;">
                   <input
+                    id="query-all-descendants"
                     type="checkbox"
                     .checked=${state.allDescendants}
                     @change=${(/** @type {Event} */ e) => {
@@ -506,6 +509,7 @@ export function renderQueryRunner(props) {
                       ? html`
                           <select
                             class="select"
+                            aria-label="Combine filters"
                             style="padding: 2px 6px; font-size: 11.5px;"
                             .value=${state.compositeOp}
                             @change=${(/** @type {Event} */ e) => {
@@ -553,6 +557,7 @@ export function renderQueryRunner(props) {
                             type="text"
                             class="input mono"
                             style="flex: 1 1 150px;"
+                            aria-label=${`Sort ${idx + 1} field path`}
                             placeholder="field path (e.g. age)"
                             .value=${o.fieldPath}
                             @input=${(/** @type {Event} */ e) => {
@@ -564,6 +569,7 @@ export function renderQueryRunner(props) {
                           />
                           <select
                             class="select"
+                            aria-label=${`Sort ${idx + 1} direction`}
                             .value=${o.direction}
                             @change=${(/** @type {Event} */ e) => {
                               o.direction =
@@ -580,6 +586,8 @@ export function renderQueryRunner(props) {
                           <button
                             type="button"
                             class="btn btn-sm btn-ghost"
+                            title="Remove sort order"
+                            aria-label=${`Remove sort order ${idx + 1}`}
                             @click=${() => {
                               state.orders.splice(idx, 1);
                               onRerender();
@@ -593,8 +601,11 @@ export function renderQueryRunner(props) {
               </div>
 
               <div class="query-section">
-                <div class="query-section-title"><span>Limit</span></div>
+                <div class="query-section-title">
+                  <label for="query-limit">Limit</label>
+                </div>
                 <input
+                  id="query-limit"
                   type="number"
                   min="1"
                   class="input mono"
@@ -614,6 +625,7 @@ export function renderQueryRunner(props) {
               <div class="raw-json-wrap">
                 <textarea
                   class="textarea raw-json-textarea"
+                  aria-label="Raw StructuredQuery JSON"
                   spellcheck="false"
                   .value=${state.rawQueryText}
                   @input=${(/** @type {Event} */ e) => {
@@ -716,6 +728,7 @@ function renderFilterRow(f, idx, state, onRerender) {
           type="text"
           class="input mono"
           style="flex: 1 1 130px;"
+          aria-label=${`Filter ${idx + 1} field path`}
           placeholder="field path (e.g. active)"
           .value=${f.fieldPath}
           @input=${(/** @type {Event} */ e) => {
@@ -725,6 +738,7 @@ function renderFilterRow(f, idx, state, onRerender) {
         />
         <select
           class="select"
+          aria-label="Filter operator"
           .value=${f.op}
           @change=${(/** @type {Event} */ e) => {
             f.op = /** @type {HTMLSelectElement} */ (e.target).value;
@@ -745,6 +759,8 @@ function renderFilterRow(f, idx, state, onRerender) {
         <button
           type="button"
           class="btn btn-sm btn-ghost"
+          title="Remove filter"
+          aria-label=${`Remove filter ${idx + 1}`}
           @click=${() => {
             state.filters.splice(idx, 1);
             onRerender();
@@ -761,6 +777,7 @@ function renderFilterRow(f, idx, state, onRerender) {
               <input
                 type="text"
                 class="input mono"
+                aria-label="Filter array values"
                 placeholder='JSON array, e.g. ["alice", "bob"] or [{"integerValue": "1"}]'
                 .value=${f.valueText}
                 @input=${(/** @type {Event} */ e) => {
@@ -775,6 +792,7 @@ function renderFilterRow(f, idx, state, onRerender) {
               <div class="query-row">
                 <select
                   class="select"
+                  aria-label="Filter value type"
                   .value=${f.valueType}
                   @change=${(/** @type {Event} */ e) => {
                     f.valueType = /** @type {ValueTypeKey} */ (
@@ -801,6 +819,7 @@ function renderFilterRow(f, idx, state, onRerender) {
                   ? html`
                       <select
                         class="select"
+                        aria-label="Filter boolean value"
                         .value=${f.valueText === "false" ? "false" : "true"}
                         @change=${(/** @type {Event} */ e) => {
                           f.valueText = /** @type {HTMLSelectElement} */ (
@@ -819,6 +838,7 @@ function renderFilterRow(f, idx, state, onRerender) {
                           type="text"
                           class="input mono"
                           style="max-width: 110px;"
+                          aria-label="Filter latitude"
                           placeholder="lat"
                           .value=${f.latText}
                           @input=${(/** @type {Event} */ e) => {
@@ -832,6 +852,7 @@ function renderFilterRow(f, idx, state, onRerender) {
                           type="text"
                           class="input mono"
                           style="max-width: 110px;"
+                          aria-label="Filter longitude"
                           placeholder="lng"
                           .value=${f.lngText}
                           @input=${(/** @type {Event} */ e) => {
@@ -847,6 +868,7 @@ function renderFilterRow(f, idx, state, onRerender) {
                           type="text"
                           class="input mono"
                           style="flex: 1 1 140px;"
+                          aria-label="Filter comparison value"
                           placeholder="comparison value"
                           .value=${f.valueText}
                           @input=${(/** @type {Event} */ e) => {

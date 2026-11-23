@@ -587,10 +587,13 @@ async fn test_rest_error_envelopes_and_404_isolation() -> Result<()> {
 
         for js_path in [
             "/ui/app.js",
+            "/ui/state.js",
+            "/ui/router.js",
             "/ui/values.js",
             "/ui/api.js",
             "/ui/components/editor.js",
             "/ui/components/explorer.js",
+            "/ui/components/modals.js",
             "/ui/components/query.js",
             "/ui/lit-html.js",
             "/lit-html.js",

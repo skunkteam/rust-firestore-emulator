@@ -815,6 +815,7 @@ function renderDraftNode(
               <input
                 type="text"
                 class="input field-key-input ${!node.key ? "input-error" : ""}"
+                aria-label=${`Field name ${index + 1}`}
                 placeholder="field name"
                 .value=${node.key}
                 @input=${(/** @type {Event} */ e) => {
@@ -831,6 +832,9 @@ function renderDraftNode(
           : html`
               <select
                 class="select field-type-select"
+                aria-label=${parentIsArray
+                  ? `Item ${index} type`
+                  : `Field ${node.key || index + 1} type`}
                 .value=${node.type}
                 @change=${onTypeChange}
               >
@@ -865,6 +869,11 @@ function renderDraftNode(
           type="button"
           class="btn btn-sm btn-ghost"
           title="Remove field"
+          aria-label=${parentIsArray
+            ? `Remove item ${index}`
+            : node.key
+              ? `Remove field ${node.key}`
+              : "Remove field"}
           @click=${removeNode}
         >
           ✕
@@ -915,6 +924,7 @@ function renderValueEditorControl(session, node, hasError, onChange) {
       return html`
         <select
           class="select"
+          aria-label="Boolean value"
           .value=${String(node.boolVal)}
           @change=${(/** @type {Event} */ e) => {
             node.boolVal =
@@ -934,6 +944,7 @@ function renderValueEditorControl(session, node, hasError, onChange) {
         <input
           type="text"
           class="input ${errClass}"
+          aria-label="64-bit integer value"
           placeholder="64-bit integer (e.g. 9223372036854775807)"
           .value=${node.text}
           @input=${updateText}
@@ -945,6 +956,7 @@ function renderValueEditorControl(session, node, hasError, onChange) {
         <input
           type="text"
           class="input ${errClass}"
+          aria-label="Double value"
           placeholder="64-bit float (e.g. 1.5, -0.0, NaN, Infinity)"
           .value=${node.text}
           @input=${updateText}
@@ -956,6 +968,7 @@ function renderValueEditorControl(session, node, hasError, onChange) {
         <input
           type="text"
           class="input ${errClass}"
+          aria-label="String value"
           placeholder="string value"
           .value=${node.text}
           @input=${updateText}
@@ -967,6 +980,7 @@ function renderValueEditorControl(session, node, hasError, onChange) {
         <input
           type="text"
           class="input ${errClass}"
+          aria-label="Timestamp value"
           placeholder="YYYY-MM-DDTHH:MM:SS.fffffffffZ"
           .value=${node.text}
           @input=${updateText}
@@ -991,6 +1005,7 @@ function renderValueEditorControl(session, node, hasError, onChange) {
         <input
           type="text"
           class="input ${errClass}"
+          aria-label="Document reference path"
           placeholder="users/alice or projects/..."
           .value=${node.text}
           @input=${updateText}
@@ -1017,6 +1032,7 @@ function renderValueEditorControl(session, node, hasError, onChange) {
         <select
           class="select"
           style="flex: 0 0 auto; font-size: 11.5px;"
+          aria-label="Bytes encoding mode"
           .value=${node.bytesMode}
           @change=${(/** @type {Event} */ e) =>
             switchBytesMode(
@@ -1034,6 +1050,7 @@ function renderValueEditorControl(session, node, hasError, onChange) {
         <input
           type="text"
           class="input ${errClass}"
+          aria-label="Bytes value"
           placeholder=${node.bytesMode === "hex"
             ? "hex bytes (e.g. 0001ff)"
             : node.bytesMode === "utf8"
@@ -1051,6 +1068,7 @@ function renderValueEditorControl(session, node, hasError, onChange) {
           type="text"
           class="input ${errClass}"
           style="max-width: 120px;"
+          aria-label="Latitude"
           placeholder="latitude"
           .value=${node.latText}
           @input=${(/** @type {Event} */ e) => {
@@ -1064,6 +1082,7 @@ function renderValueEditorControl(session, node, hasError, onChange) {
           type="text"
           class="input ${errClass}"
           style="max-width: 120px;"
+          aria-label="Longitude"
           placeholder="longitude"
           .value=${node.lngText}
           @input=${(/** @type {Event} */ e) => {
@@ -1119,6 +1138,7 @@ function renderRawProtoJson(session, onChange) {
         : nothing}
       <textarea
         class="textarea raw-json-textarea ${session.rawError ? "input-error" : ""}"
+        aria-label="Raw ProtoJSON fields"
         spellcheck="false"
         .value=${session.rawText}
         @input=${(/** @type {Event} */ e) => {
