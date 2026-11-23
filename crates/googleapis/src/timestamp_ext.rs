@@ -1,9 +1,24 @@
-use std::{fmt, sync::Mutex};
+use std::{
+    fmt,
+    sync::{Mutex, PoisonError},
+};
 
 use thiserror::Error;
 use time::{Duration, OffsetDateTime, format_description::well_known::Iso8601};
 
 use crate::google::protobuf::Timestamp;
+
+/// Minimum valid Proto3 `Timestamp` seconds (`0001-01-01T00:00:00Z`).
+pub(crate) const MIN_TIMESTAMP_SECONDS: i64 = -62_135_596_800;
+/// Maximum valid Proto3 `Timestamp` seconds (`9999-12-31T23:59:59Z`).
+pub(crate) const MAX_TIMESTAMP_SECONDS: i64 = 253_402_300_799;
+
+const NANOS_PER_SECOND: i128 = 1_000_000_000;
+/// Minimum valid Proto3 `Timestamp` Unix nanoseconds (`0001-01-01T00:00:00.000000000Z`).
+const MIN_TIMESTAMP_NANOS: i128 = MIN_TIMESTAMP_SECONDS as i128 * NANOS_PER_SECOND;
+/// Maximum valid Proto3 `Timestamp` Unix nanoseconds (`9999-12-31T23:59:59.999999999Z`).
+const MAX_TIMESTAMP_NANOS: i128 =
+    MAX_TIMESTAMP_SECONDS as i128 * NANOS_PER_SECOND + (NANOS_PER_SECOND - 1);
 
 #[derive(Clone, Debug, Error)]
 #[error("Invalid token")]
@@ -49,6 +64,13 @@ fn next_monotonic(last: Timestamp, now: Timestamp) -> Timestamp {
     }
 }
 
+fn next_from_mutex(mutex: &Mutex<Timestamp>, now: Timestamp) -> Timestamp {
+    let mut last = mutex.lock().unwrap_or_else(PoisonError::into_inner);
+    let timestamp = next_monotonic(*last, now);
+    *last = timestamp;
+    timestamp
+}
+
 impl Timestamp {
     /// Returns the current time as a `Timestamp` with the added guarantee that all calls will
     /// return a strictly higher timestamp than all calls before that (for the execution of the
@@ -58,24 +80,29 @@ impl Timestamp {
             seconds: 0,
             nanos:   0,
         });
-        let mut last = LAST.lock().unwrap();
-        let timestamp = next_monotonic(*last, OffsetDateTime::now_utc().into());
-        *last = timestamp;
-        timestamp
+        let now = OffsetDateTime::now_utc().into();
+        next_from_mutex(&LAST, now)
     }
 
     pub fn from_token(token: Vec<u8>) -> Result<Self, InvalidTokenError> {
-        let nanos = i128::from_ne_bytes(token.try_into().map_err(|_| InvalidTokenError)?);
-        Ok(OffsetDateTime::from_unix_timestamp_nanos(nanos)
-            .map_err(|_| InvalidTokenError)?
-            .into())
+        let nanos = i128::from_be_bytes(token.try_into().map_err(|_| InvalidTokenError)?);
+        if !(MIN_TIMESTAMP_NANOS..=MAX_TIMESTAMP_NANOS).contains(&nanos) {
+            return Err(InvalidTokenError);
+        }
+        Ok(Self {
+            seconds: nanos.div_euclid(NANOS_PER_SECOND) as i64,
+            nanos:   nanos.rem_euclid(NANOS_PER_SECOND) as i32,
+        })
     }
 
     pub fn get_token(self) -> Result<Vec<u8>, TimestampOutOfRangeError> {
-        Ok(OffsetDateTime::try_from(self)?
-            .unix_timestamp_nanos()
-            .to_ne_bytes()
-            .to_vec())
+        if !(MIN_TIMESTAMP_SECONDS..=MAX_TIMESTAMP_SECONDS).contains(&self.seconds)
+            || !(0..1_000_000_000).contains(&self.nanos)
+        {
+            return Err(TimestampOutOfRangeError(None));
+        }
+        let nanos = i128::from(self.seconds) * NANOS_PER_SECOND + i128::from(self.nanos);
+        Ok(nanos.to_be_bytes().to_vec())
     }
 }
 
@@ -231,8 +258,137 @@ mod tests {
         let timestamp: Timestamp = ndt.into();
         let token = timestamp.get_token().unwrap();
         expect_that!(token, len(eq(TOKEN_LEN)));
+        expect_eq!(token, ndt.unix_timestamp_nanos().to_be_bytes().to_vec());
         let timestamp2 = Timestamp::from_token(token).unwrap();
         expect_eq!(timestamp, timestamp2);
+    }
+
+    #[gtest]
+    fn poisoned_monotonic_mutex_recovers_and_preserves_monotonicity() {
+        let mutex = Mutex::new(Timestamp {
+            seconds: 100,
+            nanos:   500,
+        });
+        assert!(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _guard = mutex.lock().unwrap();
+                panic!("simulated panic while holding timestamp mutex");
+            }))
+            .is_err()
+        );
+        assert!(mutex.is_poisoned());
+
+        let t1 = next_from_mutex(
+            &mutex,
+            Timestamp {
+                seconds: 90,
+                nanos:   0,
+            },
+        );
+        expect_eq!(
+            t1,
+            Timestamp {
+                seconds: 100,
+                nanos:   501,
+            }
+        );
+
+        let t2 = next_from_mutex(
+            &mutex,
+            Timestamp {
+                seconds: 105,
+                nanos:   0,
+            },
+        );
+        expect_eq!(
+            t2,
+            Timestamp {
+                seconds: 105,
+                nanos:   0,
+            }
+        );
+    }
+
+    #[gtest]
+    fn token_encoding_is_big_endian_and_enforces_proto3_year_bounds() {
+        // Big-endian stability: epoch zero, -1ns (pre-1970), and Proto3 min/max bounds.
+        let epoch = Timestamp {
+            seconds: 0,
+            nanos:   0,
+        };
+        expect_eq!(epoch.get_token().unwrap(), vec![0u8; TOKEN_LEN]);
+        expect_eq!(Timestamp::from_token(vec![0u8; TOKEN_LEN]).unwrap(), epoch);
+
+        let pre_epoch_1ns = Timestamp {
+            seconds: -1,
+            nanos:   999_999_999,
+        };
+        let pre_epoch_dt = datetime!(1969-12-31 23:59:59.999999999 UTC);
+        expect_eq!(
+            pre_epoch_1ns.get_token().unwrap(),
+            pre_epoch_dt.unix_timestamp_nanos().to_be_bytes().to_vec()
+        );
+        expect_eq!(pre_epoch_1ns.get_token().unwrap(), vec![0xffu8; TOKEN_LEN]);
+        expect_eq!(
+            Timestamp::from_token(vec![0xffu8; TOKEN_LEN]).unwrap(),
+            pre_epoch_1ns
+        );
+
+        // Positive timestamp big-endian byte layout (most-significant byte first).
+        let one_sec = Timestamp {
+            seconds: 1,
+            nanos:   0,
+        };
+        expect_eq!(
+            one_sec.get_token().unwrap(),
+            1_000_000_000_i128.to_be_bytes().to_vec()
+        );
+
+        // Exact Proto3 lower/upper bounds succeed and round-trip.
+        let min_proto3 = Timestamp {
+            seconds: MIN_TIMESTAMP_SECONDS,
+            nanos:   0,
+        };
+        let max_proto3 = Timestamp {
+            seconds: MAX_TIMESTAMP_SECONDS,
+            nanos:   999_999_999,
+        };
+        for bound in [min_proto3, max_proto3] {
+            let dt = OffsetDateTime::try_from(bound).unwrap();
+            let token = bound.get_token().unwrap();
+            expect_eq!(token, dt.unix_timestamp_nanos().to_be_bytes().to_vec());
+            expect_eq!(Timestamp::from_token(token).unwrap(), bound);
+        }
+
+        // Pre-0001 and post-9999 timestamps are rejected by get_token and from_token.
+        for oob_ts in [
+            Timestamp {
+                seconds: MIN_TIMESTAMP_SECONDS - 1,
+                nanos:   999_999_999,
+            },
+            Timestamp {
+                seconds: MIN_TIMESTAMP_SECONDS - 1,
+                nanos:   0,
+            },
+            Timestamp {
+                seconds: MAX_TIMESTAMP_SECONDS + 1,
+                nanos:   0,
+            },
+        ] {
+            expect_that!(oob_ts.get_token(), err(pat!(TimestampOutOfRangeError(_))));
+        }
+
+        for oob_nanos in [
+            MIN_TIMESTAMP_NANOS - 1,
+            MAX_TIMESTAMP_NANOS + 1,
+            i128::MIN,
+            i128::MAX,
+        ] {
+            expect_that!(
+                Timestamp::from_token(oob_nanos.to_be_bytes().to_vec()),
+                err(pat!(InvalidTokenError))
+            );
+        }
     }
 
     #[gtest]

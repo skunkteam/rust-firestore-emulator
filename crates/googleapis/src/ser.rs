@@ -14,19 +14,23 @@ use serde::{
 };
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
-use crate::google::{
-    firestore::v1::{
-        ArrayValue, Cursor, Document, ListCollectionIdsRequest, MapValue, Precondition,
-        RunQueryRequest, RunQueryResponse, StructuredQuery, Value, list_collection_ids_request,
-        precondition, run_query_request, run_query_response,
-        structured_query::{
-            CollectionSelector, CompositeFilter, Direction, FieldFilter, FieldReference, Filter,
-            Order, Projection, UnaryFilter, composite_filter, field_filter, filter, unary_filter,
+use crate::{
+    google::{
+        firestore::v1::{
+            ArrayValue, Cursor, Document, ListCollectionIdsRequest, MapValue, Precondition,
+            RunQueryRequest, RunQueryResponse, StructuredQuery, Value, list_collection_ids_request,
+            precondition, run_query_request, run_query_response,
+            structured_query::{
+                CollectionSelector, CompositeFilter, Direction, FieldFilter, FieldReference,
+                Filter, Order, Projection, UnaryFilter, composite_filter, field_filter, filter,
+                unary_filter,
+            },
+            value::ValueType,
         },
-        value::ValueType,
+        protobuf::{Int32Value, Timestamp},
+        r#type::LatLng,
     },
-    protobuf::{Int32Value, Timestamp},
-    r#type::LatLng,
+    timestamp_ext::{MAX_TIMESTAMP_SECONDS, MIN_TIMESTAMP_SECONDS},
 };
 
 pub(crate) fn deserialize_null_default<'de, D, T>(d: D) -> Result<T, D::Error>
@@ -47,11 +51,6 @@ pub(crate) fn serialize_sorted_map<S: Serializer>(
     }
     map.end()
 }
-
-/// Minimum valid Proto3 `Timestamp` seconds (`0001-01-01T00:00:00Z`).
-const MIN_TIMESTAMP_SECONDS: i64 = -62_135_596_800;
-/// Maximum valid Proto3 `Timestamp` seconds (`9999-12-31T23:59:59Z`).
-const MAX_TIMESTAMP_SECONDS: i64 = 253_402_300_799;
 
 impl Serialize for Timestamp {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
@@ -501,226 +500,125 @@ impl<'de> Deserialize<'de> for Precondition {
     }
 }
 
-fn serialize_direction<S: Serializer>(val: &i32, s: S) -> Result<S::Ok, S::Error> {
-    let name = match Direction::try_from(*val).unwrap_or(Direction::Unspecified) {
-        Direction::Unspecified => "DIRECTION_UNSPECIFIED",
-        Direction::Ascending => "ASCENDING",
-        Direction::Descending => "DESCENDING",
-    };
-    s.serialize_str(name)
-}
-
-fn deserialize_direction<'de, D: Deserializer<'de>>(d: D) -> Result<i32, D::Error> {
-    struct DirVisitor;
-    impl Visitor<'_> for DirVisitor {
-        type Value = i32;
-        fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-            f.write_str("a Direction enum string or integer")
-        }
-        fn visit_str<E: de::Error>(self, v: &str) -> Result<i32, E> {
-            match v {
-                "DIRECTION_UNSPECIFIED" => Ok(Direction::Unspecified as i32),
-                "ASCENDING" => Ok(Direction::Ascending as i32),
-                "DESCENDING" => Ok(Direction::Descending as i32),
-                other => Err(E::unknown_variant(
-                    other,
-                    &["DIRECTION_UNSPECIFIED", "ASCENDING", "DESCENDING"],
-                )),
-            }
-        }
-        fn visit_i64<E: de::Error>(self, v: i64) -> Result<i32, E> {
-            i32::try_from(v)
-                .ok()
-                .and_then(|n| Direction::try_from(n).ok())
-                .map(|dir| dir as i32)
-                .ok_or_else(|| E::custom(format!("unknown Direction enum number {v}")))
-        }
-        fn visit_u64<E: de::Error>(self, v: u64) -> Result<i32, E> {
-            i64::try_from(v)
-                .map_err(|_| E::custom(format!("unknown Direction enum number {v}")))
-                .and_then(|n| self.visit_i64(n))
-        }
-    }
-    d.deserialize_any(DirVisitor)
-}
-
-fn serialize_composite_op<S: Serializer>(val: &i32, s: S) -> Result<S::Ok, S::Error> {
-    let name = match composite_filter::Operator::try_from(*val)
-        .unwrap_or(composite_filter::Operator::Unspecified)
-    {
-        composite_filter::Operator::Unspecified => "OPERATOR_UNSPECIFIED",
-        composite_filter::Operator::And => "AND",
-        composite_filter::Operator::Or => "OR",
-    };
-    s.serialize_str(name)
-}
-
-fn deserialize_composite_op<'de, D: Deserializer<'de>>(d: D) -> Result<i32, D::Error> {
-    struct OpVisitor;
-    impl Visitor<'_> for OpVisitor {
-        type Value = i32;
-        fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-            f.write_str("a CompositeFilter.Operator string or integer")
-        }
-        fn visit_str<E: de::Error>(self, v: &str) -> Result<i32, E> {
-            match v {
-                "OPERATOR_UNSPECIFIED" => Ok(composite_filter::Operator::Unspecified as i32),
-                "AND" => Ok(composite_filter::Operator::And as i32),
-                "OR" => Ok(composite_filter::Operator::Or as i32),
-                other => Err(E::unknown_variant(
-                    other,
-                    &["OPERATOR_UNSPECIFIED", "AND", "OR"],
-                )),
-            }
-        }
-        fn visit_i64<E: de::Error>(self, v: i64) -> Result<i32, E> {
-            i32::try_from(v)
-                .ok()
-                .and_then(|n| composite_filter::Operator::try_from(n).ok())
-                .map(|op| op as i32)
-                .ok_or_else(|| E::custom(format!("unknown CompositeFilter.Operator number {v}")))
-        }
-        fn visit_u64<E: de::Error>(self, v: u64) -> Result<i32, E> {
-            i64::try_from(v)
-                .map_err(|_| E::custom(format!("unknown CompositeFilter.Operator number {v}")))
-                .and_then(|n| self.visit_i64(n))
-        }
-    }
-    d.deserialize_any(OpVisitor)
-}
-
-fn serialize_field_op<S: Serializer>(val: &i32, s: S) -> Result<S::Ok, S::Error> {
-    use field_filter::Operator;
-    let name = match Operator::try_from(*val).unwrap_or(Operator::Unspecified) {
-        Operator::Unspecified => "OPERATOR_UNSPECIFIED",
-        Operator::LessThan => "LESS_THAN",
-        Operator::LessThanOrEqual => "LESS_THAN_OR_EQUAL",
-        Operator::GreaterThan => "GREATER_THAN",
-        Operator::GreaterThanOrEqual => "GREATER_THAN_OR_EQUAL",
-        Operator::Equal => "EQUAL",
-        Operator::NotEqual => "NOT_EQUAL",
-        Operator::ArrayContains => "ARRAY_CONTAINS",
-        Operator::In => "IN",
-        Operator::ArrayContainsAny => "ARRAY_CONTAINS_ANY",
-        Operator::NotIn => "NOT_IN",
-    };
-    s.serialize_str(name)
-}
-
-fn deserialize_field_op<'de, D: Deserializer<'de>>(d: D) -> Result<i32, D::Error> {
-    use field_filter::Operator;
-    struct OpVisitor;
-    impl Visitor<'_> for OpVisitor {
-        type Value = i32;
-        fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-            f.write_str("a FieldFilter.Operator string or integer")
-        }
-        fn visit_str<E: de::Error>(self, v: &str) -> Result<i32, E> {
-            let op = match v {
-                "OPERATOR_UNSPECIFIED" => Operator::Unspecified,
-                "LESS_THAN" => Operator::LessThan,
-                "LESS_THAN_OR_EQUAL" => Operator::LessThanOrEqual,
-                "GREATER_THAN" => Operator::GreaterThan,
-                "GREATER_THAN_OR_EQUAL" => Operator::GreaterThanOrEqual,
-                "EQUAL" => Operator::Equal,
-                "NOT_EQUAL" => Operator::NotEqual,
-                "ARRAY_CONTAINS" => Operator::ArrayContains,
-                "IN" => Operator::In,
-                "ARRAY_CONTAINS_ANY" => Operator::ArrayContainsAny,
-                "NOT_IN" => Operator::NotIn,
-                other => {
-                    return Err(E::unknown_variant(
-                        other,
-                        &[
-                            "OPERATOR_UNSPECIFIED",
-                            "LESS_THAN",
-                            "LESS_THAN_OR_EQUAL",
-                            "GREATER_THAN",
-                            "GREATER_THAN_OR_EQUAL",
-                            "EQUAL",
-                            "NOT_EQUAL",
-                            "ARRAY_CONTAINS",
-                            "IN",
-                            "ARRAY_CONTAINS_ANY",
-                            "NOT_IN",
-                        ],
-                    ));
-                }
+macro_rules! proto_enum_serde {
+    (
+        ser = $ser_fn:ident,
+        de = $de_fn:ident,
+        ty = $enum_ty:path,
+        default = $default_variant:ident,
+        expecting = $expecting:literal,
+        unknown_num = $unknown_num:literal,
+        variants = [ $( $variant:ident => $wire:literal ),+ $(,)? ]
+    ) => {
+        fn $ser_fn<S: Serializer>(val: &i32, s: S) -> Result<S::Ok, S::Error> {
+            use $enum_ty as ProtoEnum;
+            let name = match ProtoEnum::try_from(*val).unwrap_or(ProtoEnum::$default_variant) {
+                $( ProtoEnum::$variant => $wire, )+
             };
-            Ok(op as i32)
+            s.serialize_str(name)
         }
-        fn visit_i64<E: de::Error>(self, v: i64) -> Result<i32, E> {
-            i32::try_from(v)
-                .ok()
-                .and_then(|n| Operator::try_from(n).ok())
-                .map(|op| op as i32)
-                .ok_or_else(|| E::custom(format!("unknown FieldFilter.Operator number {v}")))
-        }
-        fn visit_u64<E: de::Error>(self, v: u64) -> Result<i32, E> {
-            i64::try_from(v)
-                .map_err(|_| E::custom(format!("unknown FieldFilter.Operator number {v}")))
-                .and_then(|n| self.visit_i64(n))
-        }
-    }
-    d.deserialize_any(OpVisitor)
-}
 
-fn serialize_unary_op<S: Serializer>(val: &i32, s: S) -> Result<S::Ok, S::Error> {
-    use unary_filter::Operator;
-    let name = match Operator::try_from(*val).unwrap_or(Operator::Unspecified) {
-        Operator::Unspecified => "OPERATOR_UNSPECIFIED",
-        Operator::IsNan => "IS_NAN",
-        Operator::IsNull => "IS_NULL",
-        Operator::IsNotNan => "IS_NOT_NAN",
-        Operator::IsNotNull => "IS_NOT_NULL",
-    };
-    s.serialize_str(name)
-}
+        fn $de_fn<'de, D: Deserializer<'de>>(d: D) -> Result<i32, D::Error> {
+            use $enum_ty as ProtoEnum;
+            struct EnumVisitor;
+            impl Visitor<'_> for EnumVisitor {
+                type Value = i32;
 
-fn deserialize_unary_op<'de, D: Deserializer<'de>>(d: D) -> Result<i32, D::Error> {
-    use unary_filter::Operator;
-    struct OpVisitor;
-    impl Visitor<'_> for OpVisitor {
-        type Value = i32;
-        fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-            f.write_str("a UnaryFilter.Operator string or integer")
-        }
-        fn visit_str<E: de::Error>(self, v: &str) -> Result<i32, E> {
-            let op = match v {
-                "OPERATOR_UNSPECIFIED" => Operator::Unspecified,
-                "IS_NAN" => Operator::IsNan,
-                "IS_NULL" => Operator::IsNull,
-                "IS_NOT_NAN" => Operator::IsNotNan,
-                "IS_NOT_NULL" => Operator::IsNotNull,
-                other => {
-                    return Err(E::unknown_variant(
-                        other,
-                        &[
-                            "OPERATOR_UNSPECIFIED",
-                            "IS_NAN",
-                            "IS_NULL",
-                            "IS_NOT_NAN",
-                            "IS_NOT_NULL",
-                        ],
-                    ));
+                fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                    f.write_str($expecting)
                 }
-            };
-            Ok(op as i32)
+
+                fn visit_str<E: de::Error>(self, v: &str) -> Result<i32, E> {
+                    let parsed = match v {
+                        $( $wire => ProtoEnum::$variant, )+
+                        other => return Err(E::unknown_variant(other, &[ $( $wire ),+ ])),
+                    };
+                    Ok(parsed as i32)
+                }
+
+                fn visit_i64<E: de::Error>(self, v: i64) -> Result<i32, E> {
+                    i32::try_from(v)
+                        .ok()
+                        .and_then(|n| ProtoEnum::try_from(n).ok())
+                        .map(|parsed| parsed as i32)
+                        .ok_or_else(|| E::custom(format!(concat!($unknown_num, " {}"), v)))
+                }
+
+                fn visit_u64<E: de::Error>(self, v: u64) -> Result<i32, E> {
+                    i64::try_from(v)
+                        .map_err(|_| E::custom(format!(concat!($unknown_num, " {}"), v)))
+                        .and_then(|n| self.visit_i64(n))
+                }
+            }
+            d.deserialize_any(EnumVisitor)
         }
-        fn visit_i64<E: de::Error>(self, v: i64) -> Result<i32, E> {
-            i32::try_from(v)
-                .ok()
-                .and_then(|n| Operator::try_from(n).ok())
-                .map(|op| op as i32)
-                .ok_or_else(|| E::custom(format!("unknown UnaryFilter.Operator number {v}")))
-        }
-        fn visit_u64<E: de::Error>(self, v: u64) -> Result<i32, E> {
-            i64::try_from(v)
-                .map_err(|_| E::custom(format!("unknown UnaryFilter.Operator number {v}")))
-                .and_then(|n| self.visit_i64(n))
-        }
-    }
-    d.deserialize_any(OpVisitor)
+    };
+}
+
+proto_enum_serde! {
+    ser = serialize_direction,
+    de = deserialize_direction,
+    ty = Direction,
+    default = Unspecified,
+    expecting = "a Direction enum string or integer",
+    unknown_num = "unknown Direction enum number",
+    variants = [
+        Unspecified => "DIRECTION_UNSPECIFIED",
+        Ascending => "ASCENDING",
+        Descending => "DESCENDING",
+    ]
+}
+
+proto_enum_serde! {
+    ser = serialize_composite_op,
+    de = deserialize_composite_op,
+    ty = composite_filter::Operator,
+    default = Unspecified,
+    expecting = "a CompositeFilter.Operator string or integer",
+    unknown_num = "unknown CompositeFilter.Operator number",
+    variants = [
+        Unspecified => "OPERATOR_UNSPECIFIED",
+        And => "AND",
+        Or => "OR",
+    ]
+}
+
+proto_enum_serde! {
+    ser = serialize_field_op,
+    de = deserialize_field_op,
+    ty = field_filter::Operator,
+    default = Unspecified,
+    expecting = "a FieldFilter.Operator string or integer",
+    unknown_num = "unknown FieldFilter.Operator number",
+    variants = [
+        Unspecified => "OPERATOR_UNSPECIFIED",
+        LessThan => "LESS_THAN",
+        LessThanOrEqual => "LESS_THAN_OR_EQUAL",
+        GreaterThan => "GREATER_THAN",
+        GreaterThanOrEqual => "GREATER_THAN_OR_EQUAL",
+        Equal => "EQUAL",
+        NotEqual => "NOT_EQUAL",
+        ArrayContains => "ARRAY_CONTAINS",
+        In => "IN",
+        ArrayContainsAny => "ARRAY_CONTAINS_ANY",
+        NotIn => "NOT_IN",
+    ]
+}
+
+proto_enum_serde! {
+    ser = serialize_unary_op,
+    de = deserialize_unary_op,
+    ty = unary_filter::Operator,
+    default = Unspecified,
+    expecting = "a UnaryFilter.Operator string or integer",
+    unknown_num = "unknown UnaryFilter.Operator number",
+    variants = [
+        Unspecified => "OPERATOR_UNSPECIFIED",
+        IsNan => "IS_NAN",
+        IsNull => "IS_NULL",
+        IsNotNan => "IS_NOT_NAN",
+        IsNotNull => "IS_NOT_NULL",
+    ]
 }
 
 impl Serialize for Order {
@@ -2034,6 +1932,162 @@ mod tests {
                 err(anything())
             );
         }
+    }
+
+    #[gtest]
+    fn proto_enum_serde_preserves_exact_diagnostics_and_roundtrips() {
+        // Direction
+        let dir_bad_str = serde_json::from_value::<Order>(json!({
+            "field": { "fieldPath": "a" },
+            "direction": "SIDEWAYS"
+        }))
+        .unwrap_err()
+        .to_string();
+        assert!(
+            dir_bad_str.contains("DIRECTION_UNSPECIFIED")
+                && dir_bad_str.contains("ASCENDING")
+                && dir_bad_str.contains("DESCENDING"),
+            "unexpected Direction unknown_variant error: {dir_bad_str}"
+        );
+        for num in [json!(-1), json!(99), json!(u64::MAX)] {
+            let err = serde_json::from_value::<Order>(json!({
+                "field": { "fieldPath": "a" },
+                "direction": num
+            }))
+            .unwrap_err()
+            .to_string();
+            assert!(
+                err.contains(&format!("unknown Direction enum number {num}")),
+                "unexpected Direction numeric error: {err}"
+            );
+        }
+        let dir_bad_ty = serde_json::from_value::<Order>(json!({
+            "field": { "fieldPath": "a" },
+            "direction": true
+        }))
+        .unwrap_err()
+        .to_string();
+        assert!(
+            dir_bad_ty.contains("a Direction enum string or integer"),
+            "unexpected Direction expecting error: {dir_bad_ty}"
+        );
+        expect_eq!(
+            serde_json::to_value(Order {
+                field:     Some(FieldReference {
+                    field_path: "a".to_string(),
+                }),
+                direction: 999,
+            })
+            .unwrap()["direction"],
+            json!("DIRECTION_UNSPECIFIED")
+        );
+
+        // CompositeFilter.Operator
+        let comp_bad_str = serde_json::from_value::<CompositeFilter>(json!({
+            "op": "XOR",
+            "filters": []
+        }))
+        .unwrap_err()
+        .to_string();
+        assert!(
+            comp_bad_str.contains("OPERATOR_UNSPECIFIED")
+                && comp_bad_str.contains("AND")
+                && comp_bad_str.contains("OR"),
+            "unexpected CompositeFilter.Operator unknown_variant error: {comp_bad_str}"
+        );
+        for num in [json!(-1), json!(99), json!(u64::MAX)] {
+            let err = serde_json::from_value::<CompositeFilter>(json!({
+                "op": num,
+                "filters": []
+            }))
+            .unwrap_err()
+            .to_string();
+            assert!(
+                err.contains(&format!("unknown CompositeFilter.Operator number {num}")),
+                "unexpected CompositeFilter.Operator numeric error: {err}"
+            );
+        }
+        let comp_bad_ty = serde_json::from_value::<CompositeFilter>(json!({
+            "op": true,
+            "filters": []
+        }))
+        .unwrap_err()
+        .to_string();
+        assert!(
+            comp_bad_ty.contains("a CompositeFilter.Operator string or integer"),
+            "unexpected CompositeFilter.Operator expecting error: {comp_bad_ty}"
+        );
+
+        // FieldFilter.Operator
+        let field_bad_str = serde_json::from_value::<FieldFilter>(json!({
+            "field": { "fieldPath": "a" },
+            "op": "LIKE",
+            "value": { "integerValue": "1" }
+        }))
+        .unwrap_err()
+        .to_string();
+        assert!(
+            field_bad_str.contains("OPERATOR_UNSPECIFIED") && field_bad_str.contains("NOT_IN"),
+            "unexpected FieldFilter.Operator unknown_variant error: {field_bad_str}"
+        );
+        for num in [json!(-1), json!(99), json!(u64::MAX)] {
+            let err = serde_json::from_value::<FieldFilter>(json!({
+                "field": { "fieldPath": "a" },
+                "op": num,
+                "value": { "integerValue": "1" }
+            }))
+            .unwrap_err()
+            .to_string();
+            assert!(
+                err.contains(&format!("unknown FieldFilter.Operator number {num}")),
+                "unexpected FieldFilter.Operator numeric error: {err}"
+            );
+        }
+        let field_bad_ty = serde_json::from_value::<FieldFilter>(json!({
+            "field": { "fieldPath": "a" },
+            "op": true,
+            "value": { "integerValue": "1" }
+        }))
+        .unwrap_err()
+        .to_string();
+        assert!(
+            field_bad_ty.contains("a FieldFilter.Operator string or integer"),
+            "unexpected FieldFilter.Operator expecting error: {field_bad_ty}"
+        );
+
+        // UnaryFilter.Operator
+        let unary_bad_str = serde_json::from_value::<UnaryFilter>(json!({
+            "op": "IS_EMPTY",
+            "field": { "fieldPath": "a" }
+        }))
+        .unwrap_err()
+        .to_string();
+        assert!(
+            unary_bad_str.contains("OPERATOR_UNSPECIFIED") && unary_bad_str.contains("IS_NOT_NULL"),
+            "unexpected UnaryFilter.Operator unknown_variant error: {unary_bad_str}"
+        );
+        for num in [json!(-1), json!(99), json!(u64::MAX)] {
+            let err = serde_json::from_value::<UnaryFilter>(json!({
+                "op": num,
+                "field": { "fieldPath": "a" }
+            }))
+            .unwrap_err()
+            .to_string();
+            assert!(
+                err.contains(&format!("unknown UnaryFilter.Operator number {num}")),
+                "unexpected UnaryFilter.Operator numeric error: {err}"
+            );
+        }
+        let unary_bad_ty = serde_json::from_value::<UnaryFilter>(json!({
+            "op": true,
+            "field": { "fieldPath": "a" }
+        }))
+        .unwrap_err()
+        .to_string();
+        assert!(
+            unary_bad_ty.contains("a UnaryFilter.Operator string or integer"),
+            "unexpected UnaryFilter.Operator expecting error: {unary_bad_ty}"
+        );
     }
 
     mod proptests {
