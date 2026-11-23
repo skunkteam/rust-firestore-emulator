@@ -1,6 +1,6 @@
 #![allow(unused_crate_dependencies)]
 
-use std::{fmt, net::SocketAddr};
+use std::{fmt, net::SocketAddr, num::NonZeroU64, time::Duration};
 
 use clap::Parser;
 use emulator_database::{FirestoreConfig, FirestoreProject};
@@ -64,6 +64,18 @@ struct Args {
     /// Enable this flag to default new databases to the Enterprise edition.
     #[arg(long, env = "FIRESTORE_EMULATOR_DEFAULT_ENTERPRISE")]
     default_enterprise: bool,
+
+    /// Optional override (in milliseconds) for the active transaction idle timeout.
+    ///
+    /// Defaults to Cloud Firestore's 60-second idle timeout when unset.
+    #[arg(long, env = "FIRESTORE_EMULATOR_TRANSACTION_IDLE_TIMEOUT_MS")]
+    transaction_idle_timeout_ms: Option<NonZeroU64>,
+
+    /// Optional override (in milliseconds) for the active transaction maximum lifetime.
+    ///
+    /// Defaults to Cloud Firestore's 270-second maximum transaction lifetime when unset.
+    #[arg(long, env = "FIRESTORE_EMULATOR_TRANSACTION_MAX_LIFETIME_MS")]
+    transaction_max_lifetime_ms: Option<NonZeroU64>,
 }
 
 #[tokio::main]
@@ -74,12 +86,18 @@ async fn main() -> Result<(), CliError> {
         host_port,
         long_contention_timeout,
         default_enterprise,
+        transaction_idle_timeout_ms,
+        transaction_max_lifetime_ms,
     } = Args::parse();
 
     // Create a new Firestore Project.
     let project = Box::new(FirestoreProject::new(FirestoreConfig {
         long_contention_timeout,
         default_enterprise,
+        transaction_idle_timeout: transaction_idle_timeout_ms
+            .map(|ms| Duration::from_millis(ms.get())),
+        transaction_max_lifetime: transaction_max_lifetime_ms
+            .map(|ms| Duration::from_millis(ms.get())),
     }));
     // Make it live for the remainder of the program's life. ('static)
     let project = Box::leak(project);
@@ -154,16 +172,73 @@ mod tests {
 
     #[test]
     fn args_parse_cli_flags() {
+        use clap::CommandFactory;
+
+        let default_args =
+            Args::try_parse_from(["firestore-emulator", "--host-port", "127.0.0.1:8085"]).unwrap();
+        assert_eq!(default_args.host_port, "127.0.0.1:8085".parse().unwrap());
+        assert!(!default_args.long_contention_timeout);
+        assert!(!default_args.default_enterprise);
+        assert_eq!(default_args.transaction_idle_timeout_ms, None);
+        assert_eq!(default_args.transaction_max_lifetime_ms, None);
+
         let args = Args::try_parse_from([
             "firestore-emulator",
             "--host-port",
             "127.0.0.1:8085",
             "--long-contention-timeout",
             "--default-enterprise",
+            "--transaction-idle-timeout-ms",
+            "2000",
+            "--transaction-max-lifetime-ms",
+            "10000",
         ])
         .unwrap();
         assert_eq!(args.host_port, "127.0.0.1:8085".parse().unwrap());
         assert!(args.long_contention_timeout);
         assert!(args.default_enterprise);
+        assert_eq!(args.transaction_idle_timeout_ms.unwrap().get(), 2000);
+        assert_eq!(args.transaction_max_lifetime_ms.unwrap().get(), 10000);
+
+        // Zero values are rejected by NonZeroU64.
+        assert!(
+            Args::try_parse_from([
+                "firestore-emulator",
+                "--host-port",
+                "127.0.0.1:8085",
+                "--transaction-idle-timeout-ms",
+                "0",
+            ])
+            .is_err()
+        );
+        assert!(
+            Args::try_parse_from([
+                "firestore-emulator",
+                "--host-port",
+                "127.0.0.1:8085",
+                "--transaction-max-lifetime-ms",
+                "0",
+            ])
+            .is_err()
+        );
+
+        // Verify exact env variable bindings on clap command definition.
+        let cmd = Args::command();
+        let idle_arg = cmd
+            .get_arguments()
+            .find(|a| a.get_id() == "transaction_idle_timeout_ms")
+            .unwrap();
+        assert_eq!(
+            idle_arg.get_env().and_then(|s| s.to_str()),
+            Some("FIRESTORE_EMULATOR_TRANSACTION_IDLE_TIMEOUT_MS")
+        );
+        let max_arg = cmd
+            .get_arguments()
+            .find(|a| a.get_id() == "transaction_max_lifetime_ms")
+            .unwrap();
+        assert_eq!(
+            max_arg.get_env().and_then(|s| s.to_str()),
+            Some("FIRESTORE_EMULATOR_TRANSACTION_MAX_LIFETIME_MS")
+        );
     }
 }

@@ -1303,3 +1303,164 @@ async fn l2_acquire_writes_all_slow_warning_names_active_blocked_doc() {
     drop(w2);
     drop(batch_fut.await.unwrap());
 }
+
+#[gtest]
+#[tokio::test(start_paused = true)]
+async fn close_expired_strips_locks_surfaces_expired_error_and_respects_committing() {
+    let locks = mgr(Timeouts::FAST);
+    let d_read = doc("exp_read");
+    let d_retained = doc("exp_retained");
+    let d_write = doc("exp_write");
+    let d_blocked = doc("exp_blocked");
+    let d_promoted = doc("exp_promoted");
+
+    // 1. Active session holding active ReadLease, retained read, WriteLease, and parked waiter:
+    //    `close_expired()` strips all locks, cancels its own parked waiter with
+    //    `TransactionExpired`, wakes other parked waiters, and surfaces `TransactionExpired` on
+    //    every subsequent session/lease method.
+    let holder = locks.new_session(None, LockPriority::NextSeq, false, false);
+    let blocker_w = holder.acquire_write(&d_blocked).await.unwrap();
+
+    let s_exp = locks.new_session(None, LockPriority::NextSeq, true, true);
+    let r_active = s_exp.acquire_read(&d_read).await.unwrap();
+    let r_to_retain = s_exp.acquire_read(&d_retained).await.unwrap();
+    s_exp.retain_read(r_to_retain, None).unwrap();
+    let r_retain_fail = s_exp.acquire_read(&d_read).await.unwrap();
+    let w_held = s_exp.acquire_write(&d_write).await.unwrap();
+    let mut own_wait = Box::pin(s_exp.acquire_read(&d_blocked));
+    assert!(poll!(&mut own_wait).is_pending());
+
+    let other = locks.new_session(None, LockPriority::NextSeq, false, false);
+    let mut other_w_read = Box::pin(other.acquire_write(&d_read));
+    let mut other_w_ret = Box::pin(other.acquire_write(&d_retained));
+    let mut other_w_write = Box::pin(other.acquire_write(&d_write));
+    assert!(poll!(&mut other_w_read).is_pending());
+    assert!(poll!(&mut other_w_ret).is_pending());
+    assert!(poll!(&mut other_w_write).is_pending());
+
+    s_exp.close_expired();
+
+    let exp_err = CommitError::Aborted(AbortReason::TransactionExpired);
+    expect_eq!(
+        s_exp.abort_state(),
+        SessionAbortState::Expired(AbortReason::TransactionExpired)
+    );
+    expect_eq!(own_wait.await.unwrap_err(), exp_err);
+    expect_eq!(r_active.check_active(), Err(exp_err.clone()));
+    expect_eq!(w_held.check_active(), Err(exp_err.clone()));
+    expect_eq!(s_exp.check_active(), Err(exp_err.clone()));
+    expect_eq!(s_exp.check_read_active(), Err(exp_err.clone()));
+    expect_eq!(s_exp.check_committing_active(), Err(exp_err.clone()));
+    expect_eq!(s_exp.retain_read(r_retain_fail, None), Err(exp_err.clone()));
+    expect_eq!(s_exp.acquire_read(&d_read).await.unwrap_err(), exp_err);
+    expect_eq!(s_exp.acquire_write(&d_read).await.unwrap_err(), exp_err);
+    expect_eq!(
+        s_exp
+            .acquire_writes_all(
+                &BTreeSet::from([d_read.clone()]),
+                Instant::now() + Timeouts::FAST.write,
+            )
+            .await
+            .unwrap_err(),
+        exp_err
+    );
+    expect_eq!(
+        s_exp
+            .clone()
+            .seal_for_commit(BTreeMap::from([(d_write.clone(), w_held)]))
+            .unwrap_err(),
+        exp_err
+    );
+    // Dropping armed ReadLease after `close_expired` must preserve `STATE_EXPIRED`.
+    drop(r_active);
+    expect_eq!(
+        s_exp.abort_state(),
+        SessionAbortState::Expired(AbortReason::TransactionExpired)
+    );
+
+    // Waiting writers on all 3 stripped docs wake immediately and acquire their locks.
+    drop(other_w_read.await.unwrap());
+    drop(other_w_ret.await.unwrap());
+    drop(other_w_write.await.unwrap());
+
+    drop(blocker_w);
+    drop(holder);
+    drop(other);
+    expect_eq!(locks.table_counts(), (0, 0));
+
+    // 2. Promoted-waiter-then-expired race before `consume_wait_grant` surfaces
+    //    `TransactionExpired` and rolls back the promoted grant for the next waiter.
+    let h2 = locks.new_session(None, LockPriority::NextSeq, false, false);
+    let h2_w = h2.acquire_write(&d_promoted).await.unwrap();
+
+    let s_prom_exp = locks.new_session(None, LockPriority::NextSeq, true, true);
+    let mut prom_fut = Box::pin(s_prom_exp.acquire_read(&d_promoted));
+    assert!(poll!(&mut prom_fut).is_pending());
+
+    let s_after = locks.new_session(None, LockPriority::NextSeq, false, false);
+    let mut after_fut = Box::pin(s_after.acquire_write(&d_promoted));
+    assert!(poll!(&mut after_fut).is_pending());
+
+    // Release `h2_w` -> promotes `s_prom_exp` into `promoted_grants` and sends `Ok(())`,
+    // then expire `s_prom_exp` BEFORE `prom_fut` polls `consume_wait_grant`.
+    drop(h2_w);
+    s_prom_exp.close_expired();
+
+    expect_eq!(prom_fut.await.unwrap_err(), exp_err);
+    drop(after_fut.await.unwrap());
+    drop(h2);
+    drop(s_after);
+    expect_eq!(locks.table_counts(), (0, 0));
+
+    // 3. `LockTable::close_expired` ignores `SessionState::Committing` and terminal states.
+    let mut table = LockTable::default();
+    let alloc_seq = AtomicU64::new(1);
+    let mut g = LockTableGarbage::default();
+    let s_committing = Arc::new(SessionSharedState::new(1));
+    table.register_session(1, Arc::clone(&s_committing), None, 1, true, true);
+    assert!(matches!(
+        table.try_acquire_or_upgrade_write(1, &s_committing, &d_write, &alloc_seq, &mut g),
+        Ok(AcquireOutcome::Granted { .. })
+    ));
+    let dummy_lease = WriteLease::new(
+        locks.new_session(None, LockPriority::NextSeq, false, false),
+        d_write.clone(),
+        Timestamp::now(),
+    );
+    let mut sealed = BTreeMap::from([(d_write.clone(), dummy_lease)]);
+    expect_that!(
+        table.seal_for_commit(1, &s_committing, &sealed, &mut g),
+        ok(())
+    );
+    table.close_expired(1, &mut g);
+    expect_eq!(s_committing.abort_state(), SessionAbortState::Committing);
+    expect_eq!(table.counts(), (1, 1));
+    for lease in sealed.values_mut() {
+        lease.disarm();
+    }
+    drop(sealed);
+    // Clean up dummy session from `locks` so `locks.table_counts()` is clean too.
+    expect_eq!(locks.table_counts(), (0, 0));
+
+    // 4. `LockManager::close_expired_sessions` strips multiple active sessions under a single lock
+    //    while skipping non-active sessions.
+    let s1 = locks.new_session(None, LockPriority::NextSeq, true, true);
+    let s2 = locks.new_session(None, LockPriority::NextSeq, true, true);
+    let s_closed = locks.new_session(None, LockPriority::NextSeq, true, true);
+    let l1 = s1.acquire_read(&d_read).await.unwrap();
+    let l2 = s2.acquire_read(&d_retained).await.unwrap();
+    s1.retain_read(l1, None).unwrap();
+    s2.retain_read(l2, None).unwrap();
+    s_closed.close();
+    let wait_other = locks.new_session(None, LockPriority::NextSeq, false, false);
+    let mut w1 = Box::pin(wait_other.acquire_write(&d_read));
+    let mut w2 = Box::pin(wait_other.acquire_write(&d_retained));
+    assert!(poll!(&mut w1).is_pending());
+    assert!(poll!(&mut w2).is_pending());
+
+    locks.close_expired_sessions(&[s1, s2, s_closed]);
+    drop(w1.await.unwrap());
+    drop(w2.await.unwrap());
+    drop(wait_other);
+    expect_eq!(locks.table_counts(), (0, 0));
+}

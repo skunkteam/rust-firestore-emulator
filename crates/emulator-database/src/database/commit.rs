@@ -131,6 +131,7 @@ impl FirestoreDatabase {
         Vec<WriteResult>,
         Option<Arc<StoredDocumentVersion>>,
     )> {
+        self.transactions.reap_if_due();
         let session = self
             .locks
             .new_session(None, LockPriority::NextSeq, false, false);
@@ -153,6 +154,7 @@ impl FirestoreDatabase {
         }
         let validated = self.validate_commit_writes(writes)?;
         if validated.target_docs.is_empty() {
+            self.transactions.reap_if_due();
             return Ok((Timestamp::now(), Vec::new()));
         }
 
@@ -168,6 +170,7 @@ impl FirestoreDatabase {
             return Ok((time, results));
         }
 
+        self.transactions.reap_if_due();
         let deadline = Instant::now() + self.project.timeouts.write;
         let mut priority = LockPriority::NextSeq;
         let mut wound_retries: u32 = 0;

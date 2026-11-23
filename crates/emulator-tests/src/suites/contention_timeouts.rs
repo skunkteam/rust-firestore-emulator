@@ -1367,3 +1367,298 @@ async fn write_batch_repeated_wounds_back_off_and_expire_at_2s_write_timeout() {
         &fields!({ "v": 0i64 }),
     );
 }
+
+#[gtest]
+#[tokio::test(start_paused = true)]
+async fn abandoned_pessimistic_rw_expiry_releases_locks_for_arriving_and_parked_writers() {
+    const EXPIRED_MSG: &str = "The referenced transaction has expired or is no longer valid.";
+
+    for (edition, mode) in [("STANDARD", "PESSIMISTIC"), ("ENTERPRISE", "PESSIMISTIC")] {
+        // Part A: `Timeouts::FAST` (2s write / 5s read) with 60s unused / 120s used TTL.
+        // Verify both already-parked writers/readers (parked at t=119s) and newly-arriving
+        // non-tx/batch/RW writers after t=120s succeed cleanly once the abandoned holder expires.
+        let mut db = TestEnv::new().build_db();
+        db.set_admin_mode(Some(edition), Some(mode)).await;
+        for doc in [
+            "ttl_lock/parked_nontx",
+            "ttl_lock/parked_batch_a",
+            "ttl_lock/parked_batch_b",
+            "ttl_lock/parked_young",
+            "ttl_lock/arriving_nontx",
+            "ttl_lock/arriving_batch",
+            "ttl_lock/arriving_young",
+        ] {
+            db.put(doc, fields!({ "v": 0i64 })).await.unwrap();
+        }
+
+        let mut holder_parked = db.begin_rw_txn().await.unwrap();
+        let holder_parked_id = holder_parked.id().to_vec();
+        for doc in [
+            "ttl_lock/parked_nontx",
+            "ttl_lock/parked_batch_a",
+            "ttl_lock/parked_young",
+        ] {
+            let _unused = holder_parked.get(doc).await.unwrap();
+        }
+
+        let mut holder_arriving = db.begin_rw_txn().await.unwrap();
+        let holder_arriving_id = holder_arriving.id().to_vec();
+        for doc in [
+            "ttl_lock/arriving_nontx",
+            "ttl_lock/arriving_batch",
+            "ttl_lock/arriving_young",
+        ] {
+            let _unused = holder_arriving.get(doc).await.unwrap();
+        }
+
+        // Advance to t=119s (`< 120s` used-RW expiry): holders still retain read locks.
+        tokio::time::advance(Duration::from_secs(119)).await;
+        tokio::task::yield_now().await;
+
+        let mut db_nontx = db.clone();
+        let mut parked_nontx = ContentionProbe::spawn_op(async move {
+            db_nontx
+                .put("ttl_lock/parked_nontx", fields!({ "v": 1i64 }))
+                .await
+        });
+        parked_nontx.assert_pending().await;
+
+        let mut db_batch = db.clone();
+        let mut parked_batch = ContentionProbe::spawn_op(async move {
+            db_batch
+                .commit_writes(
+                    WriteBatchSpec::new()
+                        .put("ttl_lock/parked_batch_a", fields!({ "v": 2i64 }))
+                        .put("ttl_lock/parked_batch_b", fields!({ "v": 2i64 })),
+                )
+                .await
+        });
+        parked_batch.assert_pending().await;
+
+        let mut young_rw = db.begin_rw_txn().await.unwrap();
+        let _unused = young_rw.get("ttl_lock/parked_young").await.unwrap();
+        young_rw.put("ttl_lock/parked_young", fields!({ "v": 3i64 }));
+        let mut parked_young = ContentionProbe::spawn_op(young_rw.commit());
+        parked_young.assert_pending().await;
+
+        // Default point read parked behind `parked_nontx` also unblocks after expiry.
+        let mut db_def_read = db.clone();
+        let mut parked_read =
+            ContentionProbe::spawn_op(
+                async move { db_def_read.get("ttl_lock/parked_nontx").await },
+            );
+        parked_read.assert_pending().await;
+
+        // Advance 1s -> t=120s (before the 2s write / 5s read lock deadlines!): expiry wakes all
+        // parked ops and lets them succeed.
+        ContentionProbe::advance_and_poll(
+            Duration::from_secs(1),
+            &mut parked_nontx,
+            Some(&mut parked_batch),
+        )
+        .await;
+        parked_young.drive_settled().await;
+        parked_read.drive_settled().await;
+
+        parked_nontx
+            .expect_ready()
+            .await
+            .expect("parked non-tx write must succeed on holder expiry");
+        parked_batch
+            .expect_ready()
+            .await
+            .expect("parked multi-doc WriteBatch must succeed on holder expiry");
+        parked_young
+            .expect_ready()
+            .await
+            .expect("parked younger RW commit must succeed on holder expiry");
+        assert_doc_wire_eq(
+            &parked_read
+                .expect_ready()
+                .await
+                .expect("parked Default read must see post-write value"),
+            "ttl_lock/parked_nontx",
+            &fields!({ "v": 1i64 }),
+        );
+
+        // Arriving non-tx write, multi-doc WriteBatch, and new RW txn after expiry never stall.
+        db.put("ttl_lock/arriving_nontx", fields!({ "v": 10i64 }))
+            .await
+            .unwrap();
+        db.commit_writes(
+            WriteBatchSpec::new()
+                .put("ttl_lock/arriving_batch", fields!({ "v": 20i64 }))
+                .put("ttl_lock/parked_batch_b", fields!({ "v": 20i64 })),
+        )
+        .await
+        .unwrap();
+        let mut arriving_rw = db.begin_rw_txn().await.unwrap();
+        let _unused = arriving_rw.get("ttl_lock/arriving_young").await.unwrap();
+        arriving_rw.put("ttl_lock/arriving_young", fields!({ "v": 30i64 }));
+        arriving_rw.commit().await.unwrap();
+
+        for expired_id in [&holder_parked_id, &holder_arriving_id] {
+            let status = assert_status_code(
+                db.get_in_txn("ttl_lock/parked_nontx", expired_id).await,
+                Code::Aborted,
+            );
+            assert_eq!(status.message(), EXPIRED_MSG);
+        }
+
+        // Part B: `Timeouts::CLOUD` (15s write timeout), parking writers at t=112s -> unblock at
+        // t=120s (8s wait < 15s deadline), matching live Cloud Firestore probe timing.
+        let mut cloud_db = TestEnv::new().cloud_timeouts().build_db();
+        cloud_db.set_admin_mode(Some(edition), Some(mode)).await;
+        for doc in ["ttl_cloud/a", "ttl_cloud/b"] {
+            cloud_db.put(doc, fields!({ "v": 0i64 })).await.unwrap();
+        }
+        let mut cloud_holder = cloud_db.begin_rw_txn().await.unwrap();
+        let cloud_holder_id = cloud_holder.id().to_vec();
+        let _unused = cloud_holder.get("ttl_cloud/a").await.unwrap();
+        let _unused = cloud_holder.get("ttl_cloud/b").await.unwrap();
+
+        tokio::time::advance(Duration::from_secs(112)).await;
+        tokio::task::yield_now().await;
+
+        let mut ca = cloud_db.clone();
+        let mut cloud_nontx = ContentionProbe::spawn_op(async move {
+            ca.put("ttl_cloud/a", fields!({ "v": 1i64 })).await
+        });
+        let mut cloud_young = cloud_db.begin_rw_txn().await.unwrap();
+        let _unused = cloud_young.get("ttl_cloud/b").await.unwrap();
+        cloud_young.put("ttl_cloud/b", fields!({ "v": 2i64 }));
+        let mut cloud_young_commit = ContentionProbe::spawn_op(cloud_young.commit());
+
+        ContentionProbe::advance_and_poll(
+            Duration::from_secs(2),
+            &mut cloud_nontx,
+            Some(&mut cloud_young_commit),
+        )
+        .await;
+        cloud_nontx.assert_pending().await;
+        cloud_young_commit.assert_pending().await;
+
+        ContentionProbe::advance_and_poll(
+            Duration::from_secs(6),
+            &mut cloud_nontx,
+            Some(&mut cloud_young_commit),
+        )
+        .await;
+        cloud_nontx.expect_ready().await.unwrap();
+        cloud_young_commit.expect_ready().await.unwrap();
+
+        let status = assert_status_code(
+            cloud_db.get_in_txn("ttl_cloud/a", &cloud_holder_id).await,
+            Code::Aborted,
+        );
+        assert_eq!(status.message(), EXPIRED_MSG);
+    }
+}
+
+#[gtest]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn realtime_short_ttl_concurrent_abandoned_rw_and_ro_contention_stress() {
+    for (edition, mode) in [("STANDARD", "PESSIMISTIC"), ("ENTERPRISE", "PESSIMISTIC")] {
+        let mut db = TestEnv::new()
+            .transaction_timeouts(Duration::from_millis(50), Duration::from_millis(250))
+            .build_db();
+        db.set_admin_mode(Some(edition), Some(mode)).await;
+
+        for i in 0..4 {
+            db.put(&format!("rt_ttl/d{i}"), fields!({ "v": 0i64 }))
+                .await
+                .unwrap();
+        }
+
+        let start = Arc::new(Barrier::new(6));
+        let mut handles = Vec::new();
+
+        // 2 workers creating abandoned RW read-lock holders + abandoned RO transactions.
+        for w in 0..2usize {
+            let mut wdb = db.clone();
+            let sb = Arc::clone(&start);
+            handles.push(tokio::spawn(async move {
+                sb.wait().await;
+                for iter in 0..6usize {
+                    let doc = format!("rt_ttl/d{}", (w + iter) % 4);
+                    let mut rw = wdb.begin_rw_txn().await.unwrap();
+                    if let Err(e) = rw.get(&doc).await {
+                        assert_eq!(
+                            e.code(),
+                            Code::Aborted,
+                            "only contention/ttl Aborted allowed on rw.get, got {e:?}"
+                        );
+                    }
+                    let mut ro = wdb.begin_ro_txn(None).await.unwrap();
+                    if let Err(e) = ro.get(&doc).await {
+                        assert_eq!(
+                            e.code(),
+                            Code::Aborted,
+                            "only ttl Aborted allowed on ro.get, got {e:?}"
+                        );
+                    }
+                    tokio::time::sleep(Duration::from_millis(25)).await;
+                }
+            }));
+        }
+
+        // 3 workers issuing non-tx writes, WriteBatches, and younger RW commits against those
+        // docs; with `used_min = 100ms << write_timeout = 2s`, none may ever hit WriteTimeout or
+        // Internal.
+        for w in 0..3usize {
+            let mut wdb = db.clone();
+            let sb = Arc::clone(&start);
+            handles.push(tokio::spawn(async move {
+                sb.wait().await;
+                for iter in 0..8usize {
+                    let doc = format!("rt_ttl/d{}", (w + iter) % 4);
+                    let next_doc = format!("rt_ttl/d{}", (w + iter + 1) % 4);
+                    match iter % 3 {
+                        0 => {
+                            wdb.put(&doc, fields!({ "v": (iter + 1) as i64 }))
+                                .await
+                                .expect("non-tx write must not time out behind expired RW");
+                        }
+                        1 => {
+                            wdb.commit_writes(
+                                WriteBatchSpec::new()
+                                    .put(&doc, fields!({ "v": (iter + 1) as i64 }))
+                                    .put(&next_doc, fields!({ "v": (iter + 1) as i64 })),
+                            )
+                            .await
+                            .expect("WriteBatch must not time out behind expired RW");
+                        }
+                        _ => {
+                            let mut tx = wdb.begin_rw_txn().await.unwrap();
+                            match tx.get(&doc).await {
+                                Ok(_) => {
+                                    tx.put(&doc, fields!({ "v": (iter + 1) as i64 }));
+                                    if let Err(e) = tx.commit().await {
+                                        assert_eq!(
+                                            e.code(),
+                                            Code::Aborted,
+                                            "only contention/wound Aborted allowed, got {e:?}"
+                                        );
+                                    }
+                                }
+                                Err(e) => {
+                                    assert_eq!(
+                                        e.code(),
+                                        Code::Aborted,
+                                        "only contention/wound/ttl Aborted allowed on tx.get, got \
+                                         {e:?}"
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            }));
+        }
+
+        start.wait().await;
+        for h in handles {
+            h.await.unwrap();
+        }
+    }
+}

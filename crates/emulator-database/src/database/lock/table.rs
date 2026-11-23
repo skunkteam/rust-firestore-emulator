@@ -10,8 +10,8 @@ use googleapis::google::protobuf::Timestamp;
 use tokio::sync::oneshot;
 
 use super::{
-    ReadLease, STATE_CLEARED, STATE_COMMITTING, STATE_TIMED_OUT, STATE_WOUNDED, SessionAbortState,
-    SessionSharedState, WriteLease, transaction_closed,
+    ReadLease, STATE_CLEARED, STATE_COMMITTING, STATE_EXPIRED, STATE_TIMED_OUT, STATE_WOUNDED,
+    SessionAbortState, SessionSharedState, WriteLease, transaction_closed,
 };
 use crate::{
     GenericDatabaseError,
@@ -37,6 +37,14 @@ pub(super) enum SessionState {
     Committing,
     Wounded,
     TimedOut,
+    Expired,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum CloseDisposition {
+    Normal(u8),
+    TimedOut(AbortReason),
+    Expired,
 }
 
 type ParkedWaiterMap = HashMap<u64, (DocumentRef, (u64, u64))>;
@@ -733,10 +741,28 @@ impl LockTable {
         closed_state_code: u8,
         garbage: &mut LockTableGarbage,
     ) {
+        let disposition = match timeout_reason {
+            Some(reason) => CloseDisposition::TimedOut(reason),
+            None => CloseDisposition::Normal(closed_state_code),
+        };
+        self.close_session_inner(session_id, disposition, garbage);
+    }
+
+    pub(super) fn close_expired(&mut self, session_id: u64, garbage: &mut LockTableGarbage) {
+        self.close_session_inner(session_id, CloseDisposition::Expired, garbage);
+    }
+
+    fn close_session_inner(
+        &mut self,
+        session_id: u64,
+        disposition: CloseDisposition,
+        garbage: &mut LockTableGarbage,
+    ) {
         let Some(rec) = self.sessions.get(&session_id) else {
             return;
         };
-        if timeout_reason.is_some() && rec.state != SessionState::Active {
+        if !matches!(disposition, CloseDisposition::Normal(_)) && rec.state != SessionState::Active
+        {
             return;
         }
 
@@ -745,18 +771,29 @@ impl LockTable {
             .remove(&session_id)
             .expect("session verified present");
 
-        if let Some(reason) = timeout_reason {
-            rec.state = SessionState::TimedOut;
-            rec.abort_reason = Some(reason);
-            rec.shared.publish_abort(STATE_TIMED_OUT, reason);
-        } else if rec.state == SessionState::Active || rec.state == SessionState::Committing {
-            rec.shared.publish_state(closed_state_code);
-        }
+        let cancel_err = match disposition {
+            CloseDisposition::TimedOut(reason) => {
+                rec.state = SessionState::TimedOut;
+                rec.abort_reason = Some(reason);
+                rec.shared.publish_abort(STATE_TIMED_OUT, reason);
+                CommitError::Aborted(reason)
+            }
+            CloseDisposition::Expired => {
+                let reason = AbortReason::TransactionExpired;
+                rec.state = SessionState::Expired;
+                rec.abort_reason = Some(reason);
+                rec.shared.publish_abort(STATE_EXPIRED, reason);
+                CommitError::Aborted(reason)
+            }
+            CloseDisposition::Normal(closed_state_code) => {
+                if rec.state == SessionState::Active || rec.state == SessionState::Committing {
+                    rec.shared.publish_state(closed_state_code);
+                }
+                transaction_closed()
+            }
+        };
 
         let mut affected_docs = Vec::new();
-        let cancel_err = timeout_reason
-            .map(CommitError::Aborted)
-            .unwrap_or_else(transaction_closed);
         self.strip_session_resources(
             session_id,
             &mut rec,
@@ -1154,7 +1191,8 @@ fn missing_session_error(shared: &SessionSharedState) -> CommitError {
     match shared.abort_state() {
         SessionAbortState::Wounded(reason)
         | SessionAbortState::TimedOut(reason)
-        | SessionAbortState::Cleared(reason) => CommitError::Aborted(reason),
+        | SessionAbortState::Cleared(reason)
+        | SessionAbortState::Expired(reason) => CommitError::Aborted(reason),
         SessionAbortState::Active | SessionAbortState::Committing | SessionAbortState::Closed => {
             transaction_closed()
         }
@@ -1173,6 +1211,9 @@ fn inactive_record_error(rec: &SessionRecord) -> CommitError {
         }
         SessionState::TimedOut => {
             CommitError::Aborted(rec.abort_reason.unwrap_or(AbortReason::WriteTimeout))
+        }
+        SessionState::Expired => {
+            CommitError::Aborted(rec.abort_reason.unwrap_or(AbortReason::TransactionExpired))
         }
     }
 }

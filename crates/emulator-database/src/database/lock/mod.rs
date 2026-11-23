@@ -5,9 +5,9 @@ mod tests;
 
 use std::{
     collections::{BTreeMap, BTreeSet},
-    future::Future,
+    pin::Pin,
     sync::{
-        Arc, Mutex, PoisonError,
+        Arc, Mutex, OnceLock, PoisonError, Weak,
         atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering},
     },
     time::Duration,
@@ -15,8 +15,8 @@ use std::{
 
 use googleapis::google::protobuf::Timestamp;
 use tokio::{
-    sync::oneshot,
-    time::{Instant, error::Elapsed, sleep, sleep_until, timeout},
+    sync::{Notify, oneshot},
+    time::{Instant, sleep, sleep_until},
 };
 
 use self::{
@@ -30,6 +30,7 @@ pub(crate) use self::{
 use crate::{
     GenericDatabaseError,
     database::{
+        FirestoreDatabase,
         reference::{DocumentRef, RootRef},
         timeouts::Timeouts,
         transaction::TransactionId,
@@ -43,11 +44,12 @@ pub(super) const STATE_WOUNDED: u8 = 2;
 pub(super) const STATE_TIMED_OUT: u8 = 3;
 pub(super) const STATE_CLEARED: u8 = 4;
 pub(super) const STATE_CLOSED: u8 = 5;
+pub(super) const STATE_EXPIRED: u8 = 6;
 
 fn is_terminal_state(state: u8) -> bool {
     matches!(
         state,
-        STATE_WOUNDED | STATE_TIMED_OUT | STATE_CLEARED | STATE_CLOSED
+        STATE_WOUNDED | STATE_TIMED_OUT | STATE_CLEARED | STATE_CLOSED | STATE_EXPIRED
     )
 }
 
@@ -76,6 +78,7 @@ pub(crate) enum SessionAbortState {
     Wounded(AbortReason),
     TimedOut(AbortReason),
     Cleared(AbortReason),
+    Expired(AbortReason),
     Closed,
 }
 
@@ -157,6 +160,9 @@ impl SessionSharedState {
             STATE_CLEARED => {
                 SessionAbortState::Cleared(self.read_abort_reason(AbortReason::DatabaseCleared))
             }
+            STATE_EXPIRED => {
+                SessionAbortState::Expired(self.read_abort_reason(AbortReason::TransactionExpired))
+            }
             _ => SessionAbortState::Closed,
         }
     }
@@ -172,6 +178,8 @@ pub(crate) struct LockManager {
     next_session_id: AtomicU64,
     next_seq: AtomicU64,
     cleared: AtomicBool,
+    expiry_notify: Arc<Notify>,
+    reaper: OnceLock<Weak<FirestoreDatabase>>,
 }
 
 impl LockManager {
@@ -183,7 +191,43 @@ impl LockManager {
             next_session_id: AtomicU64::new(1),
             next_seq: AtomicU64::new(1),
             cleared: AtomicBool::new(false),
+            expiry_notify: Arc::new(Notify::new()),
+            reaper: OnceLock::new(),
         }
+    }
+
+    pub(crate) fn set_reaper(&self, db: Weak<FirestoreDatabase>) {
+        drop(self.reaper.set(db));
+    }
+
+    pub(crate) fn expiry_notify(&self) -> Arc<Notify> {
+        Arc::clone(&self.expiry_notify)
+    }
+
+    pub(crate) fn close_expired_sessions(&self, sessions: &[Arc<LockSession>]) {
+        if !sessions
+            .iter()
+            .any(|s| s.shared.state_code() == STATE_ACTIVE)
+        {
+            return;
+        }
+        let mut garbage = LockTableGarbage::default();
+        {
+            let mut table = self.table.lock().unwrap_or_else(PoisonError::into_inner);
+            for session in sessions {
+                if session.shared.state_code() == STATE_ACTIVE {
+                    table.close_expired(session.session_id, &mut garbage);
+                }
+            }
+        }
+        drop(garbage);
+    }
+
+    fn reap_and_next_expiry(&self) -> Option<Instant> {
+        self.reaper
+            .get()
+            .and_then(Weak::upgrade)
+            .and_then(|db| db.transactions.reap_and_next_pessimistic_expiry())
     }
 
     pub(crate) fn new_session(
@@ -256,7 +300,7 @@ impl LockManager {
     }
 
     #[cfg(test)]
-    pub(super) fn table_counts(&self) -> (usize, usize) {
+    pub(crate) fn table_counts(&self) -> (usize, usize) {
         self.table
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
@@ -310,7 +354,8 @@ impl LockSession {
             SessionAbortState::Active => Ok(()),
             SessionAbortState::Wounded(reason)
             | SessionAbortState::TimedOut(reason)
-            | SessionAbortState::Cleared(reason) => Err(CommitError::Aborted(reason)),
+            | SessionAbortState::Cleared(reason)
+            | SessionAbortState::Expired(reason) => Err(CommitError::Aborted(reason)),
             SessionAbortState::Committing | SessionAbortState::Closed => Err(transaction_closed()),
         }
     }
@@ -328,7 +373,8 @@ impl LockSession {
             SessionAbortState::Active | SessionAbortState::Committing => Ok(()),
             SessionAbortState::Wounded(reason)
             | SessionAbortState::TimedOut(reason)
-            | SessionAbortState::Cleared(reason) => Err(CommitError::Aborted(reason)),
+            | SessionAbortState::Cleared(reason)
+            | SessionAbortState::Expired(reason) => Err(CommitError::Aborted(reason)),
             SessionAbortState::Closed => Err(transaction_closed()),
         }
     }
@@ -416,6 +462,19 @@ impl LockSession {
         {
             let mut table = self.lock_table();
             table.close_session(self.session_id, None, STATE_CLOSED, &mut garbage);
+        }
+        drop(garbage);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn close_expired(&self) {
+        if self.shared.state_code() != STATE_ACTIVE {
+            return;
+        }
+        let mut garbage = LockTableGarbage::default();
+        {
+            let mut table = self.lock_table();
+            table.close_expired(self.session_id, &mut garbage);
         }
         drop(garbage);
     }
@@ -631,21 +690,20 @@ impl LockSession {
 
         for waiter in &mut waiters {
             last_waited_doc = waiter.doc_ref.clone();
-            let rx_res = loop {
-                tokio::select! {
-                    biased;
-                    res = &mut waiter.rx => break Some(res),
-                    _ = &mut deadline_fut => {
-                        timed_out = true;
-                        break None;
-                    }
-                    _ = &mut slow_warn, if !warned => {
-                        warned = true;
-                        self.emit_slow_wait_warning(&waiter.doc_ref, "write lock", start);
-                    }
-                }
-            };
-            let Some(rx_res) = rx_res else {
+            let Some(rx_res) = self
+                .await_waiter_rx(
+                    &mut waiter.rx,
+                    &waiter.doc_ref,
+                    "write lock",
+                    start,
+                    deadline,
+                    deadline_fut.as_mut(),
+                    slow_warn.as_mut(),
+                    &mut warned,
+                )
+                .await
+            else {
+                timed_out = true;
                 break;
             };
             let wait_id = waiter
@@ -745,19 +803,34 @@ impl LockSession {
         doc_ref: &DocumentRef,
         kind: &'static str,
         wait_id: u64,
-        rx: oneshot::Receiver<Result<(), CommitError>>,
+        mut rx: oneshot::Receiver<Result<(), CommitError>>,
         timeout_duration: Duration,
         timeout_reason: AbortReason,
         is_read: bool,
     ) -> Result<(), CommitError> {
         let start = Instant::now();
+        let deadline = start + timeout_duration;
         let guard = WaiterGuard::new(Arc::clone(self), wait_id);
+        let slow_warn = sleep(Duration::from_secs(1));
+        tokio::pin!(slow_warn);
+        let mut warned = false;
+        let deadline_fut = sleep_until(deadline);
+        tokio::pin!(deadline_fut);
         let awaited = self
-            .await_with_slow_warning(doc_ref, kind, start, timeout(timeout_duration, rx))
+            .await_waiter_rx(
+                &mut rx,
+                doc_ref,
+                kind,
+                start,
+                deadline,
+                deadline_fut,
+                slow_warn,
+                &mut warned,
+            )
             .await;
 
         match awaited {
-            Ok(Ok(Ok(()))) => {
+            Some(Ok(Ok(()))) => {
                 let consumed = {
                     let mut table = self.lock_table();
                     table.consume_wait_grant(self.session_id, &self.shared, guard.wait_id())
@@ -781,7 +854,7 @@ impl LockSession {
                     Err(err) => Err(err),
                 }
             }
-            Ok(Ok(Err(err))) => {
+            Some(Ok(Err(err))) => {
                 guard.disarm();
                 tracing::debug!(
                     target: "emulator_database::lock",
@@ -797,7 +870,7 @@ impl LockSession {
                 );
                 Err(err)
             }
-            Ok(Err(_)) => {
+            Some(Err(_)) => {
                 guard.disarm();
                 let check = if is_read {
                     self.check_read_active()
@@ -809,7 +882,7 @@ impl LockSession {
                     Ok(()) => CommitError::Aborted(AbortReason::DatabaseDropped),
                 })
             }
-            Err(_elapsed) => {
+            None => {
                 guard.disarm();
                 self.close_timed_out(timeout_reason);
                 let final_err = match self.check_active() {
@@ -833,22 +906,64 @@ impl LockSession {
         }
     }
 
-    async fn await_with_slow_warning<F, Out>(
+    #[allow(clippy::too_many_arguments)]
+    async fn await_waiter_rx(
         &self,
+        rx: &mut oneshot::Receiver<Result<(), CommitError>>,
         doc_ref: &DocumentRef,
         kind: &'static str,
         start: Instant,
-        timeout_fut: F,
-    ) -> Result<Out, Elapsed>
-    where
-        F: Future<Output = Result<Out, Elapsed>>,
-    {
-        tokio::pin!(timeout_fut);
-        tokio::select! {
-            res = &mut timeout_fut => res,
-            _ = sleep(Duration::from_secs(1)) => {
-                self.emit_slow_wait_warning(doc_ref, kind, start);
-                timeout_fut.await
+        deadline: Instant,
+        mut deadline_fut: Pin<&mut tokio::time::Sleep>,
+        mut slow_warn: Pin<&mut tokio::time::Sleep>,
+        warned: &mut bool,
+    ) -> Option<Result<Result<(), CommitError>, oneshot::error::RecvError>> {
+        loop {
+            let notified = self.manager.expiry_notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+
+            let next_expiry = self.manager.reap_and_next_expiry();
+            let expiry_sleep = next_expiry.filter(|&exp| exp < deadline).map(sleep_until);
+            let has_expiry = expiry_sleep.is_some();
+            tokio::pin!(expiry_sleep);
+
+            let wake_slow = !*warned;
+            enum WaitTick {
+                Rx(Result<Result<(), CommitError>, oneshot::error::RecvError>),
+                TimedOut,
+                Expiry,
+                SlowWarn,
+            }
+
+            let tick = tokio::select! {
+                biased;
+                res = &mut *rx => WaitTick::Rx(res),
+                _ = &mut deadline_fut => WaitTick::TimedOut,
+                _ = async {
+                    if let Some(fut) = expiry_sleep.as_mut().as_pin_mut() {
+                        fut.await;
+                    }
+                }, if has_expiry => WaitTick::Expiry,
+                _ = &mut notified => WaitTick::Expiry,
+                _ = &mut slow_warn, if wake_slow => WaitTick::SlowWarn,
+            };
+
+            match tick {
+                WaitTick::Rx(res) => return Some(res),
+                WaitTick::TimedOut => {
+                    let _ = self.manager.reap_and_next_expiry();
+                    match rx.try_recv() {
+                        Ok(res) => return Some(Ok(res)),
+                        Err(oneshot::error::TryRecvError::Closed) => return Some(rx.await),
+                        Err(oneshot::error::TryRecvError::Empty) => return None,
+                    }
+                }
+                WaitTick::Expiry => {}
+                WaitTick::SlowWarn => {
+                    *warned = true;
+                    self.emit_slow_wait_warning(doc_ref, kind, start);
+                }
             }
         }
     }

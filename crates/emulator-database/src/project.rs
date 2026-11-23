@@ -31,10 +31,21 @@ impl std::fmt::Debug for FirestoreProject {
 
 impl FirestoreProject {
     pub fn new(config: FirestoreConfig) -> Self {
-        let timeouts = if config.long_contention_timeout {
+        let base = if config.long_contention_timeout {
             Timeouts::CLOUD
         } else {
             Timeouts::FAST
+        };
+        let txn_max = config.transaction_max_lifetime.unwrap_or(base.txn_max);
+        let txn_idle = config
+            .transaction_idle_timeout
+            .unwrap_or(base.txn_idle)
+            .min(txn_max);
+        let timeouts = Timeouts {
+            write: base.write,
+            read: base.read,
+            txn_idle,
+            txn_max,
         };
         Self {
             timeouts,

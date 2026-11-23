@@ -4,6 +4,9 @@ use thiserror::Error;
 
 use crate::database::transaction::TransactionId;
 
+pub(crate) const EXPIRED_TRANSACTION_MSG: &str =
+    "The referenced transaction has expired or is no longer valid.";
+
 pub(crate) type Result<T, E = GenericDatabaseError> = std::result::Result<T, E>;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -16,6 +19,7 @@ pub(crate) enum AbortReason {
     ReadTimeout,
     WriteTimeout,
     OptimisticWriteSkew,
+    TransactionExpired,
     DatabaseCleared,
     DatabaseDropped,
 }
@@ -43,6 +47,7 @@ impl fmt::Display for AbortReason {
             Self::OptimisticWriteSkew => {
                 f.write_str("contention: optimistic concurrency violation")
             }
+            Self::TransactionExpired => f.write_str(EXPIRED_TRANSACTION_MSG),
             Self::DatabaseCleared => f.write_str("database was cleared"),
             Self::DatabaseDropped => f.write_str("database was dropped"),
         }

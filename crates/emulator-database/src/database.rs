@@ -80,7 +80,7 @@ impl FirestoreDatabase {
         enterprise_edition: bool,
     ) -> Arc<Self> {
         let locks = Arc::new(LockManager::new(name.clone(), project.timeouts));
-        Arc::new_cyclic(|database| FirestoreDatabase {
+        let db = Arc::new_cyclic(|database| FirestoreDatabase {
             project,
             name,
             enterprise_edition: AtomicBool::new(enterprise_edition),
@@ -88,10 +88,12 @@ impl FirestoreDatabase {
             cleared: AtomicBool::new(false),
             collections: Default::default(),
             locks: Arc::clone(&locks),
-            transactions: RunningTransactions::new(Weak::clone(database), locks),
+            transactions: RunningTransactions::new(Weak::clone(database), locks, project.timeouts),
             optimistic_commit_lock: Default::default(),
             events: std::sync::Mutex::new(Some(broadcast::channel(MAX_EVENT_BACKLOG).0)),
-        })
+        });
+        db.locks.set_reaper(Arc::downgrade(&db));
+        db
     }
 
     pub(crate) fn mark_cleared(&self) {
@@ -137,6 +139,7 @@ impl FirestoreDatabase {
                 if self.is_cleared() {
                     return Err(AbortReason::DatabaseCleared.into());
                 }
+                self.transactions.reap_if_due();
                 let session = self
                     .locks
                     .new_session(None, LockPriority::NextSeq, false, false);
@@ -153,6 +156,7 @@ impl FirestoreDatabase {
                 if self.is_cleared() {
                     return Err(AbortReason::DatabaseCleared.into());
                 }
+                self.transactions.reap_if_due();
                 let time = validate_read_time(time)?;
                 self.peek_doc_meta(name)
                     .await?
@@ -638,6 +642,7 @@ impl FirestoreDatabase {
                 if self.is_cleared() {
                     return Err(AbortReason::DatabaseCleared.into());
                 }
+                self.transactions.reap_if_due();
                 Ok(Timestamp::now())
             }
             ReadConsistency::Transaction(id) => {
@@ -648,6 +653,7 @@ impl FirestoreDatabase {
                 if self.is_cleared() {
                     return Err(AbortReason::DatabaseCleared.into());
                 }
+                self.transactions.reap_if_due();
                 validate_read_time(time)
             }
         }
