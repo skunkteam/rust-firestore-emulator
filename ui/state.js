@@ -1,8 +1,10 @@
 // @ts-check
 
+import { createContentionState } from "./components/contention.js";
 import { createQueryRunnerState } from "./components/query.js";
 
 /** @typedef {import('./api.js').DatabaseMetadata} DatabaseMetadata */
+/** @typedef {import('./components/contention.js').ContentionState} ContentionState */
 /** @typedef {import('./components/explorer.js').CollectionColumnState} CollectionColumnState */
 /** @typedef {import('./components/explorer.js').DocumentLevelState} DocumentLevelState */
 /** @typedef {import('./components/editor.js').EditorSession} EditorSession */
@@ -24,14 +26,16 @@ import { createQueryRunnerState } from "./components/query.js";
  *   activeProjectId: string | null,
  *   activeDatabaseId: string | null,
  *   activeDbMeta: DatabaseMetadata | null,
- *   view: 'explorer' | 'query',
+ *   view: 'explorer' | 'query' | 'contention',
  *   rootCollections: string[],
  *   rootLoading: boolean,
  *   segments: string[],
  *   collectionColumns: Map<string, CollectionColumnState>,
  *   documentLevels: Map<string, DocumentLevelState>,
  *   queryState: QueryRunnerState,
+ *   contention: ContentionState,
  *   sseStatus: 'live' | 'error',
+ *   contentionSseStatus: 'idle' | 'connecting' | 'live' | 'error',
  *   ssePaused: boolean,
  *   modal: ActiveModal | null,
  *   toasts: Array<{ id: number, text: string, tone: 'info' | 'success' | 'error' }>,
@@ -55,8 +59,10 @@ export const state = {
   documentLevels: new Map(),
 
   queryState: createQueryRunnerState(),
+  contention: createContentionState(),
 
   sseStatus: "live",
+  contentionSseStatus: "idle",
   ssePaused: false,
 
   modal: null,
@@ -68,6 +74,7 @@ let nextToastId = 1;
 let dbEpoch = 0;
 let navEpoch = 0;
 let dbListSeq = 0;
+let contentionSeq = 0;
 /** @type {Map<string, number>} */
 const colRequestSeq = new Map();
 /** @type {Map<string, number>} */
@@ -165,6 +172,23 @@ export function isCurrentDocSeq(docPath, seq) {
 }
 
 /**
+ * Increments and returns the contention snapshot request sequence number.
+ * @returns {number}
+ */
+export function nextContentionSeq() {
+  return ++contentionSeq;
+}
+
+/**
+ * Checks whether a contention snapshot request sequence number is still the latest.
+ * @param {number} seq
+ * @returns {boolean}
+ */
+export function isCurrentContentionSeq(seq) {
+  return seq === contentionSeq;
+}
+
+/**
  * Removes cached document level state (and its request sequence when targeting the global state) for `docPath`.
  * @param {string} docPath
  * @param {AppState} [targetState]
@@ -177,7 +201,8 @@ export function deleteDocumentLevelCache(docPath, targetState = state) {
 }
 
 /**
- * Clears cached collection/document levels and query runner state for the active database.
+ * Clears cached collection/document levels, query runner state, and contention snapshot data
+ * for the active database (preserving the selected contention scope).
  * @param {AppState} [targetState]
  */
 export function resetDatabaseCaches(targetState = state) {
@@ -188,8 +213,15 @@ export function resetDatabaseCaches(targetState = state) {
   if (targetState === state) {
     colRequestSeq.clear();
     docRequestSeq.clear();
+    nextContentionSeq();
   }
   targetState.queryState = createQueryRunnerState();
+  targetState.contention.snapshot = null;
+  targetState.contention.loading = false;
+  targetState.contention.clearing = false;
+  targetState.contention.error = null;
+  targetState.contention.lastFetchedAtMs = null;
+  targetState.contention.lastFetchedIso = null;
 }
 
 /**

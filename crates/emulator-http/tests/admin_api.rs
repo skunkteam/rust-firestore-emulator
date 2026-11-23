@@ -591,6 +591,7 @@ async fn test_rest_error_envelopes_and_404_isolation() -> Result<()> {
             "/ui/router.js",
             "/ui/values.js",
             "/ui/api.js",
+            "/ui/components/contention.js",
             "/ui/components/editor.js",
             "/ui/components/explorer.js",
             "/ui/components/modals.js",
@@ -2169,6 +2170,69 @@ async fn test_contention_sse_events_resync_heartbeat_and_drop_cleanup() -> Resul
     // 5. Dropping the SSE stream decrements the lock-free subscriber counter back to zero.
     drop(sse_stream);
     expect_eq!(project.contention_subscriber_count(), 0);
+
+    Ok(())
+}
+
+#[gtest]
+#[tokio::test]
+async fn test_ui_contention_asset_and_api_coexistence() -> Result<()> {
+    let (_project, client, base_url) = spawn_server(false).await?;
+
+    #[cfg(feature = "ui")]
+    {
+        let js_res = client
+            .get(format!("{base_url}/ui/components/contention.js"))
+            .send()
+            .await?;
+        expect_eq!(js_res.status(), StatusCode::OK);
+        expect_eq!(
+            js_res
+                .headers()
+                .get("content-type")
+                .and_then(|v| v.to_str().ok()),
+            Some("text/javascript; charset=utf-8")
+        );
+        let js_body = js_res.text().await?;
+        expect_that!(
+            js_body,
+            contains_substring("export function renderContention")
+        );
+
+        let spa_contention = client
+            .get(format!(
+                "{base_url}/projects/demo/databases/(default)/contention"
+            ))
+            .send()
+            .await?;
+        expect_eq!(spa_contention.status(), StatusCode::OK);
+        expect_eq!(
+            spa_contention
+                .headers()
+                .get("content-type")
+                .and_then(|v| v.to_str().ok()),
+            Some("text/html; charset=utf-8")
+        );
+    }
+
+    let get_res = client
+        .get(format!(
+            "{base_url}/emulator/v1/contention?database=projects%2Fp%2Fdatabases%2F%28default%29%\
+             2Fdocuments"
+        ))
+        .send()
+        .await?;
+    expect_eq!(get_res.status(), StatusCode::OK);
+    let snap: serde_json::Value = get_res.json().await?;
+    expect_eq!(snap, json!({ "databases": [] }));
+
+    let del_res = client
+        .delete(format!("{base_url}/emulator/v1/contention"))
+        .send()
+        .await?;
+    expect_eq!(del_res.status(), StatusCode::OK);
+    let del_body: serde_json::Value = del_res.json().await?;
+    expect_eq!(del_body, json!({}));
 
     Ok(())
 }

@@ -46,25 +46,52 @@ export function startsWithSegments(full, prefix) {
 }
 
 /**
- * Parses `/projects/{p}/databases/{d}/documents[/...]` from a browser pathname.
+ * Decodes and validates project and database path segments.
+ * @param {string} rawProject
+ * @param {string} rawDatabase
+ * @returns {{ projectId: string, databaseId: string } | null}
+ */
+function decodeProjectAndDatabase(rawProject, rawDatabase) {
+  const projectId = decodeURIComponent(rawProject);
+  const databaseId = decodeURIComponent(rawDatabase);
+  if (!isValidPathSegment(projectId) || !isValidPathSegment(databaseId)) {
+    return null;
+  }
+  return { projectId, databaseId };
+}
+
+/**
+ * Parses `/projects/{p}/databases/{d}/documents[/...]` or `/projects/{p}/databases/{d}/contention`
+ * from a browser pathname.
  * Returns `null` for non-matching routes, malformed percent-encoding, or invalid segments.
  * @param {string} pathname
- * @returns {{ projectId: string, databaseId: string, segments: string[] } | null}
+ * @returns {{ projectId: string, databaseId: string, segments: string[], view?: 'contention' } | null}
  */
 export function parseBrowserRoute(pathname) {
   const stripped = pathname.replace(/\/+$/, "");
   if (!stripped) return null;
+  const contentionMatch =
+    /^\/projects\/([^/]+)\/databases\/([^/]+)\/contention$/.exec(stripped);
+  if (contentionMatch) {
+    try {
+      const ids = decodeProjectAndDatabase(
+        contentionMatch[1],
+        contentionMatch[2]
+      );
+      if (!ids) return null;
+      return { ...ids, segments: [], view: "contention" };
+    } catch {
+      return null;
+    }
+  }
   const m =
     /^\/projects\/([^/]+)\/databases\/([^/]+)\/documents(?:\/(.*))?$/.exec(
       stripped
     );
   if (!m) return null;
   try {
-    const projectId = decodeURIComponent(m[1]);
-    const databaseId = decodeURIComponent(m[2]);
-    if (!isValidPathSegment(projectId) || !isValidPathSegment(databaseId)) {
-      return null;
-    }
+    const ids = decodeProjectAndDatabase(m[1], m[2]);
+    if (!ids) return null;
     /** @type {string[]} */
     const tail = [];
     if (m[3] !== undefined) {
@@ -76,30 +103,37 @@ export function parseBrowserRoute(pathname) {
         tail.push(seg);
       }
     }
-    return { projectId, databaseId, segments: tail };
+    return { ...ids, segments: tail };
   } catch {
     return null;
   }
 }
 
 /**
- * Syncs the browser address bar with the given active database and segments.
+ * Syncs the browser address bar with the given active database, segments, and view.
  * @param {string | null} projectId
  * @param {string | null} databaseId
  * @param {string[]} segments
  * @param {boolean} [replace]
+ * @param {'explorer' | 'query' | 'contention'} [view]
  */
 export function syncBrowserUrl(
   projectId,
   databaseId,
   segments,
-  replace = false
+  replace = false,
+  view = "explorer"
 ) {
   let nextPath = "/";
   if (projectId && databaseId) {
-    const base = `/projects/${encodeURIComponent(projectId)}/databases/${encodeURIComponent(databaseId)}/documents`;
-    const tail = segments.map((s) => encodeURIComponent(s)).join("/");
-    nextPath = tail ? `${base}/${tail}` : base;
+    const dbPrefix = `/projects/${encodeURIComponent(projectId)}/databases/${encodeURIComponent(databaseId)}`;
+    if (view === "contention") {
+      nextPath = `${dbPrefix}/contention`;
+    } else {
+      const base = `${dbPrefix}/documents`;
+      const tail = segments.map((s) => encodeURIComponent(s)).join("/");
+      nextPath = tail ? `${base}/${tail}` : base;
+    }
   }
   if (window.location.pathname !== nextPath) {
     if (replace) {
