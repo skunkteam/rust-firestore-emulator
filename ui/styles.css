@@ -809,13 +809,6 @@ input[type="checkbox"]:focus-visible {
   overflow: hidden;
 }
 
-@media (max-width: 900px) {
-  .query-workspace {
-    grid-template-columns: 1fr;
-    overflow-y: auto;
-  }
-}
-
 .query-builder-pane {
   border-right: 1px solid var(--border);
   background: var(--bg-surface);
@@ -831,6 +824,17 @@ input[type="checkbox"]:focus-visible {
   display: flex;
   flex-direction: column;
   overflow: hidden;
+}
+
+@media (max-width: 900px) {
+  .query-workspace {
+    grid-template-columns: 1fr;
+    overflow-y: auto;
+  }
+
+  .query-results-pane {
+    overflow: visible;
+  }
 }
 
 .query-section {

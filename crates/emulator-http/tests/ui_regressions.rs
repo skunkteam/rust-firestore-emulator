@@ -4698,3 +4698,282 @@ console.log("regression_contention_clear_history_loading_and_stale_error_guards 
 
     run_node_ui_test(&script);
 }
+
+#[test]
+fn regression_editor_key_value_errors_bytes_mode_error_and_narrow_query_overflow() {
+    let repo_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let css = fs::read_to_string(repo_root.join("ui/styles.css")).expect("read ui/styles.css");
+
+    // Verify `@media (max-width: 900px)` sets `.query-results-pane { overflow: visible; }`
+    // strictly AFTER the base `.query-results-pane` rule so it wins the CSS cascade.
+    let base_results_idx = css
+        .find(".query-results-pane {")
+        .expect("base .query-results-pane rule must exist");
+    let media_900_idx = css
+        .find("@media (max-width: 900px)")
+        .expect("@media (max-width: 900px) block must exist");
+    assert!(
+        media_900_idx > base_results_idx,
+        "@media (max-width: 900px) must appear after base .query-results-pane rule to override \
+         overflow: hidden"
+    );
+    let media_slice = &css[media_900_idx..];
+    let media_end = media_slice
+        .find("\n\n.")
+        .or_else(|| media_slice.find("\n.query-section"))
+        .unwrap_or(media_slice.len());
+    let media_block = &media_slice[..media_end];
+    assert!(
+        media_block.contains(".query-results-pane") && media_block.contains("overflow: visible;"),
+        "@media (max-width: 900px) must set .query-results-pane {{ overflow: visible; }}, \
+         got:\n{media_block}"
+    );
+
+    let script = format!(
+        r#"{NODE_BOOTSTRAP}
+const {{
+  createEditorSession,
+  draftNodesToFields,
+  extractSessionFields,
+  renderHybridEditor,
+  syncSessionWithDocument,
+}} = await import("./ui/components/editor.js");
+
+function findEventHandlers(node, attrPattern, results = []) {{
+  if (!node || typeof node !== "object") return results;
+  if (Array.isArray(node)) {{
+    for (const item of node) findEventHandlers(item, attrPattern, results);
+    return results;
+  }}
+  if (Array.isArray(node.strings) && Array.isArray(node.values)) {{
+    for (let i = 0; i < node.values.length; i++) {{
+      const v = node.values[i];
+      if (typeof v === "function" && attrPattern.test(node.strings[i])) {{
+        let tagBefore = "";
+        for (let k = i; k >= 0; k--) {{
+          tagBefore = node.strings[k] + tagBefore;
+          const lastLt = tagBefore.lastIndexOf("<");
+          if (lastLt >= 0) {{
+            tagBefore = tagBefore.slice(lastLt);
+            break;
+          }}
+        }}
+        results.push({{ tagBefore, handler: v }});
+      }}
+      findEventHandlers(v, attrPattern, results);
+    }}
+  }}
+  return results;
+}}
+
+// 1. Key vs value validation errors are tracked independently and styled on the right inputs.
+const docPath = "projects/p/databases/(default)/documents/items/d1";
+const session = createEditorSession(docPath, "p", "(default)", {{
+  name: docPath,
+  fields: {{
+    alpha: {{ integerValue: "10" }},
+    beta: {{ integerValue: "20" }},
+    gamma: {{ stringValue: "ok" }},
+  }},
+}});
+
+// Duplicate key ("alpha") with VALID value on beta, plus EMPTY key with VALID value on gamma.
+session.nodes[1].key = "alpha";
+session.nodes[2].key = "";
+
+let check = draftNodesToFields(session.nodes, "p", "(default)");
+assert.equal(check.valid, false);
+assert.equal(check.errors.get(session.nodes[0].id), undefined);
+assert.deepEqual(check.errors.get(session.nodes[1].id), {{
+  keyError: 'Duplicate field name "alpha"',
+}});
+assert.deepEqual(check.errors.get(session.nodes[2].id), {{
+  keyError: "Field name is required",
+}});
+
+let extracted = extractSessionFields(session);
+assert.equal(extracted.valid, false);
+assert.equal(typeof extracted.error, "string");
+assert.ok(extracted.error.includes('Duplicate field name "alpha"'));
+
+let markup = renderTemplateMarkup(renderHybridEditor({{ session, onChange: () => {{}} }}));
+// Row 2 (duplicate key "alpha"): key input has input-error, value input does NOT!
+const rowMatches = markup.split('<div class="field-row">').slice(1);
+assert.equal(rowMatches.length, 3);
+assert.equal(rowMatches[0].includes("input-error"), false, "valid first field must have no input-error");
+assert.ok(
+  rowMatches[1].includes('class="input field-key-input input-error"'),
+  "duplicate key must highlight .field-key-input"
+);
+assert.equal(
+  rowMatches[1].includes('class="input input-error"'),
+  false,
+  "duplicate key with valid value must NOT highlight value input"
+);
+assert.ok(
+  rowMatches[2].includes('class="input field-key-input input-error"'),
+  "empty key must highlight .field-key-input"
+);
+assert.equal(
+  rowMatches[2].includes('class="input input-error"'),
+  false,
+  "empty key with valid value must NOT highlight value input"
+);
+
+// Simultaneous duplicate key AND invalid integer value must keep BOTH errors without overwriting.
+session.nodes[1].text = "not-an-int";
+check = draftNodesToFields(session.nodes, "p", "(default)");
+assert.equal(check.valid, false);
+const combinedErr = check.errors.get(session.nodes[1].id);
+assert.ok(combinedErr?.keyError?.includes('Duplicate field name "alpha"'));
+assert.ok(combinedErr?.valueError, "valueError must be recorded alongside keyError");
+
+markup = renderTemplateMarkup(renderHybridEditor({{ session, onChange: () => {{}} }}));
+const bothRows = markup.split('<div class="field-row">').slice(1);
+assert.ok(bothRows[1].includes('class="input field-key-input input-error"'));
+assert.ok(bothRows[1].includes('class="input input-error"'));
+assert.ok(bothRows[1].includes('Duplicate field name "alpha"'));
+assert.ok(bothRows[1].includes(combinedErr.valueError));
+
+// Pure value error on a valid unique key highlights ONLY the value input.
+session.nodes[1].key = "beta";
+session.nodes[2].key = "gamma";
+markup = renderTemplateMarkup(renderHybridEditor({{ session, onChange: () => {{}} }}));
+const valueOnlyRows = markup.split('<div class="field-row">').slice(1);
+assert.equal(
+  valueOnlyRows[1].includes('class="input field-key-input input-error"'),
+  false,
+  "pure value error must NOT highlight .field-key-input"
+);
+assert.ok(
+  valueOnlyRows[1].includes('class="input input-error"'),
+  "pure value error must highlight value input"
+);
+
+// 2. Rejected switchBytesMode("utf8") on non-UTF-8 bytes surfaces inline error without dirtying
+//    a clean session, and clears on edit / type-change / mode-switch / editor mode switch / revert.
+const binDoc = {{
+  name: docPath,
+  fields: {{
+    raw: {{ bytesValue: "/+8=" }}, // [0xff, 0xef] — invalid UTF-8
+  }},
+}};
+const binSession = createEditorSession(docPath, "p", "(default)", binDoc);
+assert.equal(binSession.isDirty, false);
+assert.equal(binSession.nodes[0].bytesMode, "base64");
+assert.equal(binSession.nodes[0].bytesModeError, undefined);
+
+let rerenderCount = 0;
+const renderBin = () =>
+  renderHybridEditor({{
+    session: binSession,
+    onChange: () => {{
+      rerenderCount++;
+    }},
+  }});
+
+let tpl = renderBin();
+const findBytesModeSelectHandler = (t) =>
+  findEventHandlers(t, /@change=\s*$/).find((h) =>
+    h.tagBefore.includes('aria-label="Bytes encoding mode"')
+  );
+const findTypeSelectHandler = (t) =>
+  findEventHandlers(t, /@change=\s*$/).find((h) =>
+    h.tagBefore.includes("field-type-select")
+  );
+const findBytesInputHandler = (t) =>
+  findEventHandlers(t, /@input=\s*$/).find((h) =>
+    h.tagBefore.includes('aria-label="Bytes value"')
+  );
+
+const bytesSelect = findBytesModeSelectHandler(tpl);
+assert.ok(bytesSelect, "bytes encoding mode select handler must exist");
+const mockSelectTarget = {{ value: "utf8" }};
+bytesSelect.handler({{ target: mockSelectTarget }});
+
+assert.equal(binSession.nodes[0].bytesMode, "base64", "mode stays base64 when UTF-8 decode fails");
+assert.equal(mockSelectTarget.value, "base64", "DOM select value snaps back to base64");
+assert.ok(
+  binSession.nodes[0].bytesModeError?.includes("UTF-8"),
+  "bytesModeError must explain UTF-8 rejection"
+);
+assert.equal(binSession.isDirty, false, "rejected switchBytesMode must NOT dirty a clean session");
+assert.equal(extractSessionFields(binSession).valid, true, "valid base64 bytes remain saveable");
+assert.ok(rerenderCount >= 1);
+
+const rejectedMarkup = renderTemplateMarkup(renderBin());
+assert.ok(rejectedMarkup.includes("Cannot switch to UTF-8"));
+assert.ok(rejectedMarkup.includes('class="select input-error"'));
+assert.equal(
+  rejectedMarkup.includes('class="input input-error"'),
+  false,
+  "valid base64 value input must NOT be marked input-error on bytesModeError"
+);
+
+// (a) Switching to valid "hex" mode clears bytesModeError and preserves clean state.
+const bytesSelect2 = findBytesModeSelectHandler(renderBin());
+bytesSelect2.handler({{ target: {{ value: "hex" }} }});
+assert.equal(binSession.nodes[0].bytesMode, "hex");
+assert.equal(binSession.nodes[0].text, "ffef");
+assert.equal(binSession.nodes[0].bytesModeError, undefined);
+assert.equal(binSession.isDirty, false);
+
+// Reject UTF-8 again from hex mode, then (b) editing value text clears bytesModeError.
+findBytesModeSelectHandler(renderBin()).handler({{ target: {{ value: "utf8" }} }});
+assert.ok(binSession.nodes[0].bytesModeError?.includes("UTF-8"));
+findBytesInputHandler(renderBin()).handler({{ target: {{ value: "6869" }} }});
+assert.equal(binSession.nodes[0].bytesModeError, undefined, "editing value clears bytesModeError");
+assert.equal(binSession.isDirty, true);
+
+// (c) Revert (syncSessionWithDocument) clears bytesModeError & restores clean state.
+syncSessionWithDocument(binSession, binDoc);
+assert.equal(binSession.isDirty, false);
+assert.equal(binSession.nodes[0].bytesModeError, undefined);
+
+// (d) Switching Structured -> Raw -> Structured clears bytesModeError even when rawText is untouched.
+findBytesModeSelectHandler(renderBin()).handler({{ target: {{ value: "utf8" }} }});
+assert.ok(binSession.nodes[0].bytesModeError?.includes("UTF-8"));
+const toRaw = findClickHandler(renderBin(), "Raw ProtoJSON");
+assert.ok(toRaw);
+toRaw();
+assert.equal(binSession.mode, "raw");
+assert.equal(binSession.nodes[0].bytesModeError, undefined, "switching to Raw clears bytesModeError");
+const toStructured = findClickHandler(renderBin(), "Structured Fields");
+assert.ok(toStructured);
+toStructured();
+assert.equal(binSession.nodes[0].bytesModeError, undefined);
+assert.equal(binSession.isDirty, false);
+
+// (e) Changing field type clears bytesModeError.
+findBytesModeSelectHandler(renderBin()).handler({{ target: {{ value: "utf8" }} }});
+assert.ok(binSession.nodes[0].bytesModeError?.includes("UTF-8"));
+const typeSelect = findTypeSelectHandler(renderBin());
+assert.ok(typeSelect);
+typeSelect.handler({{ target: {{ value: "stringValue" }} }});
+assert.equal(binSession.nodes[0].type, "stringValue");
+assert.equal(binSession.nodes[0].bytesModeError, undefined, "changing type clears bytesModeError");
+
+// 3. Manual DraftNode literal omitting optional bytesModeError still validates cleanly.
+const manualCheck = draftNodesToFields(
+  [{{
+    id: 999,
+    key: "k",
+    type: "bytesValue",
+    text: "AAEC",
+    boolVal: false,
+    latText: "0",
+    lngText: "0",
+    bytesMode: "base64",
+    children: [],
+  }}],
+  "p",
+  "(default)"
+);
+assert.equal(manualCheck.valid, true);
+
+console.log("regression_editor_key_value_errors_bytes_mode_error_and_narrow_query_overflow passed");
+"#
+    );
+
+    run_node_ui_test(&script);
+}
