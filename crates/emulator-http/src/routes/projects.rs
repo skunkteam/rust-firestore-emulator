@@ -2,7 +2,6 @@ use std::sync::Arc;
 
 use axum::{
     Json, Router,
-    body::Bytes,
     extract::{DefaultBodyLimit, State},
     http::{HeaderMap, Method, Uri},
     response::{IntoResponse, Response},
@@ -27,7 +26,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tracing::{Level, instrument};
 
-use crate::error::{ApiJson, RestError, Result, parse_json_body};
+use crate::error::{
+    ApiJson, RestBytes, RestError, Result, method_not_allowed_fallback, parse_json_body,
+};
 
 const PHASE2_VERBS: &[&str] = &[
     "commit",
@@ -51,7 +52,12 @@ pub(crate) fn router() -> Router<&'static FirestoreProject> {
     Router::new()
         .route(
             "/{project_id}/databases/{database_id}",
-            get(get_database).patch(patch_database),
+            get(get_database)
+                .patch(patch_database)
+                .fallback(method_not_allowed_fallback(
+                    "/v1/projects",
+                    "GET, HEAD, PATCH",
+                )),
         )
         .route(
             "/{project_id}/databases/{database_id}/documents",
@@ -59,11 +65,13 @@ pub(crate) fn router() -> Router<&'static FirestoreProject> {
         )
         .route(
             "/{project_id}/databases/{database_id}/documents:listCollectionIds",
-            post(dispatch_root_list_collection_ids),
+            post(dispatch_root_list_collection_ids)
+                .fallback(method_not_allowed_fallback("/v1/projects", "POST")),
         )
         .route(
             "/{project_id}/databases/{database_id}/documents:runQuery",
-            post(dispatch_root_run_query),
+            post(dispatch_root_run_query)
+                .fallback(method_not_allowed_fallback("/v1/projects", "POST")),
         )
         .route(
             "/{project_id}/databases/{database_id}/documents/{*tail}",
@@ -100,7 +108,10 @@ struct DatabaseMetadata {
 impl DatabaseMetadata {
     fn new(name: &RootRef, enterprise_edition: bool, optimistic_concurrency: bool) -> Self {
         Self {
-            name: name.to_string(),
+            name: format!(
+                "projects/{}/databases/{}",
+                name.project_id, name.database_id
+            ),
             uid: "emulator-uid",
             r#type: "FIRESTORE_NATIVE",
             database_edition: if enterprise_edition {
@@ -219,7 +230,7 @@ async fn dispatch_documents_root(
     method: Method,
     uri: Uri,
     headers: HeaderMap,
-    body: Bytes,
+    RestBytes(body): RestBytes,
 ) -> Result<Response> {
     let (project_id, database_id) = extract_raw_project_and_database(uri.path())?;
     dispatch_documents(
@@ -240,7 +251,7 @@ async fn dispatch_root_list_collection_ids(
     State(project): State<&'static FirestoreProject>,
     uri: Uri,
     headers: HeaderMap,
-    body: Bytes,
+    RestBytes(body): RestBytes,
 ) -> Result<Response> {
     let (project_id, database_id) = extract_raw_project_and_database(uri.path())?;
     dispatch_documents(
@@ -261,7 +272,7 @@ async fn dispatch_root_run_query(
     State(project): State<&'static FirestoreProject>,
     uri: Uri,
     headers: HeaderMap,
-    body: Bytes,
+    RestBytes(body): RestBytes,
 ) -> Result<Response> {
     let (project_id, database_id) = extract_raw_project_and_database(uri.path())?;
     dispatch_documents(
@@ -283,7 +294,7 @@ async fn dispatch_documents_tail(
     method: Method,
     uri: Uri,
     headers: HeaderMap,
-    body: Bytes,
+    RestBytes(body): RestBytes,
 ) -> Result<Response> {
     let (project_id, database_id) = extract_raw_project_and_database(uri.path())?;
     parse_root_ref(&project_id, &database_id)?;
@@ -362,7 +373,7 @@ async fn dispatch_documents(
     }
 }
 
-#[instrument(level = Level::DEBUG, skip_all, fields(doc = %doc_ref), err)]
+#[instrument(level = Level::DEBUG, skip_all, fields(doc = %doc_ref), err(level = Level::DEBUG))]
 async fn handle_get_document(
     db: &Arc<FirestoreDatabase>,
     doc_ref: DocumentRef,
@@ -377,7 +388,7 @@ async fn handle_get_document(
     Ok(Json(projection.project(&doc)).into_response())
 }
 
-#[instrument(level = Level::DEBUG, skip_all, fields(collection = %col_ref), err)]
+#[instrument(level = Level::DEBUG, skip_all, fields(collection = %col_ref), err(level = Level::DEBUG))]
 async fn handle_list_documents(
     db: &Arc<FirestoreDatabase>,
     col_ref: CollectionRef,
@@ -411,7 +422,7 @@ async fn handle_list_documents(
     .into_response())
 }
 
-#[instrument(level = Level::DEBUG, skip_all, fields(collection = %col_ref), err)]
+#[instrument(level = Level::DEBUG, skip_all, fields(collection = %col_ref), err(level = Level::DEBUG))]
 async fn handle_create_document(
     db: &Arc<FirestoreDatabase>,
     col_ref: CollectionRef,
@@ -434,7 +445,7 @@ async fn handle_create_document(
     Ok(Json(created).into_response())
 }
 
-#[instrument(level = Level::DEBUG, skip_all, fields(doc = %doc_ref), err)]
+#[instrument(level = Level::DEBUG, skip_all, fields(doc = %doc_ref), err(level = Level::DEBUG))]
 async fn handle_update_document(
     db: &Arc<FirestoreDatabase>,
     doc_ref: DocumentRef,
@@ -457,7 +468,7 @@ async fn handle_update_document(
     Ok(Json(updated).into_response())
 }
 
-#[instrument(level = Level::DEBUG, skip_all, fields(doc = %doc_ref), err)]
+#[instrument(level = Level::DEBUG, skip_all, fields(doc = %doc_ref), err(level = Level::DEBUG))]
 async fn handle_delete_document(
     db: &Arc<FirestoreDatabase>,
     doc_ref: DocumentRef,
@@ -468,7 +479,7 @@ async fn handle_delete_document(
     Ok(Json(json!({})).into_response())
 }
 
-#[instrument(level = Level::DEBUG, skip_all, fields(parent = %parent), err)]
+#[instrument(level = Level::DEBUG, skip_all, fields(parent = %parent), err(level = Level::DEBUG))]
 async fn handle_list_collection_ids(
     db: &Arc<FirestoreDatabase>,
     parent: Ref,
@@ -502,7 +513,7 @@ async fn handle_list_collection_ids(
     .into_response())
 }
 
-#[instrument(level = Level::DEBUG, skip_all, fields(parent = %parent), err)]
+#[instrument(level = Level::DEBUG, skip_all, fields(parent = %parent), err(level = Level::DEBUG))]
 async fn handle_run_query(
     db: &Arc<FirestoreDatabase>,
     parent: Ref,
@@ -510,10 +521,8 @@ async fn handle_run_query(
     body: &[u8],
 ) -> Result<Response> {
     let raw: serde_json::Value = parse_json_body(headers, body)?;
-    if let Some(sq) = raw
-        .get("structuredQuery")
-        .or_else(|| raw.get("structured_query"))
-        && let Some(fn_val) = sq.get("findNearest").or_else(|| sq.get("find_nearest"))
+    if let Some(sq) = raw.get("structuredQuery")
+        && let Some(fn_val) = sq.get("findNearest")
         && !fn_val.is_null()
     {
         if fn_val.is_object() {

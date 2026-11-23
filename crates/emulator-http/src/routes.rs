@@ -12,6 +12,7 @@ use axum::{
     body::Body,
     http::{HeaderValue, Method, StatusCode, Uri, header},
     response::{IntoResponse, Response},
+    routing::any,
 };
 use emulator_database::FirestoreProject;
 use emulator_tracing::Tracing;
@@ -32,26 +33,57 @@ mod generated_ui {
 const NO_CACHE: HeaderValue = HeaderValue::from_static("no-cache");
 
 #[derive(Debug)]
-pub struct RouterBuilder(Router);
+pub struct RouterBuilder {
+    router: Router,
+    has_dynamic_tracing: bool,
+}
 
 impl RouterBuilder {
     pub fn new(project: &'static FirestoreProject) -> Self {
-        Self(
-            Router::new()
+        Self {
+            router: Router::new()
                 .nest("/emulator/v1", emulator::router())
                 .nest("/v1/projects", projects::router())
                 .with_state(project),
-        )
+            has_dynamic_tracing: false,
+        }
     }
 
     pub fn add_dynamic_tracing(self, tracing: &'static impl Tracing) -> Self {
-        let Self(router) = self;
-        let router = router.nest("/emulator/v1/logging", logging::router(tracing));
-        Self(router)
+        let Self { router, .. } = self;
+        let router = router
+            .nest("/emulator/v1/logging", logging::router(tracing))
+            .route(
+                "/emulator/v1/logging/",
+                any(logging::unmatched_logging_route),
+            );
+        Self {
+            router,
+            has_dynamic_tracing: true,
+        }
     }
 
     pub fn build(self) -> Router {
-        let Self(router) = self;
+        let Self {
+            mut router,
+            has_dynamic_tracing,
+        } = self;
+
+        if !has_dynamic_tracing {
+            router = router
+                .route(
+                    "/emulator/v1/logging",
+                    any(logging::unmounted_logging_route),
+                )
+                .route(
+                    "/emulator/v1/logging/",
+                    any(logging::unmounted_logging_route),
+                )
+                .route(
+                    "/emulator/v1/logging/{*rest}",
+                    any(logging::unmounted_logging_route),
+                );
+        }
 
         #[cfg(feature = "ui")]
         let router = router

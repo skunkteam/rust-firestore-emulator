@@ -143,6 +143,7 @@ async fn test_database_admin_api() -> Result<()> {
     let res = client.get(&url).send().await?;
     expect_eq!(res.status(), StatusCode::OK);
     let body: serde_json::Value = res.json().await?;
+    expect_eq!(body["name"], "projects/my-project/databases/(default)");
     expect_eq!(body["databaseEdition"], "STANDARD");
     expect_eq!(body["concurrencyMode"], "PESSIMISTIC");
 
@@ -156,6 +157,7 @@ async fn test_database_admin_api() -> Result<()> {
         .await?;
     expect_eq!(res.status(), StatusCode::OK);
     let body: serde_json::Value = res.json().await?;
+    expect_eq!(body["name"], "projects/my-project/databases/(default)");
     expect_eq!(body["databaseEdition"], "ENTERPRISE");
     expect_eq!(body["concurrencyMode"], "OPTIMISTIC");
 
@@ -2233,6 +2235,541 @@ async fn test_ui_contention_asset_and_api_coexistence() -> Result<()> {
     expect_eq!(del_res.status(), StatusCode::OK);
     let del_body: serde_json::Value = del_res.json().await?;
     expect_eq!(del_body, json!({}));
+
+    Ok(())
+}
+
+#[gtest]
+#[tokio::test]
+async fn test_protocol_fixes_database_metadata_run_query_snake_case_and_non_creating_delete()
+-> Result<()> {
+    let project = Box::leak(Box::new(FirestoreProject::new(FirestoreConfig::default())));
+    let router = RouterBuilder::new(project).build();
+
+    // 1. Subscribe to project SSE events before deleting nonexistent collection/document paths.
+    let mut sse_rx = project.subscribe_project_events();
+
+    for nonexistent_ref in [
+        "/emulator/v1/projects/absent-proj/databases/(default)/documents/items",
+        "/emulator/v1/projects/absent-proj/databases/(default)/documents/items/doc1",
+        "/emulator/v1/projects/absent-proj/databases/(default)",
+    ] {
+        let (status, body) = send_oneshot(&router, Method::DELETE, nonexistent_ref, None).await?;
+        expect_eq!(status, StatusCode::OK, "uri: {nonexistent_ref}");
+        expect_eq!(body, json!({}), "uri: {nonexistent_ref}");
+    }
+    expect_true!(project.database_names().await.is_empty());
+    expect_pred!(sse_rx.try_recv().is_err());
+
+    // 2. DatabaseMetadata.name uses Admin API v1 format (`projects/{p}/databases/{d}` without
+    //    `/documents`), while `GET /emulator/v1` preserves `RootRef` (`/documents`).
+    let (status, meta) =
+        send_oneshot(&router, Method::GET, "/v1/projects/p1/databases/db1", None).await?;
+    expect_eq!(status, StatusCode::OK);
+    expect_eq!(meta["name"], "projects/p1/databases/db1");
+
+    let (status, patched_meta) = send_oneshot(
+        &router,
+        Method::PATCH,
+        "/v1/projects/p1/databases/db1",
+        Some(json!({ "databaseEdition": "ENTERPRISE" })),
+    )
+    .await?;
+    expect_eq!(status, StatusCode::OK);
+    expect_eq!(patched_meta["name"], "projects/p1/databases/db1");
+
+    let (status, emu_dbs) = send_oneshot(&router, Method::GET, "/emulator/v1", None).await?;
+    expect_eq!(status, StatusCode::OK);
+    expect_eq!(emu_dbs, json!(["projects/p1/databases/db1/documents"]));
+
+    // 3. Deleting an existing collection/document via `/emulator/v1/{*ref}` still deletes data.
+    let docs_root = "/v1/projects/p1/databases/db1/documents";
+    let (status, _) = send_oneshot(
+        &router,
+        Method::POST,
+        &format!("{docs_root}/items?documentId=d1"),
+        Some(json!({ "fields": { "x": { "integerValue": "1" } } })),
+    )
+    .await?;
+    expect_eq!(status, StatusCode::OK);
+    let (status, _) = send_oneshot(
+        &router,
+        Method::POST,
+        &format!("{docs_root}/items?documentId=d2"),
+        Some(json!({ "fields": { "x": { "integerValue": "2" } } })),
+    )
+    .await?;
+    expect_eq!(status, StatusCode::OK);
+
+    let (status, _) = send_oneshot(
+        &router,
+        Method::DELETE,
+        "/emulator/v1/projects/p1/databases/db1/documents/items/d1",
+        None,
+    )
+    .await?;
+    expect_eq!(status, StatusCode::OK);
+    let (status, _) =
+        send_oneshot(&router, Method::GET, &format!("{docs_root}/items/d1"), None).await?;
+    expect_eq!(status, StatusCode::NOT_FOUND);
+    let (status, _) =
+        send_oneshot(&router, Method::GET, &format!("{docs_root}/items/d2"), None).await?;
+    expect_eq!(status, StatusCode::OK);
+
+    let (status, _) = send_oneshot(
+        &router,
+        Method::DELETE,
+        "/emulator/v1/projects/p1/databases/db1/documents/items",
+        None,
+    )
+    .await?;
+    expect_eq!(status, StatusCode::OK);
+    let (status, _) =
+        send_oneshot(&router, Method::GET, &format!("{docs_root}/items/d2"), None).await?;
+    expect_eq!(status, StatusCode::NOT_FOUND);
+
+    // 4. `:runQuery` enforces strict camelCase (`structuredQuery` / `findNearest`): snake_case
+    //    variants return 400 INVALID_ARGUMENT, while camelCase `structuredQuery.findNearest` object
+    //    returns 501 UNIMPLEMENTED.
+    for snake_payload in [
+        json!({
+            "structured_query": {
+                "from": [{ "collectionId": "items" }],
+                "find_nearest": { "limit": 1 }
+            }
+        }),
+        json!({
+            "structured_query": {
+                "from": [{ "collectionId": "items" }],
+                "findNearest": { "limit": 1 }
+            }
+        }),
+        json!({
+            "structuredQuery": {
+                "from": [{ "collectionId": "items" }],
+                "find_nearest": { "limit": 1 }
+            }
+        }),
+    ] {
+        let (status, err) = send_oneshot(
+            &router,
+            Method::POST,
+            &format!("{docs_root}:runQuery"),
+            Some(snake_payload.clone()),
+        )
+        .await?;
+        expect_eq!(status, StatusCode::BAD_REQUEST, "payload: {snake_payload}");
+        expect_eq!(err["error"]["code"], 400, "payload: {snake_payload}");
+        expect_eq!(
+            err["error"]["status"],
+            "INVALID_ARGUMENT",
+            "payload: {snake_payload}"
+        );
+    }
+
+    let (status, err) = send_oneshot(
+        &router,
+        Method::POST,
+        &format!("{docs_root}:runQuery"),
+        Some(json!({
+            "structuredQuery": {
+                "from": [{ "collectionId": "items" }],
+                "findNearest": { "limit": 1 }
+            }
+        })),
+    )
+    .await?;
+    expect_eq!(status, StatusCode::NOT_IMPLEMENTED);
+    expect_eq!(err["error"]["code"], 501);
+    expect_eq!(err["error"]["status"], "UNIMPLEMENTED");
+
+    Ok(())
+}
+
+#[gtest]
+#[tokio::test]
+async fn test_uniform_json_error_envelopes_405_head_413_logging_and_rest_debug_level() -> Result<()>
+{
+    use emulator_tracing::DefaultTracing;
+
+    let project = Box::leak(Box::new(FirestoreProject::new(FirestoreConfig::default())));
+    let router_without_logging = RouterBuilder::new(project).build();
+    let tracing = DefaultTracing::start();
+    let router_with_logging = RouterBuilder::new(project)
+        .add_dynamic_tracing(tracing)
+        .build();
+
+    // 1. Unmatched `/emulator/v1/nonexistent` remains 404 NOT_FOUND JSON (not 405).
+    let (status, headers, bytes) = send_raw_oneshot(
+        &router_without_logging,
+        Method::GET,
+        "/emulator/v1/nonexistent",
+        None,
+    )
+    .await?;
+    expect_eq!(status, StatusCode::NOT_FOUND);
+    let ct = headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    expect_that!(ct, starts_with("application/json"));
+    let body: serde_json::Value = serde_json::from_slice(&bytes)?;
+    expect_eq!(body["error"]["code"], 404);
+    expect_eq!(body["error"]["status"], "NOT_FOUND");
+
+    // 2. Fixed-path routes return uniform JSON 405 METHOD_NOT_ALLOWED with `Allow` header.
+    for (router, method, uri, expected_allow) in [
+        (
+            &router_without_logging,
+            Method::POST,
+            "/emulator/v1",
+            "GET, HEAD",
+        ),
+        (
+            &router_without_logging,
+            Method::POST,
+            "/emulator/v1/events",
+            "GET, HEAD",
+        ),
+        (
+            &router_without_logging,
+            Method::POST,
+            "/emulator/v1/contention",
+            "GET, HEAD, DELETE",
+        ),
+        (
+            &router_without_logging,
+            Method::POST,
+            "/emulator/v1/contention/events",
+            "GET, HEAD",
+        ),
+        (
+            &router_without_logging,
+            Method::POST,
+            "/v1/projects/p/databases/(default)",
+            "GET, HEAD, PATCH",
+        ),
+        (
+            &router_without_logging,
+            Method::DELETE,
+            "/v1/projects/p/databases/(default)",
+            "GET, HEAD, PATCH",
+        ),
+        (
+            &router_without_logging,
+            Method::GET,
+            "/v1/projects/p/databases/(default)/documents:listCollectionIds",
+            "POST",
+        ),
+        (
+            &router_without_logging,
+            Method::GET,
+            "/v1/projects/p/databases/(default)/documents:runQuery",
+            "POST",
+        ),
+        (
+            &router_with_logging,
+            Method::GET,
+            "/emulator/v1/logging/my-handle",
+            "POST, DELETE",
+        ),
+    ] {
+        let (status, headers, bytes) = send_raw_oneshot(router, method.clone(), uri, None).await?;
+        expect_eq!(status, StatusCode::METHOD_NOT_ALLOWED, "{method} {uri}");
+        let ct = headers
+            .get(header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        expect_that!(ct, starts_with("application/json"));
+        expect_eq!(
+            headers.get(header::ALLOW).and_then(|v| v.to_str().ok()),
+            Some(expected_allow),
+            "{method} {uri}"
+        );
+        let err: serde_json::Value = serde_json::from_slice(&bytes)?;
+        expect_eq!(err["error"]["code"], 405, "{method} {uri}");
+        expect_eq!(
+            err["error"]["status"],
+            "METHOD_NOT_ALLOWED",
+            "{method} {uri}"
+        );
+    }
+
+    // 3. `HEAD` remains supported (200 OK with empty body) on `get(...)` routes with fallbacks.
+    for uri in [
+        "/emulator/v1",
+        "/emulator/v1/events",
+        "/emulator/v1/contention",
+        "/emulator/v1/contention/events",
+        "/v1/projects/p/databases/(default)",
+    ] {
+        let (status, _headers, bytes) =
+            send_raw_oneshot(&router_without_logging, Method::HEAD, uri, None).await?;
+        expect_eq!(status, StatusCode::OK, "HEAD {uri}");
+        expect_true!(bytes.is_empty(), "HEAD {uri} must have empty body");
+    }
+
+    // 4. Unmounted `/emulator/v1/logging` returns JSON 501 UNIMPLEMENTED (never 400 Invalid
+    //    reference from `emulator::router`'s `/{*ref}`), while mounted logging routes return 404
+    //    JSON on unmatched logging subpaths.
+    for (method, uri) in [
+        (Method::GET, "/emulator/v1/logging"),
+        (Method::GET, "/emulator/v1/logging/"),
+        (Method::DELETE, "/emulator/v1/logging"),
+        (Method::DELETE, "/emulator/v1/logging/"),
+        (Method::POST, "/emulator/v1/logging/my-handle"),
+        (Method::DELETE, "/emulator/v1/logging/my-handle"),
+        (Method::DELETE, "/emulator/v1/logging/nested/path"),
+    ] {
+        let (status, headers, bytes) =
+            send_raw_oneshot(&router_without_logging, method.clone(), uri, None).await?;
+        expect_eq!(
+            status,
+            StatusCode::NOT_IMPLEMENTED,
+            "unmounted {method} {uri}"
+        );
+        let ct = headers
+            .get(header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        expect_that!(ct, starts_with("application/json"));
+        let err: serde_json::Value = serde_json::from_slice(&bytes)?;
+        expect_eq!(err["error"]["code"], 501, "unmounted {method} {uri}");
+        expect_eq!(
+            err["error"]["status"],
+            "UNIMPLEMENTED",
+            "unmounted {method} {uri}"
+        );
+    }
+
+    for (method, uri) in [
+        (Method::GET, "/emulator/v1/logging"),
+        (Method::GET, "/emulator/v1/logging/"),
+        (Method::DELETE, "/emulator/v1/logging"),
+        (Method::DELETE, "/emulator/v1/logging/"),
+        (Method::DELETE, "/emulator/v1/logging/nested/path"),
+    ] {
+        let (status, headers, bytes) =
+            send_raw_oneshot(&router_with_logging, method.clone(), uri, None).await?;
+        expect_eq!(status, StatusCode::NOT_FOUND, "mounted {method} {uri}");
+        let ct = headers
+            .get(header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        expect_that!(ct, starts_with("application/json"));
+        let err: serde_json::Value = serde_json::from_slice(&bytes)?;
+        expect_eq!(err["error"]["code"], 404, "mounted {method} {uri}");
+        expect_eq!(
+            err["error"]["status"],
+            "NOT_FOUND",
+            "mounted {method} {uri}"
+        );
+    }
+
+    // 5. Oversized bodies return JSON 413 RESOURCE_EXHAUSTED across `RestBytes` (document/query and
+    //    logging handlers) AND `ApiJson` (`PATCH /v1/projects/.../databases/...`, fixing the 413 ->
+    //    400 coercion bug).
+    let oversized_projects_body = Bytes::from(vec![b' '; 50 * 1024 * 1024 + 1]);
+    for (method, uri) in [
+        (Method::PATCH, "/v1/projects/p/databases/(default)"),
+        (
+            Method::POST,
+            "/v1/projects/p/databases/(default)/documents/items?documentId=huge",
+        ),
+        (
+            Method::POST,
+            "/v1/projects/p/databases/(default)/documents:runQuery",
+        ),
+    ] {
+        let resp = router_without_logging
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(method.clone())
+                    .uri(uri)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(oversized_projects_body.clone()))?,
+            )
+            .await?;
+        expect_eq!(
+            resp.status(),
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "{method} {uri}"
+        );
+        let ct = resp
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_owned();
+        expect_that!(ct.as_str(), starts_with("application/json"));
+        let err: serde_json::Value =
+            serde_json::from_slice(&to_bytes(resp.into_body(), usize::MAX).await?)?;
+        expect_eq!(err["error"]["code"], 413, "{method} {uri}");
+        expect_eq!(
+            err["error"]["status"],
+            "RESOURCE_EXHAUSTED",
+            "{method} {uri}"
+        );
+    }
+
+    // Logging route uses default Axum 2 MiB body limit and returns JSON 413 / 400 on limit or
+    // invalid UTF-8 errors.
+    let oversized_logging_body = vec![b'a'; 2 * 1024 * 1024 + 1];
+    let resp = router_with_logging
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/emulator/v1/logging/oversized-handle")
+                .body(Body::from(oversized_logging_body))?,
+        )
+        .await?;
+    expect_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    let err: serde_json::Value =
+        serde_json::from_slice(&to_bytes(resp.into_body(), usize::MAX).await?)?;
+    expect_eq!(err["error"]["code"], 413);
+    expect_eq!(err["error"]["status"], "RESOURCE_EXHAUSTED");
+
+    let bad_utf8_resp = router_with_logging
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/emulator/v1/logging/bad-utf8-handle")
+                .body(Body::from(vec![0xFF, 0xFE]))?,
+        )
+        .await?;
+    expect_eq!(bad_utf8_resp.status(), StatusCode::BAD_REQUEST);
+    let bad_utf8_err: serde_json::Value =
+        serde_json::from_slice(&to_bytes(bad_utf8_resp.into_body(), usize::MAX).await?)?;
+    expect_eq!(bad_utf8_err["error"]["code"], 400);
+    expect_eq!(bad_utf8_err["error"]["status"], "INVALID_ARGUMENT");
+
+    // 6. Expected REST handler errors log at DEBUG (never ERROR) via `err(level = Level::DEBUG)`.
+    let start_err_capture = router_with_logging
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/emulator/v1/logging/rest-err-level")
+                .body(Body::from("emulator_http=error"))?,
+        )
+        .await?;
+    expect_eq!(start_err_capture.status(), StatusCode::OK);
+
+    let (status, _) = send_oneshot(
+        &router_with_logging,
+        Method::GET,
+        "/v1/projects/p/databases/(default)/documents/missing_col/missing_doc",
+        None,
+    )
+    .await?;
+    expect_eq!(status, StatusCode::NOT_FOUND);
+    let (status, _) = send_oneshot(
+        &router_with_logging,
+        Method::POST,
+        "/v1/projects/p/databases/(default)/documents/missing_col",
+        Some(json!({ "fields": {} })),
+    )
+    .await?;
+    expect_eq!(status, StatusCode::BAD_REQUEST);
+
+    let stop_err_capture = router_with_logging
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::DELETE)
+                .uri("/emulator/v1/logging/rest-err-level")
+                .body(Body::empty())?,
+        )
+        .await?;
+    expect_eq!(stop_err_capture.status(), StatusCode::OK);
+    let captured_err_logs = String::from_utf8(
+        to_bytes(stop_err_capture.into_body(), usize::MAX)
+            .await?
+            .to_vec(),
+    )?;
+    expect_eq!(captured_err_logs, "");
+
+    // Companion capture at `emulator_http=debug` confirms `err(level = Level::DEBUG)` emits
+    // the expected `error=...` event at `DEBUG` (not merely suppressing logs altogether).
+    let start_debug_capture = router_with_logging
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/emulator/v1/logging/rest-debug-level")
+                .body(Body::from("emulator_http=debug"))?,
+        )
+        .await?;
+    expect_eq!(start_debug_capture.status(), StatusCode::OK);
+
+    let (status, _) = send_oneshot(
+        &router_with_logging,
+        Method::GET,
+        "/v1/projects/p/databases/(default)/documents/missing_col/missing_doc",
+        None,
+    )
+    .await?;
+    expect_eq!(status, StatusCode::NOT_FOUND);
+    let (status, _) = send_oneshot(
+        &router_with_logging,
+        Method::POST,
+        "/v1/projects/p/databases/(default)/documents/missing_col",
+        Some(json!({ "fields": {} })),
+    )
+    .await?;
+    expect_eq!(status, StatusCode::BAD_REQUEST);
+
+    let stop_debug_capture = router_with_logging
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::DELETE)
+                .uri("/emulator/v1/logging/rest-debug-level")
+                .body(Body::empty())?,
+        )
+        .await?;
+    expect_eq!(stop_debug_capture.status(), StatusCode::OK);
+    let captured_debug_logs = String::from_utf8(
+        to_bytes(stop_debug_capture.into_body(), usize::MAX)
+            .await?
+            .to_vec(),
+    )?;
+    // Strip ANSI SGR sequences emitted by `tracing_subscriber::fmt` so `error=` matches literally.
+    let plain_debug_logs = {
+        let mut out = String::with_capacity(captured_debug_logs.len());
+        let mut chars = captured_debug_logs.chars();
+        while let Some(ch) = chars.next() {
+            if ch == '\x1b' {
+                for next in chars.by_ref() {
+                    if next == 'm' {
+                        break;
+                    }
+                }
+            } else {
+                out.push(ch);
+            }
+        }
+        out
+    };
+    let debug_error_lines: Vec<&str> = plain_debug_logs
+        .lines()
+        .filter(|line| line.contains("DEBUG") && line.contains("error="))
+        .collect();
+    expect_true!(
+        debug_error_lines
+            .iter()
+            .any(|line| line.contains("handle_get_document") && line.contains("404 (NOT_FOUND)")),
+        "expected DEBUG error line from handle_get_document; got:\n{plain_debug_logs}"
+    );
+    expect_true!(
+        debug_error_lines.iter().any(|line| {
+            line.contains("handle_create_document") && line.contains("400 (INVALID_ARGUMENT)")
+        }),
+        "expected DEBUG error line from handle_create_document; got:\n{plain_debug_logs}"
+    );
 
     Ok(())
 }
