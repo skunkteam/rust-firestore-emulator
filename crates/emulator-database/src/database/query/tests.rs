@@ -1612,3 +1612,128 @@ fn collection_cache_guards_against_foreign_database_roots() -> Result<()> {
 
     Ok(())
 }
+
+#[tokio::test]
+async fn enterprise_all_descendants_empty_order_by_is_deterministic_in_firestore_order()
+-> Result<()> {
+    use std::collections::HashMap;
+
+    use googleapis::google::firestore::v1::{
+        Document, TransactionOptions, Write, transaction_options, write,
+    };
+
+    use crate::{database::DocumentRef, query::QueryMatch};
+
+    let database = fresh_database()?;
+    database.set_config(true, true);
+
+    // Seed multiple docs per parent and `-` vs `/` parent names (`doc/sub/...` < `doc-1/sub/...`).
+    for (col_path, doc_id) in [
+        ("parents/doc-1/sub", "d2"),
+        ("parents/doc-1/sub", "d1"),
+        ("parents/doc/sub", "d3"),
+        ("parents/doc/sub", "d1"),
+        ("parents/doc/sub", "d2"),
+    ] {
+        let doc_ref: DocumentRef = format!("{}/{col_path}/{doc_id}", database.name).parse()?;
+        database
+            .update_doc(
+                &doc_ref,
+                HashMap::from([("tag".to_string(), Value::string("keep"))]),
+                None,
+                None,
+                None,
+            )
+            .await?;
+    }
+
+    let root_prefix = format!("{}/", database.name);
+    let make_query = |consistency: ReadConsistency| -> Result<Query> {
+        Ok(QueryBuilder::from(
+            database.name.clone().into(),
+            vec![CollectionSelector {
+                collection_id:   "sub".to_string(),
+                all_descendants: true,
+            }],
+        )
+        .enterprise_edition(true)
+        .filter(Filter::Field(FieldFilter {
+            field: "tag".parse()?,
+            op:    FieldOperator::Equal,
+            value: Value::string("keep"),
+        }))
+        .consistency(consistency)
+        .build()?)
+    };
+
+    // 1. Validate stays unsynthesized (`order_by` empty) while execution orders deterministically
+    //    via `cmp_firestore_order` (`doc/sub/...` before `doc-1/sub/...`, and `d1 < d2 < d3`).
+    let mut q = make_query(ReadConsistency::Default)?;
+    assert!(q.order_by().is_empty());
+    let (_, matches) = q.once(&database).await?;
+    let rel_paths = |ms: &[QueryMatch]| {
+        ms.iter()
+            .map(|m| {
+                m.version
+                    .name
+                    .to_string()
+                    .strip_prefix(&root_prefix)
+                    .unwrap()
+                    .to_string()
+            })
+            .collect_vec()
+    };
+    let expected = vec![
+        "parents/doc/sub/d1",
+        "parents/doc/sub/d2",
+        "parents/doc/sub/d3",
+        "parents/doc-1/sub/d1",
+        "parents/doc-1/sub/d2",
+    ];
+    assert_eq!(rel_paths(&matches), expected);
+
+    // 2. Under an optimistic transaction, concurrent non-matching inserts that force HashMap
+    //    rehashing of `Collection::documents` must NOT permute result order or trigger a false
+    //    `OptimisticWriteSkew` abort.
+    let txn_id = database
+        .new_txn(TransactionOptions {
+            mode: Some(transaction_options::Mode::ReadWrite(
+                transaction_options::ReadWrite::default(),
+            )),
+        })
+        .await?;
+    let mut txn_q = make_query(ReadConsistency::Transaction(txn_id))?;
+    let (_, txn_matches) = txn_q.once(&database).await?;
+    assert_eq!(rel_paths(&txn_matches), expected);
+
+    for i in 0..64 {
+        let noise_ref: DocumentRef =
+            format!("{}/parents/doc/sub/noise-{i}", database.name).parse()?;
+        database
+            .update_doc(
+                &noise_ref,
+                HashMap::from([("tag".to_string(), Value::string("noise"))]),
+                None,
+                None,
+                None,
+            )
+            .await?;
+    }
+
+    let other_ref: DocumentRef = format!("{}/other/out", database.name).parse()?;
+    database
+        .commit(
+            vec![Write {
+                operation: Some(write::Operation::Update(Document {
+                    name: other_ref.to_string(),
+                    fields: HashMap::from([("ok".to_string(), Value::boolean(true))]),
+                    ..Default::default()
+                })),
+                ..Default::default()
+            }],
+            Some(txn_id),
+        )
+        .await?;
+
+    Ok(())
+}

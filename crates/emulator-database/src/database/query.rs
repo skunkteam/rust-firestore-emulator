@@ -1012,7 +1012,13 @@ impl Query {
             }
 
             if self.order_by.is_empty() {
-                buffer.sort_unstable_by_key(|&(col_idx, orig_idx, _)| (col_idx, orig_idx));
+                if self.from.iter().any(|selector| selector.all_descendants) {
+                    buffer.sort_unstable_by(|(_, _, a), (_, _, b)| {
+                        a.version.name.cmp_firestore_order(&b.version.name)
+                    });
+                } else {
+                    buffer.sort_unstable_by_key(|&(col_idx, orig_idx, _)| (col_idx, orig_idx));
+                }
             } else {
                 buffer.sort_unstable_by(|(_, _, a), (_, _, b)| {
                     self.order_by_cmp(&a.version, &b.version)
