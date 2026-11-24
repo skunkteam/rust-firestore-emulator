@@ -2088,6 +2088,178 @@ mod tests {
             unary_bad_ty.contains("a UnaryFilter.Operator string or integer"),
             "unexpected UnaryFilter.Operator expecting error: {unary_bad_ty}"
         );
+
+        // Positive string + integer (`visit_u64` & `visit_i64`) round-trips across all variants,
+        // plus unknown `i32` (`999`) fallback serialization on all three `Operator` types.
+        use serde::de::value::I64Deserializer;
+        for (variant, wire_str) in [
+            (Direction::Unspecified, "DIRECTION_UNSPECIFIED"),
+            (Direction::Ascending, "ASCENDING"),
+            (Direction::Descending, "DESCENDING"),
+        ] {
+            let num = variant as i32;
+            let via_u64 = serde_json::from_value::<Order>(json!({
+                "field": { "fieldPath": "a" },
+                "direction": num
+            }))
+            .unwrap();
+            let via_str = serde_json::from_value::<Order>(json!({
+                "field": { "fieldPath": "a" },
+                "direction": wire_str
+            }))
+            .unwrap();
+            expect_eq!(via_u64.direction, num);
+            expect_eq!(via_str.direction, num);
+            expect_eq!(
+                deserialize_direction(I64Deserializer::<serde_json::Error>::new(i64::from(num)))
+                    .unwrap(),
+                num
+            );
+            expect_eq!(
+                serde_json::to_value(via_u64).unwrap(),
+                json!({ "field": { "fieldPath": "a" }, "direction": wire_str })
+            );
+        }
+
+        for (variant, wire_str) in [
+            (
+                composite_filter::Operator::Unspecified,
+                "OPERATOR_UNSPECIFIED",
+            ),
+            (composite_filter::Operator::And, "AND"),
+            (composite_filter::Operator::Or, "OR"),
+        ] {
+            let num = variant as i32;
+            let via_u64 = serde_json::from_value::<CompositeFilter>(json!({
+                "op": num,
+                "filters": []
+            }))
+            .unwrap();
+            let via_str = serde_json::from_value::<CompositeFilter>(json!({
+                "op": wire_str,
+                "filters": []
+            }))
+            .unwrap();
+            expect_eq!(via_u64.op, num);
+            expect_eq!(via_str.op, num);
+            expect_eq!(
+                deserialize_composite_op(I64Deserializer::<serde_json::Error>::new(i64::from(num)))
+                    .unwrap(),
+                num
+            );
+            expect_eq!(
+                serde_json::to_value(via_u64).unwrap(),
+                json!({ "op": wire_str, "filters": [] })
+            );
+        }
+        expect_eq!(
+            serde_json::to_value(CompositeFilter {
+                op:      999,
+                filters: vec![],
+            })
+            .unwrap()["op"],
+            json!("OPERATOR_UNSPECIFIED")
+        );
+
+        for (variant, wire_str) in [
+            (field_filter::Operator::Unspecified, "OPERATOR_UNSPECIFIED"),
+            (field_filter::Operator::LessThan, "LESS_THAN"),
+            (
+                field_filter::Operator::LessThanOrEqual,
+                "LESS_THAN_OR_EQUAL",
+            ),
+            (field_filter::Operator::GreaterThan, "GREATER_THAN"),
+            (
+                field_filter::Operator::GreaterThanOrEqual,
+                "GREATER_THAN_OR_EQUAL",
+            ),
+            (field_filter::Operator::Equal, "EQUAL"),
+            (field_filter::Operator::NotEqual, "NOT_EQUAL"),
+            (field_filter::Operator::ArrayContains, "ARRAY_CONTAINS"),
+            (field_filter::Operator::In, "IN"),
+            (
+                field_filter::Operator::ArrayContainsAny,
+                "ARRAY_CONTAINS_ANY",
+            ),
+            (field_filter::Operator::NotIn, "NOT_IN"),
+        ] {
+            let num = variant as i32;
+            let via_u64 = serde_json::from_value::<FieldFilter>(json!({
+                "field": { "fieldPath": "a" },
+                "op": num,
+                "value": { "integerValue": "1" }
+            }))
+            .unwrap();
+            let via_str = serde_json::from_value::<FieldFilter>(json!({
+                "field": { "fieldPath": "a" },
+                "op": wire_str,
+                "value": { "integerValue": "1" }
+            }))
+            .unwrap();
+            expect_eq!(via_u64.op, num);
+            expect_eq!(via_str.op, num);
+            expect_eq!(
+                deserialize_field_op(I64Deserializer::<serde_json::Error>::new(i64::from(num)))
+                    .unwrap(),
+                num
+            );
+            expect_eq!(
+                serde_json::to_value(via_u64).unwrap()["op"],
+                json!(wire_str)
+            );
+        }
+        expect_eq!(
+            serde_json::to_value(FieldFilter {
+                field: Some(FieldReference {
+                    field_path: "a".to_string(),
+                }),
+                op:    999,
+                value: Some(Value::integer(1)),
+            })
+            .unwrap()["op"],
+            json!("OPERATOR_UNSPECIFIED")
+        );
+
+        for (variant, wire_str) in [
+            (unary_filter::Operator::Unspecified, "OPERATOR_UNSPECIFIED"),
+            (unary_filter::Operator::IsNan, "IS_NAN"),
+            (unary_filter::Operator::IsNull, "IS_NULL"),
+            (unary_filter::Operator::IsNotNan, "IS_NOT_NAN"),
+            (unary_filter::Operator::IsNotNull, "IS_NOT_NULL"),
+        ] {
+            let num = variant as i32;
+            let via_u64 = serde_json::from_value::<UnaryFilter>(json!({
+                "op": num,
+                "field": { "fieldPath": "a" }
+            }))
+            .unwrap();
+            let via_str = serde_json::from_value::<UnaryFilter>(json!({
+                "op": wire_str,
+                "field": { "fieldPath": "a" }
+            }))
+            .unwrap();
+            expect_eq!(via_u64.op, num);
+            expect_eq!(via_str.op, num);
+            expect_eq!(
+                deserialize_unary_op(I64Deserializer::<serde_json::Error>::new(i64::from(num)))
+                    .unwrap(),
+                num
+            );
+            expect_eq!(
+                serde_json::to_value(via_u64).unwrap(),
+                json!({ "op": wire_str, "field": { "fieldPath": "a" } })
+            );
+        }
+        expect_eq!(
+            serde_json::to_value(UnaryFilter {
+                op: 999,
+                operand_type: Some(unary_filter::OperandType::Field(FieldReference {
+                    field_path: "a".to_string(),
+                })),
+            })
+            .unwrap()["op"],
+            json!("OPERATOR_UNSPECIFIED")
+        );
     }
 
     mod proptests {
