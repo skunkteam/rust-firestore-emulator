@@ -118,7 +118,7 @@ pub(super) fn execute(
                     if values.is_empty() {
                         Value::null()
                     } else {
-                        values.into_iter().sum()
+                        crate::database::sum_enterprise_checked(values)?
                     }
                 }
                 "average" => {
@@ -128,7 +128,7 @@ pub(super) fn execute(
                         Value::null()
                     } else {
                         let len = values.len();
-                        let sum: Value = values.into_iter().sum();
+                        let sum = crate::database::sum_enterprise_checked(values)?;
                         Value::double(sum.as_double().unwrap_or(0.0) / len as f64)
                     }
                 }

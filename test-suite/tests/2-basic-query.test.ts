@@ -13,7 +13,18 @@ import {
     Timestamp,
 } from '@google-cloud/firestore';
 import { differenceWith, isEqual, omit, orderBy, sortedUniq, uniq } from 'lodash';
-import { callRawUnaryRpc, connection, editions, expectRpcCode, RawDocument, readData, writeData } from './utils';
+import {
+    RawDocument,
+    RawProtoValue,
+    callRawStreamRpc,
+    callRawUnaryRpc,
+    connection,
+    editions,
+    expectRpcCode,
+    readData,
+    toRunQueryProto,
+    writeData,
+} from './utils';
 
 interface RawListDocumentsRequest {
     parent: string;
@@ -1300,6 +1311,136 @@ describe.each(editions)('$description', fs => {
                 sumArea: 129.97,
                 averagePopulation: 90_150,
             });
+        });
+
+        test('sum and avg i64 intermediate overflow and cancellation wire semantics', async () => {
+            interface RawAggregationResponseChunk {
+                result?: {
+                    aggregateFields?: Record<string, RawProtoValue>;
+                };
+            }
+
+            const I64_MAX = 9_223_372_036_854_775_807n;
+            const I64_MIN = -9_223_372_036_854_775_808n;
+
+            const wireRepr = (val: RawProtoValue | undefined) => {
+                if (val?.integerValue !== undefined) {
+                    return { kind: 'integerValue', value: val.integerValue };
+                }
+                if (val?.doubleValue !== undefined) {
+                    return { kind: 'doubleValue', value: val.doubleValue };
+                }
+                return { kind: 'other', value: val };
+            };
+
+            const probeSingleAgg = async (
+                subCol: ReturnType<typeof fs.collection.doc>['parent'],
+                alias: 's' | 'a',
+                kind: 'sum' | 'avg',
+            ) => {
+                // Standard Edition rejects `orderBy(__name__)` combined with `sum(v)`/`avg(v)` because
+                // `__name__` cannot precede `v` in its single-field index plan; Enterprise allows it.
+                const queryProto = toRunQueryProto(fs.enterprise ? subCol.orderBy(FieldPath.documentId()) : subCol);
+                try {
+                    const chunks = await callRawStreamRpc<object, RawAggregationResponseChunk>(fs.firestore, 'runAggregationQuery', {
+                        parent: queryProto.parent,
+                        structuredAggregationQuery: {
+                            structuredQuery: queryProto.structuredQuery,
+                            aggregations: [{ alias, [kind]: { field: { fieldPath: 'v' } } }],
+                        },
+                    });
+                    const fields = chunks.find(c => c.result?.aggregateFields)?.result?.aggregateFields;
+                    return { ok: true as const, res: wireRepr(fields?.[alias]) };
+                } catch (err: unknown) {
+                    const code = typeof err === 'object' && err !== null ? (err as { code?: unknown }).code : undefined;
+                    const message = err instanceof Error ? err.message : String(err);
+                    return { ok: false as const, code, message };
+                }
+            };
+
+            const probeCases = async (name: string, values: Array<bigint | number>) => {
+                const subCol = fs.collection.doc().collection(`sumOverflow_${name}`);
+                await Promise.all(values.map((v, idx) => subCol.doc(`d${String(idx).padStart(2, '0')}`).set(writeData({ v }))));
+                const [s, a] = await Promise.all([probeSingleAgg(subCol, 's', 'sum'), probeSingleAgg(subCol, 'a', 'avg')]);
+                return { s, a };
+            };
+
+            const [
+                maxPosNeg,
+                maxNegPos,
+                cancelNeg2,
+                finalOverflow,
+                singleRound,
+                avgCancel,
+                avgOffsetCancel,
+                mixedDoubleFirst,
+                mixedDoubleLast,
+            ] = await Promise.all([
+                probeCases('maxPosNeg', [I64_MAX, 1n, -1n]),
+                probeCases('maxNegPos', [I64_MAX, -1n, 1n]),
+                probeCases('cancelNeg2', [I64_MAX, I64_MAX, I64_MIN, I64_MIN]),
+                probeCases('finalOverflow', [I64_MAX, I64_MAX]),
+                probeCases('singleRound', [I64_MAX - 512n, 1535n]),
+                probeCases('avgCancel', [I64_MAX, I64_MAX, -I64_MAX, -I64_MAX, 3n]),
+                probeCases('avgOffsetCancel', [I64_MAX, 1n, -I64_MAX, -1n, 3n]),
+                probeCases('mixedDoubleFirst', [1.5, I64_MAX, I64_MAX]),
+                probeCases('mixedDoubleLast', [I64_MAX, I64_MAX, 1.5]),
+            ]);
+
+            const longOverflow = {
+                ok: false,
+                code: 3,
+                message: expect.stringContaining('Long overflow'),
+            };
+
+            const okInt = (value: string) => ({ ok: true, res: { kind: 'integerValue', value } });
+            const okDbl = (value: number) => ({ ok: true, res: { kind: 'doubleValue', value } });
+
+            if (fs.enterprise) {
+                expect({
+                    maxPosNeg,
+                    maxNegPos,
+                    cancelNeg2,
+                    finalOverflow,
+                    singleRound,
+                    avgCancel,
+                    avgOffsetCancel,
+                    mixedDoubleFirst,
+                    mixedDoubleLast,
+                }).toEqual({
+                    maxPosNeg: { s: longOverflow, a: longOverflow },
+                    maxNegPos: { s: okInt('9223372036854775807'), a: okDbl(Number(I64_MAX) / 3) },
+                    cancelNeg2: { s: longOverflow, a: longOverflow },
+                    finalOverflow: { s: longOverflow, a: longOverflow },
+                    singleRound: { s: longOverflow, a: longOverflow },
+                    avgCancel: { s: longOverflow, a: longOverflow },
+                    avgOffsetCancel: { s: longOverflow, a: longOverflow },
+                    mixedDoubleFirst: { s: okDbl(2 ** 64), a: okDbl(2 ** 64 / 3) },
+                    mixedDoubleLast: { s: longOverflow, a: longOverflow },
+                });
+            } else {
+                expect({
+                    maxPosNeg,
+                    maxNegPos,
+                    cancelNeg2,
+                    finalOverflow,
+                    singleRound,
+                    avgCancel,
+                    avgOffsetCancel,
+                    mixedDoubleFirst,
+                    mixedDoubleLast,
+                }).toEqual({
+                    maxPosNeg: { s: okInt('9223372036854775807'), a: okDbl(Number(I64_MAX) / 3) },
+                    maxNegPos: { s: okInt('9223372036854775807'), a: okDbl(Number(I64_MAX) / 3) },
+                    cancelNeg2: { s: okInt('-2'), a: okDbl(-0.5) },
+                    finalOverflow: { s: okDbl(2 ** 64), a: okDbl(2 ** 63) },
+                    singleRound: { s: okDbl(2 ** 63), a: okDbl(2 ** 62) },
+                    avgCancel: { s: okInt('3'), a: okDbl(0.6) },
+                    avgOffsetCancel: { s: okInt('3'), a: okDbl(0.6) },
+                    mixedDoubleFirst: { s: okDbl(2 ** 64), a: okDbl(2 ** 64 / 3) },
+                    mixedDoubleLast: { s: okDbl(2 ** 64), a: okDbl(2 ** 64 / 3) },
+                });
+            }
         });
 
         async function getAggregate(aggregate: AggregateQuery<AggregateSpec, unknown, DocumentData>) {

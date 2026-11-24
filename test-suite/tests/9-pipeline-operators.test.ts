@@ -1,6 +1,8 @@
 import { CollectionReference, DocumentData, FieldPath, FieldValue, GeoPoint, Timestamp } from '@google-cloud/firestore';
 import * as p from '@google-cloud/firestore/pipelines';
 import {
+    RawDocument,
+    RawProtoValue,
     callRawStreamRpc,
     ConcurrentTest,
     editions,
@@ -619,6 +621,144 @@ suite('$description', fs => {
                     minN: 10,
                     maxN: 10,
                     revenue: 60,
+                });
+            });
+
+            test.concurrent('sum and average i64 intermediate overflow and cancellation wire semantics', async () => {
+                interface RawExecutePipelineChunk {
+                    results?: RawDocument[];
+                }
+
+                const I64_MAX = 9_223_372_036_854_775_807n;
+                const I64_MIN = -9_223_372_036_854_775_808n;
+                const database = (fs.firestore as unknown as { formattedName: string }).formattedName;
+
+                const wireRepr = (val: RawProtoValue | undefined) => {
+                    if (val?.integerValue !== undefined) {
+                        return { kind: 'integerValue', value: val.integerValue };
+                    }
+                    if (val?.doubleValue !== undefined) {
+                        return { kind: 'doubleValue', value: val.doubleValue };
+                    }
+                    return { kind: 'other', value: val };
+                };
+
+                const probeSinglePipelineAgg = async (subCol: CollectionReference, alias: 's' | 'a', fnName: 'sum' | 'average') => {
+                    try {
+                        const chunks = await callRawStreamRpc<object, RawExecutePipelineChunk>(fs.firestore, 'executePipeline', {
+                            database,
+                            structuredPipeline: {
+                                pipeline: {
+                                    stages: [
+                                        { name: 'collection', args: [{ referenceValue: `/${subCol.path}` }] },
+                                        {
+                                            name: 'sort',
+                                            args: [
+                                                {
+                                                    mapValue: {
+                                                        fields: {
+                                                            direction: { stringValue: 'ascending' },
+                                                            expression: { fieldReferenceValue: '__name__' },
+                                                        },
+                                                    },
+                                                },
+                                            ],
+                                        },
+                                        {
+                                            name: 'aggregate',
+                                            args: [
+                                                {
+                                                    mapValue: {
+                                                        fields: {
+                                                            [alias]: {
+                                                                functionValue: {
+                                                                    name: fnName,
+                                                                    args: [{ fieldReferenceValue: 'v' }],
+                                                                },
+                                                            },
+                                                        },
+                                                    },
+                                                },
+                                                { mapValue: { fields: {} } },
+                                            ],
+                                        },
+                                    ],
+                                },
+                            },
+                        });
+                        const fields = chunks.flatMap(c => c.results ?? [])[0]?.fields;
+                        return { ok: true as const, res: wireRepr(fields?.[alias]) };
+                    } catch (err: unknown) {
+                        const code = typeof err === 'object' && err !== null ? (err as { code?: unknown }).code : undefined;
+                        const message = err instanceof Error ? err.message : String(err);
+                        return { ok: false as const, code, message };
+                    }
+                };
+
+                const probePipelineAgg = async (name: string, values: Array<bigint | number>) => {
+                    const subCol = fs.collection.doc().collection(`pipeSumOverflow_${name}`);
+                    await Promise.all(values.map((v, idx) => subCol.doc(`d${String(idx).padStart(2, '0')}`).set(writeData({ v }))));
+                    const [s, a] = await Promise.all([
+                        probeSinglePipelineAgg(subCol, 's', 'sum'),
+                        probeSinglePipelineAgg(subCol, 'a', 'average'),
+                    ]);
+                    return { s, a };
+                };
+
+                const [
+                    maxPosNeg,
+                    maxNegPos,
+                    cancelNeg2,
+                    finalOverflow,
+                    singleRound,
+                    avgCancel,
+                    avgOffsetCancel,
+                    mixedDoubleFirst,
+                    mixedDoubleLast,
+                ] = await Promise.all([
+                    probePipelineAgg('maxPosNeg', [I64_MAX, 1n, -1n]),
+                    probePipelineAgg('maxNegPos', [I64_MAX, -1n, 1n]),
+                    probePipelineAgg('cancelNeg2', [I64_MAX, I64_MAX, I64_MIN, I64_MIN]),
+                    probePipelineAgg('finalOverflow', [I64_MAX, I64_MAX]),
+                    probePipelineAgg('singleRound', [I64_MAX - 512n, 1535n]),
+                    probePipelineAgg('avgCancel', [I64_MAX, I64_MAX, -I64_MAX, -I64_MAX, 3n]),
+                    probePipelineAgg('avgOffsetCancel', [I64_MAX, 1n, -I64_MAX, -1n, 3n]),
+                    probePipelineAgg('mixedDoubleFirst', [1.5, I64_MAX, I64_MAX]),
+                    probePipelineAgg('mixedDoubleLast', [I64_MAX, I64_MAX, 1.5]),
+                ]);
+
+                const longOverflow = {
+                    ok: false,
+                    code: 3,
+                    message: expect.stringContaining('Long overflow'),
+                };
+
+                expect({
+                    maxPosNeg,
+                    maxNegPos,
+                    cancelNeg2,
+                    finalOverflow,
+                    singleRound,
+                    avgCancel,
+                    avgOffsetCancel,
+                    mixedDoubleFirst,
+                    mixedDoubleLast,
+                }).toEqual({
+                    maxPosNeg: { s: longOverflow, a: longOverflow },
+                    maxNegPos: {
+                        s: { ok: true, res: { kind: 'integerValue', value: '9223372036854775807' } },
+                        a: { ok: true, res: { kind: 'doubleValue', value: Number(I64_MAX) / 3 } },
+                    },
+                    cancelNeg2: { s: longOverflow, a: longOverflow },
+                    finalOverflow: { s: longOverflow, a: longOverflow },
+                    singleRound: { s: longOverflow, a: longOverflow },
+                    avgCancel: { s: longOverflow, a: longOverflow },
+                    avgOffsetCancel: { s: longOverflow, a: longOverflow },
+                    mixedDoubleFirst: {
+                        s: { ok: true, res: { kind: 'doubleValue', value: 2 ** 64 } },
+                        a: { ok: true, res: { kind: 'doubleValue', value: 2 ** 64 / 3 } },
+                    },
+                    mixedDoubleLast: { s: longOverflow, a: longOverflow },
                 });
             });
         });
