@@ -6,7 +6,7 @@ use clap::Parser;
 use emulator_database::{FirestoreConfig, FirestoreProject};
 use emulator_tracing::DefaultTracing;
 use firestore_emulator::run;
-use tokio::{net::TcpListener, signal::ctrl_c};
+use tokio::net::TcpListener;
 
 #[cfg(target_os = "linux")]
 #[global_allocator]
@@ -82,8 +82,13 @@ struct Args {
 fn shutdown_signal() -> Result<impl Future<Output = ()> + Send + 'static, CliError> {
     use tokio::signal::unix::{SignalKind, signal};
 
-    // Register SIGTERM eagerly before `run(...)` prints "listening" to avoid a startup race
-    // where an early SIGTERM hits the default termination disposition.
+    // Register both SIGINT and SIGTERM eagerly before `run(...)` prints "listening" to avoid a
+    // startup race where an early signal hits the default termination disposition.
+    let mut sigint = signal(SignalKind::interrupt()).map_err(|err| CliError {
+        context:    Some("Could not install SIGINT signal handler"),
+        source:     Box::new(err),
+        suggestion: None,
+    })?;
     let mut sigterm = signal(SignalKind::terminate()).map_err(|err| CliError {
         context:    Some("Could not install SIGTERM signal handler"),
         source:     Box::new(err),
@@ -92,9 +97,7 @@ fn shutdown_signal() -> Result<impl Future<Output = ()> + Send + 'static, CliErr
 
     Ok(async move {
         tokio::select! {
-            res = ctrl_c() => {
-                res.expect("failed to listen for ctrl-c event");
-            }
+            _ = sigint.recv() => {}
             _ = sigterm.recv() => {}
         }
     })
@@ -102,6 +105,8 @@ fn shutdown_signal() -> Result<impl Future<Output = ()> + Send + 'static, CliErr
 
 #[cfg(not(unix))]
 fn shutdown_signal() -> Result<impl Future<Output = ()> + Send + 'static, CliError> {
+    use tokio::signal::ctrl_c;
+
     Ok(async {
         ctrl_c().await.expect("failed to listen for ctrl-c event");
     })
