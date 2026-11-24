@@ -66,6 +66,15 @@ pub(crate) mod transaction;
 mod validation;
 pub(crate) mod vector;
 
+pub(crate) fn ensure_owns_root(expected: &RootRef, actual: &RootRef) -> Result<()> {
+    if actual != expected {
+        return Err(GenericDatabaseError::invalid_argument(format!(
+            "resource root {actual} does not match database {expected}"
+        )));
+    }
+    Ok(())
+}
+
 const MAX_EVENT_BACKLOG: usize = 1024;
 
 #[derive(Debug)]
@@ -126,13 +135,7 @@ impl FirestoreDatabase {
     }
 
     fn ensure_owns_root(&self, root_ref: &RootRef) -> Result<()> {
-        if root_ref != &self.name {
-            return Err(GenericDatabaseError::invalid_argument(format!(
-                "resource root {root_ref} does not match database {}",
-                self.name
-            )));
-        }
-        Ok(())
+        ensure_owns_root(&self.name, root_ref)
     }
 
     pub(crate) fn ensure_owns_doc(&self, doc_ref: &DocumentRef) -> Result<()> {

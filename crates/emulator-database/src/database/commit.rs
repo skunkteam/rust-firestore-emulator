@@ -5,11 +5,7 @@ use std::{
 };
 
 use googleapis::google::{
-    firestore::v1::{
-        DocumentMask, Value, Write, WriteResult,
-        document_transform::field_transform::{ServerValue, TransformType},
-        write,
-    },
+    firestore::v1::{Value, Write, WriteResult},
     protobuf::Timestamp,
 };
 use tokio::time::Instant;
@@ -26,17 +22,20 @@ use super::{
     lock::{CommitSeal, LockPriority, ReadObservation, SessionKind},
     reference::DocumentRef,
     transaction::{CommitTake, ReadWriteTransaction, TransactionId},
-    validation,
+    validation::{
+        self, ValidatedFieldTransform, ValidatedTransformOp, ValidatedWrite,
+        ValidatedWriteOperation,
+    },
 };
 use crate::{
     GenericDatabaseError,
     error::{AbortReason, CommitError, Result},
-    unimplemented, unimplemented_collection, unimplemented_option,
+    unimplemented,
 };
 
 struct ValidatedCommitWrites {
     target_docs: BTreeSet<DocumentRef>,
-    writes:      Vec<(DocumentRef, Write)>,
+    writes:      Vec<ValidatedWrite>,
 }
 
 impl FirestoreDatabase {
@@ -90,15 +89,14 @@ impl FirestoreDatabase {
         self: &Arc<Self>,
         write: Write,
     ) -> Result<(WriteResult, Option<Arc<StoredDocumentVersion>>)> {
-        let name = get_doc_name_from_write(&write)?;
-        self.ensure_owns_doc(&name)?;
-        validation::validate_write(&write)?;
+        let validated = ValidatedWrite::parse(write, &self.name)?;
         if self.is_cleared() {
             return Err(AbortReason::DatabaseCleared.into());
         }
 
+        let doc_ref = validated.doc_ref.clone();
         let (_, mut results, stored) = self
-            .apply_single_non_transactional(name.clone(), vec![(name, write)])
+            .apply_single_non_transactional(doc_ref, vec![validated])
             .await?;
         let result = results
             .pop()
@@ -110,11 +108,9 @@ impl FirestoreDatabase {
         let mut target_docs = BTreeSet::new();
         let mut parsed_writes = Vec::with_capacity(writes.len());
         for write in writes {
-            let name = get_doc_name_from_write(&write)?;
-            self.ensure_owns_doc(&name)?;
-            validation::validate_write(&write)?;
-            target_docs.insert(name.clone());
-            parsed_writes.push((name, write));
+            let validated = ValidatedWrite::parse(write, &self.name)?;
+            target_docs.insert(validated.doc_ref.clone());
+            parsed_writes.push(validated);
         }
         Ok(ValidatedCommitWrites {
             target_docs,
@@ -125,7 +121,7 @@ impl FirestoreDatabase {
     async fn apply_single_non_transactional(
         self: &Arc<Self>,
         doc_ref: DocumentRef,
-        writes: Vec<(DocumentRef, Write)>,
+        writes: Vec<ValidatedWrite>,
     ) -> Result<(
         Timestamp,
         Vec<WriteResult>,
@@ -261,7 +257,7 @@ impl FirestoreDatabase {
         self: &Arc<Self>,
         rw: &ReadWriteTransaction,
         target_docs: BTreeSet<DocumentRef>,
-        writes: Vec<(DocumentRef, Write)>,
+        writes: Vec<ValidatedWrite>,
     ) -> std::result::Result<(Timestamp, Vec<WriteResult>), CommitError> {
         // Serialize optimistic validation-through-commit critical sections so concurrent
         // optimistic transactions cannot pass validation against each other's pre-commit state.
@@ -324,7 +320,7 @@ impl FirestoreDatabase {
     async fn apply_sealed_commit_writes(
         self: &Arc<Self>,
         seal: CommitSeal,
-        writes: Vec<(DocumentRef, Write)>,
+        writes: Vec<ValidatedWrite>,
     ) -> std::result::Result<
         (
             Timestamp,
@@ -350,9 +346,12 @@ impl FirestoreDatabase {
                 .collect();
             let mut write_results = Vec::with_capacity(writes.len());
 
-            for (name, write) in writes {
-                let staged = staged_docs.get_mut(&name).ok_or_else(|| {
-                    GenericDatabaseError::internal(format!("missing staged document for {name}"))
+            for write in writes {
+                let staged = staged_docs.get_mut(&write.doc_ref).ok_or_else(|| {
+                    GenericDatabaseError::internal(format!(
+                        "missing staged document for {}",
+                        write.doc_ref
+                    ))
                 })?;
                 write_results.push(self.stage_write(write, staged, commit_time)?);
             }
@@ -385,71 +384,53 @@ impl FirestoreDatabase {
     #[instrument(level = Level::DEBUG, skip_all, err)]
     fn stage_write(
         &self,
-        write: Write,
+        write: ValidatedWrite,
         document: &mut StagedDocument<'_>,
         commit_time: Timestamp,
     ) -> Result<WriteResult> {
-        let Write {
-            update_mask,
-            update_transforms,
-            current_document,
+        let ValidatedWrite {
+            doc_ref: _,
+            precondition,
             operation,
         } = write;
 
-        let operation = operation.ok_or(GenericDatabaseError::invalid_argument(
-            "missing operation in write",
-        ))?;
-        let condition = current_document
-            .and_then(|cd| cd.condition_type)
-            .map(Into::into);
-        if let Some(condition) = condition {
+        if let Some(condition) = precondition {
             document.check_precondition(condition)?;
         }
         let mut transform_results = vec![];
 
-        use write::Operation::*;
         let update_time = match operation {
-            Update(doc) => {
+            ValidatedWriteOperation::Update {
+                fields,
+                update_mask,
+                update_transforms,
+            } => {
                 debug!(name = %document.name, "Update");
-                validation::validate_writable_fields(&doc.fields)?;
-                if let Some(mask) = &update_mask {
-                    validation::validate_update_mask(mask)?;
-                }
-                validation::validate_field_transforms(&update_transforms)?;
-
                 let mut fields = if let Some(mask) = update_mask {
                     apply_updates(
                         document.current_version().map(|v| &v.fields),
-                        mask,
-                        &doc.fields,
-                    )?
+                        &mask,
+                        &fields,
+                    )
                 } else {
-                    doc.fields
+                    fields
                 };
+                let has_transforms = !update_transforms.is_empty();
                 for tf in update_transforms {
-                    transform_results.push(apply_transform(
-                        &mut fields,
-                        tf.field_path,
-                        tf.transform_type.ok_or_else(|| {
-                            GenericDatabaseError::invalid_argument(
-                                "empty transform_type in field_transform",
-                            )
-                        })?,
-                        commit_time,
-                    )?);
+                    transform_results.push(apply_transform(&mut fields, tf, commit_time)?);
                 }
-                validation::validate_writable_fields(&fields)?;
+                if has_transforms {
+                    validation::validate_writable_fields(&fields)?;
+                } else {
+                    debug_assert!(validation::validate_writable_fields(&fields).is_ok());
+                }
                 document.stage_update(fields, commit_time)
             }
-            Delete(_) => {
+            ValidatedWriteOperation::Delete => {
                 debug!(name = %document.name, "Delete");
-
-                unimplemented_option!(update_mask);
-                unimplemented_collection!(update_transforms);
                 document.stage_delete(commit_time);
                 commit_time
             }
-            Transform(_) => unimplemented!("transform"),
         };
         Ok(WriteResult {
             update_time: Some(update_time),
@@ -517,12 +498,11 @@ impl<'a> StagedDocument<'a> {
 
 fn apply_updates(
     existing_fields: Option<&HashMap<String, Value>>,
-    mask: DocumentMask,
+    mask: &[FieldPath],
     updated_values: &HashMap<String, Value>,
-) -> Result<HashMap<String, Value>, GenericDatabaseError> {
+) -> HashMap<String, Value> {
     let mut fields = existing_fields.cloned().unwrap_or_default();
-    for field_path in mask.field_paths {
-        let field_path: FieldPath = field_path.parse()?;
+    for field_path in mask {
         match field_path.get_value(updated_values) {
             Some(new_value) => field_path.set_value(&mut fields, new_value.clone()),
             None => {
@@ -530,43 +510,30 @@ fn apply_updates(
             }
         }
     }
-    Ok(fields)
+    fields
 }
 
 fn apply_transform(
     fields: &mut HashMap<String, Value>,
-    path: String,
-    transform: TransformType,
+    transform: ValidatedFieldTransform,
     commit_time: Timestamp,
 ) -> Result<Value> {
-    let field_path: FieldPath = path.parse()?;
-    let result = match transform {
-        TransformType::SetToServerValue(code) => {
-            match ServerValue::try_from(code).map_err(|_| {
-                GenericDatabaseError::invalid_argument(format!("invalid server_value: {code}"))
-            })? {
-                ServerValue::RequestTime => {
-                    let new_value = Value::timestamp(commit_time);
-                    field_path.set_value(fields, new_value.clone());
-                    new_value
-                }
-                ServerValue::Unspecified => {
-                    return Err(GenericDatabaseError::invalid_argument(
-                        "ServerValue type must be specified for set_to_server_value \
-                         transformation.",
-                    ));
-                }
-            }
+    let ValidatedFieldTransform { field_path, op } = transform;
+    let result = match op {
+        ValidatedTransformOp::SetToRequestTime => {
+            let new_value = Value::timestamp(commit_time);
+            field_path.set_value(fields, new_value.clone());
+            new_value
         }
-        TransformType::Increment(value) => field_path
+        ValidatedTransformOp::Increment(value) => field_path
             .transform_value(fields, |cur| cur.unwrap_or_else(Value::null) + value)
             .clone(),
-        TransformType::Maximum(_) => unimplemented!("TransformType::Maximum"),
-        TransformType::Minimum(_) => unimplemented!("TransformType::Minimum"),
-        TransformType::AppendMissingElements(elements) => {
+        ValidatedTransformOp::Maximum => unimplemented!("TransformType::Maximum"),
+        ValidatedTransformOp::Minimum => unimplemented!("TransformType::Minimum"),
+        ValidatedTransformOp::AppendMissingElements(elements) => {
             field_path.transform_value(fields, |cur_value| {
                 let mut array = cur_value.and_then(Value::into_array).unwrap_or_default();
-                for el in elements.values {
+                for el in elements {
                     if !array.contains(&el) {
                         array.push(el);
                     }
@@ -575,11 +542,11 @@ fn apply_transform(
             });
             Value::null()
         }
-        TransformType::RemoveAllFromArray(elements) => {
+        ValidatedTransformOp::RemoveAllFromArray(elements) => {
             field_path.transform_value(fields, |cur_value| {
                 match cur_value.and_then(Value::into_array) {
                     Some(mut array) => {
-                        array.retain(|v| !elements.values.contains(v));
+                        array.retain(|v| !elements.contains(v));
                         Value::array(array)
                     }
                     None => Value::array(vec![]),
@@ -591,18 +558,589 @@ fn apply_transform(
     Ok(result)
 }
 
-fn get_doc_name_from_write(write: &Write) -> Result<DocumentRef> {
-    let operation = write
-        .operation
-        .as_ref()
-        .ok_or(GenericDatabaseError::not_implemented(
-            "missing operation in write",
-        ))?;
-    use write::Operation::*;
-    let name: &str = match operation {
-        Update(doc) => &doc.name,
-        Delete(name) => name,
-        Transform(trans) => &trans.document,
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use googleapis::google::{
+        firestore::v1::{
+            Document, DocumentMask, Precondition, TransactionOptions, Value, Write,
+            document_transform::{
+                FieldTransform,
+                field_transform::{ServerValue, TransformType},
+            },
+            precondition, transaction_options, write,
+        },
+        protobuf::Timestamp,
     };
-    name.parse()
+
+    use crate::{
+        FirestoreConfig, FirestoreProject, GenericDatabaseError,
+        database::read_consistency::ReadConsistency,
+        reference::{DocumentRef, RootRef},
+    };
+
+    async fn test_db() -> (
+        &'static FirestoreProject,
+        RootRef,
+        std::sync::Arc<crate::FirestoreDatabase>,
+    ) {
+        let project: &'static FirestoreProject =
+            Box::leak(Box::new(FirestoreProject::new(FirestoreConfig::default())));
+        let root: RootRef = "projects/p/databases/(default)".parse().unwrap();
+        let db = project.database(&root).await;
+        (project, root, db)
+    }
+
+    #[tokio::test]
+    async fn transform_only_empty_mask_preserves_existing_fields_while_none_overwrites() {
+        let (_project, _root, db) = test_db().await;
+        let doc_ref: DocumentRef = "projects/p/databases/(default)/documents/c/d"
+            .parse()
+            .unwrap();
+
+        db.update_doc(
+            &doc_ref,
+            HashMap::from([
+                ("keep".to_string(), Value::string("yes")),
+                ("count".to_string(), Value::integer(10)),
+            ]),
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        // Empty `update_mask: Some([])` with transforms preserves existing fields and ignores
+        // unmasked `doc.fields`.
+        db.commit(
+            vec![Write {
+                update_mask: Some(DocumentMask {
+                    field_paths: vec![],
+                }),
+                update_transforms: vec![FieldTransform {
+                    field_path:     "count".to_string(),
+                    transform_type: Some(TransformType::Increment(Value::integer(5))),
+                }],
+                operation: Some(write::Operation::Update(Document {
+                    name: doc_ref.to_string(),
+                    fields: HashMap::from([("ignored".to_string(), Value::integer(999))]),
+                    ..Default::default()
+                })),
+                ..Default::default()
+            }],
+            None,
+        )
+        .await
+        .unwrap();
+
+        let after_empty_mask = db
+            .get_doc(&doc_ref, ReadConsistency::Default)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            after_empty_mask.fields,
+            HashMap::from([
+                ("keep".to_string(), Value::string("yes")),
+                ("count".to_string(), Value::integer(15)),
+            ])
+        );
+
+        // `update_mask: None` overwrites the document with `doc.fields` before running transforms.
+        db.commit(
+            vec![Write {
+                update_mask: None,
+                update_transforms: vec![FieldTransform {
+                    field_path:     "count".to_string(),
+                    transform_type: Some(TransformType::Increment(Value::integer(1))),
+                }],
+                operation: Some(write::Operation::Update(Document {
+                    name: doc_ref.to_string(),
+                    fields: HashMap::new(),
+                    ..Default::default()
+                })),
+                ..Default::default()
+            }],
+            None,
+        )
+        .await
+        .unwrap();
+
+        let after_none_mask = db
+            .get_doc(&doc_ref, ReadConsistency::Default)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            after_none_mask.fields,
+            HashMap::from([("count".to_string(), Value::integer(1))])
+        );
+    }
+
+    #[tokio::test]
+    async fn max_min_checks_precondition_before_not_implemented_and_rejects_bad_operand_prelock() {
+        let (_project, _root, db) = test_db().await;
+        let doc_ref: DocumentRef = "projects/p/databases/(default)/documents/c/mm"
+            .parse()
+            .unwrap();
+
+        let max_tf = |val: Value| {
+            vec![FieldTransform {
+                field_path:     "x".to_string(),
+                transform_type: Some(TransformType::Maximum(val)),
+            }]
+        };
+        let min_tf = |val: Value| {
+            vec![FieldTransform {
+                field_path:     "x".to_string(),
+                transform_type: Some(TransformType::Minimum(val)),
+            }]
+        };
+
+        // Missing doc with `Exists(true)` fails precondition (`NotFound`) before `NotImplemented`.
+        let err = db
+            .commit(
+                vec![Write {
+                    current_document: Some(Precondition {
+                        condition_type: Some(precondition::ConditionType::Exists(true)),
+                    }),
+                    update_mask: Some(DocumentMask::default()),
+                    update_transforms: max_tf(Value::integer(10)),
+                    operation: Some(write::Operation::Update(Document {
+                        name: doc_ref.to_string(),
+                        ..Default::default()
+                    })),
+                }],
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, GenericDatabaseError::NotFound(_)));
+
+        // Invalid operand on `Maximum` fails pre-lock with `InvalidArgument` even when
+        // `Exists(true)` would fail under lock, and preserves an active transaction.
+        let rw_id = db
+            .new_txn(TransactionOptions {
+                mode: Some(transaction_options::Mode::ReadWrite(
+                    transaction_options::ReadWrite::default(),
+                )),
+            })
+            .await
+            .unwrap();
+        let err = db
+            .commit(
+                vec![Write {
+                    current_document: Some(Precondition {
+                        condition_type: Some(precondition::ConditionType::Exists(true)),
+                    }),
+                    update_mask: Some(DocumentMask::default()),
+                    update_transforms: max_tf(Value::default()),
+                    operation: Some(write::Operation::Update(Document {
+                        name: doc_ref.to_string(),
+                        ..Default::default()
+                    })),
+                }],
+                Some(rw_id),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, GenericDatabaseError::InvalidArgument(_)));
+        assert!(
+            db.get_doc(&doc_ref, ReadConsistency::Transaction(rw_id))
+                .await
+                .is_ok(),
+            "pre-lock operand rejection must keep active transaction open"
+        );
+        db.rollback(rw_id).await.unwrap();
+
+        // Create doc, then check `Exists(false)` -> `AlreadyExists` and stale `UpdateTime` ->
+        // `FailedPrecondition` before `NotImplemented`.
+        db.update_doc(
+            &doc_ref,
+            HashMap::from([("x".to_string(), Value::integer(5))]),
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let err = db
+            .commit(
+                vec![Write {
+                    current_document: Some(Precondition {
+                        condition_type: Some(precondition::ConditionType::Exists(false)),
+                    }),
+                    update_mask: Some(DocumentMask::default()),
+                    update_transforms: min_tf(Value::integer(1)),
+                    operation: Some(write::Operation::Update(Document {
+                        name: doc_ref.to_string(),
+                        ..Default::default()
+                    })),
+                }],
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, GenericDatabaseError::AlreadyExists(_)));
+
+        let err = db
+            .commit(
+                vec![Write {
+                    current_document: Some(Precondition {
+                        condition_type: Some(precondition::ConditionType::UpdateTime(Timestamp {
+                            seconds: 1,
+                            nanos:   0,
+                        })),
+                    }),
+                    update_mask: Some(DocumentMask::default()),
+                    update_transforms: max_tf(Value::integer(1)),
+                    operation: Some(write::Operation::Update(Document {
+                        name: doc_ref.to_string(),
+                        ..Default::default()
+                    })),
+                }],
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, GenericDatabaseError::FailedPrecondition(_)));
+
+        // When precondition passes, `Maximum`/`Minimum` returns `NotImplemented`.
+        let err = db
+            .commit(
+                vec![Write {
+                    current_document: Some(Precondition {
+                        condition_type: Some(precondition::ConditionType::Exists(true)),
+                    }),
+                    update_mask: Some(DocumentMask::default()),
+                    update_transforms: min_tf(Value::integer(1)),
+                    operation: Some(write::Operation::Update(Document {
+                        name: doc_ref.to_string(),
+                        ..Default::default()
+                    })),
+                }],
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, GenericDatabaseError::NotImplemented(_)));
+    }
+
+    #[tokio::test]
+    async fn overlapping_and_repeated_mask_paths_apply_cleanly_without_losing_values() {
+        let (_project, _root, db) = test_db().await;
+        let doc_ref: DocumentRef = "projects/p/databases/(default)/documents/c/overlap"
+            .parse()
+            .unwrap();
+
+        db.update_doc(
+            &doc_ref,
+            HashMap::from([
+                ("keep".to_string(), Value::boolean(true)),
+                ("emb".to_string(), Value::vector([1.0, 2.0])),
+                (
+                    "a".to_string(),
+                    Value::map(HashMap::from([
+                        ("old".to_string(), Value::integer(1)),
+                        ("sib".to_string(), Value::integer(2)),
+                        (
+                            "b".to_string(),
+                            Value::map(HashMap::from([
+                                ("c".to_string(), Value::integer(10)),
+                                ("keep_b".to_string(), Value::integer(20)),
+                            ])),
+                        ),
+                    ])),
+                ),
+            ]),
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        // Descendant-only mask preserves unmasked siblings (`a.sib`, `a.b.keep_b`), ignores
+        // unmasked incoming fields (`a.ignored`), explicitly deletes absent `a.old`, and leaves
+        // stored `VectorValue` `emb` intact when absent subpath `emb.value` is masked.
+        let updated = db
+            .update_doc(
+                &doc_ref,
+                HashMap::from([(
+                    "a".to_string(),
+                    Value::map(HashMap::from([
+                        ("ignored".to_string(), Value::integer(99)),
+                        (
+                            "b".to_string(),
+                            Value::map(HashMap::from([("c".to_string(), Value::integer(3))])),
+                        ),
+                    ])),
+                )]),
+                Some(DocumentMask {
+                    field_paths: vec![
+                        "a.b.c".to_string(),
+                        "a.old".to_string(),
+                        "a.b.c".to_string(),
+                        "emb.value".to_string(),
+                    ],
+                }),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            updated.fields,
+            HashMap::from([
+                ("keep".to_string(), Value::boolean(true)),
+                ("emb".to_string(), Value::vector([1.0, 2.0])),
+                (
+                    "a".to_string(),
+                    Value::map(HashMap::from([
+                        ("sib".to_string(), Value::integer(2)),
+                        (
+                            "b".to_string(),
+                            Value::map(HashMap::from([
+                                ("c".to_string(), Value::integer(3)),
+                                ("keep_b".to_string(), Value::integer(20)),
+                            ])),
+                        ),
+                    ])),
+                ),
+            ])
+        );
+
+        // Descendant-before-ancestor mask `["a.b.c", "a.b", "a", "emb.value"]`: ancestor `"a"`
+        // overwrites existing siblings (`a.sib`, `a.b.keep_b`) while applying `a.new_sib`, and
+        // `emb.value` still leaves `VectorValue` `emb` intact.
+        let updated = db
+            .update_doc(
+                &doc_ref,
+                HashMap::from([(
+                    "a".to_string(),
+                    Value::map(HashMap::from([
+                        ("new_sib".to_string(), Value::integer(4)),
+                        (
+                            "b".to_string(),
+                            Value::map(HashMap::from([("c".to_string(), Value::integer(5))])),
+                        ),
+                    ])),
+                )]),
+                Some(DocumentMask {
+                    field_paths: vec![
+                        "a.b.c".to_string(),
+                        "a.b".to_string(),
+                        "a".to_string(),
+                        "emb.value".to_string(),
+                    ],
+                }),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            updated.fields,
+            HashMap::from([
+                ("keep".to_string(), Value::boolean(true)),
+                ("emb".to_string(), Value::vector([1.0, 2.0])),
+                (
+                    "a".to_string(),
+                    Value::map(HashMap::from([
+                        ("new_sib".to_string(), Value::integer(4)),
+                        (
+                            "b".to_string(),
+                            Value::map(HashMap::from([("c".to_string(), Value::integer(5))])),
+                        ),
+                    ])),
+                ),
+            ])
+        );
+
+        // Ancestor-before-descendant repeated mask `["a", "a.b", "a.b.c", "a"]` deletes
+        // `a.new_sib`, while `["emb", "emb.value"]` writes `VectorValue` without corrupting its
+        // sentinel `value` key.
+        let updated = db
+            .update_doc(
+                &doc_ref,
+                HashMap::from([
+                    (
+                        "a".to_string(),
+                        Value::map(HashMap::from([(
+                            "b".to_string(),
+                            Value::map(HashMap::from([("c".to_string(), Value::integer(6))])),
+                        )])),
+                    ),
+                    ("emb".to_string(), Value::vector([3.0, 4.0])),
+                ]),
+                Some(DocumentMask {
+                    field_paths: vec![
+                        "a".to_string(),
+                        "a.b".to_string(),
+                        "a.b.c".to_string(),
+                        "a".to_string(),
+                        "emb".to_string(),
+                        "emb.value".to_string(),
+                    ],
+                }),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            updated.fields,
+            HashMap::from([
+                ("keep".to_string(), Value::boolean(true)),
+                ("emb".to_string(), Value::vector([3.0, 4.0])),
+                (
+                    "a".to_string(),
+                    Value::map(HashMap::from([(
+                        "b".to_string(),
+                        Value::map(HashMap::from([("c".to_string(), Value::integer(6))])),
+                    )])),
+                ),
+            ])
+        );
+
+        // Writing a subpath onto a stored `VectorValue` replaces it atomically as a valid map
+        // (satisfying post-merge `debug_assert!(validate_writable_fields(&fields).is_ok())`).
+        let updated = db
+            .update_doc(
+                &doc_ref,
+                HashMap::from([(
+                    "emb".to_string(),
+                    Value::map(HashMap::from([("nested".to_string(), Value::string("ok"))])),
+                )]),
+                Some(DocumentMask {
+                    field_paths: vec!["emb.nested".to_string()],
+                }),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            updated.fields,
+            HashMap::from([
+                ("keep".to_string(), Value::boolean(true)),
+                (
+                    "emb".to_string(),
+                    Value::map(HashMap::from([("nested".to_string(), Value::string("ok"))])),
+                ),
+                (
+                    "a".to_string(),
+                    Value::map(HashMap::from([(
+                        "b".to_string(),
+                        Value::map(HashMap::from([("c".to_string(), Value::integer(6))])),
+                    )])),
+                ),
+            ])
+        );
+    }
+
+    #[tokio::test]
+    async fn commit_preserves_multi_write_order_for_same_document_and_cleared_db_precedence() {
+        let (project, root, db) = test_db().await;
+        let doc_ref: DocumentRef = "projects/p/databases/(default)/documents/c/seq"
+            .parse()
+            .unwrap();
+
+        let (commit_ts, results) = db
+            .commit(
+                vec![
+                    Write {
+                        operation: Some(write::Operation::Update(Document {
+                            name: doc_ref.to_string(),
+                            fields: HashMap::from([("v".to_string(), Value::integer(1))]),
+                            ..Default::default()
+                        })),
+                        ..Default::default()
+                    },
+                    Write {
+                        update_mask: Some(DocumentMask::default()),
+                        update_transforms: vec![
+                            FieldTransform {
+                                field_path:     "v".to_string(),
+                                transform_type: Some(TransformType::Increment(Value::integer(4))),
+                            },
+                            FieldTransform {
+                                field_path:     "ts".to_string(),
+                                transform_type: Some(TransformType::SetToServerValue(
+                                    ServerValue::RequestTime as i32,
+                                )),
+                            },
+                        ],
+                        operation: Some(write::Operation::Update(Document {
+                            name: doc_ref.to_string(),
+                            ..Default::default()
+                        })),
+                        ..Default::default()
+                    },
+                    Write {
+                        update_mask: Some(DocumentMask {
+                            field_paths: vec!["tag".to_string()],
+                        }),
+                        operation: Some(write::Operation::Update(Document {
+                            name: doc_ref.to_string(),
+                            fields: HashMap::from([("tag".to_string(), Value::string("done"))]),
+                            ..Default::default()
+                        })),
+                        ..Default::default()
+                    },
+                ],
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(results.len(), 3);
+        assert!(results[0].transform_results.is_empty());
+        assert_eq!(
+            results[1].transform_results,
+            vec![Value::integer(5), Value::timestamp(commit_ts)]
+        );
+        assert!(results[2].transform_results.is_empty());
+
+        let stored = db
+            .get_doc(&doc_ref, ReadConsistency::Default)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            stored.fields,
+            HashMap::from([
+                ("v".to_string(), Value::integer(5)),
+                ("ts".to_string(), Value::timestamp(commit_ts)),
+                ("tag".to_string(), Value::string("done")),
+            ])
+        );
+
+        // Cleared-database ordering: `write_with_version` validates before `is_cleared()`, whereas
+        // `commit_non_transactional` checks `is_cleared()` before validating writes.
+        project.clear_database(&root).await;
+        let invalid_write = Write {
+            operation: Some(write::Operation::Update(Document {
+                name: doc_ref.to_string(),
+                fields: HashMap::from([("__bad__".to_string(), Value::integer(1))]),
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+        assert!(matches!(
+            db.write(invalid_write.clone()).await,
+            Err(GenericDatabaseError::InvalidArgument(_))
+        ));
+        assert!(matches!(
+            db.commit(vec![invalid_write], None).await,
+            Err(GenericDatabaseError::Aborted(_))
+        ));
+    }
 }

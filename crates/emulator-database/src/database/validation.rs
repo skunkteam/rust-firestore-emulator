@@ -18,8 +18,97 @@ use googleapis::{
     },
 };
 
-use super::{field_path::FieldPath, reference};
+use super::{
+    document::DocumentPrecondition,
+    field_path::FieldPath,
+    reference::{self, DocumentRef, RootRef},
+};
 use crate::{GenericDatabaseError, error::Result, unimplemented_collection, unimplemented_option};
+
+#[derive(Debug)]
+pub(crate) struct ValidatedWrite {
+    pub(crate) doc_ref:      DocumentRef,
+    pub(crate) precondition: Option<DocumentPrecondition>,
+    pub(crate) operation:    ValidatedWriteOperation,
+}
+
+#[derive(Debug)]
+pub(crate) enum ValidatedWriteOperation {
+    Update {
+        fields: HashMap<String, Value>,
+        update_mask: Option<Vec<FieldPath>>,
+        update_transforms: Vec<ValidatedFieldTransform>,
+    },
+    Delete,
+}
+
+#[derive(Debug)]
+pub(crate) struct ValidatedFieldTransform {
+    pub(crate) field_path: FieldPath,
+    pub(crate) op: ValidatedTransformOp,
+}
+
+#[derive(Debug)]
+pub(crate) enum ValidatedTransformOp {
+    SetToRequestTime,
+    Increment(Value),
+    AppendMissingElements(Vec<Value>),
+    RemoveAllFromArray(Vec<Value>),
+    Maximum,
+    Minimum,
+}
+
+impl ValidatedWrite {
+    pub(crate) fn parse(write: Write, expected_root: &RootRef) -> Result<Self> {
+        let Some(operation) = write.operation else {
+            return Err(GenericDatabaseError::not_implemented(
+                "missing operation in write",
+            ));
+        };
+
+        let raw_name = match &operation {
+            write::Operation::Update(doc) => &doc.name,
+            write::Operation::Delete(name) => name,
+            write::Operation::Transform(trans) => &trans.document,
+        };
+        let doc_ref: DocumentRef = raw_name.parse()?;
+
+        super::ensure_owns_root(expected_root, &doc_ref.collection_ref.root_ref)?;
+
+        if let Some(precondition) = &write.current_document {
+            validate_precondition(precondition)?;
+        }
+        let precondition = write
+            .current_document
+            .and_then(|cd| cd.condition_type)
+            .map(Into::into);
+
+        let operation = match operation {
+            write::Operation::Update(doc) => {
+                validate_writable_fields(&doc.fields)?;
+                let update_mask = write.update_mask.map(parse_update_mask).transpose()?;
+                let update_transforms = parse_field_transforms(write.update_transforms)?;
+                ValidatedWriteOperation::Update {
+                    fields: doc.fields,
+                    update_mask,
+                    update_transforms,
+                }
+            }
+            write::Operation::Delete(_) => {
+                unimplemented_option!(write.update_mask);
+                unimplemented_collection!(write.update_transforms);
+                ValidatedWriteOperation::Delete
+            }
+            write::Operation::Transform(_) => crate::unimplemented!("transform"),
+        };
+
+        Ok(Self {
+            doc_ref,
+            precondition,
+            operation,
+        })
+    }
+}
 
 pub(crate) fn validate_geo_point(geo: &LatLng) -> Result<()> {
     if !geo.latitude.is_finite() || !(-90.0..=90.0).contains(&geo.latitude) {
@@ -55,6 +144,19 @@ pub(crate) fn validate_timestamp(ts: &Timestamp) -> Result<()> {
     Ok(())
 }
 
+/// Validates all field names and values in a document map before storage.
+///
+/// # Invariant (Compositional Checks Only)
+/// Every check performed here and in [`validate_writable_value`] is purely compositional over
+/// individual keys and values—validity of a merged map follows from validity of the existing stored
+/// fields, the incoming update fields, and non-reserved [`FieldPath`] segments. Consequently,
+/// `stage_write` skips re-validating the merged document when `update_transforms` is empty (guarded
+/// by a `debug_assert!` in debug/test builds).
+///
+/// **WARNING**: If you add any non-compositional document-wide invariant here (such as Cloud
+/// Firestore's 1 MiB total document size limit or 20-level nested map depth limit, which can be
+/// violated by combining valid existing fields with valid masked updates), you MUST restore
+/// unconditional post-merge validation in `commit.rs::FirestoreDatabase::stage_write`.
 pub(crate) fn validate_writable_fields(fields: &HashMap<String, Value>) -> Result<()> {
     for (key, value) in fields {
         if key.is_empty() {
@@ -121,26 +223,30 @@ pub(crate) fn validate_writable_value(value: &Value, in_array: bool) -> Result<(
     }
 }
 
-pub(crate) fn validate_update_mask(mask: &DocumentMask) -> Result<()> {
-    for raw_path in &mask.field_paths {
-        let path: FieldPath = raw_path.parse()?;
-        path.validate_non_reserved()?;
-    }
-    Ok(())
+fn parse_update_mask(mask: DocumentMask) -> Result<Vec<FieldPath>> {
+    mask.field_paths
+        .into_iter()
+        .map(|raw_path| {
+            let path: FieldPath = raw_path.parse()?;
+            path.validate_non_reserved()?;
+            Ok(path)
+        })
+        .collect()
 }
 
-pub(crate) fn validate_field_transforms(transforms: &[FieldTransform]) -> Result<()> {
+fn parse_field_transforms(transforms: Vec<FieldTransform>) -> Result<Vec<ValidatedFieldTransform>> {
+    let mut parsed = Vec::with_capacity(transforms.len());
     for tf in transforms {
-        let path: FieldPath = tf.field_path.parse()?;
-        path.validate_non_reserved()?;
-        let Some(transform_type) = &tf.transform_type else {
+        let field_path: FieldPath = tf.field_path.parse()?;
+        field_path.validate_non_reserved()?;
+        let Some(transform_type) = tf.transform_type else {
             return Err(GenericDatabaseError::invalid_argument(
                 "empty transform_type in field_transform",
             ));
         };
-        match transform_type {
-            TransformType::SetToServerValue(code) => match ServerValue::try_from(*code) {
-                Ok(ServerValue::RequestTime) => {}
+        let op = match transform_type {
+            TransformType::SetToServerValue(code) => match ServerValue::try_from(code) {
+                Ok(ServerValue::RequestTime) => ValidatedTransformOp::SetToRequestTime,
                 Ok(ServerValue::Unspecified) => {
                     return Err(GenericDatabaseError::invalid_argument(
                         "ServerValue type must be specified for set_to_server_value \
@@ -153,25 +259,39 @@ pub(crate) fn validate_field_transforms(transforms: &[FieldTransform]) -> Result
                     )));
                 }
             },
-            TransformType::AppendMissingElements(arr) | TransformType::RemoveAllFromArray(arr) => {
+            TransformType::AppendMissingElements(arr) => {
                 for item in &arr.values {
                     validate_writable_value(item, true)?;
                 }
+                ValidatedTransformOp::AppendMissingElements(arr.values)
+            }
+            TransformType::RemoveAllFromArray(arr) => {
+                for item in &arr.values {
+                    validate_writable_value(item, true)?;
+                }
+                ValidatedTransformOp::RemoveAllFromArray(arr.values)
             }
             TransformType::Increment(v) => {
-                validate_writable_value(v, false)?;
+                validate_writable_value(&v, false)?;
                 if !v.is_number() {
                     return Err(GenericDatabaseError::invalid_argument(
                         "increment value must be an integer or double",
                     ));
                 }
+                ValidatedTransformOp::Increment(v)
             }
-            TransformType::Maximum(v) | TransformType::Minimum(v) => {
-                validate_writable_value(v, false)?;
+            TransformType::Maximum(v) => {
+                validate_writable_value(&v, false)?;
+                ValidatedTransformOp::Maximum
             }
-        }
+            TransformType::Minimum(v) => {
+                validate_writable_value(&v, false)?;
+                ValidatedTransformOp::Minimum
+            }
+        };
+        parsed.push(ValidatedFieldTransform { field_path, op });
     }
-    Ok(())
+    Ok(parsed)
 }
 
 pub(crate) fn validate_precondition(precondition: &Precondition) -> Result<()> {
@@ -190,33 +310,6 @@ pub(crate) fn validate_precondition(precondition: &Precondition) -> Result<()> {
         }
     }
     Ok(())
-}
-
-pub(crate) fn validate_write(write: &Write) -> Result<()> {
-    let Some(operation) = &write.operation else {
-        return Err(GenericDatabaseError::not_implemented(
-            "missing operation in write",
-        ));
-    };
-    if let Some(precondition) = &write.current_document {
-        validate_precondition(precondition)?;
-    }
-    match operation {
-        write::Operation::Update(doc) => {
-            validate_writable_fields(&doc.fields)?;
-            if let Some(mask) = &write.update_mask {
-                validate_update_mask(mask)?;
-            }
-            validate_field_transforms(&write.update_transforms)?;
-            Ok(())
-        }
-        write::Operation::Delete(_) => {
-            unimplemented_option!(write.update_mask);
-            unimplemented_collection!(write.update_transforms);
-            Ok(())
-        }
-        write::Operation::Transform(_) => crate::unimplemented!("transform"),
-    }
 }
 
 #[cfg(test)]
@@ -441,17 +534,21 @@ mod tests {
         );
     }
 
+    fn test_root() -> RootRef {
+        "projects/p/databases/(default)".parse().unwrap()
+    }
+
     #[gtest]
-    fn validates_update_mask_and_field_transforms() {
+    fn parses_update_mask_and_field_transforms() {
         for bad_path in ["__name__", "`__name__`", "emb.__type__", "a..b"] {
             assert_that!(
-                validate_update_mask(&DocumentMask {
+                parse_update_mask(DocumentMask {
                     field_paths: vec![bad_path.to_string()],
                 }),
                 err(matches_pattern!(GenericDatabaseError::InvalidArgument(_)))
             );
             assert_that!(
-                validate_field_transforms(&[FieldTransform {
+                parse_field_transforms(vec![FieldTransform {
                     field_path:     bad_path.to_string(),
                     transform_type: Some(TransformType::SetToServerValue(
                         ServerValue::RequestTime as i32
@@ -462,7 +559,7 @@ mod tests {
         }
 
         assert_that!(
-            validate_field_transforms(&[FieldTransform {
+            parse_field_transforms(vec![FieldTransform {
                 field_path:     "ts".to_string(),
                 transform_type: None,
             }]),
@@ -487,7 +584,7 @@ mod tests {
             TransformType::Minimum(invalid_vec),
         ] {
             assert_that!(
-                validate_field_transforms(&[FieldTransform {
+                parse_field_transforms(vec![FieldTransform {
                     field_path:     "f".to_string(),
                     transform_type: Some(tf_type),
                 }]),
@@ -497,26 +594,41 @@ mod tests {
             );
         }
 
-        // Valid SetToServerValue, Maximum, Minimum with valid operands succeed validation.
-        assert_that!(
-            validate_field_transforms(&[
-                FieldTransform {
-                    field_path:     "ts".to_string(),
-                    transform_type: Some(TransformType::SetToServerValue(
-                        ServerValue::RequestTime as i32
-                    )),
+        // Valid SetToServerValue, Maximum, Minimum with valid operands succeed pre-lock parsing.
+        let parsed = parse_field_transforms(vec![
+            FieldTransform {
+                field_path:     "ts".to_string(),
+                transform_type: Some(TransformType::SetToServerValue(
+                    ServerValue::RequestTime as i32,
+                )),
+            },
+            FieldTransform {
+                field_path:     "hi".to_string(),
+                transform_type: Some(TransformType::Maximum(Value::integer(1))),
+            },
+            FieldTransform {
+                field_path:     "lo".to_string(),
+                transform_type: Some(TransformType::Minimum(Value::integer(0))),
+            },
+        ])
+        .unwrap();
+        assert!(matches!(
+            parsed.as_slice(),
+            [
+                ValidatedFieldTransform {
+                    op: ValidatedTransformOp::SetToRequestTime,
+                    ..
                 },
-                FieldTransform {
-                    field_path:     "hi".to_string(),
-                    transform_type: Some(TransformType::Maximum(Value::integer(1))),
+                ValidatedFieldTransform {
+                    op: ValidatedTransformOp::Maximum,
+                    ..
                 },
-                FieldTransform {
-                    field_path:     "lo".to_string(),
-                    transform_type: Some(TransformType::Minimum(Value::integer(0))),
+                ValidatedFieldTransform {
+                    op: ValidatedTransformOp::Minimum,
+                    ..
                 },
-            ]),
-            ok(())
-        );
+            ]
+        ));
 
         // Non-numeric Increment operands are rejected with InvalidArgument.
         for non_numeric in [
@@ -527,7 +639,7 @@ mod tests {
             Value::map(HashMap::from([("k".to_string(), Value::integer(1))])),
         ] {
             assert_that!(
-                validate_field_transforms(&[FieldTransform {
+                parse_field_transforms(vec![FieldTransform {
                     field_path:     "cnt".to_string(),
                     transform_type: Some(TransformType::Increment(non_numeric)),
                 }]),
@@ -545,77 +657,461 @@ mod tests {
             Value::double(f64::INFINITY),
         ] {
             assert_that!(
-                validate_field_transforms(&[FieldTransform {
+                parse_field_transforms(vec![FieldTransform {
                     field_path:     "cnt".to_string(),
                     transform_type: Some(TransformType::Increment(numeric)),
                 }]),
-                ok(())
+                ok(anything())
             );
         }
     }
 
     #[gtest]
-    fn validate_write_preserves_none_delete_and_transform_errors() {
+    fn validated_write_parse_preserves_none_delete_and_transform_errors() {
+        let root = test_root();
+        let valid_doc = "projects/p/databases/(default)/documents/c/d".to_string();
+
         assert_that!(
-            validate_write(&Write::default()),
+            ValidatedWrite::parse(Write::default(), &root),
             err(eq(&GenericDatabaseError::not_implemented(
                 "missing operation in write"
             )))
         );
 
-        assert_that!(
-            validate_write(&Write {
-                operation: Some(write::Operation::Delete(
-                    "projects/p/databases/(default)/documents/c/d".to_string()
-                )),
+        let deleted = ValidatedWrite::parse(
+            Write {
+                operation: Some(write::Operation::Delete(valid_doc.clone())),
                 ..Default::default()
-            }),
-            ok(())
-        );
+            },
+            &root,
+        )
+        .unwrap();
+        assert!(matches!(deleted.operation, ValidatedWriteOperation::Delete));
 
         assert_that!(
-            validate_write(&Write {
-                update_mask: Some(DocumentMask {
-                    field_paths: vec!["a".to_string()],
-                }),
-                operation: Some(write::Operation::Delete(
-                    "projects/p/databases/(default)/documents/c/d".to_string()
-                )),
-                ..Default::default()
-            }),
+            ValidatedWrite::parse(
+                Write {
+                    update_mask: Some(DocumentMask {
+                        field_paths: vec!["a".to_string()],
+                    }),
+                    operation: Some(write::Operation::Delete(valid_doc.clone())),
+                    ..Default::default()
+                },
+                &root,
+            ),
             err(matches_pattern!(GenericDatabaseError::NotImplemented(_)))
         );
 
         assert_that!(
-            validate_write(&Write {
-                update_transforms: vec![FieldTransform::default()],
-                operation: Some(write::Operation::Delete(
-                    "projects/p/databases/(default)/documents/c/d".to_string()
-                )),
-                ..Default::default()
-            }),
+            ValidatedWrite::parse(
+                Write {
+                    update_transforms: vec![FieldTransform::default()],
+                    operation: Some(write::Operation::Delete(valid_doc.clone())),
+                    ..Default::default()
+                },
+                &root,
+            ),
             err(matches_pattern!(GenericDatabaseError::NotImplemented(_)))
         );
 
+        // `DocumentTransform::default()` has an empty `document` path, so step (b)
+        // `DocumentRef::from_str` triggers `InvalidReference` before step (e) `NotImplemented`;
+        // a valid owned `DocumentTransform` path triggers `NotImplemented`.
         assert_that!(
-            validate_write(&Write {
-                operation: Some(write::Operation::Transform(DocumentTransform::default())),
-                ..Default::default()
-            }),
+            ValidatedWrite::parse(
+                Write {
+                    operation: Some(write::Operation::Transform(DocumentTransform::default())),
+                    ..Default::default()
+                },
+                &root,
+            ),
+            err(matches_pattern!(GenericDatabaseError::InvalidReference(
+                _,
+                _
+            )))
+        );
+        assert_that!(
+            ValidatedWrite::parse(
+                Write {
+                    operation: Some(write::Operation::Transform(DocumentTransform {
+                        document: valid_doc.clone(),
+                        ..Default::default()
+                    })),
+                    ..Default::default()
+                },
+                &root,
+            ),
             err(matches_pattern!(GenericDatabaseError::NotImplemented(_)))
         );
 
-        assert_that!(
-            validate_write(&Write {
+        let updated = ValidatedWrite::parse(
+            Write {
                 operation: Some(write::Operation::Update(Document {
-                    name: "projects/p/databases/(default)/documents/c/d".to_string(),
+                    name: valid_doc,
                     fields: HashMap::from([("emb".to_string(), Value::vector([1.0, 2.0]))]),
                     ..Default::default()
                 })),
                 ..Default::default()
-            }),
-            ok(())
+            },
+            &root,
+        )
+        .unwrap();
+        assert!(matches!(
+            updated.operation,
+            ValidatedWriteOperation::Update { .. }
+        ));
+    }
+
+    #[gtest]
+    fn validated_write_parse_preserves_five_step_validation_precedence() {
+        let root = test_root();
+        let valid_doc = "projects/p/databases/(default)/documents/c/d".to_string();
+        let foreign_doc = "projects/other/databases/(default)/documents/c/d".to_string();
+        let bad_precondition = Precondition {
+            condition_type: Some(precondition::ConditionType::UpdateTime(Timestamp {
+                seconds: -1,
+                nanos:   0,
+            })),
+        };
+        let bad_fields = HashMap::from([("__bad__".to_string(), Value::integer(1))]);
+        let bad_mask = DocumentMask {
+            field_paths: vec!["__name__".to_string()],
+        };
+        let bad_transforms = vec![FieldTransform {
+            field_path:     "cnt".to_string(),
+            transform_type: Some(TransformType::Increment(Value::string("bad"))),
+        }];
+
+        // Step (a): `operation: None` precedes invalid precondition/mask/transforms.
+        assert_that!(
+            ValidatedWrite::parse(
+                Write {
+                    current_document: Some(bad_precondition),
+                    update_mask: Some(bad_mask.clone()),
+                    update_transforms: bad_transforms.clone(),
+                    operation: None,
+                },
+                &root,
+            ),
+            err(eq(&GenericDatabaseError::not_implemented(
+                "missing operation in write"
+            )))
         );
+
+        // Step (b): Invalid `DocumentRef` precedes ownership, precondition, and op checks.
+        assert_that!(
+            ValidatedWrite::parse(
+                Write {
+                    current_document: Some(bad_precondition),
+                    update_mask: Some(bad_mask.clone()),
+                    update_transforms: bad_transforms.clone(),
+                    operation: Some(write::Operation::Update(Document {
+                        name: "projects/p/databases/(default)/documents/only_col".to_string(),
+                        fields: bad_fields.clone(),
+                        ..Default::default()
+                    })),
+                },
+                &root,
+            ),
+            err(matches_pattern!(GenericDatabaseError::InvalidReference(
+                _,
+                _
+            )))
+        );
+
+        // Step (c): `ensure_owns_doc` precedes precondition and op-specific validation.
+        let ownership_err = ValidatedWrite::parse(
+            Write {
+                current_document: Some(bad_precondition),
+                update_mask: Some(bad_mask.clone()),
+                update_transforms: bad_transforms.clone(),
+                operation: Some(write::Operation::Update(Document {
+                    name: foreign_doc,
+                    fields: bad_fields.clone(),
+                    ..Default::default()
+                })),
+            },
+            &root,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(ownership_err, GenericDatabaseError::InvalidArgument(ref m) if m.contains("does not match database")),
+            "expected root ownership error, got {ownership_err:?}"
+        );
+
+        // Step (d): `validate_precondition` precedes op-specific checks (Update, Delete,
+        // Transform).
+        for bad_pre_write in [
+            Write {
+                current_document: Some(bad_precondition),
+                update_mask: Some(bad_mask.clone()),
+                update_transforms: bad_transforms.clone(),
+                operation: Some(write::Operation::Update(Document {
+                    name: valid_doc.clone(),
+                    fields: bad_fields.clone(),
+                    ..Default::default()
+                })),
+            },
+            Write {
+                current_document: Some(bad_precondition),
+                update_mask: Some(DocumentMask::default()),
+                update_transforms: bad_transforms.clone(),
+                operation: Some(write::Operation::Delete(valid_doc.clone())),
+            },
+            Write {
+                current_document: Some(bad_precondition),
+                operation: Some(write::Operation::Transform(DocumentTransform {
+                    document: valid_doc.clone(),
+                    ..Default::default()
+                })),
+                ..Default::default()
+            },
+        ] {
+            let pre_err = ValidatedWrite::parse(bad_pre_write, &root).unwrap_err();
+            assert!(
+                matches!(pre_err, GenericDatabaseError::InvalidArgument(ref m) if m.contains("epoch")),
+                "expected precondition timestamp error, got {pre_err:?}"
+            );
+        }
+
+        // Step (e) Update: `fields` -> `update_mask` -> `update_transforms`.
+        assert_that!(
+            ValidatedWrite::parse(
+                Write {
+                    update_mask: Some(bad_mask.clone()),
+                    update_transforms: bad_transforms.clone(),
+                    operation: Some(write::Operation::Update(Document {
+                        name: valid_doc.clone(),
+                        fields: bad_fields,
+                        ..Default::default()
+                    })),
+                    ..Default::default()
+                },
+                &root,
+            ),
+            err(eq(&GenericDatabaseError::invalid_argument(
+                "the name __bad__ is reserved"
+            )))
+        );
+        assert_that!(
+            ValidatedWrite::parse(
+                Write {
+                    update_mask: Some(bad_mask),
+                    update_transforms: bad_transforms.clone(),
+                    operation: Some(write::Operation::Update(Document {
+                        name: valid_doc.clone(),
+                        fields: HashMap::from([("ok".to_string(), Value::integer(1))]),
+                        ..Default::default()
+                    })),
+                    ..Default::default()
+                },
+                &root,
+            ),
+            err(eq(&GenericDatabaseError::invalid_argument(
+                "the name __name__ is reserved"
+            )))
+        );
+        assert_that!(
+            ValidatedWrite::parse(
+                Write {
+                    update_mask: Some(DocumentMask {
+                        field_paths: vec!["ok".to_string()],
+                    }),
+                    update_transforms: bad_transforms,
+                    operation: Some(write::Operation::Update(Document {
+                        name: valid_doc.clone(),
+                        fields: HashMap::from([("ok".to_string(), Value::integer(1))]),
+                        ..Default::default()
+                    })),
+                    ..Default::default()
+                },
+                &root,
+            ),
+            err(eq(&GenericDatabaseError::invalid_argument(
+                "increment value must be an integer or double"
+            )))
+        );
+
+        // Step (e) Delete: `update_mask` precedes `update_transforms`.
+        let del_mask_err = ValidatedWrite::parse(
+            Write {
+                update_mask: Some(DocumentMask::default()),
+                update_transforms: vec![FieldTransform::default()],
+                operation: Some(write::Operation::Delete(valid_doc.clone())),
+                ..Default::default()
+            },
+            &root,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(del_mask_err, GenericDatabaseError::NotImplemented(ref m) if m.contains("update_mask")),
+            "expected update_mask error before update_transforms, got {del_mask_err:?}"
+        );
+        let del_tf_err = ValidatedWrite::parse(
+            Write {
+                update_mask: None,
+                update_transforms: vec![FieldTransform::default()],
+                operation: Some(write::Operation::Delete(valid_doc)),
+                ..Default::default()
+            },
+            &root,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(del_tf_err, GenericDatabaseError::NotImplemented(ref m) if m.contains("update_transforms")),
+            "expected update_transforms error, got {del_tf_err:?}"
+        );
+    }
+
+    #[gtest]
+    fn validated_write_distinguishes_empty_mask_from_none_and_prevalidates_max_min() {
+        let root = test_root();
+        let valid_doc = "projects/p/databases/(default)/documents/c/d".to_string();
+
+        // `update_mask: Some([])` MUST remain `Some(vec![])`, distinct from `None`.
+        let empty_mask_write = ValidatedWrite::parse(
+            Write {
+                update_mask: Some(DocumentMask {
+                    field_paths: vec![],
+                }),
+                update_transforms: vec![FieldTransform {
+                    field_path:     "ts".to_string(),
+                    transform_type: Some(TransformType::SetToServerValue(
+                        ServerValue::RequestTime as i32,
+                    )),
+                }],
+                operation: Some(write::Operation::Update(Document {
+                    name: valid_doc.clone(),
+                    ..Default::default()
+                })),
+                ..Default::default()
+            },
+            &root,
+        )
+        .unwrap();
+        assert!(matches!(
+            empty_mask_write.operation,
+            ValidatedWriteOperation::Update {
+                update_mask: Some(ref mask),
+                ..
+            } if mask.is_empty()
+        ));
+
+        let no_mask_write = ValidatedWrite::parse(
+            Write {
+                update_mask: None,
+                update_transforms: vec![FieldTransform {
+                    field_path:     "ts".to_string(),
+                    transform_type: Some(TransformType::SetToServerValue(
+                        ServerValue::RequestTime as i32,
+                    )),
+                }],
+                operation: Some(write::Operation::Update(Document {
+                    name: valid_doc.clone(),
+                    ..Default::default()
+                })),
+                ..Default::default()
+            },
+            &root,
+        )
+        .unwrap();
+        assert!(matches!(
+            no_mask_write.operation,
+            ValidatedWriteOperation::Update {
+                update_mask: None,
+                ..
+            }
+        ));
+
+        // Overlapping / repeated mask paths preserve exact order and multiplicity.
+        let repeated_mask_write = ValidatedWrite::parse(
+            Write {
+                update_mask: Some(DocumentMask {
+                    field_paths: vec!["a".to_string(), "a.b".to_string(), "a".to_string()],
+                }),
+                operation: Some(write::Operation::Update(Document {
+                    name: valid_doc.clone(),
+                    ..Default::default()
+                })),
+                ..Default::default()
+            },
+            &root,
+        )
+        .unwrap();
+        assert_eq!(
+            match repeated_mask_write.operation {
+                ValidatedWriteOperation::Update {
+                    update_mask: Some(mask),
+                    ..
+                } => mask,
+                _ => panic!("expected Update with mask"),
+            },
+            vec![
+                "a".parse::<FieldPath>().unwrap(),
+                "a.b".parse::<FieldPath>().unwrap(),
+                "a".parse::<FieldPath>().unwrap(),
+            ]
+        );
+
+        // `Maximum` / `Minimum` with invalid operand fail pre-lock with `InvalidArgument`,
+        // while valid operands parse to `ValidatedTransformOp::{Maximum, Minimum}`.
+        for bad_tf in [
+            TransformType::Maximum(Value::default()),
+            TransformType::Minimum(Value::default()),
+        ] {
+            assert_that!(
+                ValidatedWrite::parse(
+                    Write {
+                        update_transforms: vec![FieldTransform {
+                            field_path:     "m".to_string(),
+                            transform_type: Some(bad_tf),
+                        }],
+                        operation: Some(write::Operation::Update(Document {
+                            name: valid_doc.clone(),
+                            ..Default::default()
+                        })),
+                        ..Default::default()
+                    },
+                    &root,
+                ),
+                err(matches_pattern!(GenericDatabaseError::InvalidArgument(_)))
+            );
+        }
+
+        let valid_max_min = ValidatedWrite::parse(
+            Write {
+                update_transforms: vec![
+                    FieldTransform {
+                        field_path:     "hi".to_string(),
+                        transform_type: Some(TransformType::Maximum(Value::integer(10))),
+                    },
+                    FieldTransform {
+                        field_path:     "lo".to_string(),
+                        transform_type: Some(TransformType::Minimum(Value::integer(1))),
+                    },
+                ],
+                operation: Some(write::Operation::Update(Document {
+                    name: valid_doc,
+                    ..Default::default()
+                })),
+                ..Default::default()
+            },
+            &root,
+        )
+        .unwrap();
+        assert!(matches!(
+            valid_max_min.operation,
+            ValidatedWriteOperation::Update {
+                ref update_transforms,
+                ..
+            } if matches!(
+                update_transforms.as_slice(),
+                [
+                    ValidatedFieldTransform { op: ValidatedTransformOp::Maximum, .. },
+                    ValidatedFieldTransform { op: ValidatedTransformOp::Minimum, .. },
+                ]
+            )
+        ));
     }
 
     #[gtest]
@@ -646,9 +1142,10 @@ mod tests {
 
     #[gtest]
     fn rejects_unspecified_or_unknown_server_value_and_invalid_precondition_timestamps() {
+        let root = test_root();
         for bad_sv in [ServerValue::Unspecified as i32, 999] {
             assert_that!(
-                validate_field_transforms(&[FieldTransform {
+                parse_field_transforms(vec![FieldTransform {
                     field_path:     "ts".to_string(),
                     transform_type: Some(TransformType::SetToServerValue(bad_sv)),
                 }]),
@@ -691,13 +1188,16 @@ mod tests {
                 err(matches_pattern!(GenericDatabaseError::InvalidArgument(_)))
             );
             assert_that!(
-                validate_write(&Write {
-                    current_document: Some(pre),
-                    operation: Some(write::Operation::Delete(
-                        "projects/p/databases/(default)/documents/c/d".to_string(),
-                    )),
-                    ..Default::default()
-                }),
+                ValidatedWrite::parse(
+                    Write {
+                        current_document: Some(pre),
+                        operation: Some(write::Operation::Delete(
+                            "projects/p/databases/(default)/documents/c/d".to_string(),
+                        )),
+                        ..Default::default()
+                    },
+                    &root,
+                ),
                 err(matches_pattern!(GenericDatabaseError::InvalidArgument(_)))
             );
         }

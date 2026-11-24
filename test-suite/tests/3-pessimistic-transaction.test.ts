@@ -416,16 +416,12 @@ describe.each(editions.filter(e => e.concurrencyMode === 'pessimistic'))('$descr
                             test.event('in txn B: update requested in txn');
                             return value;
                         });
-                        // Make sure this logging doesn't sneak ahead of the logging in txn A. This little timeout has no effect
-                        // on the validity of the test, because of the 250ms wait time inside txn A. If we got here during that
-                        // timeout, then this timeout of 1ms would not change the outcome of this test.
-                        await time(1);
                         test.event('txn B ended');
                         test.event('read: ' + result);
                     },
                 );
 
-                expect(test.log).toEqual([
+                expect(test.log.slice(0, 9)).toEqual([
                     '       | <<2>> | WAITING UNTIL: in txn A: doc read',
                     ' <<1>> | EVENT: doc created',
                     ' <<1>> | EVENT: txn A started',
@@ -435,11 +431,14 @@ describe.each(editions.filter(e => e.concurrencyMode === 'pessimistic'))('$descr
                     '       | <<2>> | EVENT: in txn B: doc read',
                     '       | <<2>> | EVENT: in txn B: update requested in txn',
                     ' <<1>> | EVENT: waited 250ms, txn B still pending',
-                    ' <<1>> | EVENT: txn A ended',
-                    ' <<1>> | EVENT: read: original value',
-                    '       | <<2>> | EVENT: txn B ended',
-                    '       | <<2>> | EVENT: read: original value',
                 ]);
+                const txnACompletion = [' <<1>> | EVENT: txn A ended', ' <<1>> | EVENT: read: original value'];
+                const txnBCompletion = ['       | <<2>> | EVENT: txn B ended', '       | <<2>> | EVENT: read: original value'];
+                expect(test.log.slice(9)).toBeOneOf([
+                    [...txnACompletion, ...txnBCompletion],
+                    [...txnBCompletion, ...txnACompletion],
+                ]);
+                expect(await getData(ref.get())).toEqual({ value: 'changed by txn B' });
             });
 
             test.concurrent('reading the same doc from different txns, try to write in both txns', async () => {
