@@ -1,4 +1,10 @@
-use std::{sync::Arc, time::Duration};
+use std::{
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::Duration,
+};
 
 use emulator_database::{query::QueryBuilder, read_consistency::ReadConsistency, reference::Ref};
 use googleapis::{
@@ -12,6 +18,7 @@ use googleapis::{
         },
         protobuf::Timestamp,
     },
+    val,
 };
 use googletest::prelude::*;
 use http::{Method, StatusCode};
@@ -2149,4 +2156,202 @@ async fn high_volume_abandoned_ro_transactions_gc_without_evicting_rw_tombstones
     let retried_expired = db.begin_retry_rw_txn(&expired_rw_id).await.unwrap();
     expect_ne!(retried_expired.id(), expired_rw_id.as_slice());
     retried_expired.rollback().await.unwrap();
+}
+
+#[gtest]
+#[tokio::test]
+async fn execute_pipeline_execution_time_matches_snapshot_for_read_time_txns_and_empty_results() {
+    let mut db = TestEnv::enterprise().build_db();
+
+    let v1 = db
+        .put("docs/d1", fields!({ "ver": 1i64 }))
+        .await
+        .unwrap()
+        .update_time
+        .unwrap();
+    let v2 = db
+        .put("docs/d1", fields!({ "ver": 2i64 }))
+        .await
+        .unwrap()
+        .update_time
+        .unwrap();
+    let v3 = db
+        .put("docs/d2", fields!({ "ver": 20i64 }))
+        .await
+        .unwrap()
+        .update_time
+        .unwrap();
+
+    // 1. ReadTime(t): historical snapshots, epoch empty, filtered-to-empty, and invalid future time
+    let pipe_v1 = db
+        .pipeline_at_time(PipelineSpec::collection("docs").sort_asc("__name__"), v1)
+        .await
+        .unwrap();
+    expect_eq!(pipe_v1.execution_time, Some(v1));
+    expect_eq!(short_ids(&pipe_v1.results), vec!["d1"]);
+    expect_eq!(pipe_v1.results[0].fields["ver"].as_integer(), Some(1));
+
+    let pipe_v2 = db
+        .pipeline_at_time(PipelineSpec::collection("docs").sort_asc("__name__"), v2)
+        .await
+        .unwrap();
+    expect_eq!(pipe_v2.execution_time, Some(v2));
+    expect_eq!(short_ids(&pipe_v2.results), vec!["d1"]);
+    expect_eq!(pipe_v2.results[0].fields["ver"].as_integer(), Some(2));
+
+    let epoch = Timestamp {
+        seconds: 0,
+        nanos:   0,
+    };
+    let pipe_epoch = db
+        .pipeline_at_time(PipelineSpec::collection("docs"), epoch)
+        .await
+        .unwrap();
+    expect_eq!(pipe_epoch.execution_time, Some(epoch));
+    expect_that!(pipe_epoch.results, is_empty());
+
+    let pipe_v3_empty = db
+        .pipeline_at_time(PipelineSpec::collection("docs").where_expr(val!(false)), v3)
+        .await
+        .unwrap();
+    expect_eq!(pipe_v3_empty.execution_time, Some(v3));
+    expect_that!(pipe_v3_empty.results, is_empty());
+
+    let future = Timestamp {
+        seconds: Timestamp::now().seconds + 60,
+        nanos:   0,
+    };
+    assert_status_code(
+        db.pipeline_at_time(PipelineSpec::collection("docs"), future)
+            .await,
+        Code::InvalidArgument,
+    );
+
+    // 2. Explicit ReadOnly transaction preserves pinned execution_time across writes & empty
+    //    results
+    let mut ro = db.begin_ro_txn(Some(v2)).await.unwrap();
+    let ro_pipe = ro
+        .pipeline(PipelineSpec::collection("docs").sort_asc("__name__"))
+        .await
+        .unwrap();
+    expect_eq!(ro_pipe.execution_time, Some(v2));
+    expect_eq!(short_ids(&ro_pipe.results), vec!["d1"]);
+    let ro_empty = ro
+        .pipeline(PipelineSpec::collection("docs").where_expr(val!(false)))
+        .await
+        .unwrap();
+    expect_eq!(ro_empty.execution_time, Some(v2));
+    expect_that!(ro_empty.results, is_empty());
+    ro.rollback().await.unwrap();
+
+    // 3. Optimistic RW transaction pins snapshot execution_time despite concurrent writes
+    let mut opt = db.begin_rw_txn().await.unwrap();
+    let opt_first = opt
+        .pipeline(PipelineSpec::collection("docs").sort_asc("__name__"))
+        .await
+        .unwrap();
+    let opt_ts = opt_first.execution_time.expect("execution_time");
+    expect_eq!(short_ids(&opt_first.results), vec!["d1", "d2"]);
+
+    let concurrent_write_ts = db
+        .put("docs/d1", fields!({ "ver": 99i64 }))
+        .await
+        .unwrap()
+        .update_time
+        .unwrap();
+    expect_lt!(opt_ts, concurrent_write_ts);
+
+    let opt_second = opt
+        .pipeline(PipelineSpec::collection("docs").sort_asc("__name__"))
+        .await
+        .unwrap();
+    expect_eq!(opt_second.execution_time, Some(opt_ts));
+    expect_eq!(opt_second.results[0].fields["ver"].as_integer(), Some(2));
+
+    let opt_empty = opt
+        .pipeline(PipelineSpec::collection("docs").where_expr(val!(false)))
+        .await
+        .unwrap();
+    expect_eq!(opt_empty.execution_time, Some(opt_ts));
+    expect_that!(opt_empty.results, is_empty());
+    opt.rollback().await.unwrap();
+
+    // 4. Empty collection & filtered-to-empty under ReadConsistency::Default emit valid snapshot
+    //    timestamps strictly ordered before subsequent writes
+    let empty_col = db
+        .pipeline(PipelineSpec::collection("never_created"))
+        .await
+        .unwrap();
+    expect_that!(empty_col.results, is_empty());
+    let empty_ts = empty_col.execution_time.expect("execution_time");
+    expect_gt!(empty_ts, concurrent_write_ts);
+
+    let filtered_empty = db
+        .pipeline(PipelineSpec::collection("docs").where_expr(val!(false)))
+        .await
+        .unwrap();
+    expect_that!(filtered_empty.results, is_empty());
+    let filtered_ts = filtered_empty.execution_time.expect("execution_time");
+    expect_gt!(filtered_ts, empty_ts);
+
+    let after_ts = db
+        .put("docs/d3", fields!({ "ver": 100i64 }))
+        .await
+        .unwrap()
+        .update_time
+        .unwrap();
+    expect_lt!(filtered_ts, after_ts);
+}
+
+#[gtest]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn execute_pipeline_default_consistency_execution_time_matches_mvcc_snapshot_during_concurrent_writes()
+ {
+    let mut db = TestEnv::enterprise().build_db();
+    db.put("race/d1", fields!({ "v": 0i64 })).await.unwrap();
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let writer_stop = Arc::clone(&stop);
+    let mut writer_db = db.clone();
+    let writer = tokio::spawn(async move {
+        let mut seq = 1i64;
+        while !writer_stop.load(Ordering::Relaxed) && seq <= 10_000 {
+            writer_db
+                .put("race/d1", fields!({ "v": seq }))
+                .await
+                .unwrap();
+            seq += 1;
+            if seq % 8 == 0 {
+                tokio::task::yield_now().await;
+            }
+        }
+    });
+
+    for idx in 0..40 {
+        let pipe = db.pipeline(PipelineSpec::collection("race")).await.unwrap();
+        let exec_ts = pipe.execution_time.expect("execution_time must be present");
+        expect_eq!(pipe.results.len(), 1);
+        let pipe_doc = &pipe.results[0];
+        expect_le!(pipe_doc.update_time.unwrap(), exec_ts);
+
+        let snap = db
+            .query_at_time(QuerySpec::collection("race"), exec_ts)
+            .await
+            .unwrap();
+        expect_eq!(snap.documents.len(), 1);
+        expect_eq!(snap.documents[0].fields, pipe_doc.fields);
+        expect_eq!(snap.documents[0].update_time, pipe_doc.update_time);
+
+        if idx % 4 == 0 {
+            let empty_pipe = db
+                .pipeline(PipelineSpec::collection("race").where_expr(val!(false)))
+                .await
+                .unwrap();
+            expect_that!(empty_pipe.results, is_empty());
+            expect_that!(empty_pipe.execution_time, some(anything()));
+        }
+    }
+
+    stop.store(true, Ordering::Relaxed);
+    writer.await.unwrap();
 }

@@ -4,8 +4,10 @@ version = { workspace = true }
 edition = "2024"
 
 [dependencies]
+base64 = { workspace = true }
 googleapis = { workspace = true }
 itertools = { workspace = true }
+prost = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 string_cache = { workspace = true }
 thiserror = { workspace = true }

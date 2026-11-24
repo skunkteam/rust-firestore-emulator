@@ -1,6 +1,15 @@
 import { CollectionReference, DocumentData, FieldPath, FieldValue, GeoPoint, Timestamp } from '@google-cloud/firestore';
 import * as p from '@google-cloud/firestore/pipelines';
-import { callRawStreamRpc, editions, expectCloudLimitationCanary, expectRpcCode, notImplementedInRust, writeData } from './utils';
+import {
+    callRawStreamRpc,
+    ConcurrentTest,
+    editions,
+    expectCloudLimitationCanary,
+    expectRpcCode,
+    notImplementedInRust,
+    readData,
+    writeData,
+} from './utils';
 
 const enterpriseDatabases = editions.filter(e => e.enterprise);
 const suite = enterpriseDatabases.length ? describe.each(enterpriseDatabases) : describe.skip.each(editions);
@@ -226,6 +235,138 @@ suite('$description', fs => {
                 expect(results).toHaveLength(1);
                 expect(results[0]).toEqual({ count: 5, missingField: null });
             });
+        });
+
+        describe('executionTime snapshot consistency', () => {
+            test.concurrent('returns Timestamp executionTime for populated, empty, and filtered-to-empty results', async () => {
+                const col = fs.collection.doc().collection('execTimeBasic');
+
+                const emptyBeforeSnap = await fs.firestore.pipeline().collection(col).execute();
+                expect(emptyBeforeSnap.results).toHaveLength(0);
+                expect(emptyBeforeSnap.executionTime).toBeInstanceOf(Timestamp);
+
+                const { writeTime: w1 } = await col.doc('d1').set(writeData({ v: 1 }));
+                expect(emptyBeforeSnap.executionTime < w1).toBeTrue();
+
+                const populatedSnap = await fs.firestore.pipeline().collection(col).execute();
+                expect(populatedSnap.executionTime).toBeInstanceOf(Timestamp);
+                expect(populatedSnap.results).toHaveLength(1);
+                expect(readData<{ v: number }>(populatedSnap.results[0].data())).toEqual({ v: 1 });
+                expect(populatedSnap.executionTime >= w1).toBeTrue();
+                if (populatedSnap.results[0].updateTime) {
+                    expect(populatedSnap.results[0].updateTime <= populatedSnap.executionTime).toBeTrue();
+                }
+
+                const filteredEmptySnap = await fs.firestore.pipeline().collection(col).where(p.field('v').lessThan(0)).execute();
+                expect(filteredEmptySnap.results).toHaveLength(0);
+                expect(filteredEmptySnap.executionTime).toBeInstanceOf(Timestamp);
+                expect(filteredEmptySnap.executionTime >= w1).toBeTrue();
+
+                const { writeTime: w2 } = await col.doc('d1').update({ v: 2 });
+                expect(filteredEmptySnap.executionTime < w2).toBeTrue();
+            });
+
+            test.concurrent(
+                'read-only transaction pins pipeline executionTime and snapshot across concurrent writes and readTime',
+                async () => {
+                    const col = fs.collection.doc().collection('execTimeRoTxn');
+                    const doc1 = col.doc('d1');
+                    const doc2 = col.doc('d2');
+
+                    const { writeTime: t1 } = await doc1.create(writeData({ id: 1, v: 1 }));
+                    await doc2.create(writeData({ id: 2, v: 1 }));
+
+                    const histSnap = await fs.firestore.runTransaction(
+                        txn => txn.execute(fs.firestore.pipeline().collection(col).sort(p.ascending('id'))),
+                        { readOnly: true, readTime: t1 },
+                    );
+                    expect(histSnap.results.map(r => readData(r.data()))).toEqual([{ id: 1, v: 1 }]);
+                    expect(histSnap.executionTime).toBeInstanceOf(Timestamp);
+                    expect(histSnap.executionTime.isEqual(t1)).toBeTrue();
+
+                    const test = new ConcurrentTest();
+                    let capturedExecTime: Timestamp | undefined;
+                    let capturedPostWriteTime: Timestamp | undefined;
+
+                    await test.run(
+                        async () => {
+                            await fs.firestore.runTransaction(
+                                async txn => {
+                                    const docSnap = await txn.get(doc1);
+                                    test.event('ro pinned');
+                                    await test.when('docs mutated');
+
+                                    const pipeSnap = await txn.execute(fs.firestore.pipeline().collection(col).sort(p.ascending('id')));
+                                    expect(pipeSnap.results.map(r => readData(r.data()))).toEqual([
+                                        { id: 1, v: 1 },
+                                        { id: 2, v: 1 },
+                                    ]);
+                                    expect(pipeSnap.executionTime).toBeInstanceOf(Timestamp);
+                                    expect(pipeSnap.executionTime.isEqual(docSnap.readTime)).toBeTrue();
+                                    capturedExecTime = pipeSnap.executionTime;
+                                },
+                                { readOnly: true },
+                            );
+                        },
+                        async () => {
+                            await test.when('ro pinned');
+                            await doc1.update({ v: 2 });
+                            const { writeTime } = await col.doc('d3').create(writeData({ id: 3, v: 2 }));
+                            capturedPostWriteTime = writeTime;
+                            test.event('docs mutated');
+                        },
+                    );
+
+                    expect(capturedExecTime).toBeInstanceOf(Timestamp);
+                    expect(capturedPostWriteTime).toBeInstanceOf(Timestamp);
+                    expect(capturedExecTime! < capturedPostWriteTime!).toBeTrue();
+                },
+            );
+
+            test.concurrent(
+                'default consistency executionTime matches historical snapshot during concurrent writes',
+                async () => {
+                    const col = fs.collection.doc().collection('execTimeConcurrent');
+                    const doc1 = col.doc('d1');
+                    await doc1.set(writeData({ v: 0 }));
+
+                    let stop = false;
+                    const writer = (async () => {
+                        let seq = 1;
+                        while (!stop) {
+                            await doc1.update({ v: seq });
+                            seq += 1;
+                        }
+                    })();
+
+                    try {
+                        for (let i = 0; i < 6; i++) {
+                            const pipeSnap = await fs.firestore.pipeline().collection(col).execute();
+                            expect(pipeSnap.results).toHaveLength(1);
+                            expect(pipeSnap.executionTime).toBeInstanceOf(Timestamp);
+                            if (pipeSnap.results[0].updateTime) {
+                                expect(pipeSnap.results[0].updateTime <= pipeSnap.executionTime).toBeTrue();
+                            }
+
+                            const roSnap = await fs.firestore.runTransaction(txn => txn.get(doc1), {
+                                readOnly: true,
+                                readTime: pipeSnap.executionTime,
+                            });
+                            expect(roSnap.exists).toBeTrue();
+                            expect(roSnap.updateTime).toBeInstanceOf(Timestamp);
+                            expect(roSnap.updateTime! <= pipeSnap.executionTime).toBeTrue();
+                            expect(readData<{ v: number }>(roSnap.data())).toEqual(readData<{ v: number }>(pipeSnap.results[0].data()));
+                            if (pipeSnap.results[0].updateTime) {
+                                expect(roSnap.updateTime!.isEqual(pipeSnap.results[0].updateTime)).toBeTrue();
+                            }
+                        }
+                    } finally {
+                        stop = true;
+                        await writer;
+                    }
+                },
+                30_000,
+            );
         });
 
         describe('expression groups', () => {

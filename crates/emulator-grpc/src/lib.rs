@@ -12,7 +12,7 @@ use std::{
 };
 
 use emulator_database::{
-    FirestoreDatabase, FirestoreProject, GenericDatabaseError, pipeline,
+    FirestoreDatabase, FirestoreProject, pipeline,
     projection::{Project, Projection},
     query::Query,
     read_consistency::ReadConsistency,
@@ -754,20 +754,14 @@ impl Firestore for FirestoreEmulator {
             };
             let mut new_txn_guard = NewTxnGuard::new(Arc::clone(&database), new_transaction);
 
-            let (results, read_time) = match async {
-                let results =
-                    pipeline::execute(&database, &root_ref, pipeline, read_consistency).await?;
-                let read_time = database.get_read_time(read_consistency).await?;
-                Ok::<_, GenericDatabaseError>((results, read_time))
-            }
-            .await
-            {
-                Ok(res) => res,
-                Err(err) => {
-                    new_txn_guard.rollback();
-                    return Err(err.into());
-                }
-            };
+            let (read_time, results) =
+                match pipeline::execute(&database, &root_ref, pipeline, read_consistency).await {
+                    Ok(res) => res,
+                    Err(err) => {
+                        new_txn_guard.rollback();
+                        return Err(err.into());
+                    }
+                };
 
             Ok(tokio_stream::iter(chunk_pipeline_responses(
                 new_txn_guard,
