@@ -263,10 +263,15 @@ async fn start_capture_or_poll_logs<S: Tracing + 'static>(
         }
         let subscriber: Box<dyn DynamicSubscriber> = Box::new(tracing.tracing.subscribe(&body)?);
         if cancelled.load(Ordering::Acquire) {
+            // Release `TracingState`'s `Arc<Mutex<SubscriberStore>>` before dropping
+            // `subscriber` so a cancelled task cannot keep the store alive past teardown.
+            drop(tracing);
             drop(subscriber);
             return Ok(Bytes::new());
         }
-        match tracing.insert_handle(name, Arc::new(SubscriberHandle::new(subscriber))) {
+        let cleanup = tracing.insert_handle(name, Arc::new(SubscriberHandle::new(subscriber)));
+        drop(tracing);
+        match cleanup {
             InsertCleanup::None => Ok(Bytes::new()),
             InsertCleanup::Evicted(handle) => {
                 // Evicted logs are discarded without draining; drop runs outside all locks here.
