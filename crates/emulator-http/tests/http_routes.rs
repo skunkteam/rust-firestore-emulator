@@ -151,12 +151,15 @@ async fn ui_asset_routes_reject_backslash_paths_and_support_head() -> Result<()>
     );
     expect_that!(head_body.is_empty(), eq(true));
 
-    // Backslash paths (percent-encoded in URI, decoded by Axum Path extractor) must return 404.
+    // Backslash and Windows drive-prefix paths must return 404.
     for path in [
         "/ui/components%5Ceditor.js",
         "/ui/%5Capp.js",
         "/ui/..%5CCargo.toml",
         "/ui/..%5C..%5CCargo.toml",
+        "/ui/C:/index.html",
+        "/ui/C:index.html",
+        "/ui/C%3A/index.html",
     ] {
         let (status, _, _) = send(&router, Method::GET, path).await?;
         expect_eq!(status, StatusCode::NOT_FOUND, "expected 404 for {path}");

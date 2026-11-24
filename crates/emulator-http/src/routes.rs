@@ -1,5 +1,7 @@
 #[cfg(all(feature = "ui", debug_assertions))]
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
+#[cfg(feature = "ui")]
+use std::path::{Component, Path};
 
 #[cfg(feature = "ui")]
 use axum::extract::Path as AxumPath;
@@ -113,9 +115,15 @@ fn serve_ui_asset(rel_path: &str) -> Response {
     let trimmed = rel_path.trim_start_matches('/');
     if trimmed.is_empty()
         || trimmed.contains('\\')
-        || trimmed
-            .split('/')
-            .any(|seg| seg.is_empty() || seg == "." || seg == "..")
+        || trimmed.split('/').any(|seg| {
+            seg.is_empty()
+                || seg == "."
+                || seg == ".."
+                || matches!(seg.as_bytes(), [drive, b':', ..] if drive.is_ascii_alphabetic())
+        })
+        || !Path::new(trimmed)
+            .components()
+            .all(|c| matches!(c, Component::Normal(_)))
         || trimmed.ends_with(".d.ts")
         || trimmed.ends_with(".md")
     {
@@ -186,6 +194,19 @@ mod tests {
             r"\app.js",
             r"..\Cargo.toml",
             r"..\..\Cargo.toml",
+        ] {
+            let resp = serve_ui_asset(path);
+            assert_eq!(resp.status(), StatusCode::NOT_FOUND, "path: {path}");
+        }
+    }
+
+    #[test]
+    fn serve_ui_asset_rejects_drive_prefixes() {
+        for path in [
+            "C:/index.html",
+            "C:index.html",
+            "d:/components/editor.js",
+            "sub/C:index.html",
         ] {
             let resp = serve_ui_asset(path);
             assert_eq!(resp.status(), StatusCode::NOT_FOUND, "path: {path}");
