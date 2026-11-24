@@ -1204,7 +1204,7 @@ suite('$description', fs => {
                     { name: 'toLower (upper)', expr: p.constant('V').toLower(), expected: 'v' },
                     { name: 'toLower (lower)', expr: p.constant('v').toLower(), expected: 'v' },
                 ],
-                charLength: notImplementedInRust || { name: 'charLength', expr: p.constant('🇳🇱').charLength(), expected: 2 },
+                charLength: { name: 'charLength', expr: p.constant('🇳🇱').charLength(), expected: 2 },
                 byteLength: notImplementedInRust || { name: 'byteLength', expr: p.constant('🇳🇱').byteLength(), expected: 8 },
                 split: [
                     { name: 'split (match)', expr: p.constant('a,b').split(','), expected: ['a', 'b'] },
@@ -1650,7 +1650,7 @@ suite('$description', fs => {
                     { name: 'toLower (upper)', expr: p.toLower(p.constant('V')), expected: 'v' },
                     { name: 'toLower (lower)', expr: p.toLower(p.constant('v')), expected: 'v' },
                 ],
-                charLength: notImplementedInRust || { name: 'charLength', expr: p.charLength(p.constant('123')), expected: 3 },
+                charLength: { name: 'charLength', expr: p.charLength(p.constant('123')), expected: 3 },
                 split: [
                     { name: 'split (match)', expr: p.split(p.constant('a,b'), ','), expected: ['a', 'b'] },
                     { name: 'split (no match)', expr: p.split(p.constant('a%b'), ','), expected: ['a%b'] },

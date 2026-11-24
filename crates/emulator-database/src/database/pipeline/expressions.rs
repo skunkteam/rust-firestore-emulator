@@ -20,6 +20,7 @@ pub(super) fn maybe_evaluate<'a>(value: &'a Value, doc: &'a Document) -> Result<
             Ok(get_document_value(&field_ref, doc))
         }
         ValueType::VariableReferenceValue(_) => crate::unimplemented!("variable_reference_value"),
+        ValueType::PipelineValue(_) => crate::unimplemented!("pipeline_value"),
         ValueType::FunctionValue(f) => function::evaluate(f, doc),
         _ => Ok(Some(value.clone())),
     }
@@ -27,6 +28,8 @@ pub(super) fn maybe_evaluate<'a>(value: &'a Value, doc: &'a Document) -> Result<
 
 #[cfg(test)]
 mod tests {
+    use googleapis::google::firestore::v1::{Function, Pipeline};
+
     use super::*;
 
     #[test]
@@ -36,6 +39,26 @@ mod tests {
         };
         let doc = Document::default();
         let err = maybe_evaluate(&val, &doc).unwrap_err();
+        assert!(matches!(err, GenericDatabaseError::NotImplemented(_)));
+    }
+
+    #[test]
+    fn pipeline_value_returns_not_implemented_and_propagates_through_is_error() {
+        let pipeline_val = Value {
+            value_type: Some(ValueType::PipelineValue(Pipeline::default())),
+        };
+        let doc = Document::default();
+        let err = maybe_evaluate(&pipeline_val, &doc).unwrap_err();
+        assert!(matches!(err, GenericDatabaseError::NotImplemented(_)));
+
+        let is_error_val = Value {
+            value_type: Some(ValueType::FunctionValue(Function {
+                name:    "is_error".to_string(),
+                args:    vec![pipeline_val],
+                options: Default::default(),
+            })),
+        };
+        let err = evaluate(&is_error_val, &doc).unwrap_err();
         assert!(matches!(err, GenericDatabaseError::NotImplemented(_)));
     }
 }
