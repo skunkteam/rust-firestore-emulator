@@ -1,12 +1,12 @@
 #![allow(unused_crate_dependencies)]
 
-use std::{fmt, net::SocketAddr, num::NonZeroU64, time::Duration};
+use std::{fmt, future::Future, net::SocketAddr, num::NonZeroU64, time::Duration};
 
 use clap::Parser;
 use emulator_database::{FirestoreConfig, FirestoreProject};
 use emulator_tracing::DefaultTracing;
 use firestore_emulator::run;
-use tokio::{net::TcpListener, signal::ctrl_c};
+use tokio::net::TcpListener;
 
 #[cfg(target_os = "linux")]
 #[global_allocator]
@@ -78,6 +78,40 @@ struct Args {
     transaction_max_lifetime_ms: Option<NonZeroU64>,
 }
 
+#[cfg(unix)]
+fn shutdown_signal() -> Result<impl Future<Output = ()> + Send + 'static, CliError> {
+    use tokio::signal::unix::{SignalKind, signal};
+
+    // Register both SIGINT and SIGTERM eagerly before `run(...)` prints "listening" to avoid a
+    // startup race where an early signal hits the default termination disposition.
+    let mut sigint = signal(SignalKind::interrupt()).map_err(|err| CliError {
+        context:    Some("Could not install SIGINT signal handler"),
+        source:     Box::new(err),
+        suggestion: None,
+    })?;
+    let mut sigterm = signal(SignalKind::terminate()).map_err(|err| CliError {
+        context:    Some("Could not install SIGTERM signal handler"),
+        source:     Box::new(err),
+        suggestion: None,
+    })?;
+
+    Ok(async move {
+        tokio::select! {
+            _ = sigint.recv() => {}
+            _ = sigterm.recv() => {}
+        }
+    })
+}
+
+#[cfg(not(unix))]
+fn shutdown_signal() -> Result<impl Future<Output = ()> + Send + 'static, CliError> {
+    use tokio::signal::ctrl_c;
+
+    Ok(async {
+        ctrl_c().await.expect("failed to listen for ctrl-c event");
+    })
+}
+
 #[tokio::main]
 async fn main() -> Result<(), CliError> {
     let tracing = DefaultTracing::start();
@@ -102,8 +136,6 @@ async fn main() -> Result<(), CliError> {
     // Make it live for the remainder of the program's life. ('static)
     let project = Box::leak(project);
 
-    let ctrl_c_listener = async { ctrl_c().await.expect("failed to listen for ctrl-c event") };
-
     let listener = TcpListener::bind(host_port).await.map_err(|err| CliError {
         context:    Some("Could not start listener on provided address"),
         source:     Box::new(err),
@@ -111,7 +143,10 @@ async fn main() -> Result<(), CliError> {
             "Use \"--host-port 127.0.0.1:0\" to listen to a random port on localhost.",
         ),
     })?;
-    run(project, listener, ctrl_c_listener, tracing)
+
+    let shutdown = shutdown_signal()?;
+
+    run(project, listener, shutdown, tracing)
         .await
         .map_err(|source| CliError {
             context: None,
