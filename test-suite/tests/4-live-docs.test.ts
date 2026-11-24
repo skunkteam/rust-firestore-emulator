@@ -49,6 +49,41 @@ describe.each(editions)('$description', fs => {
             stop();
         });
 
+        test.concurrent('no update when deleting a never-existing or already-deleted document', async () => {
+            const doc = fs.collection.doc();
+
+            const { stop, snapshots, getNext, getCurrent } = listen(doc);
+
+            const initialSnap = await getCurrent();
+            expect(initialSnap.exists).toBeFalse();
+            expect(snapshots).toHaveLength(1);
+
+            // Deleting a never-existing document must not emit any extra snapshots.
+            await doc.delete();
+            await doc.delete();
+
+            const [createdSnap, { writeTime: createTime }] = await Promise.all([getNext(), doc.create(writeData({ some: 'data' }))]);
+            expect(createdSnap.exists).toBeTrue();
+            expect(snapshots).toHaveLength(2);
+            checkSnap(createdSnap, { createTime, updateTime: createTime, data: { some: 'data' } });
+
+            // Deleting the existing document emits a single deletion snapshot.
+            const [deletedSnap] = await Promise.all([getNext(), doc.delete()]);
+            expect(deletedSnap.exists).toBeFalse();
+            expect(snapshots).toHaveLength(3);
+
+            // Subsequent deletes of the already-deleted document must also be silent.
+            await doc.delete();
+            await doc.delete();
+
+            const [recreatedSnap, { writeTime: recreateTime }] = await Promise.all([getNext(), doc.create(writeData({ some: 'again' }))]);
+            expect(recreatedSnap.exists).toBeTrue();
+            expect(snapshots).toHaveLength(4);
+            checkSnap(recreatedSnap, { createTime: recreateTime, updateTime: recreateTime, data: { some: 'again' } });
+
+            stop();
+        });
+
         test.concurrent(
             'updates when changing numeric representation (-0.0 to 0 or double 1.0 to int 1), but not on identical NaN',
             async () => {

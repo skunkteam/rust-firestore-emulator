@@ -6,6 +6,26 @@ interface BeginTransactionResponse {
     transaction: Uint8Array;
 }
 
+interface RawTimestamp {
+    seconds?: string | number | { toString(): string };
+    nanos?: number;
+}
+
+interface RawCommitResponse {
+    commitTime?: RawTimestamp;
+    writeResults?: Array<{
+        updateTime?: RawTimestamp | null;
+        transformResults?: Array<Record<string, unknown>>;
+    }>;
+}
+
+function timestampToNs(ts: RawTimestamp | undefined): bigint {
+    expect(ts).toBeDefined();
+    const secs = ts?.seconds ?? 0;
+    const secsBig = typeof secs === 'string' || typeof secs === 'number' ? BigInt(secs) : BigInt(secs.toString());
+    return secsBig * 1_000_000_000n + BigInt(ts?.nanos ?? 0);
+}
+
 function databasePath(firestore: Firestore): string {
     return (firestore as unknown as { formattedName: string }).formattedName;
 }
@@ -86,6 +106,106 @@ describe.each(editions)('$description - precondition edge cases', fs => {
 
         await expect(batch.commit()).rejects.toThrow('5 NOT_FOUND');
         expect(await docRef.get()).toHaveProperty('exists', false);
+    });
+
+    test('raw Commit WriteResult.updateTime is null on deletes while commitTime advances monotonically', async () => {
+        const db = databasePath(fs.firestore);
+        const path = documentPath(fs.firestore, docRef);
+
+        // Consecutive deletes of a never-existing document: updateTime is unset, commitTime advances.
+        const delMissing1 = await callRawUnaryRpc<Record<string, unknown>, RawCommitResponse>(fs.firestore, 'commit', {
+            database: db,
+            writes: [{ delete: path }],
+        });
+        expect(delMissing1.writeResults).toHaveLength(1);
+        expect(delMissing1.writeResults?.[0]?.updateTime ?? null).toBeNull();
+        const t1 = timestampToNs(delMissing1.commitTime);
+
+        const delMissing2 = await callRawUnaryRpc<Record<string, unknown>, RawCommitResponse>(fs.firestore, 'commit', {
+            database: db,
+            writes: [{ delete: path }],
+        });
+        expect(delMissing2.writeResults).toHaveLength(1);
+        expect(delMissing2.writeResults?.[0]?.updateTime ?? null).toBeNull();
+        const t2 = timestampToNs(delMissing2.commitTime);
+        expect(t2).toBeGreaterThan(t1);
+
+        // Create and delete an existing document: updateTime is still unset on delete.
+        await docRef.set(writeData({ foo: 'live' }));
+        const delExisting = await callRawUnaryRpc<Record<string, unknown>, RawCommitResponse>(fs.firestore, 'commit', {
+            database: db,
+            writes: [{ delete: path }],
+        });
+        expect(delExisting.writeResults).toHaveLength(1);
+        expect(delExisting.writeResults?.[0]?.updateTime ?? null).toBeNull();
+        const t3 = timestampToNs(delExisting.commitTime);
+        expect(t3).toBeGreaterThan(t2);
+
+        // Deleting the already-deleted document again: updateTime remains unset and commitTime advances.
+        const delAlreadyDeleted = await callRawUnaryRpc<Record<string, unknown>, RawCommitResponse>(fs.firestore, 'commit', {
+            database: db,
+            writes: [{ delete: path }],
+        });
+        expect(delAlreadyDeleted.writeResults).toHaveLength(1);
+        expect(delAlreadyDeleted.writeResults?.[0]?.updateTime ?? null).toBeNull();
+        const t4 = timestampToNs(delAlreadyDeleted.commitTime);
+        expect(t4).toBeGreaterThan(t3);
+    });
+
+    test('multi-write Commit WriteResult.updateTime matches post-commit state for [delete, update] and [update, delete]', async () => {
+        const db = databasePath(fs.firestore);
+        const path = documentPath(fs.firestore, docRef);
+        const fields = rawFieldsWithTtl({ k: { stringValue: 'same' } });
+
+        // 1. `[delete, update(same fields)]` on an existing doc recreates it: createTime advances
+        //    and BOTH WriteResults report the post-commit updateTime (`commitTime`).
+        await callRawUnaryRpc<Record<string, unknown>, RawCommitResponse>(fs.firestore, 'commit', {
+            database: db,
+            writes: [{ update: { name: path, fields } }],
+        });
+        const before = await docRef.get();
+        expect(before.exists).toBeTrue();
+        expect(before.createTime).toBeDefined();
+
+        const recreate = await callRawUnaryRpc<Record<string, unknown>, RawCommitResponse>(fs.firestore, 'commit', {
+            database: db,
+            writes: [{ delete: path }, { update: { name: path, fields } }],
+        });
+        expect(recreate.writeResults).toHaveLength(2);
+        const recreateCommitNs = timestampToNs(recreate.commitTime);
+        expect(timestampToNs(recreate.writeResults?.[0]?.updateTime ?? undefined)).toBe(recreateCommitNs);
+        expect(timestampToNs(recreate.writeResults?.[1]?.updateTime ?? undefined)).toBe(recreateCommitNs);
+
+        const after = await docRef.get();
+        expect(after.exists).toBeTrue();
+        expect(after.createTime!.toMillis()).toBeGreaterThanOrEqual(before.createTime!.toMillis());
+        expect(after.createTime!.isEqual(before.createTime!)).toBeFalse();
+        expect(readData(after.data())).toEqual({ k: 'same' });
+
+        // 2. `[update(+serverTimestamp), delete(exists: true)]` on a never-existing doc evaluates
+        //    transforms and intra-batch preconditions, leaves the doc absent, and sets
+        //    `updateTime: null` on BOTH WriteResults.
+        const ephemeralRef = fs.collection.doc();
+        const ephemeralPath = documentPath(fs.firestore, ephemeralRef);
+        const ephemeral = await callRawUnaryRpc<Record<string, unknown>, RawCommitResponse>(fs.firestore, 'commit', {
+            database: db,
+            writes: [
+                {
+                    update: { name: ephemeralPath, fields },
+                    updateTransforms: [{ fieldPath: 'ts', setToServerValue: 'REQUEST_TIME' }],
+                },
+                {
+                    delete: ephemeralPath,
+                    currentDocument: { exists: true },
+                },
+            ],
+        });
+        expect(ephemeral.writeResults).toHaveLength(2);
+        expect(ephemeral.writeResults?.[0]?.updateTime ?? null).toBeNull();
+        expect(ephemeral.writeResults?.[0]?.transformResults).toHaveLength(1);
+        expect(ephemeral.writeResults?.[0]?.transformResults?.[0]).toHaveProperty('timestampValue');
+        expect(ephemeral.writeResults?.[1]?.updateTime ?? null).toBeNull();
+        expect(await ephemeralRef.get()).toHaveProperty('exists', false);
     });
 });
 

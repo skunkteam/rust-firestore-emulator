@@ -2153,6 +2153,60 @@ describe.each(editions.filter(e => e.concurrencyMode === 'pessimistic'))('$descr
                 },
                 30_000,
             );
+
+            test.concurrent(
+                'probe D5: pessimistic delete on missing document still contends for write lock and wounds younger reader',
+                async () => {
+                    const [missingRef, unrelatedRef] = refs();
+
+                    let txnA: Uint8Array | undefined;
+                    let txnB: Uint8Array | undefined;
+                    let txnACommitted = false;
+                    let txnBCommitted = false;
+
+                    try {
+                        txnA = await rawBeginTxn();
+                        await time(50);
+                        txnB = await rawBeginTxn();
+
+                        const activeA = txnA;
+                        const activeB = txnB;
+
+                        const chunkA = await rawReadDoc(missingRef, activeA);
+                        expect(chunkA.missing).toBeDefined();
+                        const chunkB = await rawReadDoc(missingRef, activeB);
+                        expect(chunkB.missing).toBeDefined();
+
+                        // Older txnA commits delete on the missing document, wounding younger txnB.
+                        const txnAOutcome = await captureRpcOutcome(() => rawCommit([{ delete: docResourceName(missingRef) }], activeA));
+                        txnACommitted = txnAOutcome.ok;
+
+                        // Even though txnB only writes an unrelated document, txnA's missing-doc
+                        // delete wounded txnB's read lock on missingRef.
+                        const txnBOutcome = await captureRpcOutcome(() =>
+                            rawCommit([rawUpdateWrite(unrelatedRef, { value: { stringValue: 'from B' }, ttl: rawTtlValue() })], activeB),
+                        );
+                        txnBCommitted = txnBOutcome.ok;
+
+                        expect({
+                            txnAOk: txnAOutcome.ok,
+                            txnACode: txnAOutcome.ok ? undefined : txnAOutcome.code,
+                            txnBOk: txnBOutcome.ok,
+                            txnBCode: txnBOutcome.ok ? undefined : txnBOutcome.code,
+                        }).toEqual({
+                            txnAOk: true,
+                            txnACode: undefined,
+                            txnBOk: false,
+                            txnBCode: 10,
+                        });
+                        expect(await unrelatedRef.get()).toHaveProperty('exists', false);
+                    } finally {
+                        if (txnA && !txnACommitted) await rawRollback(txnA).catch(() => undefined);
+                        if (txnB && !txnBCommitted) await rawRollback(txnB).catch(() => undefined);
+                    }
+                },
+                30_000,
+            );
         });
 
         type UsedRefs = DocumentReference[] | { read: DocumentReference[]; write: DocumentReference[] };
