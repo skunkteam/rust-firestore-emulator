@@ -11,7 +11,9 @@ use googleapis::google::{
 use proptest::{prelude::*, sample::select};
 
 use super::{
-    builders::{PipelineSpec, QuerySpec, field_filter, field_ref_val, fn_val, unary_filter},
+    builders::{
+        PipelineSpec, QuerySpec, SortDirection, field_filter, field_ref_val, fn_val, unary_filter,
+    },
     client::TestDb,
     env::{DOCUMENTS_ROOT, TestEnv},
 };
@@ -412,8 +414,10 @@ impl GeneratedQueryKind {
                         ),
                     ],
                 ))
-                .sort_asc("__name__")
-                .sort_asc("num"),
+                .sort([
+                    ("num", SortDirection::Asc),
+                    ("__name__", SortDirection::Asc),
+                ]),
             Self::NumLessThan(t) => PipelineSpec::collection(col)
                 .where_expr(fn_val(
                     "and",
@@ -422,8 +426,10 @@ impl GeneratedQueryKind {
                         fn_val("less_than", vec![field_ref_val("num"), (*t).into()]),
                     ],
                 ))
-                .sort_desc("__name__")
-                .sort_desc("num"),
+                .sort([
+                    ("num", SortDirection::Desc),
+                    ("__name__", SortDirection::Desc),
+                ]),
             Self::TagEquals(tag) => PipelineSpec::collection(col)
                 .where_expr(fn_val(
                     "and",
@@ -432,8 +438,10 @@ impl GeneratedQueryKind {
                         fn_val("equal", vec![field_ref_val("tag"), (*tag).into()]),
                     ],
                 ))
-                .sort_asc("__name__")
-                .sort_asc("num"),
+                .sort([
+                    ("num", SortDirection::Asc),
+                    ("__name__", SortDirection::Asc),
+                ]),
             Self::TagNotEquals(tag) => PipelineSpec::collection(col)
                 .where_expr(fn_val(
                     "and",
@@ -442,8 +450,10 @@ impl GeneratedQueryKind {
                         fn_val("not_equal", vec![field_ref_val("tag"), (*tag).into()]),
                     ],
                 ))
-                .sort_asc("__name__")
-                .sort_asc("tag"),
+                .sort([
+                    ("tag", SortDirection::Asc),
+                    ("__name__", SortDirection::Asc),
+                ]),
             Self::EnterpriseTagNotEqualsMissingIncluded(tag) => PipelineSpec::collection(col)
                 .where_expr(fn_val(
                     "not_equal",
@@ -473,8 +483,10 @@ impl GeneratedQueryKind {
                         fn_val("equal", vec![field_ref_val("flag"), (*flag).into()]),
                     ],
                 ))
-                .sort_asc("__name__")
-                .sort_asc("num"),
+                .sort([
+                    ("num", SortDirection::Asc),
+                    ("__name__", SortDirection::Asc),
+                ]),
             Self::AlphaIsNull => PipelineSpec::collection(col)
                 .where_expr(fn_val("equal", vec![field_ref_val("alpha"), Value::null()]))
                 .sort_asc("__name__"),
@@ -497,8 +509,10 @@ impl GeneratedQueryKind {
                         fn_val("less_than", vec![field_ref_val("alpha"), val.clone()]),
                     ],
                 ))
-                .sort_desc("__name__")
-                .sort_desc("alpha"),
+                .sort([
+                    ("alpha", SortDirection::Desc),
+                    ("__name__", SortDirection::Desc),
+                ]),
             Self::AlphaGreaterOrEqual(val) => PipelineSpec::collection(col)
                 .where_expr(fn_val(
                     "and",
@@ -510,8 +524,10 @@ impl GeneratedQueryKind {
                         ),
                     ],
                 ))
-                .sort_asc("__name__")
-                .sort_asc("alpha"),
+                .sort([
+                    ("alpha", SortDirection::Asc),
+                    ("__name__", SortDirection::Asc),
+                ]),
             Self::AlphaIn(vals) => {
                 let pred = if vals.len() == 1 {
                     fn_val("equal", vec![field_ref_val("alpha"), vals[0].clone()])
@@ -529,12 +545,14 @@ impl GeneratedQueryKind {
                     .sort_asc("__name__")
             }
             Self::AlphaOrderBy { descending } => {
-                let base = PipelineSpec::collection(col).where_expr(present("alpha"));
-                if *descending {
-                    base.sort_desc("__name__").sort_desc("alpha")
+                let dir = if *descending {
+                    SortDirection::Desc
                 } else {
-                    base.sort_asc("__name__").sort_asc("alpha")
-                }
+                    SortDirection::Asc
+                };
+                PipelineSpec::collection(col)
+                    .where_expr(present("alpha"))
+                    .sort([("alpha", dir), ("__name__", dir)])
             }
         };
         if offset > 0 {
