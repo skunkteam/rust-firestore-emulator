@@ -1,11 +1,12 @@
 use std::{
-    collections::{BTreeSet, HashMap},
+    collections::{BTreeSet, HashMap, HashSet},
     sync::{
         Arc, Weak,
         atomic::{self, AtomicBool},
     },
 };
 
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use googleapis::google::{
     firestore::v1::{
         structured_aggregation_query::{Aggregation, aggregation},
@@ -15,6 +16,7 @@ use googleapis::google::{
     protobuf::Timestamp,
 };
 use itertools::Itertools;
+use prost::Message as _;
 use string_cache::DefaultAtom;
 use tokio::sync::{
     Mutex, RwLock,
@@ -580,14 +582,58 @@ impl FirestoreDatabase {
                 "page_size must be non-negative",
             ));
         }
-        if show_missing && !order_by.is_empty() {
+        if show_missing && !order_by.trim().is_empty() {
             return Err(GenericDatabaseError::invalid_argument(
-                "show_missing cannot be combined with order_by",
+                "cannot specify an order when show_missing is true",
+            ));
+        }
+        if self.enterprise_edition() && !order_by.trim().is_empty() {
+            return Err(GenericDatabaseError::invalid_argument(
+                "order by is not supported",
             ));
         }
         unimplemented_bool!(show_missing && collection_id.is_empty());
 
         let parsed_orders = parse_list_order_by(&order_by)?;
+        let effective_orders = if parsed_orders.is_empty() {
+            vec![(FieldReference::DocumentName, Direction::Ascending)]
+        } else {
+            let last_dir = parsed_orders
+                .last()
+                .map_or(Direction::Ascending, |(_, d)| *d);
+            let has_doc_name = parsed_orders.iter().any(|(f, _)| f.is_document_name());
+            let mut orders = parsed_orders;
+            if !has_doc_name {
+                orders.push((FieldReference::DocumentName, last_dir));
+            }
+            orders
+        };
+
+        let expected_has_mask = mask.is_some();
+        let expected_mask_paths: Vec<String> = mask
+            .as_ref()
+            .map_or_else(Vec::new, |m| m.field_paths.clone());
+
+        let parent_str = parent.to_string();
+        let token_binding = ListDocsTokenBinding {
+            parent: &parent_str,
+            collection_id: &collection_id,
+            show_missing,
+            raw_order_by: &order_by,
+            has_mask: expected_has_mask,
+            mask_field_paths: &expected_mask_paths,
+        };
+        let decoded_cursor = if page_token.is_empty() {
+            None
+        } else {
+            Some(decode_list_docs_page_token(
+                &page_token,
+                &token_binding,
+                effective_orders.len(),
+                parent.root(),
+            )?)
+        };
+
         let mut builder = QueryBuilder::from(
             parent,
             vec![CollectionSelector {
@@ -599,51 +645,103 @@ impl FirestoreDatabase {
         .select(mask.map(Projection::try_from).transpose()?)
         .consistency(consistency);
 
-        if parsed_orders.is_empty() {
-            builder = builder.order_by(FieldReference::DocumentName, Direction::Ascending);
-        } else {
-            let last_dir = parsed_orders
-                .last()
-                .map(|(_, d)| *d)
-                .unwrap_or(Direction::Ascending);
-            let has_doc_name = parsed_orders.iter().any(|(f, _)| f.is_document_name());
-            for (field, dir) in parsed_orders {
-                builder = builder.order_by(field, dir);
-            }
-            if !has_doc_name {
-                builder = builder.order_by(FieldReference::DocumentName, last_dir);
-            }
+        for (field, dir) in effective_orders {
+            builder = builder.order_by(field, dir);
         }
+
+        if !show_missing {
+            if let Some(cursor) = decoded_cursor {
+                builder = builder.start_at(cursor);
+            }
+            if page_size > 0 {
+                builder = builder.limit((page_size as usize).saturating_add(1));
+            }
+            let mut query = builder.build()?;
+            let (_, mut found_docs) = query.once(self).await?;
+            let next_page_token = if page_size > 0 && found_docs.len() > page_size as usize {
+                found_docs.truncate(page_size as usize);
+                let last = found_docs.last().ok_or_else(|| {
+                    GenericDatabaseError::internal("missing boundary document for list_docs cursor")
+                })?;
+                let mut values = Vec::with_capacity(query.order_by().len());
+                for order in query.order_by() {
+                    let val = order.field().get_value(&last.version).ok_or_else(|| {
+                        GenericDatabaseError::internal(format!(
+                            "missing order_by field '{}' on matched document {}",
+                            order.field(),
+                            last.version.name
+                        ))
+                    })?;
+                    values.push(val.into_owned());
+                }
+                encode_list_docs_page_token(
+                    &token_binding,
+                    Cursor {
+                        values,
+                        before: false,
+                    },
+                )
+            } else {
+                String::new()
+            };
+            let documents = found_docs.iter().map(|v| query.project(v)).collect();
+            return Ok((documents, next_page_token));
+        }
+
+        let cursor_name = decoded_cursor
+            .as_ref()
+            .map(|cursor| {
+                cursor
+                    .values
+                    .first()
+                    .and_then(|v| v.as_reference())
+                    .ok_or_else(|| {
+                        GenericDatabaseError::internal("validated cursor missing reference")
+                    })
+            })
+            .transpose()?;
 
         let mut query = builder.build()?;
         let (_, found_docs) = query.once(self).await?;
-        let mut documents: Vec<Document> = found_docs.iter().map(|v| query.project(v)).collect();
+        let mut documents: Vec<Document> = found_docs
+            .iter()
+            .filter(|v| {
+                cursor_name.is_none_or(|cursor| {
+                    googleapis::cmp_reference_paths(&v.version.name.to_string(), cursor).is_gt()
+                })
+            })
+            .map(|v| query.project(v))
+            .collect();
 
-        if show_missing && !collection_id.is_empty() {
-            let existing_names: std::collections::HashSet<String> =
-                documents.iter().map(|d| d.name.clone()).collect();
-            for missing_name in query.missing_docs(self).await? {
-                if !existing_names.contains(&missing_name) {
-                    documents.push(Document {
-                        name: missing_name,
-                        ..Default::default()
-                    });
-                }
-            }
-            documents.sort_by(|a, b| a.name.split('/').cmp(b.name.split('/')));
-        }
-
-        if !page_token.is_empty() {
-            if let Some(pos) = documents.iter().position(|d| d.name == page_token) {
-                documents.drain(..=pos);
-            } else if order_by.is_empty() {
-                documents.retain(|d| d.name.split('/').gt(page_token.split('/')));
+        let existing_names: HashSet<String> = documents.iter().map(|d| d.name.clone()).collect();
+        for missing_name in query.missing_docs_after(self, cursor_name).await? {
+            if !existing_names.contains(&missing_name) {
+                documents.push(Document {
+                    name: missing_name,
+                    ..Default::default()
+                });
             }
         }
+        documents.sort_by(|a, b| googleapis::cmp_reference_paths(&a.name, &b.name));
 
         let next_page_token = if page_size > 0 && documents.len() > page_size as usize {
             documents.truncate(page_size as usize);
-            documents.last().map(|d| d.name.clone()).unwrap_or_default()
+            let last_name = documents
+                .last()
+                .ok_or_else(|| {
+                    GenericDatabaseError::internal(
+                        "missing boundary document for show_missing list_docs cursor",
+                    )
+                })?
+                .name
+                .clone();
+            encode_list_docs_page_token(
+                &token_binding,
+                Cursor {
+                    values: vec![Value::reference(last_name)],
+                    before: false,
+                },
+            )
         } else {
             String::new()
         };
@@ -806,31 +904,218 @@ impl FirestoreDatabase {
     }
 }
 
+const LIST_DOCS_TOKEN_VERSION: u32 = 1;
+const MAX_PAGE_TOKEN_LEN: usize = 2 * 1024 * 1024;
+
+struct ListDocsTokenBinding<'a> {
+    parent: &'a str,
+    collection_id: &'a str,
+    show_missing: bool,
+    raw_order_by: &'a str,
+    has_mask: bool,
+    mask_field_paths: &'a [String],
+}
+
+#[derive(Clone, PartialEq, prost::Message)]
+struct ListDocsPageToken {
+    #[prost(uint32, tag = "1")]
+    version: u32,
+    #[prost(string, tag = "2")]
+    parent: String,
+    #[prost(string, tag = "3")]
+    collection_id: String,
+    #[prost(bool, tag = "4")]
+    show_missing: bool,
+    #[prost(message, optional, tag = "6")]
+    cursor: Option<Cursor>,
+    #[prost(string, tag = "7")]
+    raw_order_by: String,
+    #[prost(bool, tag = "8")]
+    has_mask: bool,
+    #[prost(string, repeated, tag = "9")]
+    mask_field_paths: Vec<String>,
+}
+
+fn encode_list_docs_page_token(binding: &ListDocsTokenBinding<'_>, cursor: Cursor) -> String {
+    let token = ListDocsPageToken {
+        version: LIST_DOCS_TOKEN_VERSION,
+        parent: binding.parent.to_owned(),
+        collection_id: binding.collection_id.to_owned(),
+        show_missing: binding.show_missing,
+        cursor: Some(cursor),
+        raw_order_by: binding.raw_order_by.to_owned(),
+        has_mask: binding.has_mask,
+        mask_field_paths: binding.mask_field_paths.to_vec(),
+    };
+    URL_SAFE_NO_PAD.encode(token.encode_to_vec())
+}
+
+fn decode_list_docs_page_token(
+    page_token: &str,
+    binding: &ListDocsTokenBinding<'_>,
+    expected_cursor_len: usize,
+    expected_root: &RootRef,
+) -> Result<Cursor> {
+    if page_token.len() > MAX_PAGE_TOKEN_LEN {
+        return Err(GenericDatabaseError::invalid_argument(
+            "page_token exceeds maximum allowed length",
+        ));
+    }
+    let raw = URL_SAFE_NO_PAD
+        .decode(page_token)
+        .map_err(|_| GenericDatabaseError::invalid_argument("invalid page_token"))?;
+    let token = ListDocsPageToken::decode(raw.as_slice())
+        .map_err(|_| GenericDatabaseError::invalid_argument("invalid page_token"))?;
+
+    if token.version != LIST_DOCS_TOKEN_VERSION
+        || token.parent != binding.parent
+        || token.collection_id != binding.collection_id
+        || token.show_missing != binding.show_missing
+        || token.raw_order_by != binding.raw_order_by
+        || token.has_mask != binding.has_mask
+        || token.mask_field_paths.as_slice() != binding.mask_field_paths
+    {
+        return Err(GenericDatabaseError::invalid_argument(
+            "invalid or mismatched page_token",
+        ));
+    }
+
+    let cursor = token
+        .cursor
+        .ok_or_else(|| GenericDatabaseError::invalid_argument("invalid page_token"))?;
+    if cursor.before || cursor.values.len() != expected_cursor_len {
+        return Err(GenericDatabaseError::invalid_argument("invalid page_token"));
+    }
+    if binding.show_missing {
+        if cursor.values.len() != 1
+            || !matches!(
+                cursor.values[0].value_type,
+                Some(value::ValueType::ReferenceValue(_))
+            )
+        {
+            return Err(GenericDatabaseError::invalid_argument("invalid page_token"));
+        }
+        query::validate_cursor_key_ref(&cursor.values[0], expected_root)?;
+    }
+    Ok(cursor)
+}
+
+struct BacktickScanner {
+    in_backticks: bool,
+    escaped: bool,
+    at_segment_start: bool,
+    saw_non_ws_in_segment: bool,
+}
+
+impl BacktickScanner {
+    fn new() -> Self {
+        Self {
+            in_backticks: false,
+            escaped: false,
+            at_segment_start: true,
+            saw_non_ws_in_segment: false,
+        }
+    }
+
+    fn reset_segment(&mut self) {
+        self.at_segment_start = true;
+        self.saw_non_ws_in_segment = false;
+    }
+
+    /// Advances over `ch` and returns `true` when `ch` is outside backtick-quoted segments.
+    fn step(&mut self, ch: char) -> bool {
+        if self.in_backticks {
+            if self.escaped {
+                self.escaped = false;
+            } else if ch == '\\' {
+                self.escaped = true;
+            } else if ch == '`' {
+                self.in_backticks = false;
+            }
+            return false;
+        }
+        match ch {
+            '`' if self.at_segment_start => {
+                self.in_backticks = true;
+                self.at_segment_start = false;
+                self.saw_non_ws_in_segment = true;
+                false
+            }
+            '.' => {
+                self.reset_segment();
+                true
+            }
+            _ if ch.is_whitespace() => {
+                if self.saw_non_ws_in_segment {
+                    self.at_segment_start = false;
+                }
+                true
+            }
+            _ => {
+                self.at_segment_start = false;
+                self.saw_non_ws_in_segment = true;
+                true
+            }
+        }
+    }
+}
+
+fn split_order_by_clauses(input: &str) -> Vec<&str> {
+    let mut clauses = Vec::new();
+    let mut start = 0;
+    let mut scanner = BacktickScanner::new();
+
+    for (idx, ch) in input.char_indices() {
+        if scanner.step(ch) && ch == ',' {
+            clauses.push(&input[start..idx]);
+            start = idx + 1;
+            scanner.reset_segment();
+        }
+    }
+    clauses.push(&input[start..]);
+    clauses
+}
+
+fn split_clause_field_and_dir(clause: &str) -> Option<(&str, &str)> {
+    let mut scanner = BacktickScanner::new();
+    for (idx, ch) in clause.char_indices() {
+        if scanner.step(ch) && ch.is_whitespace() {
+            return Some((clause[..idx].trim_end(), clause[idx..].trim_start()));
+        }
+    }
+    None
+}
+
 fn parse_list_order_by(order_by: &str) -> Result<Vec<(FieldReference, Direction)>> {
     let trimmed = order_by.trim();
     if trimmed.is_empty() {
         return Ok(vec![]);
     }
     let mut orders = Vec::new();
-    for raw_clause in trimmed.split(',') {
+    for raw_clause in split_order_by_clauses(trimmed) {
         let clause = raw_clause.trim();
         if clause.is_empty() {
             return Err(GenericDatabaseError::invalid_argument(
                 "empty clause in order_by",
             ));
         }
-        let (field_str, direction) = match clause.rsplit_once(char::is_whitespace) {
+        let (field_str, direction) = match split_clause_field_and_dir(clause) {
             Some((f, dir))
                 if dir.eq_ignore_ascii_case("asc") || dir.eq_ignore_ascii_case("ascending") =>
             {
-                (f.trim(), Direction::Ascending)
+                (f, Direction::Ascending)
             }
             Some((f, dir))
                 if dir.eq_ignore_ascii_case("desc") || dir.eq_ignore_ascii_case("descending") =>
             {
-                (f.trim(), Direction::Descending)
+                (f, Direction::Descending)
             }
-            _ => (clause, Direction::Ascending),
+            Some((_, dir)) => {
+                return Err(GenericDatabaseError::invalid_argument(format!(
+                    "invalid order_by direction {dir:?} in clause {clause:?}"
+                )));
+            }
+            None => (clause, Direction::Ascending),
         };
         orders.push((field_str.parse()?, direction));
     }
@@ -1793,6 +2078,240 @@ mod tests {
         assert_eq!(
             initial_to.doc_name.as_deref(),
             Some(d2.to_string().as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn list_docs_multi_clause_cursor_and_show_missing_skips_prior_ancestors() {
+        let project: &'static FirestoreProject =
+            Box::leak(Box::new(FirestoreProject::new(FirestoreConfig::default())));
+        let root: RootRef = "projects/p/databases/(default)".parse().unwrap();
+        let db = project.database(&root).await;
+
+        for (id, rank, other) in [
+            ("m1", 1i64, 20i64),
+            ("m2", 1, 20),
+            ("m3", 1, 20),
+            ("m4", 1, 10),
+            ("m5", 2, 30),
+            ("m6", 2, 30),
+        ] {
+            let doc_ref: DocumentRef =
+                format!("projects/p/databases/(default)/documents/multi/{id}")
+                    .parse()
+                    .unwrap();
+            db.update_doc(
+                &doc_ref,
+                HashMap::from([
+                    ("rank".to_string(), Value::integer(rank)),
+                    ("other".to_string(), Value::integer(other)),
+                ]),
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        }
+
+        // Verify `Query::order_by()` / `Order::field()` / `Order::direction()` with implicit
+        // `__name__` inheriting the last explicit `DESC` direction.
+        let built = QueryBuilder::from(
+            Ref::Root(root.clone()),
+            vec![CollectionSelector {
+                collection_id:   "multi".to_string(),
+                all_descendants: false,
+            }],
+        )
+        .order_by("rank".parse().unwrap(), Direction::Ascending)
+        .order_by("other".parse().unwrap(), Direction::Descending)
+        .build()
+        .unwrap();
+        assert_eq!(built.order_by().len(), 3);
+        assert_eq!(built.order_by()[0].field().to_string(), "rank");
+        assert!(matches!(
+            built.order_by()[0].direction(),
+            Direction::Ascending
+        ));
+        assert_eq!(built.order_by()[1].field().to_string(), "other");
+        assert!(matches!(
+            built.order_by()[1].direction(),
+            Direction::Descending
+        ));
+        assert!(built.order_by()[2].field().is_document_name());
+        assert!(matches!(
+            built.order_by()[2].direction(),
+            Direction::Descending
+        ));
+
+        let (p1, tok1) = db
+            .list_docs(
+                Ref::Root(root.clone()),
+                "multi".to_string(),
+                2,
+                String::new(),
+                "rank asc, other desc".to_string(),
+                None,
+                false,
+                ReadConsistency::Default,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            p1.iter()
+                .map(|d| d.name.rsplit('/').next().unwrap())
+                .collect::<Vec<_>>(),
+            vec!["m3", "m2"]
+        );
+        let decoded =
+            ListDocsPageToken::decode(URL_SAFE_NO_PAD.decode(&tok1).unwrap().as_slice()).unwrap();
+        assert_eq!(decoded.raw_order_by, "rank asc, other desc");
+        assert_eq!(decoded.cursor.as_ref().unwrap().values.len(), 3);
+
+        // Wrong cursor length for a 3-element effective order must be rejected.
+        let short_cursor_tok = URL_SAFE_NO_PAD.encode(
+            ListDocsPageToken {
+                version: LIST_DOCS_TOKEN_VERSION,
+                parent: root.to_string(),
+                collection_id: "multi".to_string(),
+                show_missing: false,
+                cursor: Some(Cursor {
+                    values: vec![Value::integer(1), Value::integer(20)],
+                    before: false,
+                }),
+                raw_order_by: "rank asc, other desc".to_string(),
+                has_mask: false,
+                mask_field_paths: vec![],
+            }
+            .encode_to_vec(),
+        );
+        assert!(matches!(
+            db.list_docs(
+                Ref::Root(root.clone()),
+                "multi".to_string(),
+                2,
+                short_cursor_tok,
+                "rank asc, other desc".to_string(),
+                None,
+                false,
+                ReadConsistency::Default,
+            )
+            .await,
+            Err(GenericDatabaseError::InvalidArgument(_))
+        ));
+
+        let (p2, tok2) = db
+            .list_docs(
+                Ref::Root(root.clone()),
+                "multi".to_string(),
+                2,
+                tok1,
+                "rank asc, other desc".to_string(),
+                None,
+                false,
+                ReadConsistency::Default,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            p2.iter()
+                .map(|d| d.name.rsplit('/').next().unwrap())
+                .collect::<Vec<_>>(),
+            vec!["m1", "m4"]
+        );
+        let (p3, tok3) = db
+            .list_docs(
+                Ref::Root(root.clone()),
+                "multi".to_string(),
+                2,
+                tok2,
+                "rank asc, other desc".to_string(),
+                None,
+                false,
+                ReadConsistency::Default,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            p3.iter()
+                .map(|d| d.name.rsplit('/').next().unwrap())
+                .collect::<Vec<_>>(),
+            vec!["m6", "m5"]
+        );
+        assert_eq!(tok3, "");
+
+        // `show_missing = true` with a cursor must skip prior phantom ancestors before `get_doc`
+        // (leaving `peek_doc_meta == None`) and prior real docs before `query.project`.
+        let d0_ref: DocumentRef = "projects/p/databases/(default)/documents/miss_skip/d0"
+            .parse()
+            .unwrap();
+        let d1_ref: DocumentRef = "projects/p/databases/(default)/documents/miss_skip/d1"
+            .parse()
+            .unwrap();
+        let d1_sub_ref: DocumentRef = "projects/p/databases/(default)/documents/miss_skip/d1/sub/\
+                                       s1"
+        .parse()
+        .unwrap();
+        let d2_ref: DocumentRef = "projects/p/databases/(default)/documents/miss_skip/d2"
+            .parse()
+            .unwrap();
+        let d3_sub_ref: DocumentRef = "projects/p/databases/(default)/documents/miss_skip/d3/sub/\
+                                       s1"
+        .parse()
+        .unwrap();
+        for doc_ref in [&d0_ref, &d1_sub_ref, &d2_ref, &d3_sub_ref] {
+            db.update_doc(
+                doc_ref,
+                HashMap::from([("v".to_string(), Value::integer(1))]),
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        }
+        assert!(db.peek_doc_meta(&d1_ref).await.unwrap().is_none());
+
+        let tok_after_d1 = URL_SAFE_NO_PAD.encode(
+            ListDocsPageToken {
+                version: LIST_DOCS_TOKEN_VERSION,
+                parent: root.to_string(),
+                collection_id: "miss_skip".to_string(),
+                show_missing: true,
+                cursor: Some(Cursor {
+                    values: vec![Value::reference(d1_ref.to_string())],
+                    before: false,
+                }),
+                raw_order_by: String::new(),
+                has_mask: false,
+                mask_field_paths: vec![],
+            }
+            .encode_to_vec(),
+        );
+        let (miss_after_d1, miss_tok) = db
+            .list_docs(
+                Ref::Root(root),
+                "miss_skip".to_string(),
+                10,
+                tok_after_d1,
+                String::new(),
+                None,
+                true,
+                ReadConsistency::Default,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            miss_after_d1
+                .iter()
+                .map(|d| d.name.rsplit('/').next().unwrap())
+                .collect::<Vec<_>>(),
+            vec!["d2", "d3"]
+        );
+        assert_eq!(miss_tok, "");
+        assert!(
+            db.peek_doc_meta(&d1_ref).await.unwrap().is_none(),
+            "missing_docs_after must not invoke get_doc on skipped ancestor <= cursor"
         );
     }
 }
