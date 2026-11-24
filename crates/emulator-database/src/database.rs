@@ -257,6 +257,73 @@ impl FirestoreDatabase {
         Ok(result)
     }
 
+    /// Lists direct child collection IDs underneath a root or document parent in lexicographical
+    /// order, applying optional `page_size` and opaque `page_token` pagination.
+    #[instrument(level = Level::DEBUG, skip_all, err)]
+    pub async fn list_collection_ids(
+        &self,
+        parent: &Ref,
+        page_size: i32,
+        page_token: &str,
+    ) -> Result<(Vec<String>, String)> {
+        self.ensure_owns_root(parent.root())?;
+        if self.is_cleared() {
+            return Err(AbortReason::DatabaseCleared.into());
+        }
+        if matches!(parent, Ref::Collection(_)) {
+            let parent_str = parent.to_string();
+            return Err(GenericDatabaseError::invalid_argument(format!(
+                "Document parent name \"{parent_str}\" lacks \"/\" at index {}.",
+                parent_str.len()
+            )));
+        }
+        if page_size < 0 {
+            return Err(GenericDatabaseError::invalid_argument(
+                "page_size must be greater than or equal to zero.",
+            ));
+        }
+
+        let parent_str = parent.to_string();
+        let after = if page_token.is_empty() {
+            None
+        } else {
+            Some(decode_list_collection_ids_page_token(
+                page_token,
+                &parent_str,
+            )?)
+        };
+
+        let all_ids = self.get_collection_ids(parent).await?;
+        let iter = match after.as_deref() {
+            Some(after_id) => all_ids.range::<str, _>((
+                std::ops::Bound::Excluded(after_id),
+                std::ops::Bound::Unbounded,
+            )),
+            None => all_ids.range::<str, _>(..),
+        };
+
+        let mut collection_ids: Vec<String> = if page_size > 0 {
+            iter.take((page_size as usize).saturating_add(1))
+                .cloned()
+                .collect()
+        } else {
+            iter.cloned().collect()
+        };
+
+        let next_page_token = if page_size > 0 && collection_ids.len() > page_size as usize {
+            collection_ids.truncate(page_size as usize);
+            let boundary = collection_ids.last().cloned().ok_or_else(|| {
+                GenericDatabaseError::internal(
+                    "missing boundary collection ID for list_collection_ids cursor",
+                )
+            })?;
+            encode_list_collection_ids_page_token(parent_str, boundary)
+        } else {
+            String::new()
+        };
+
+        Ok((collection_ids, next_page_token))
+    }
     /// Get all collections asap collected into a [`Vec`] in order to keep the read lock time
     /// minimal.
     async fn get_all_collections(&self) -> Vec<Arc<Collection>> {
@@ -953,6 +1020,51 @@ fn decode_list_docs_page_token(
         query::validate_cursor_key_ref(&cursor.values[0], expected_root)?;
     }
     Ok(cursor)
+}
+
+const LIST_COLLECTION_IDS_TOKEN_VERSION: u32 = 1;
+const LIST_COLLECTION_IDS_TOKEN_KIND: &str = "list_collection_ids";
+
+#[derive(Clone, PartialEq, prost::Message)]
+struct ListCollectionIdsPageToken {
+    #[prost(uint32, tag = "1")]
+    version: u32,
+    #[prost(string, tag = "2")]
+    parent: String,
+    #[prost(string, tag = "3")]
+    last_collection_id: String,
+    #[prost(string, tag = "10")]
+    kind: String,
+}
+
+fn encode_list_collection_ids_page_token(parent: String, last_collection_id: String) -> String {
+    let token = ListCollectionIdsPageToken {
+        version: LIST_COLLECTION_IDS_TOKEN_VERSION,
+        parent,
+        last_collection_id,
+        kind: LIST_COLLECTION_IDS_TOKEN_KIND.to_string(),
+    };
+    URL_SAFE_NO_PAD.encode(token.encode_to_vec())
+}
+
+fn decode_list_collection_ids_page_token(page_token: &str, parent_str: &str) -> Result<String> {
+    if page_token.len() > MAX_PAGE_TOKEN_LEN {
+        return Err(GenericDatabaseError::invalid_argument("invalid page token"));
+    }
+    let raw = URL_SAFE_NO_PAD
+        .decode(page_token)
+        .map_err(|_| GenericDatabaseError::invalid_argument("invalid page token"))?;
+    let token = ListCollectionIdsPageToken::decode(raw.as_slice())
+        .map_err(|_| GenericDatabaseError::invalid_argument("invalid page token"))?;
+    if token.version != LIST_COLLECTION_IDS_TOKEN_VERSION
+        || token.kind != LIST_COLLECTION_IDS_TOKEN_KIND
+        || token.parent != parent_str
+        || token.last_collection_id.is_empty()
+        || token.encode_to_vec() != raw
+    {
+        return Err(GenericDatabaseError::invalid_argument("invalid page token"));
+    }
+    Ok(token.last_collection_id)
 }
 
 struct BacktickScanner {
@@ -2318,6 +2430,196 @@ mod tests {
         assert!(
             db.peek_doc_meta(&d1_ref).await.unwrap().is_none(),
             "missing_docs_after must not invoke get_doc on skipped ancestor <= cursor"
+        );
+    }
+
+    #[tokio::test]
+    async fn list_collection_ids_pagination_and_token_validation() {
+        let project = Box::leak(Box::new(FirestoreProject::new(FirestoreConfig::default())));
+        let root: RootRef = "projects/p/databases/(default)".parse().unwrap();
+        let db = project.database(&root).await;
+
+        let parent_doc: Ref = "projects/p/databases/(default)/documents/parents/doc1"
+            .parse()
+            .unwrap();
+        let other_doc: Ref = "projects/p/databases/(default)/documents/parents/doc2"
+            .parse()
+            .unwrap();
+
+        // Malformed / raw-string page_token rejected even when parent has no subcollections.
+        for bad in ["not-a-valid-token", "c2", "AAAA===="] {
+            assert!(matches!(
+                db.list_collection_ids(&parent_doc, 2, bad).await,
+                Err(GenericDatabaseError::InvalidArgument(_))
+            ));
+        }
+
+        // Nonexistent doc parent returns empty list and empty next_page_token.
+        assert_eq!(
+            db.list_collection_ids(&parent_doc, 0, "").await.unwrap(),
+            (vec![], String::new())
+        );
+
+        // Seed 5 subcollections out of lexicographic order.
+        for col_name in ["c3", "c1", "c5", "c2", "c4"] {
+            let doc_ref: DocumentRef =
+                format!("projects/p/databases/(default)/documents/parents/doc1/{col_name}/d")
+                    .parse()
+                    .unwrap();
+            db.update_doc(
+                &doc_ref,
+                HashMap::from([("n".to_string(), Value::string(col_name))]),
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        }
+        let other_sub: DocumentRef = "projects/p/databases/(default)/documents/parents/doc2/c1/d"
+            .parse()
+            .unwrap();
+        db.update_doc(
+            &other_sub,
+            HashMap::from([("n".to_string(), Value::string("other"))]),
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        // (a) page_size = 2 across 3 pages returns lexicographic IDs and empty final token.
+        let (p1, tok1) = db.list_collection_ids(&parent_doc, 2, "").await.unwrap();
+        assert_eq!(p1, vec!["c1", "c2"]);
+        assert!(!tok1.is_empty());
+
+        let (p2, tok2) = db.list_collection_ids(&parent_doc, 2, &tok1).await.unwrap();
+        assert_eq!(p2, vec!["c3", "c4"]);
+        assert!(!tok2.is_empty());
+
+        let (p3, tok3) = db.list_collection_ids(&parent_doc, 2, &tok2).await.unwrap();
+        assert_eq!(p3, vec!["c5"]);
+        assert_eq!(tok3, "");
+
+        // Changing page_size on follow-up page (including page_size = 0) works cleanly.
+        let (rest, rest_tok) = db.list_collection_ids(&parent_doc, 0, &tok1).await.unwrap();
+        assert_eq!(rest, vec!["c3", "c4", "c5"]);
+        assert_eq!(rest_tok, "");
+
+        // (b) Exact fit page_size == total, page_size > total, and page_size == 0 return empty
+        // token.
+        for size in [5, 6, 0] {
+            let (all, next) = db.list_collection_ids(&parent_doc, size, "").await.unwrap();
+            assert_eq!(all, vec!["c1", "c2", "c3", "c4", "c5"]);
+            assert_eq!(next, "");
+        }
+
+        // (c) Negative page_size rejected with InvalidArgument.
+        assert!(matches!(
+            db.list_collection_ids(&parent_doc, -1, "").await,
+            Err(GenericDatabaseError::InvalidArgument(_))
+        ));
+
+        // (d) Arbitrary, oversized, tampered, cross-parent, and cross-RPC tokens rejected.
+        for bad in ["not-a-valid-token", "c2", "c9"] {
+            assert!(matches!(
+                db.list_collection_ids(&parent_doc, 2, bad).await,
+                Err(GenericDatabaseError::InvalidArgument(_))
+            ));
+        }
+        assert!(matches!(
+            db.list_collection_ids(&other_doc, 2, &tok1).await,
+            Err(GenericDatabaseError::InvalidArgument(_))
+        ));
+        let bad_tokens = [
+            ListCollectionIdsPageToken {
+                version: 2,
+                parent: parent_doc.to_string(),
+                last_collection_id: "c2".to_string(),
+                kind: LIST_COLLECTION_IDS_TOKEN_KIND.to_string(),
+            },
+            ListCollectionIdsPageToken {
+                version: LIST_COLLECTION_IDS_TOKEN_VERSION,
+                parent: parent_doc.to_string(),
+                last_collection_id: String::new(),
+                kind: LIST_COLLECTION_IDS_TOKEN_KIND.to_string(),
+            },
+            ListCollectionIdsPageToken {
+                version: LIST_COLLECTION_IDS_TOKEN_VERSION,
+                parent: parent_doc.to_string(),
+                last_collection_id: "c2".to_string(),
+                kind: "list_docs".to_string(),
+            },
+        ];
+        for tok in bad_tokens {
+            let encoded = URL_SAFE_NO_PAD.encode(tok.encode_to_vec());
+            assert!(matches!(
+                db.list_collection_ids(&parent_doc, 2, &encoded).await,
+                Err(GenericDatabaseError::InvalidArgument(_))
+            ));
+        }
+        // Cross-RPC ListDocsPageToken cannot decode as a ListCollectionIdsPageToken.
+        let (_, list_docs_tok) = db
+            .list_docs(
+                parent_doc.clone(),
+                "c1".to_string(),
+                1,
+                String::new(),
+                String::new(),
+                None,
+                false,
+                ReadConsistency::Default,
+            )
+            .await
+            .unwrap();
+        if !list_docs_tok.is_empty() {
+            assert!(matches!(
+                db.list_collection_ids(&parent_doc, 2, &list_docs_tok).await,
+                Err(GenericDatabaseError::InvalidArgument(_))
+            ));
+        }
+        // Non-canonical trailing bytes appended to a valid token are rejected.
+        let mut raw_valid = URL_SAFE_NO_PAD.decode(&tok1).unwrap();
+        raw_valid.extend_from_slice(&[0x78, 0x01]); // unknown protobuf field tag 15 = 1
+        let with_extra = URL_SAFE_NO_PAD.encode(raw_valid);
+        assert!(matches!(
+            db.list_collection_ids(&parent_doc, 2, &with_extra).await,
+            Err(GenericDatabaseError::InvalidArgument(_))
+        ));
+
+        // (e) Collection-path parent rejected with InvalidArgument.
+        let col_parent: Ref = "projects/p/databases/(default)/documents/parents"
+            .parse()
+            .unwrap();
+        assert!(matches!(
+            db.list_collection_ids(&col_parent, 0, "").await,
+            Err(GenericDatabaseError::InvalidArgument(_))
+        ));
+
+        // Boundary collection deleted between pages resumes cleanly at the next collection ID.
+        let boundary_doc: DocumentRef = "projects/p/databases/(default)/documents/parents/doc1/c2/\
+                                         d"
+        .parse()
+        .unwrap();
+        db.delete_doc(&boundary_doc, None).await.unwrap();
+        let (after_del, after_del_tok) =
+            db.list_collection_ids(&parent_doc, 2, &tok1).await.unwrap();
+        assert_eq!(after_del, vec!["c3", "c4"]);
+        assert!(!after_del_tok.is_empty());
+
+        // Normalized root parent ("projects/p/databases/(default)" vs ".../documents") works.
+        let root_no_docs: Ref = "projects/p/databases/(default)".parse().unwrap();
+        let root_with_docs: Ref = "projects/p/databases/(default)/documents".parse().unwrap();
+        assert_eq!(
+            db.list_collection_ids(&root_no_docs, 1, "").await.unwrap(),
+            (vec!["parents".to_string()], String::new())
+        );
+        assert_eq!(
+            db.list_collection_ids(&root_with_docs, 1, "")
+                .await
+                .unwrap(),
+            (vec!["parents".to_string()], String::new())
         );
     }
 }

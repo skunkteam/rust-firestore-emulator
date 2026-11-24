@@ -189,34 +189,83 @@ async fn list_collection_ids_lists_root_and_subcollections_and_rejects_unsupport
     let after_del = db.list_collection_ids("", 0, "", None).await.unwrap();
     expect_eq!(after_del.collection_ids, vec!["alpha", "beta", "orgs"]);
 
-    // Pagination (`0 < page_size < len`), non-empty `page_token`, and `ReadTime` return
-    // `Code::Unimplemented`
+    // Paginate root collections (`alpha`, `beta`, `orgs`) with `page_size = 2` and exact fit `3`
+    let root_p1 = db.list_collection_ids("", 2, "", None).await.unwrap();
+    expect_eq!(root_p1.collection_ids, vec!["alpha", "beta"]);
+    assert!(!root_p1.next_page_token.is_empty());
+
+    let root_p2 = db
+        .list_collection_ids("", 2, &root_p1.next_page_token, None)
+        .await
+        .unwrap();
+    expect_eq!(root_p2.collection_ids, vec!["orgs"]);
+    expect_eq!(root_p2.next_page_token, "");
+
+    let root_exact = db.list_collection_ids("", 3, "", None).await.unwrap();
+    expect_eq!(root_exact.collection_ids, vec!["alpha", "beta", "orgs"]);
+    expect_eq!(root_exact.next_page_token, "");
+
+    // Paginate subcollections under phantom parent `orgs/acme` (`audit`, `billing`, `teams`)
+    let sub_p1 = db
+        .list_collection_ids("orgs/acme", 2, "", None)
+        .await
+        .unwrap();
+    expect_eq!(sub_p1.collection_ids, vec!["audit", "billing"]);
+    assert!(!sub_p1.next_page_token.is_empty());
+
+    let sub_p2 = db
+        .list_collection_ids("orgs/acme", 2, &sub_p1.next_page_token, None)
+        .await
+        .unwrap();
+    expect_eq!(sub_p2.collection_ids, vec!["teams"]);
+    expect_eq!(sub_p2.next_page_token, "");
+
+    // Nonexistent doc parent returns empty list and empty next_page_token
+    let missing_parent = db
+        .list_collection_ids("orgs/missing", 2, "", None)
+        .await
+        .unwrap();
+    expect_eq!(missing_parent.collection_ids, Vec::<String>::new());
+    expect_eq!(missing_parent.next_page_token, "");
+
+    // Arbitrary / raw-string / cross-parent `page_token` -> `Code::InvalidArgument`
+    for bad_tok in ["tok", "alpha", "not-a-valid-token"] {
+        assert_status_code(
+            db.list_collection_ids("", 2, bad_tok, None).await,
+            Code::InvalidArgument,
+        );
+    }
     assert_status_code(
-        db.list_collection_ids("", 2, "", None).await,
-        Code::Unimplemented,
+        db.list_collection_ids("orgs/acme", 2, &root_p1.next_page_token, None)
+            .await,
+        Code::InvalidArgument,
     );
-    assert_status_code(
-        db.list_collection_ids("", 0, "tok", None).await,
-        Code::Unimplemented,
-    );
+
+    // `ReadTime` remains `Code::Unimplemented`
     assert_status_code(
         db.list_collection_ids("", 0, "", Some(snap_t)).await,
         Code::Unimplemented,
     );
 
-    // Malformed `parent` resource name -> `Code::InvalidArgument`
-    assert_status_code(
-        db.raw_grpc()
-            .list_collection_ids(ListCollectionIdsRequest {
-                parent: format!("{DOCUMENTS_ROOT}/alpha/__reserved__/doc"),
-                page_size: 0,
-                page_token: String::new(),
-                consistency_selector: None,
-                request_options: None,
-            })
-            .await,
-        Code::InvalidArgument,
-    );
+    // Collection-path `parent` and malformed `parent` resource name -> `Code::InvalidArgument`
+    for bad_parent in [
+        format!("{DOCUMENTS_ROOT}/alpha"),
+        format!("{DOCUMENTS_ROOT}/orgs/acme/teams"),
+        format!("{DOCUMENTS_ROOT}/alpha/__reserved__/doc"),
+    ] {
+        assert_status_code(
+            db.raw_grpc()
+                .list_collection_ids(ListCollectionIdsRequest {
+                    parent: bad_parent,
+                    page_size: 0,
+                    page_token: String::new(),
+                    consistency_selector: None,
+                    request_options: None,
+                })
+                .await,
+            Code::InvalidArgument,
+        );
+    }
 }
 
 #[gtest]
