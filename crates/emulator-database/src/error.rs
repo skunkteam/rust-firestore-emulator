@@ -99,7 +99,7 @@ pub enum GenericDatabaseError {
     /// The operation was cancelled (typically by the caller).
     #[error("Cancelled: {0}")]
     Cancelled(String),
-    /// The operation was cancelled (typically by the caller).
+    /// Internal errors. Means some invariants expected by underlying system have been broken.
     #[error("Internal error: {0}")]
     Internal(String),
     /// Client specified an invalid argument. Note that this differs from FailedPrecondition.
