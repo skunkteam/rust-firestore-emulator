@@ -43,7 +43,9 @@ import assert from "node:assert/strict";
 
 const popstateListeners = [];
 const docKeydownListeners = [];
+const docVisibilityListeners = [];
 let mockActiveElement = null;
+let mockVisibilityState = "visible";
 let fetchImpl = async () => {
   throw new Error("unexpected fetch call");
 };
@@ -51,6 +53,9 @@ let fetchImpl = async () => {
 globalThis.document = {
   createTreeWalker: () => ({ currentNode: null, nextNode: () => null }),
   getElementById: () => null,
+  get visibilityState() {
+    return mockVisibilityState;
+  },
   get activeElement() {
     return mockActiveElement;
   },
@@ -59,11 +64,16 @@ globalThis.document = {
   },
   addEventListener(type, fn) {
     if (type === "keydown") docKeydownListeners.push(fn);
+    if (type === "visibilitychange") docVisibilityListeners.push(fn);
   },
   removeEventListener(type, fn) {
     if (type === "keydown") {
       const idx = docKeydownListeners.indexOf(fn);
       if (idx >= 0) docKeydownListeners.splice(idx, 1);
+    }
+    if (type === "visibilitychange") {
+      const idx = docVisibilityListeners.indexOf(fn);
+      if (idx >= 0) docVisibilityListeners.splice(idx, 1);
     }
   },
 };
@@ -3002,6 +3012,1687 @@ for (const fx of modalFixtures) {{
 }}
 
 console.log("regression_a11y_modals_aria_labels_escape_focus_and_backdrop passed");
+"#
+    );
+
+    run_node_ui_test(&script);
+}
+
+#[test]
+fn regression_contention_sse_lifecycle_and_routing() {
+    let script = format!(
+        r#"{NODE_BOOTSTRAP}
+const streams = [];
+globalThis.EventSource = class {{
+  constructor(url) {{
+    this.url = url;
+    this.closed = false;
+    this.closeCount = 0;
+    this.listeners = new Map();
+    streams.push(this);
+  }}
+  addEventListener(type, fn) {{
+    const list = this.listeners.get(type) ?? [];
+    list.push(fn);
+    this.listeners.set(type, list);
+  }}
+  emit(type, data) {{
+    for (const fn of this.listeners.get(type) ?? []) {{
+      fn(data);
+    }}
+  }}
+  close() {{
+    this.closed = true;
+    this.closeCount++;
+  }}
+}};
+
+const app = await import("./ui/app.js");
+
+// 1. parseBrowserRoute supports /projects/.../databases/.../contention while keeping /documents exact.
+assert.deepEqual(
+  app.parseBrowserRoute("/projects/p/databases/(default)/contention"),
+  {{ projectId: "p", databaseId: "(default)", segments: [], view: "contention" }}
+);
+assert.deepEqual(
+  app.parseBrowserRoute("/projects/p/databases/(default)/contention/"),
+  {{ projectId: "p", databaseId: "(default)", segments: [], view: "contention" }}
+);
+assert.equal(app.parseBrowserRoute("/projects/../databases/(default)/contention"), null);
+assert.equal(app.parseBrowserRoute("/projects/p/databases/(default)/contention/extra"), null);
+assert.deepEqual(
+  app.parseBrowserRoute("/projects/p/databases/(default)/documents/users/alice"),
+  {{ projectId: "p", databaseId: "(default)", segments: ["users", "alice"] }}
+);
+
+const rootPath = "projects/p/databases/(default)/documents";
+let contentionFetches = 0;
+fetchImpl = async (url) => {{
+  if (url === "/emulator/v1") {{
+    return jsonResponse([rootPath]);
+  }}
+  if (url === "/v1/projects/p/databases/(default)") {{
+    return jsonResponse({{
+      name: "projects/p/databases/(default)",
+      uid: "u1",
+      type: "FIRESTORE_NATIVE",
+      databaseEdition: "STANDARD",
+      concurrencyMode: "PESSIMISTIC",
+    }});
+  }}
+  if (url === "/v1/projects/p/databases/(default)/documents:listCollectionIds") {{
+    return jsonResponse({{ collectionIds: ["users"] }});
+  }}
+  if (url.startsWith("/v1/projects/p/databases/(default)/documents/users?")) {{
+    return jsonResponse({{ documents: [] }});
+  }}
+  if (url.startsWith("/emulator/v1/contention")) {{
+    contentionFetches++;
+    return jsonResponse({{
+      databases: [{{
+        database: rootPath,
+        summary: {{ woundsTotal: 0, timeoutsTotal: 0, upgradeAbortsTotal: 0, writeBatchRetriesTotal: 0 }},
+        contendedDocuments: [],
+        totalContendedDocuments: 0,
+        truncated: false,
+        recentEvents: [],
+      }}],
+    }});
+  }}
+  throw new Error("unexpected url: " + url);
+}};
+
+// 2. Starting on explorer must NOT open contention SSE or fetch /emulator/v1/contention.
+await app.init();
+assert.equal(app.state.view, "explorer");
+assert.equal(app.state.contentionSseStatus, "idle");
+assert.equal(streams.filter((s) => s.url === "/emulator/v1/events").length, 1);
+assert.equal(streams.filter((s) => s.url === "/emulator/v1/contention/events").length, 0);
+assert.equal(contentionFetches, 0);
+
+// 3. Clicking Contention tab opens contention SSE, syncs URL, and fetches once (without double-fetch on initial open).
+const contentionTab = findClickHandler(app.renderTopbar(), "Contention");
+assert.ok(contentionTab, "expected Contention button in topbar");
+await contentionTab();
+assert.equal(app.state.view, "contention");
+assert.equal(globalThis.window.location.pathname, "/projects/p/databases/(default)/contention");
+assert.equal(contentionFetches, 1);
+let contentionStreams = streams.filter((s) => s.url === "/emulator/v1/contention/events");
+assert.equal(contentionStreams.length, 1);
+assert.equal(contentionStreams[0].closed, false);
+assert.equal(app.state.contentionSseStatus, "connecting");
+
+contentionStreams[0].emit("open");
+assert.equal(app.state.contentionSseStatus, "live");
+assert.equal(contentionFetches, 1, "initial SSE open must not double-fetch");
+
+// 4. Leaving Contention to Query Runner closes contention SSE and resets status to idle.
+const queryTab = findClickHandler(app.renderTopbar(), "Query Runner");
+assert.ok(queryTab);
+await queryTab();
+assert.equal(app.state.view, "query");
+assert.equal(contentionStreams[0].closed, true);
+assert.equal(contentionStreams[0].closeCount, 1);
+assert.equal(app.state.contentionSseStatus, "idle");
+assert.equal(globalThis.window.location.pathname, "/projects/p/databases/(default)/documents");
+
+// 5. Re-entering Contention opens a new stream; error -> live triggers reconnect refresh.
+await app.switchView("contention");
+contentionStreams = streams.filter((s) => s.url === "/emulator/v1/contention/events");
+assert.equal(contentionStreams.length, 2);
+assert.equal(contentionStreams[1].closed, false);
+assert.equal(contentionFetches, 2);
+
+contentionStreams[1].emit("error");
+assert.equal(app.state.contentionSseStatus, "error");
+contentionStreams[1].emit("open");
+await new Promise((r) => setTimeout(r, 0));
+assert.equal(app.state.contentionSseStatus, "live");
+assert.equal(contentionFetches, 3, "error -> live reconnect must refresh contention");
+
+// 6. Pausing SSE closes contention SSE; unpausing reopens and refreshes contention.
+await app.toggleSsePaused();
+assert.equal(app.state.ssePaused, true);
+assert.equal(contentionStreams[1].closed, true);
+assert.equal(app.state.contentionSseStatus, "idle");
+
+await app.toggleSsePaused();
+assert.equal(app.state.ssePaused, false);
+contentionStreams = streams.filter((s) => s.url === "/emulator/v1/contention/events");
+assert.equal(contentionStreams.length, 3);
+assert.equal(contentionStreams[2].closed, false);
+assert.equal(contentionFetches, 4);
+
+// 7. Tab hidden closes contention SSE; becoming visible reopens and refreshes.
+mockVisibilityState = "hidden";
+for (const fn of docVisibilityListeners) {{
+  await fn();
+}}
+await new Promise((r) => setTimeout(r, 0));
+assert.equal(contentionStreams[2].closed, true);
+assert.equal(app.state.contentionSseStatus, "idle");
+
+// Switching away & back while hidden must keep contention SSE closed.
+await app.switchView("explorer");
+await app.switchView("contention");
+contentionStreams = streams.filter((s) => s.url === "/emulator/v1/contention/events");
+assert.equal(contentionStreams.length, 3, "must not open contention SSE while document is hidden");
+
+mockVisibilityState = "visible";
+for (const fn of docVisibilityListeners) {{
+  await fn();
+}}
+await new Promise((r) => setTimeout(r, 0));
+contentionStreams = streams.filter((s) => s.url === "/emulator/v1/contention/events");
+assert.equal(contentionStreams.length, 4);
+assert.equal(contentionStreams[3].closed, false);
+assert.equal(contentionFetches, 6);
+
+// 8. popstate back to /documents/users switches to explorer and closes contention SSE.
+globalThis.window.location.pathname = "/projects/p/databases/(default)/documents/users";
+for (const fn of popstateListeners) {{
+  fn();
+}}
+await new Promise((r) => setTimeout(r, 0));
+assert.equal(app.state.view, "explorer");
+assert.equal(contentionStreams[3].closed, true);
+assert.deepEqual(app.state.segments, ["users"]);
+
+// 9. Missing activeDatabaseId keeps contention SSE closed, and handleVisibilityChange outside contention does not fetch.
+await app.switchView("contention");
+contentionStreams = streams.filter((s) => s.url === "/emulator/v1/contention/events");
+assert.equal(contentionStreams.length, 5);
+const fetchesBeforeVisOutside = contentionFetches;
+await app.switchView("explorer");
+assert.equal(contentionStreams[4].closed, true);
+mockVisibilityState = "hidden";
+await app.handleVisibilityChange();
+mockVisibilityState = "visible";
+await app.handleVisibilityChange();
+assert.equal(contentionFetches, fetchesBeforeVisOutside, "visibilitychange outside contention must not fetch contention");
+
+// When activeDatabaseId is unset, entering contention must NOT open SSE.
+app.state.activeDatabaseId = null;
+await app.switchView("contention");
+contentionStreams = streams.filter((s) => s.url === "/emulator/v1/contention/events");
+assert.equal(contentionStreams.length, 5, "must require both activeProjectId and activeDatabaseId");
+app.state.activeDatabaseId = "(default)";
+await app.switchView("contention");
+contentionStreams = streams.filter((s) => s.url === "/emulator/v1/contention/events");
+assert.equal(contentionStreams.length, 6);
+
+// 10. Unpausing SSE when enqueueSseBatch switches to another DB avoids duplicate refreshContention().
+await app.toggleSsePaused();
+assert.equal(contentionStreams[5].closed, true);
+const origFetch = fetchImpl;
+const db2Root = "projects/p/databases/db2/documents";
+let db2ContentionFetches = 0;
+fetchImpl = async (url) => {{
+  if (url === "/emulator/v1") return jsonResponse([db2Root]);
+  if (url === "/v1/projects/p/databases/db2") {{
+    return jsonResponse({{
+      name: "projects/p/databases/db2",
+      uid: "u2",
+      type: "FIRESTORE_NATIVE",
+      databaseEdition: "STANDARD",
+      concurrencyMode: "PESSIMISTIC",
+    }});
+  }}
+  if (url === "/v1/projects/p/databases/db2/documents:listCollectionIds") {{
+    return jsonResponse({{ collectionIds: [] }});
+  }}
+  if (url.startsWith("/emulator/v1/contention")) {{
+    db2ContentionFetches++;
+    return jsonResponse({{ databases: [] }});
+  }}
+  return origFetch(url);
+}};
+await app.toggleSsePaused();
+assert.equal(app.state.activeDatabaseId, "db2");
+assert.equal(db2ContentionFetches, 1, "unpause resync DB switch must refresh contention exactly once");
+
+// 11. Synchronous EventSource constructor throw leaves contentionSseStatus === "error" cleanly.
+await app.switchView("explorer");
+fetchImpl = origFetch;
+const OrigEs = globalThis.EventSource;
+let esThrowAttempts = 0;
+globalThis.EventSource = class {{
+  constructor(url) {{
+    if (url === "/emulator/v1/contention/events") {{
+      esThrowAttempts++;
+      throw new Error("EventSource disabled");
+    }}
+    return new OrigEs(url);
+  }}
+}};
+await app.switchView("contention");
+assert.equal(app.state.contentionSseStatus, "error");
+assert.equal(esThrowAttempts, 1, "synchronous EventSource throw must not retry in renderApp loop");
+globalThis.EventSource = OrigEs;
+await app.switchView("explorer");
+
+// 12. Paused SSE suppresses automatic visibilitychange refreshContention while preserving manual Refresh.
+await app.switchView("contention");
+await app.toggleSsePaused();
+assert.equal(app.state.ssePaused, true);
+const fetchesWhilePausedBeforeVis = contentionFetches;
+mockVisibilityState = "hidden";
+for (const fn of docVisibilityListeners) {{
+  await fn();
+}}
+mockVisibilityState = "visible";
+for (const fn of docVisibilityListeners) {{
+  await fn();
+}}
+assert.equal(
+  contentionFetches,
+  fetchesWhilePausedBeforeVis,
+  "visibilitychange while ssePaused must not automatically refresh contention"
+);
+contentionStreams = streams.filter((s) => s.url === "/emulator/v1/contention/events");
+assert.equal(
+  contentionStreams.every((s) => s.closed),
+  true,
+  "visibilitychange while ssePaused must keep contention SSE closed"
+);
+const manualRefreshBtn = findClickHandler(app.renderWorkspace(), "Refresh");
+assert.ok(manualRefreshBtn, "expected manual Refresh button while SSE paused");
+await manualRefreshBtn();
+assert.equal(
+  contentionFetches,
+  fetchesWhilePausedBeforeVis + 1,
+  "manual Refresh must still fetch contention while ssePaused"
+);
+await app.toggleSsePaused();
+
+// 13. Switching DB via selectDatabase while in Contention view sets loading=true immediately so
+//     empty-state copy does not flash during getDatabase()/listCollectionIds() awaits.
+const db3Root = "projects/p/databases/db3/documents";
+const db3MetaDef = deferred();
+const db3ColsDef = deferred();
+fetchImpl = async (url) => {{
+  if (url === "/emulator/v1") return jsonResponse([rootPath, db2Root, db3Root]);
+  if (url === "/v1/projects/p/databases/db3") return db3MetaDef.promise;
+  if (url === "/v1/projects/p/databases/db3/documents:listCollectionIds") return db3ColsDef.promise;
+  if (url.startsWith("/emulator/v1/contention")) {{
+    return jsonResponse({{ databases: [] }});
+  }}
+  return origFetch(url);
+}};
+const selectDb3Promise = app.selectDatabase("p", "db3", [], true);
+assert.equal(app.state.contention.loading, true, "selectDatabase in contention view must set loading=true immediately");
+assert.equal(app.state.contention.snapshot, null);
+const pendingDbSwitchMarkup = renderTemplateMarkup(app.renderWorkspace());
+assert.ok(
+  pendingDbSwitchMarkup.includes("Loading contention snapshot..."),
+  "pending DB switch in contention view must show loading state"
+);
+assert.equal(
+  pendingDbSwitchMarkup.includes("No active lock contention"),
+  false,
+  "pending DB switch in contention view must not flash empty contention copy"
+);
+db3MetaDef.resolve(jsonResponse({{
+  name: "projects/p/databases/db3",
+  uid: "u3",
+  type: "FIRESTORE_NATIVE",
+  databaseEdition: "STANDARD",
+  concurrencyMode: "PESSIMISTIC",
+}}));
+db3ColsDef.resolve(jsonResponse({{ collectionIds: [] }}));
+await selectDb3Promise;
+assert.equal(app.state.contention.loading, false);
+await app.switchView("explorer");
+
+console.log("regression_contention_sse_lifecycle_and_routing passed");
+"#
+    );
+
+    run_node_ui_test(&script);
+}
+
+#[test]
+fn regression_contention_debounced_refetch_and_stale_guard() {
+    let script = format!(
+        r#"{NODE_BOOTSTRAP}
+let virtualNow = 0;
+let nextTimerId = 1;
+const scheduledTimers = new Map();
+const origSetTimeout = globalThis.setTimeout;
+const origClearTimeout = globalThis.clearTimeout;
+
+globalThis.setTimeout = (fn, ms = 0) => {{
+  const id = nextTimerId++;
+  scheduledTimers.set(id, {{ fn, runAt: virtualNow + Number(ms), seq: id }});
+  return id;
+}};
+globalThis.clearTimeout = (id) => {{
+  scheduledTimers.delete(id);
+}};
+
+async function flushMicrotasks() {{
+  for (let i = 0; i < 6; i++) {{
+    await Promise.resolve();
+  }}
+}}
+
+async function advanceTimers(deltaMs) {{
+  const target = virtualNow + deltaMs;
+  while (true) {{
+    let next = null;
+    for (const entry of scheduledTimers.values()) {{
+      if (entry.runAt <= target) {{
+        if (!next || entry.runAt < next.runAt || (entry.runAt === next.runAt && entry.seq < next.seq)) {{
+          next = entry;
+        }}
+      }}
+    }}
+    if (!next) break;
+    scheduledTimers.delete(next.seq);
+    virtualNow = next.runAt;
+    next.fn();
+    await flushMicrotasks();
+  }}
+  virtualNow = target;
+}}
+
+const streams = [];
+globalThis.EventSource = class {{
+  constructor(url) {{
+    this.url = url;
+    this.closed = false;
+    this.listeners = new Map();
+    streams.push(this);
+  }}
+  addEventListener(type, fn) {{
+    const list = this.listeners.get(type) ?? [];
+    list.push(fn);
+    this.listeners.set(type, list);
+  }}
+  emit(type, data) {{
+    for (const fn of this.listeners.get(type) ?? []) {{
+      fn(data);
+    }}
+  }}
+  close() {{
+    this.closed = true;
+  }}
+}};
+
+const app = await import("./ui/app.js");
+
+const rootPath = "projects/p/databases/(default)/documents";
+let contentionFetches = 0;
+let nextSnapshotFn = () => jsonResponse({{
+  databases: [{{
+    database: rootPath,
+    summary: {{ woundsTotal: 0, timeoutsTotal: 0, upgradeAbortsTotal: 0, writeBatchRetriesTotal: 0 }},
+    contendedDocuments: [],
+    totalContendedDocuments: 0,
+    truncated: false,
+    recentEvents: [],
+  }}],
+}});
+
+fetchImpl = async (url) => {{
+  if (url === "/emulator/v1") return jsonResponse([rootPath]);
+  if (url === "/v1/projects/p/databases/(default)") {{
+    return jsonResponse({{
+      name: "projects/p/databases/(default)",
+      uid: "u1",
+      type: "FIRESTORE_NATIVE",
+      databaseEdition: "STANDARD",
+      concurrencyMode: "PESSIMISTIC",
+    }});
+  }}
+  if (url === "/v1/projects/p/databases/(default)/documents:listCollectionIds") {{
+    return jsonResponse({{ collectionIds: [] }});
+  }}
+  if (url.startsWith("/emulator/v1/contention")) {{
+    contentionFetches++;
+    return nextSnapshotFn();
+  }}
+  throw new Error("unexpected url: " + url);
+}};
+
+globalThis.window.location.pathname = "/projects/p/databases/(default)/documents";
+await app.init();
+await app.switchView("contention");
+const es = streams.find((s) => s.url === "/emulator/v1/contention/events");
+assert.ok(es);
+es.emit("open");
+assert.equal(contentionFetches, 1);
+
+// 1. Rapid burst of contention_changed / database_cleared / resync events coalesces into 1 refetch after 200ms.
+es.emit("contention", {{ data: JSON.stringify({{ type: "contention_changed", database: rootPath }}) }});
+await advanceTimers(40);
+es.emit("contention", {{ data: JSON.stringify({{ type: "contention_changed", database: rootPath }}) }});
+await advanceTimers(40);
+es.emit("contention", {{ data: JSON.stringify({{ type: "database_cleared", database: rootPath }}) }});
+es.emit("resync", {{ data: JSON.stringify({{ type: "resync", skipped: 2 }}) }});
+es.emit("contention", {{ data: JSON.stringify({{ type: "contention_changed", database: rootPath }}) }});
+
+await advanceTimers(199);
+assert.equal(contentionFetches, 1, "debounced burst must not fetch before 200ms trailing quiet window");
+
+await advanceTimers(1);
+assert.equal(contentionFetches, 2, "rapid burst must coalesce into exactly 1 GET /emulator/v1/contention at 200ms");
+
+// 2. Sustained >5Hz contention events (every 100ms) must still flush at maxWaitMs=1000 instead of starving.
+for (let step = 0; step < 9; step++) {{
+  es.emit("contention", {{ data: JSON.stringify({{ type: "contention_changed", database: rootPath }}) }});
+  await advanceTimers(100);
+}}
+assert.equal(contentionFetches, 2, "must not flush before maxWaitMs=1000 while events arrive every 100ms");
+es.emit("contention", {{ data: JSON.stringify({{ type: "contention_changed", database: rootPath }}) }});
+await advanceTimers(100);
+assert.equal(contentionFetches, 3, "maxWaitMs=1000 must force refresh under continuous >5Hz contention");
+await advanceTimers(250);
+assert.equal(contentionFetches, 3, "flushing at maxWaitMs must clear trailing timer cleanly");
+
+// 3. Events for another database (and non-object JSON payloads) do not trigger extra fetches in active scope.
+es.emit("contention", {{ data: "null" }});
+es.emit("contention", {{ data: '"str"' }});
+es.emit("contention", {{ data: JSON.stringify({{ type: "contention_changed", database: "projects/p/databases/other/documents" }}) }});
+await advanceTimers(1200);
+assert.equal(contentionFetches, 3, "unrelated DB or non-object payloads must not trigger fetches");
+
+// 4. Stale in-flight GET response must NOT overwrite newer snapshot.
+const slowFirst = deferred();
+const fastSecond = deferred();
+let seqMode = 0;
+nextSnapshotFn = () => {{
+  seqMode++;
+  return seqMode === 1 ? slowFirst.promise : fastSecond.promise;
+}};
+const p1 = app.refreshContention();
+const p2 = app.refreshContention();
+fastSecond.resolve(jsonResponse({{
+  databases: [{{
+    database: rootPath,
+    summary: {{ woundsTotal: 7, timeoutsTotal: 0, upgradeAbortsTotal: 0, writeBatchRetriesTotal: 0 }},
+    contendedDocuments: [],
+    totalContendedDocuments: 0,
+    truncated: false,
+    recentEvents: [],
+  }}],
+}}));
+await p2;
+slowFirst.resolve(jsonResponse({{
+  databases: [{{
+    database: rootPath,
+    summary: {{ woundsTotal: 1, timeoutsTotal: 0, upgradeAbortsTotal: 0, writeBatchRetriesTotal: 0 }},
+    contendedDocuments: [],
+    totalContendedDocuments: 0,
+    truncated: false,
+    recentEvents: [],
+  }}],
+}}));
+await p1;
+assert.equal(app.state.contention.snapshot.databases[0].summary.woundsTotal, 7);
+
+// 5. Leaving view before debounce/maxWait timers fire clears timers cleanly (no fetch after leave).
+nextSnapshotFn = () => jsonResponse({{ databases: [] }});
+const fetchesBeforeLeave = contentionFetches;
+es.emit("contention", {{ data: JSON.stringify({{ type: "contention_changed", database: rootPath }}) }});
+await app.switchView("explorer");
+assert.equal(es.closed, true);
+await advanceTimers(1500);
+assert.equal(contentionFetches, fetchesBeforeLeave, "closing contention SSE must cancel pending debounce and maxWait timers");
+
+globalThis.setTimeout = origSetTimeout;
+globalThis.clearTimeout = origClearTimeout;
+console.log("regression_contention_debounced_refetch_and_stale_guard passed");
+"#
+    );
+
+    run_node_ui_test(&script);
+}
+
+#[test]
+fn regression_contention_dom_only_waiter_ticker_lifecycle() {
+    let script = format!(
+        r#"{NODE_BOOTSTRAP}
+let nextIntervalId = 1;
+const activeIntervals = new Map();
+const startedIntervals = [];
+const clearedIntervals = [];
+const origSetInterval = globalThis.setInterval;
+const origClearInterval = globalThis.clearInterval;
+
+globalThis.setInterval = (fn, ms) => {{
+  const id = nextIntervalId++;
+  activeIntervals.set(id, {{ fn, ms }});
+  startedIntervals.push({{ id, ms }});
+  return id;
+}};
+globalThis.clearInterval = (id) => {{
+  if (activeIntervals.has(id)) {{
+    activeIntervals.delete(id);
+    clearedIntervals.push(id);
+  }}
+  return origClearInterval(id);
+}};
+
+let mockNow = 1_700_000_000_000;
+Date.now = () => mockNow;
+
+const waitNode = {{
+  attrs: {{ "data-wait-base-ms": "160", "data-wait-ms": "160", "data-wait-label": "160ms" }},
+  textContent: "160ms",
+  getAttribute(name) {{
+    return this.attrs[name] ?? null;
+  }},
+  setAttribute(name, val) {{
+    this.attrs[name] = String(val);
+  }},
+}};
+let querySelectorCalls = 0;
+const mockWorkspaceEl = {{
+  querySelectorAll(sel) {{
+    if (sel === "[data-wait-base-ms]") {{
+      querySelectorCalls++;
+      return [waitNode];
+    }}
+    return [];
+  }},
+}};
+
+const app = await import("./ui/app.js");
+document.getElementById = (id) => (id === "workspace" ? mockWorkspaceEl : null);
+
+const rootPath = "projects/p/databases/(default)/documents";
+const otherRoot = "projects/p/databases/other/documents";
+let currentWaiters = [];
+
+fetchImpl = async (url) => {{
+  if (url === "/emulator/v1") return jsonResponse([rootPath, otherRoot]);
+  if (url === "/v1/projects/p/databases/(default)") {{
+    return jsonResponse({{
+      name: "projects/p/databases/(default)",
+      uid: "u1",
+      type: "FIRESTORE_NATIVE",
+      databaseEdition: "STANDARD",
+      concurrencyMode: "PESSIMISTIC",
+    }});
+  }}
+  if (url === "/v1/projects/p/databases/other") {{
+    return jsonResponse({{
+      name: "projects/p/databases/other",
+      uid: "u2",
+      type: "FIRESTORE_NATIVE",
+      databaseEdition: "STANDARD",
+      concurrencyMode: "PESSIMISTIC",
+    }});
+  }}
+  if (url.endsWith(":listCollectionIds")) {{
+    return jsonResponse({{ collectionIds: [] }});
+  }}
+  if (url.startsWith("/emulator/v1/contention")) {{
+    const dbName = url.includes("other") ? otherRoot : rootPath;
+    return jsonResponse({{
+      databases: [{{
+        database: dbName,
+        summary: {{ woundsTotal: 0, timeoutsTotal: 0, upgradeAbortsTotal: 0, writeBatchRetriesTotal: 0 }},
+        contendedDocuments: currentWaiters.length > 0
+          ? [{{
+              document: `${{dbName}}/c/d1`,
+              writer: null,
+              readers: [],
+              readerCount: 1,
+              waiters: currentWaiters,
+              waiterCount: currentWaiters.length,
+            }}]
+          : [],
+        totalContendedDocuments: currentWaiters.length > 0 ? 1 : 0,
+        truncated: false,
+        recentEvents: [],
+      }}],
+    }});
+  }}
+  throw new Error("unexpected url: " + url);
+}};
+
+await app.init();
+
+// 1. Snapshot with 0 waiters must NOT start the 1000ms ticker.
+await app.switchView("contention");
+assert.equal(startedIntervals.length, 0, "no ticker interval when waiters list is empty");
+
+// 2. Snapshot with 1 waiter starts exactly one 1000ms interval.
+currentWaiters = [{{
+  sessionId: 7,
+  txnId: "1:1",
+  kind: "PESSIMISTIC_TXN",
+  seq: 3,
+  mode: "WRITE",
+  waitedMs: 160,
+}}];
+await app.refreshContention();
+assert.equal(startedIntervals.length, 1);
+assert.equal(startedIntervals[0].ms, 1000);
+assert.equal(activeIntervals.size, 1);
+
+// 3. Running ticks updates ONLY DOM nodes directly without re-fetching or overwriting snapshot waitedMs.
+const tickId = startedIntervals[0].id;
+const tickFn = activeIntervals.get(tickId).fn;
+const snapRefBeforeTicks = app.state.contention.snapshot;
+mockNow += 1000;
+tickFn();
+assert.equal(querySelectorCalls, 1);
+assert.equal(waitNode.attrs["data-wait-ms"], "1160");
+assert.equal(waitNode.attrs["data-wait-label"], "1.2s");
+assert.equal(waitNode.textContent, "1.2s");
+
+mockNow += 1000;
+tickFn();
+assert.equal(waitNode.attrs["data-wait-ms"], "2160");
+assert.equal(waitNode.attrs["data-wait-label"], "2.2s");
+assert.equal(waitNode.textContent, "2.2s");
+assert.equal(app.state.contention.snapshot, snapRefBeforeTicks);
+assert.equal(app.state.contention.snapshot.databases[0].contendedDocuments[0].waiters[0].waitedMs, 160);
+
+// 4. Clearing waiters stops the interval immediately.
+currentWaiters = [];
+await app.refreshContention();
+assert.equal(activeIntervals.size, 0, "interval must clear when waiters drop to 0");
+
+// 5. Re-enabling waiter starts interval, then hidden visibility clears it, then visible restarts it.
+currentWaiters = [{{ sessionId: 8, txnId: null, kind: "SINGLE_WRITE", seq: 4, mode: "WRITE", waitedMs: 25 }}];
+await app.refreshContention();
+assert.equal(activeIntervals.size, 1);
+
+mockVisibilityState = "hidden";
+for (const fn of docVisibilityListeners) {{
+  await fn();
+}}
+assert.equal(activeIntervals.size, 0, "interval must clear when tab becomes hidden");
+
+mockVisibilityState = "visible";
+for (const fn of docVisibilityListeners) {{
+  await fn();
+}}
+assert.equal(activeIntervals.size, 1, "interval must restart when tab becomes visible with waiters");
+
+// 6. Database change stops existing interval before new snapshot arrives, then restarts for new DB waiters.
+const clearedBeforeDbSwitch = clearedIntervals.length;
+await app.selectDatabase("p", "other");
+assert.ok(clearedIntervals.length > clearedBeforeDbSwitch, "database change must clear previous ticker");
+assert.equal(activeIntervals.size, 1);
+
+// 7. Switching view away from contention clears the interval immediately.
+await app.switchView("query");
+assert.equal(activeIntervals.size, 0, "leaving contention view must clear ticker interval");
+
+globalThis.setInterval = origSetInterval;
+console.log("regression_contention_dom_only_waiter_ticker_lifecycle passed");
+"#
+    );
+
+    run_node_ui_test(&script);
+}
+
+#[test]
+fn regression_contention_clear_history_open_doc_and_rendering() {
+    let script = format!(
+        r#"{NODE_BOOTSTRAP}
+const app = await import("./ui/app.js");
+const {{ renderContention }} = await import("./ui/components/contention.js");
+
+const rootA = "projects/p/databases/(default)/documents";
+const rootB = "projects/other/databases/db2/documents";
+const nestedDoc = `${{rootA}}/rooms/r1/messages/m1`;
+const crossDbDoc = `${{rootB}}/orders/o1`;
+
+const deleteCalls = [];
+const fetchedUrls = [];
+let clearedOnce = false;
+
+fetchImpl = async (url, init) => {{
+  fetchedUrls.push(`${{init.method ?? "GET"}} ${{url}}`);
+  if (url === "/emulator/v1") return jsonResponse([rootA, rootB]);
+  if (url === "/v1/projects/p/databases/(default)") {{
+    return jsonResponse({{
+      name: "projects/p/databases/(default)",
+      uid: "u1",
+      type: "FIRESTORE_NATIVE",
+      databaseEdition: "STANDARD",
+      concurrencyMode: "PESSIMISTIC",
+    }});
+  }}
+  if (url === "/v1/projects/other/databases/db2") {{
+    return jsonResponse({{
+      name: "projects/other/databases/db2",
+      uid: "u2",
+      type: "FIRESTORE_NATIVE",
+      databaseEdition: "ENTERPRISE",
+      concurrencyMode: "OPTIMISTIC",
+    }});
+  }}
+  if (url.endsWith(":listCollectionIds")) {{
+    if (url.includes("/rooms/r1:")) return jsonResponse({{ collectionIds: ["messages"] }});
+    if (url.includes("/documents:")) return jsonResponse({{ collectionIds: ["rooms", "orders"] }});
+    return jsonResponse({{ collectionIds: [] }});
+  }}
+  if (url.includes("/documents/rooms?")) {{
+    return jsonResponse({{ documents: [{{ name: `${{rootA}}/rooms/r1` }}] }});
+  }}
+  if (url.includes("/documents/rooms/r1/messages?")) {{
+    return jsonResponse({{
+      documents: [{{ name: nestedDoc, createTime: "2026-01-01T00:00:00Z", updateTime: "2026-01-01T00:00:00Z" }}],
+    }});
+  }}
+  if (url === `/v1/${{nestedDoc}}`) {{
+    return jsonResponse({{ name: nestedDoc, fields: {{ body: {{ stringValue: "hi" }} }} }});
+  }}
+  if (url.includes("/documents/orders?")) {{
+    return jsonResponse({{
+      documents: [{{ name: crossDbDoc, createTime: "2026-01-01T00:00:00Z", updateTime: "2026-01-01T00:00:00Z" }}],
+    }});
+  }}
+  if (url === `/v1/${{crossDbDoc}}`) {{
+    return jsonResponse({{ name: crossDbDoc, fields: {{ total: {{ integerValue: "42" }} }} }});
+  }}
+  if (url.startsWith("/emulator/v1/contention") && init.method === "DELETE") {{
+    deleteCalls.push(url);
+    clearedOnce = true;
+    return jsonResponse({{}});
+  }}
+  if (url.startsWith("/emulator/v1/contention")) {{
+    return jsonResponse({{
+      databases: [{{
+        database: rootA,
+        summary: clearedOnce
+          ? {{ woundsTotal: 0, timeoutsTotal: 0, upgradeAbortsTotal: 0, writeBatchRetriesTotal: 0 }}
+          : {{ woundsTotal: 3, timeoutsTotal: 2, upgradeAbortsTotal: 1, writeBatchRetriesTotal: 4 }},
+        contendedDocuments: [{{
+          document: nestedDoc,
+          writer: {{
+            sessionId: 11,
+            txnId: "11:1",
+            kind: "PESSIMISTIC_TXN",
+            seq: 1,
+            state: "ACTIVE",
+            woundable: false,
+          }},
+          readers: [{{
+            sessionId: 12,
+            txnId: "12:1",
+            kind: "PESSIMISTIC_TXN",
+            seq: 2,
+            state: "ACTIVE",
+            woundable: true,
+            retained: true,
+            activeLeases: 1,
+          }}],
+          readerCount: 1,
+          waiters: [{{
+            sessionId: 13,
+            txnId: "13:1",
+            kind: "PESSIMISTIC_TXN",
+            seq: 3,
+            mode: "WRITE",
+            waitedMs: 250,
+          }}],
+          waiterCount: 1,
+        }}],
+        totalContendedDocuments: 1,
+        truncated: false,
+        recentEvents: clearedOnce ? [] : [
+          {{
+            id: 2,
+            kind: "WOUNDED",
+            timestamp: "2026-11-23T12:00:01Z",
+            docName: nestedDoc,
+            sessionId: 14,
+            txnId: "14:1",
+            sessionKind: "PESSIMISTIC_TXN",
+            seq: 5,
+            wounderSessionId: 11,
+            wounderTxnId: "11:1",
+            wounderKind: "PESSIMISTIC_TXN",
+            wounderSeq: 1,
+          }},
+          {{
+            id: 1,
+            kind: "WRITE_BATCH_RETRY",
+            timestamp: "2026-11-23T12:00:00Z",
+            docName: null,
+            sessionId: 15,
+            txnId: null,
+            sessionKind: "WRITE_BATCH",
+            seq: 6,
+            attempt: 1,
+          }},
+        ],
+      }}],
+    }});
+  }}
+  throw new Error("unexpected url: " + url);
+}};
+
+globalThis.window.location.pathname = "/projects/p/databases/(default)/documents";
+await app.init();
+await app.switchView("contention");
+
+// 1. Verify topbar ARIA & rendered contention UI (summary, writer, readers, waiters, WOUNDED, WRITE_BATCH_RETRY).
+const topbarMarkup = renderTemplateMarkup(app.renderTopbar());
+assert.ok(topbarMarkup.includes("Contention"));
+assert.ok(topbarMarkup.includes('aria-pressed="true"'));
+
+const markup = renderTemplateMarkup(app.renderWorkspace());
+assert.ok(markup.includes("Wounds") && markup.includes(">3<"));
+assert.ok(markup.includes("Timeouts") && markup.includes(">2<"));
+assert.ok(markup.includes("Upgrade Aborts") && markup.includes(">1<"));
+assert.ok(markup.includes("WriteBatch Retries") && markup.includes(">4<"));
+assert.equal(markup.includes("slowWaitsTotal"), false);
+assert.equal(markup.includes("SLOW_WAIT"), false);
+assert.equal(markup.includes("OptimisticWriteSkew"), false);
+assert.ok(markup.includes('data-wait-base-ms="250"'));
+assert.ok(markup.includes('data-wait-ms='));
+assert.ok(/data-wait-label="\d+ms"\s*><\/span>/.test(markup), ".wait-elapsed must remain empty (no ChildPart inside)");
+assert.ok(markup.includes('aria-label="Clear history (p/(default))"'), "WCAG 2.5.3 Label in Name");
+assert.ok(markup.includes("retained"));
+assert.ok(markup.includes("wounded by"));
+assert.ok(markup.includes("WOUNDED"));
+assert.ok(markup.includes("WRITE_BATCH_RETRY"));
+assert.ok(markup.includes("attempt 1"));
+
+// 2. Clicking "Clear history" in active scope sends DELETE with ?database=... and preserves active waiters.
+const clearBtn = findClickHandler(app.renderWorkspace(), "Clear history");
+assert.ok(clearBtn, "expected Clear history button");
+await clearBtn();
+assert.deepEqual(deleteCalls, [
+  "/emulator/v1/contention?database=projects%2Fp%2Fdatabases%2F%28default%29%2Fdocuments",
+]);
+assert.equal(app.state.contention.clearing, false);
+assert.equal(app.state.contention.snapshot.databases[0].summary.woundsTotal, 0);
+assert.equal(app.state.contention.snapshot.databases[0].contendedDocuments[0].waiters.length, 1);
+
+// 2b. Guard clearContentionHistory against wrong view, missing DB, and pre-clear GET race.
+const delCountBeforeGuards = deleteCalls.length;
+await app.switchView("explorer");
+await app.clearContentionHistory();
+assert.equal(deleteCalls.length, delCountBeforeGuards, "clearContentionHistory must no-op outside contention view");
+await app.switchView("contention");
+
+const savedDbId = app.state.activeDatabaseId;
+app.state.activeDatabaseId = null;
+await app.clearContentionHistory();
+assert.equal(deleteCalls.length, delCountBeforeGuards, "clearContentionHistory must no-op when activeDatabaseId is null");
+app.state.activeDatabaseId = savedDbId;
+
+// Pre-clear GET race: an in-flight GET returning stale woundsTotal=99 must be discarded after clearContentionHistory().
+const stalePreClearGet = deferred();
+const baseFetch = fetchImpl;
+fetchImpl = async (url, init) => {{
+  if (url.startsWith("/emulator/v1/contention") && (init.method ?? "GET") === "GET") {{
+    if (!clearedOnce) return stalePreClearGet.promise;
+  }}
+  return baseFetch(url, init);
+}};
+clearedOnce = false;
+const preClearRefresh = app.refreshContention();
+await app.clearContentionHistory();
+stalePreClearGet.resolve(jsonResponse({{
+  databases: [{{
+    database: rootA,
+    summary: {{ woundsTotal: 99, timeoutsTotal: 0, upgradeAbortsTotal: 0, writeBatchRetriesTotal: 0 }},
+    contendedDocuments: [],
+    totalContendedDocuments: 0,
+    truncated: false,
+    recentEvents: [],
+  }}],
+}}));
+await preClearRefresh;
+assert.equal(app.state.contention.snapshot.databases[0].summary.woundsTotal, 0, "stale pre-clear GET must be ignored");
+fetchImpl = baseFetch;
+
+// 3. Switching scope to All Databases resets snapshot synchronously while loading and clears without ?database=.
+const allScopeBtn = findClickHandler(app.renderWorkspace(), "All Databases");
+assert.ok(allScopeBtn);
+const deferredAllGet = deferred();
+fetchImpl = async (url, init) => {{
+  if (url === "/emulator/v1/contention" && (init.method ?? "GET") === "GET") {{
+    return deferredAllGet.promise;
+  }}
+  return baseFetch(url, init);
+}};
+const scopePromise = allScopeBtn();
+assert.equal(app.state.contention.scope, "all");
+assert.equal(app.state.contention.snapshot, null, "scope switch must clear stale snapshot before fetch resolves");
+deferredAllGet.resolve(baseFetch("/emulator/v1/contention", {{ method: "GET" }}));
+await scopePromise;
+fetchImpl = baseFetch;
+
+const clearAllBtn = findClickHandler(app.renderWorkspace(), "Clear history");
+await clearAllBtn();
+assert.equal(deleteCalls[deleteCalls.length - 1], "/emulator/v1/contention");
+
+// 4. Clicking document button calls openDocumentFromName -> switches to explorer & hydrates nested document.
+const docBtn = findClickHandler(app.renderWorkspace(), nestedDoc);
+assert.ok(docBtn, "expected semantic <button> for contended document path");
+docBtn();
+await new Promise((r) => setTimeout(r, 10));
+assert.equal(app.state.view, "explorer");
+assert.deepEqual(app.state.segments, ["rooms", "r1", "messages", "m1"]);
+assert.equal(app.state.contentionSseStatus, "idle");
+
+// 4b. openDocumentFromName rejects invalid/odd paths and refreshes missing root collection in same-DB branch.
+await app.openDocumentFromName(`${{rootA}}/rooms/../messages/m1`);
+assert.deepEqual(app.state.segments, ["rooms", "r1", "messages", "m1"], "dot-dot segment must be ignored");
+await app.openDocumentFromName(`${{rootA}}/rooms//r1/m1`);
+assert.deepEqual(app.state.segments, ["rooms", "r1", "messages", "m1"], "empty segment must be ignored");
+await app.openDocumentFromName(`${{rootA}}/rooms`);
+assert.deepEqual(app.state.segments, ["rooms", "r1", "messages", "m1"], "odd collection path must be ignored");
+
+const newColDoc = `${{rootA}}/newcol/d1`;
+fetchImpl = async (url, init) => {{
+  if (url === `/v1/${{rootA}}:listCollectionIds`) {{
+    return jsonResponse({{ collectionIds: ["rooms", "orders", "newcol"] }});
+  }}
+  if (url.includes("/documents/newcol?")) {{
+    return jsonResponse({{ documents: [{{ name: newColDoc, createTime: "2026-01-01T00:00:00Z", updateTime: "2026-01-01T00:00:00Z" }}] }});
+  }}
+  if (url === `/v1/${{newColDoc}}`) {{
+    return jsonResponse({{ name: newColDoc, fields: {{}} }});
+  }}
+  return baseFetch(url, init);
+}};
+await app.openDocumentFromName(newColDoc);
+assert.ok(app.state.rootCollections.includes("newcol"), "same-DB openDocumentFromName must refresh missing root collection");
+assert.deepEqual(app.state.segments, ["newcol", "d1"]);
+fetchImpl = baseFetch;
+
+// Cross-database openDocumentFromName switches active DB and opens target doc.
+await app.openDocumentFromName(crossDbDoc);
+assert.equal(app.state.activeProjectId, "other");
+assert.equal(app.state.activeDatabaseId, "db2");
+assert.deepEqual(app.state.segments, ["orders", "o1"]);
+
+// DELETE error during clearContentionHistory sets error and resets clearing flag.
+await app.switchView("contention");
+const prevFetch = fetchImpl;
+fetchImpl = async (url, init) => {{
+  if (url.startsWith("/emulator/v1/contention") && init.method === "DELETE") {{
+    return jsonResponse({{ error: {{ code: 500, status: "INTERNAL", message: "clear failed" }} }}, 500);
+  }}
+  return prevFetch(url, init);
+}};
+await app.clearContentionHistory();
+assert.equal(app.state.contention.clearing, false);
+assert.equal(app.state.contention.error, "[500 INTERNAL] clear failed");
+fetchImpl = prevFetch;
+await app.switchView("explorer");
+
+// 5. Truncation banner (simultaneous doc + participant truncation), empty state, and error banner rendering.
+const truncMarkup = renderTemplateMarkup(renderContention({{
+  projectId: "p",
+  databaseId: "(default)",
+  state: {{
+    scope: "active",
+    snapshot: {{
+      databases: [{{
+        database: rootA,
+        summary: {{ woundsTotal: 0, timeoutsTotal: 0, upgradeAbortsTotal: 0, writeBatchRetriesTotal: 0 }},
+        contendedDocuments: [{{
+          document: nestedDoc,
+          writer: null,
+          readers: [],
+          readerCount: 70,
+          waiters: [],
+          waiterCount: 0,
+        }}],
+        totalContendedDocuments: 300,
+        truncated: true,
+        recentEvents: [],
+      }}],
+    }},
+    loading: false,
+    clearing: false,
+    error: "[500 INTERNAL] boom",
+    lastFetchedAtMs: null,
+    lastFetchedIso: null,
+  }},
+  sseStatus: "error",
+  ssePaused: false,
+  onChangeScope: () => {{}},
+  onRefresh: () => {{}},
+  onClearHistory: () => {{}},
+  onOpenDocument: () => {{}},
+}}));
+assert.ok(truncMarkup.includes('role="alert"') && truncMarkup.includes("[500 INTERNAL] boom"));
+assert.ok(truncMarkup.includes("Snapshot truncated:") && truncMarkup.includes("showing 1 of 300"));
+assert.ok(truncMarkup.includes("participant lists capped at 64 readers / waiters per document"));
+assert.ok(truncMarkup.includes("No contention events recorded."));
+
+const emptyMarkup = renderTemplateMarkup(renderContention({{
+  projectId: "p",
+  databaseId: "(default)",
+  state: {{
+    scope: "active",
+    snapshot: {{ databases: [] }},
+    loading: false,
+    clearing: false,
+    error: null,
+    lastFetchedAtMs: null,
+    lastFetchedIso: null,
+  }},
+  sseStatus: "live",
+  ssePaused: false,
+  onChangeScope: () => {{}},
+  onRefresh: () => {{}},
+  onClearHistory: () => {{}},
+  onOpenDocument: () => {{}},
+}}));
+assert.ok(emptyMarkup.includes("No active lock contention"));
+assert.ok(emptyMarkup.includes("No contention events recorded."));
+
+// 6. When snapshot === null && !loading && error, render "—" in all 4 summary cards and explicit error + Retry in .contention-body.
+let retryClicks = 0;
+const initialErrTpl = renderContention({{
+  projectId: "p",
+  databaseId: "(default)",
+  state: {{
+    scope: "active",
+    snapshot: null,
+    loading: false,
+    clearing: false,
+    error: "[503 UNAVAILABLE] contention endpoint failed",
+    lastFetchedAtMs: null,
+    lastFetchedIso: null,
+  }},
+  sseStatus: "error",
+  ssePaused: false,
+  onChangeScope: () => {{}},
+  onRefresh: () => {{
+    retryClicks++;
+  }},
+  onClearHistory: () => {{}},
+  onOpenDocument: () => {{}},
+}});
+const initialErrMarkup = renderTemplateMarkup(initialErrTpl);
+const dashCardMatches = initialErrMarkup.match(/class="contention-stat-value mono">\u{{2014}}<\/strong>/gu) ?? [];
+assert.equal(dashCardMatches.length, 4, "all 4 summary cards must show em-dash when initial snapshot failed: " + initialErrMarkup);
+assert.equal(initialErrMarkup.includes(">0</strong>"), false, "summary cards must not show 0 when snapshot is null with error");
+assert.ok(initialErrMarkup.includes("Failed to load contention snapshot: [503 UNAVAILABLE] contention endpoint failed"));
+assert.equal(initialErrMarkup.includes("No active lock contention"), false, "error state must not render empty contention copy");
+assert.equal(initialErrMarkup.includes("No contention events recorded."), false);
+const retryBtn = findClickHandler(initialErrTpl, "Retry");
+assert.ok(retryBtn, "expected Retry button in .contention-body");
+retryBtn();
+assert.equal(retryClicks, 1);
+
+console.log("regression_contention_clear_history_open_doc_and_rendering passed");
+"#
+    );
+
+    run_node_ui_test(&script);
+}
+
+#[test]
+fn regression_contention_lit_html_waiter_rerender_and_tick() {
+    let repo_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let css =
+        fs::read_to_string(repo_root.join("ui/styles.css")).expect("failed to read ui/styles.css");
+    assert!(
+        css.contains(".wait-elapsed {"),
+        "expected .wait-elapsed CSS rule"
+    );
+    assert!(
+        !css.contains(".wait-elapsed:empty::before"),
+        "CSS must not own .wait-elapsed text via :empty::before"
+    );
+    assert!(
+        !css.contains("attr(data-wait-label)"),
+        "CSS must not duplicate data-wait-label text via content: attr(...)"
+    );
+
+    let script = format!(
+        r#"{NODE_BOOTSTRAP}
+class DomNode {{
+  constructor(nodeType) {{
+    this.nodeType = nodeType;
+    this.parentNode = null;
+    this.childNodes = [];
+  }}
+  get firstChild() {{
+    return this.childNodes[0] ?? null;
+  }}
+  get nextSibling() {{
+    if (!this.parentNode) return null;
+    const list = this.parentNode.childNodes;
+    const idx = list.indexOf(this);
+    return idx >= 0 && idx + 1 < list.length ? list[idx + 1] : null;
+  }}
+  insertBefore(node, refNode) {{
+    if (node.nodeType === 11) {{
+      const kids = [...node.childNodes];
+      for (const k of kids) this.insertBefore(k, refNode);
+      node.childNodes = [];
+      return node;
+    }}
+    if (node.parentNode) node.remove();
+    node.parentNode = this;
+    const idx = refNode ? this.childNodes.indexOf(refNode) : -1;
+    if (idx >= 0) {{
+      this.childNodes.splice(idx, 0, node);
+    }} else {{
+      this.childNodes.push(node);
+    }}
+    return node;
+  }}
+  append(...items) {{
+    for (const item of items) {{
+      const node = typeof item === "string" ? new DomText(item) : item;
+      this.insertBefore(node, null);
+    }}
+  }}
+  remove() {{
+    if (!this.parentNode) return;
+    const list = this.parentNode.childNodes;
+    const idx = list.indexOf(this);
+    if (idx >= 0) list.splice(idx, 1);
+    this.parentNode = null;
+  }}
+  cloneNode(deep) {{
+    const copy = this._cloneShallow();
+    if (deep) {{
+      for (const child of this.childNodes) {{
+        copy.insertBefore(child.cloneNode(true), null);
+      }}
+    }}
+    return copy;
+  }}
+}}
+
+class DomText extends DomNode {{
+  constructor(data) {{
+    super(3);
+    this.data = String(data);
+  }}
+  _cloneShallow() {{
+    return new DomText(this.data);
+  }}
+}}
+
+class DomComment extends DomNode {{
+  constructor(data) {{
+    super(8);
+    this.data = String(data);
+  }}
+  _cloneShallow() {{
+    return new DomComment(this.data);
+  }}
+}}
+
+class DomFragment extends DomNode {{
+  constructor() {{
+    super(11);
+  }}
+  _cloneShallow() {{
+    return new DomFragment();
+  }}
+}}
+
+const VOID_TAGS = new Set(["INPUT", "BR", "HR", "IMG"]);
+
+function parseHtmlToFragment(htmlStr) {{
+  const frag = new DomFragment();
+  const stack = [frag];
+  const tokenRe = /<!--([\s\S]*?)-->|<\?([^>]*)>|<\/([A-Za-z0-9-]+)\s*>|<([A-Za-z0-9-]+)((?:\s+[^\s=/>]+(?:\s*=\s*(?:"[^"]*"|'[^']*'|[^\s"'=<>`]+))?)*)\s*(\/?)>|([^<]+)/g;
+  let match;
+  while ((match = tokenRe.exec(htmlStr)) !== null) {{
+    const parent = stack[stack.length - 1];
+    if (match[1] !== undefined) {{
+      parent.insertBefore(new DomComment(match[1]), null);
+    }} else if (match[2] !== undefined) {{
+      parent.insertBefore(new DomComment("?" + match[2]), null);
+    }} else if (match[3] !== undefined) {{
+      const closeTag = match[3].toUpperCase();
+      while (stack.length > 1) {{
+        const top = stack.pop();
+        if (top.tagName === closeTag) break;
+      }}
+    }} else if (match[4] !== undefined) {{
+      const tag = match[4].toUpperCase();
+      const el = new DomElement(tag);
+      const attrStr = match[5] ?? "";
+      const attrRe = /([^\s=/>]+)(?:\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'=<>`]+)))?/g;
+      let am;
+      while ((am = attrRe.exec(attrStr)) !== null) {{
+        const val = am[2] ?? am[3] ?? am[4] ?? "";
+        el.setAttribute(am[1], val);
+      }}
+      parent.insertBefore(el, null);
+      if (!match[6] && !VOID_TAGS.has(tag)) {{
+        stack.push(el);
+      }}
+    }} else if (match[7] !== undefined) {{
+      parent.insertBefore(new DomText(match[7]), null);
+    }}
+  }}
+  return frag;
+}}
+
+class DomElement extends DomNode {{
+  constructor(tagName) {{
+    super(1);
+    this.tagName = tagName;
+    this._attrs = new Map();
+    if (tagName === "TEMPLATE") {{
+      this.content = new DomFragment();
+    }}
+  }}
+  set innerHTML(val) {{
+    this.content = parseHtmlToFragment(String(val));
+  }}
+  get textContent() {{
+    let out = "";
+    for (const c of this.childNodes) {{
+      out += c.nodeType === 3 ? c.data : c.nodeType === 1 ? c.textContent : "";
+    }}
+    return out;
+  }}
+  set textContent(val) {{
+    for (const c of [...this.childNodes]) c.remove();
+    if (val !== "" && val !== null && val !== undefined) {{
+      this.insertBefore(new DomText(String(val)), null);
+    }}
+  }}
+  hasAttributes() {{
+    return this._attrs.size > 0;
+  }}
+  getAttributeNames() {{
+    return Array.from(this._attrs.keys());
+  }}
+  getAttribute(name) {{
+    return this._attrs.has(name) ? this._attrs.get(name) : null;
+  }}
+  hasAttribute(name) {{
+    return this._attrs.has(name);
+  }}
+  setAttribute(name, val) {{
+    this._attrs.set(name, String(val));
+  }}
+  removeAttribute(name) {{
+    this._attrs.delete(name);
+  }}
+  toggleAttribute(name, force) {{
+    if (force) this._attrs.set(name, "");
+    else this._attrs.delete(name);
+  }}
+  addEventListener() {{}}
+  removeEventListener() {{}}
+  querySelectorAll(selector) {{
+    const attrName = selector.startsWith("[") && selector.endsWith("]")
+      ? selector.slice(1, -1)
+      : null;
+    const className = selector.startsWith(".") ? selector.slice(1) : null;
+    const out = [];
+    const visit = (node) => {{
+      for (const c of node.childNodes) {{
+        if (c.nodeType === 1) {{
+          if (attrName && c.hasAttribute(attrName)) out.push(c);
+          else if (className && (c.getAttribute("class") ?? "").split(/\s+/).includes(className)) out.push(c);
+          visit(c);
+        }}
+      }}
+    }};
+    visit(this);
+    return out;
+  }}
+  _cloneShallow() {{
+    const el = new DomElement(this.tagName);
+    for (const [k, v] of this._attrs) el._attrs.set(k, v);
+    return el;
+  }}
+}}
+
+function collectPreOrder(root, whatToShow) {{
+  const nodes = [];
+  const walk = (n) => {{
+    for (const c of n.childNodes) {{
+      if (whatToShow === 129 ? (c.nodeType === 1 || c.nodeType === 8) : true) {{
+        nodes.push(c);
+      }}
+      walk(c);
+    }}
+  }};
+  walk(root);
+  return nodes;
+}}
+
+globalThis.document = {{
+  nodeType: 9,
+  childNodes: [],
+  createComment: (data) => new DomComment(data),
+  createTextNode: (data) => new DomText(data),
+  createElement: (tag) => new DomElement(String(tag).toUpperCase()),
+  importNode: (node, deep) => node.cloneNode(Boolean(deep)),
+  createTreeWalker(root, whatToShow) {{
+    return {{
+      _root: root,
+      _current: root,
+      get currentNode() {{
+        return this._current;
+      }},
+      set currentNode(node) {{
+        this._root = node;
+        this._current = node;
+      }},
+      nextNode() {{
+        const list = collectPreOrder(this._root, whatToShow);
+        if (this._current === this._root) {{
+          this._current = list[0] ?? null;
+          return this._current;
+        }}
+        const idx = list.indexOf(this._current);
+        this._current = idx >= 0 && idx + 1 < list.length ? list[idx + 1] : null;
+        return this._current;
+      }},
+    }};
+  }},
+}};
+
+const {{ render }} = await import("./ui/lit-html.js");
+const {{ createContentionState, renderContention, updateWaiterElapsedDom }} = await import("./ui/components/contention.js");
+
+const container = new DomElement("MAIN");
+const rootPath = "projects/p/databases/(default)/documents";
+
+function makeSnapshot(waitedMs) {{
+  return {{
+    databases: [{{
+      database: rootPath,
+      summary: {{ woundsTotal: 1, timeoutsTotal: 0, upgradeAbortsTotal: 0, writeBatchRetriesTotal: 0 }},
+      contendedDocuments: waitedMs === null ? [] : [{{
+        document: `${{rootPath}}/users/alice`,
+        writer: null,
+        readers: [],
+        readerCount: 1,
+        waiters: [{{
+          sessionId: 9,
+          txnId: "9:1",
+          kind: "PESSIMISTIC_TXN",
+          seq: 2,
+          mode: "WRITE",
+          waitedMs,
+        }}],
+        waiterCount: 1,
+      }}],
+      totalContendedDocuments: waitedMs === null ? 0 : 1,
+      truncated: false,
+      recentEvents: [],
+    }}],
+  }};
+}}
+
+const cState = createContentionState();
+let mockNow = 1_700_000_000_000;
+const origDateNow = Date.now;
+Date.now = () => mockNow;
+
+const renderView = () => {{
+  render(renderContention({{
+    projectId: "p",
+    databaseId: "(default)",
+    state: cState,
+    sseStatus: "live",
+    ssePaused: false,
+    onChangeScope: () => {{}},
+    onRefresh: () => {{}},
+    onClearHistory: () => {{}},
+    onOpenDocument: () => {{}},
+  }}), container);
+  updateWaiterElapsedDom(container, cState, mockNow);
+}};
+
+// Cycle 1: Render with waitedMs=160 -> verify no Comment anchor inside .wait-elapsed, and text reconciled to 160ms.
+cState.snapshot = makeSnapshot(160);
+cState.lastFetchedAtMs = mockNow;
+renderView();
+
+let waitNodes = container.querySelectorAll("[data-wait-base-ms]");
+assert.equal(waitNodes.length, 1);
+assert.equal(waitNodes[0].childNodes.some((n) => n.nodeType === 8), false, "must not place lit-html Comment anchor inside .wait-elapsed");
+assert.equal(waitNodes[0].getAttribute("data-wait-ms"), "160");
+assert.equal(waitNodes[0].getAttribute("data-wait-label"), "160ms");
+assert.equal(waitNodes[0].textContent, "160ms");
+
+// Tick +1000ms directly via updateWaiterElapsedDom (DOM-only).
+mockNow += 1000;
+updateWaiterElapsedDom(container, cState, mockNow);
+assert.equal(waitNodes[0].getAttribute("data-wait-ms"), "1160");
+assert.equal(waitNodes[0].getAttribute("data-wait-label"), "1.2s");
+assert.equal(waitNodes[0].textContent, "1.2s");
+
+// Cycle 2: Subsequent lit-html re-render with a new snapshot whose formatted string ("160ms") matches Cycle 1's _$AH cache!
+// Must NOT throw TypeError on missing Comment node and must update DOM back to 160ms cleanly.
+cState.snapshot = makeSnapshot(160);
+cState.lastFetchedAtMs = mockNow;
+renderView();
+waitNodes = container.querySelectorAll("[data-wait-base-ms]");
+assert.equal(waitNodes.length, 1);
+assert.equal(waitNodes[0].getAttribute("data-wait-ms"), "160");
+assert.equal(waitNodes[0].getAttribute("data-wait-label"), "160ms");
+assert.equal(waitNodes[0].textContent, "160ms");
+
+// Cycle 3: Empty waiters -> waiter returns -> tick -> re-render.
+cState.snapshot = makeSnapshot(null);
+cState.lastFetchedAtMs = mockNow;
+renderView();
+assert.equal(container.querySelectorAll("[data-wait-base-ms]").length, 0);
+
+cState.snapshot = makeSnapshot(400);
+cState.lastFetchedAtMs = mockNow;
+renderView();
+mockNow += 2000;
+updateWaiterElapsedDom(container, cState, mockNow);
+waitNodes = container.querySelectorAll("[data-wait-base-ms]");
+assert.equal(waitNodes[0].getAttribute("data-wait-ms"), "2400");
+assert.equal(waitNodes[0].textContent, "2.4s");
+
+// Cycle 4: When lastFetchedAtMs is null, updateWaiterElapsedDom owns fallback reconciliation from data-wait-label
+// (resetting stale ticked text without CSS :empty::before).
+cState.snapshot = makeSnapshot(400);
+cState.lastFetchedAtMs = null;
+renderView();
+waitNodes = container.querySelectorAll("[data-wait-base-ms]");
+assert.equal(waitNodes.length, 1);
+assert.equal(waitNodes[0].getAttribute("data-wait-label"), "400ms");
+assert.equal(waitNodes[0].textContent, "400ms", "null lastFetchedAtMs must fall back to data-wait-label");
+
+// Also verify null fetchedOrState argument directly, non-numeric base fallback to data-wait-label, and missing label fallback.
+waitNodes[0].textContent = "stale";
+updateWaiterElapsedDom(container, null);
+assert.equal(waitNodes[0].textContent, "400ms");
+waitNodes[0].setAttribute("data-wait-base-ms", "");
+waitNodes[0].setAttribute("data-wait-label", "750ms");
+waitNodes[0].textContent = "stale";
+updateWaiterElapsedDom(container, null);
+assert.equal(waitNodes[0].textContent, "750ms");
+waitNodes[0].removeAttribute("data-wait-label");
+updateWaiterElapsedDom(container, null);
+assert.equal(waitNodes[0].textContent, "");
+
+Date.now = origDateNow;
+console.log("regression_contention_lit_html_waiter_rerender_and_tick passed");
+"#
+    );
+
+    run_node_ui_test(&script);
+}
+
+#[test]
+fn regression_contention_clear_history_loading_and_stale_error_guards() {
+    let script = format!(
+        r#"{NODE_BOOTSTRAP}
+const app = await import("./ui/app.js");
+
+const db1Root = "projects/p/databases/db1/documents";
+const db2Root = "projects/p/databases/db2/documents";
+
+let contentionGetHandler = async () => jsonResponse({{
+  databases: [{{
+    database: db1Root,
+    summary: {{ woundsTotal: 2, timeoutsTotal: 0, upgradeAbortsTotal: 0, writeBatchRetriesTotal: 0 }},
+    contendedDocuments: [],
+    totalContendedDocuments: 0,
+    truncated: false,
+    recentEvents: [],
+  }}],
+}});
+let contentionDeleteHandler = async () => jsonResponse({{}});
+let contentionGetCount = 0;
+
+fetchImpl = async (url, init) => {{
+  const method = init.method ?? "GET";
+  if (url === "/emulator/v1") return jsonResponse([db1Root, db2Root]);
+  if (url === "/v1/projects/p/databases/db1") {{
+    return jsonResponse({{
+      name: "projects/p/databases/db1",
+      uid: "u1",
+      type: "FIRESTORE_NATIVE",
+      databaseEdition: "STANDARD",
+      concurrencyMode: "PESSIMISTIC",
+    }});
+  }}
+  if (url === "/v1/projects/p/databases/db2") {{
+    return jsonResponse({{
+      name: "projects/p/databases/db2",
+      uid: "u2",
+      type: "FIRESTORE_NATIVE",
+      databaseEdition: "STANDARD",
+      concurrencyMode: "PESSIMISTIC",
+    }});
+  }}
+  if (url.endsWith(":listCollectionIds")) return jsonResponse({{ collectionIds: [] }});
+  if (url.startsWith("/emulator/v1/contention") && method === "DELETE") {{
+    return contentionDeleteHandler(url);
+  }}
+  if (url.startsWith("/emulator/v1/contention") && method === "GET") {{
+    contentionGetCount++;
+    return contentionGetHandler(url);
+  }}
+  throw new Error("unexpected url: " + method + " " + url);
+}};
+
+await app.init();
+await app.switchView("contention");
+assert.equal(app.state.contention.loading, false);
+
+// 1. Stale in-flight refreshContention() + failed clearContention() must NOT strand loading === true.
+const staleGetDef = deferred();
+const failDeleteDef = deferred();
+contentionGetHandler = () => staleGetDef.promise;
+contentionDeleteHandler = () => failDeleteDef.promise;
+
+const staleRefreshP = app.refreshContention();
+assert.equal(app.state.contention.loading, true);
+
+const clearFailP = app.clearContentionHistory();
+assert.equal(app.state.contention.loading, false, "clearContentionHistory must reset loading immediately after bumping seq");
+assert.equal(app.state.contention.clearing, true);
+
+staleGetDef.resolve(jsonResponse({{
+  databases: [{{
+    database: db1Root,
+    summary: {{ woundsTotal: 99, timeoutsTotal: 0, upgradeAbortsTotal: 0, writeBatchRetriesTotal: 0 }},
+    contendedDocuments: [],
+    totalContendedDocuments: 0,
+    truncated: false,
+    recentEvents: [],
+  }}],
+}}));
+await staleRefreshP;
+assert.equal(app.state.contention.loading, false);
+assert.equal(app.state.contention.snapshot.databases[0].summary.woundsTotal, 2, "stale refresh must be ignored");
+
+failDeleteDef.resolve(jsonResponse({{ error: {{ code: 500, status: "INTERNAL", message: "clear failed" }} }}, 500));
+await clearFailP;
+assert.equal(app.state.contention.loading, false, "failed clearContention after invalidated refresh must not strand loading");
+assert.equal(app.state.contention.clearing, false);
+assert.equal(app.state.contention.error, "[500 INTERNAL] clear failed");
+const afterFailMarkup = renderTemplateMarkup(app.renderWorkspace());
+assert.equal(afterFailMarkup.includes("Refreshing..."), false, "Refresh button must remain enabled after failed clear");
+
+// 2. Switching scope mid-clear prevents stale error from overwriting newer scope state and suppresses stale post-clear refresh.
+const scopeFailDelDef = deferred();
+contentionDeleteHandler = () => scopeFailDelDef.promise;
+contentionGetHandler = async () => jsonResponse({{
+  databases: [{{
+    database: db2Root,
+    summary: {{ woundsTotal: 5, timeoutsTotal: 1, upgradeAbortsTotal: 0, writeBatchRetriesTotal: 0 }},
+    contendedDocuments: [],
+    totalContendedDocuments: 0,
+    truncated: false,
+    recentEvents: [],
+  }}],
+}});
+
+const clearActiveP = app.clearContentionHistory();
+const allBtn = findClickHandler(app.renderWorkspace(), "All Databases");
+assert.ok(allBtn);
+await allBtn();
+assert.equal(app.state.contention.scope, "all");
+assert.equal(app.state.contention.error, null);
+assert.equal(app.state.contention.snapshot.databases[0].summary.woundsTotal, 5);
+
+scopeFailDelDef.resolve(jsonResponse({{ error: {{ code: 500, status: "INTERNAL", message: "stale active error" }} }}, 500));
+await clearActiveP;
+assert.equal(app.state.contention.error, null, "stale error from active scope must not overwrite all-scope state");
+assert.equal(app.state.contention.clearing, false);
+
+// Successful clear after scope switch must NOT fire post-clear refreshContention().
+const scopeOkDelDef = deferred();
+contentionDeleteHandler = () => scopeOkDelDef.promise;
+const clearAllP = app.clearContentionHistory();
+const activeBtn = findClickHandler(app.renderWorkspace(), "Active DB");
+assert.ok(activeBtn);
+await activeBtn();
+const getsAfterScopeSwitch = contentionGetCount;
+scopeOkDelDef.resolve(jsonResponse({{}}));
+await clearAllP;
+assert.equal(contentionGetCount, getsAfterScopeSwitch, "stale clear success after scope switch must not call refreshContention");
+
+// 3. Switching view mid-clear (to Explorer, and Explorer -> Contention) blocks stale error and post-clear refresh.
+const viewFailDelDef = deferred();
+contentionDeleteHandler = () => viewFailDelDef.promise;
+const clearViewFailP = app.clearContentionHistory();
+await app.switchView("explorer");
+viewFailDelDef.resolve(jsonResponse({{ error: {{ code: 500, status: "INTERNAL", message: "stale view error" }} }}, 500));
+await clearViewFailP;
+assert.equal(app.state.view, "explorer");
+assert.equal(app.state.contention.error, null, "failed clear after leaving contention view must not set error");
+assert.equal(app.state.contention.clearing, false);
+
+await app.switchView("contention");
+const viewCycleDelDef = deferred();
+contentionDeleteHandler = () => viewCycleDelDef.promise;
+const clearCycleP = app.clearContentionHistory();
+await app.switchView("explorer");
+await app.switchView("contention");
+const getsAfterReenter = contentionGetCount;
+viewCycleDelDef.resolve(jsonResponse({{ error: {{ code: 500, status: "INTERNAL", message: "stale cycle error" }} }}, 500));
+await clearCycleP;
+assert.equal(app.state.contention.error, null, "failed clear from prior view visit must not overwrite re-entered view error");
+assert.equal(contentionGetCount, getsAfterReenter);
+
+// 4. Switching DB mid-clear prevents stale error and stale toast on new DB.
+const dbSwitchDelDef = deferred();
+contentionDeleteHandler = () => dbSwitchDelDef.promise;
+const clearDb1P = app.clearContentionHistory();
+app.state.toasts = [];
+await app.selectDatabase("p", "db2", [], true);
+assert.equal(app.state.activeDatabaseId, "db2");
+dbSwitchDelDef.resolve(jsonResponse({{ error: {{ code: 500, status: "INTERNAL", message: "stale db1 error" }} }}, 500));
+await clearDb1P;
+assert.equal(app.state.contention.error, null, "failed clear from db1 must not overwrite db2 contention error");
+assert.equal(app.state.contention.clearing, false);
+assert.equal(app.state.toasts.length, 0, "failed clear from db1 must not toast after switching to db2");
+
+console.log("regression_contention_clear_history_loading_and_stale_error_guards passed");
 "#
     );
 

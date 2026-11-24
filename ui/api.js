@@ -25,6 +25,110 @@ import { stringifyProtoJson } from "./values.js";
  * }} EmulatorSseEvent
  */
 
+/** @typedef {'PESSIMISTIC_TXN' | 'OPTIMISTIC_TXN' | 'WRITE_BATCH' | 'SINGLE_WRITE' | 'POINT_READ'} SessionKind */
+/** @typedef {'READ' | 'WRITE'} ContentionLockMode */
+/** @typedef {'ACTIVE' | 'COMMITTING'} ContentionSessionState */
+/** @typedef {'WOUNDED' | 'READ_TIMEOUT' | 'WRITE_TIMEOUT' | 'UPGRADE_ABORT' | 'WRITE_BATCH_RETRY' | 'TRANSACTION_EXPIRED'} ContentionEventKind */
+
+/**
+ * @typedef {{
+ *   woundsTotal: number,
+ *   timeoutsTotal: number,
+ *   upgradeAbortsTotal: number,
+ *   writeBatchRetriesTotal: number,
+ * }} ContentionSummary
+ */
+
+/**
+ * @typedef {{
+ *   sessionId: number,
+ *   txnId: string | null,
+ *   kind: SessionKind,
+ *   seq: number | null,
+ *   state: ContentionSessionState,
+ *   woundable: boolean,
+ * }} WriterSnapshot
+ */
+
+/**
+ * @typedef {{
+ *   sessionId: number,
+ *   txnId: string | null,
+ *   kind: SessionKind,
+ *   seq: number | null,
+ *   state: ContentionSessionState,
+ *   woundable: boolean,
+ *   retained: boolean,
+ *   activeLeases: number,
+ * }} ReaderSnapshot
+ */
+
+/**
+ * @typedef {{
+ *   sessionId: number,
+ *   txnId: string | null,
+ *   kind: SessionKind,
+ *   seq: number,
+ *   mode: ContentionLockMode,
+ *   waitedMs: number,
+ * }} WaiterSnapshot
+ */
+
+/**
+ * @typedef {{
+ *   document: string,
+ *   writer: WriterSnapshot | null,
+ *   readers: ReaderSnapshot[],
+ *   readerCount: number,
+ *   waiters: WaiterSnapshot[],
+ *   waiterCount: number,
+ * }} ContendedDocumentSnapshot
+ */
+
+/**
+ * @typedef {{
+ *   id: number,
+ *   kind: ContentionEventKind,
+ *   timestamp: string,
+ *   docName: string | null,
+ *   sessionId: number,
+ *   txnId: string | null,
+ *   sessionKind: SessionKind,
+ *   seq: number | null,
+ *   wounderSessionId?: number,
+ *   wounderTxnId?: string,
+ *   wounderKind?: SessionKind,
+ *   wounderSeq?: number,
+ *   waitMs?: number,
+ *   attempt?: number,
+ * }} ContentionEvent
+ */
+
+/**
+ * @typedef {{
+ *   database: string,
+ *   summary: ContentionSummary,
+ *   contendedDocuments: ContendedDocumentSnapshot[],
+ *   totalContendedDocuments: number,
+ *   truncated: boolean,
+ *   recentEvents: ContentionEvent[],
+ * }} DatabaseContentionSnapshot
+ */
+
+/**
+ * @typedef {{
+ *   databases: DatabaseContentionSnapshot[],
+ * }} ContentionSnapshot
+ */
+
+/**
+ * @typedef {{
+ *   type: 'contention_changed' | 'database_cleared' | 'resync',
+ *   database?: string,
+ *   skipped?: number,
+ * }} ContentionSseEvent
+ */
+
 export class ApiError extends Error {
   /**
    * @param {number} code
@@ -340,45 +444,102 @@ export async function runQuery(parentPath, structuredQuery) {
 }
 
 /**
- * Connects to `/emulator/v1/events` SSE stream and coalesces events with a 150ms trailing debounce.
- * @param {(events: EmulatorSseEvent[]) => void} onInvalidate
- * @param {(status: 'live' | 'error') => void} onStatusChange
+ * Fetches contention snapshots and recent events, optionally scoped to a database RootRef.
+ * @param {string} [database]
+ * @returns {Promise<ContentionSnapshot>}
+ */
+export async function getContention(database) {
+  const qs = database
+    ? `?${new URLSearchParams({ database }).toString()}`
+    : "";
+  return requestJson(`/emulator/v1/contention${qs}`);
+}
+
+/**
+ * Clears contention summary counters and recent event history without disturbing active locks.
+ * @param {string} [database]
+ * @returns {Promise<void>}
+ */
+export async function clearContention(database) {
+  const qs = database
+    ? `?${new URLSearchParams({ database }).toString()}`
+    : "";
+  await requestJson(`/emulator/v1/contention${qs}`, {
+    method: "DELETE",
+  });
+}
+
+/**
+ * @template T
+ * @param {{
+ *   url: string,
+ *   primaryEvent: string,
+ *   debounceMs: number,
+ *   maxWaitMs?: number,
+ *   onInvalidate?: (events: T[]) => void,
+ *   onStatusChange?: (status: 'live' | 'error') => void,
+ *   makeResyncFallback: () => T,
+ * }} opts
  * @returns {{ close: () => void }}
  */
-export function connectEventStream(onInvalidate, onStatusChange) {
-  const es = new EventSource("/emulator/v1/events");
-  /** @type {EmulatorSseEvent[]} */
+function createDebouncedEventStream(opts) {
+  const es = new EventSource(opts.url);
+  /** @type {T[]} */
   let pending = [];
   /** @type {ReturnType<typeof setTimeout> | null} */
   let timer = null;
+  /** @type {ReturnType<typeof setTimeout> | null} */
+  let maxTimer = null;
+  let closed = false;
 
-  const enqueue = (/** @type {EmulatorSseEvent} */ ev) => {
+  const flush = () => {
+    if (timer !== null) {
+      clearTimeout(timer);
+      timer = null;
+    }
+    if (maxTimer !== null) {
+      clearTimeout(maxTimer);
+      maxTimer = null;
+    }
+    const batch = pending;
+    pending = [];
+    if (!closed && batch.length > 0) {
+      opts.onInvalidate?.(batch);
+    }
+  };
+
+  const enqueue = (/** @type {T} */ ev) => {
+    if (closed) return;
     pending.push(ev);
     if (timer !== null) {
       clearTimeout(timer);
     }
-    timer = setTimeout(() => {
-      const batch = pending;
-      pending = [];
-      timer = null;
-      onInvalidate(batch);
-    }, 150);
+    timer = setTimeout(flush, opts.debounceMs);
+    if (opts.maxWaitMs !== undefined && maxTimer === null) {
+      maxTimer = setTimeout(flush, opts.maxWaitMs);
+    }
   };
 
   es.addEventListener("open", () => {
-    onStatusChange("live");
+    if (!closed) {
+      opts.onStatusChange?.("live");
+    }
   });
 
   es.addEventListener("error", () => {
-    onStatusChange("error");
+    if (!closed) {
+      opts.onStatusChange?.("error");
+    }
   });
 
-  es.addEventListener("change", (msg) => {
+  es.addEventListener(opts.primaryEvent, (msg) => {
     try {
-      const ev = /** @type {EmulatorSseEvent} */ (
+      const ev = /** @type {unknown} */ (
         JSON.parse(/** @type {MessageEvent} */ (msg).data)
       );
-      enqueue(ev);
+      if (ev && typeof ev === "object") {
+        enqueue(/** @type {T} */ (ev));
+      }
     } catch {
       // Ignore malformed frame
     }
@@ -386,21 +547,72 @@ export function connectEventStream(onInvalidate, onStatusChange) {
 
   es.addEventListener("resync", (msg) => {
     try {
-      const ev = /** @type {EmulatorSseEvent} */ (
+      const ev = /** @type {unknown} */ (
         JSON.parse(/** @type {MessageEvent} */ (msg).data)
       );
-      enqueue(ev);
+      if (ev && typeof ev === "object") {
+        enqueue(/** @type {T} */ (ev));
+      } else {
+        enqueue(opts.makeResyncFallback());
+      }
     } catch {
-      enqueue({ type: "resync" });
+      enqueue(opts.makeResyncFallback());
     }
   });
 
   return {
     close() {
+      closed = true;
       if (timer !== null) {
         clearTimeout(timer);
+        timer = null;
       }
+      if (maxTimer !== null) {
+        clearTimeout(maxTimer);
+        maxTimer = null;
+      }
+      pending = [];
       es.close();
     },
   };
+}
+
+/**
+ * Connects to `/emulator/v1/events` SSE stream and coalesces events with a 150ms trailing debounce.
+ * @param {(events: EmulatorSseEvent[]) => void} onInvalidate
+ * @param {(status: 'live' | 'error') => void} onStatusChange
+ * @returns {{ close: () => void }}
+ */
+export function connectEventStream(onInvalidate, onStatusChange) {
+  return createDebouncedEventStream({
+    url: "/emulator/v1/events",
+    primaryEvent: "change",
+    debounceMs: 150,
+    onInvalidate,
+    onStatusChange,
+    makeResyncFallback: () => /** @type {EmulatorSseEvent} */ ({ type: "resync" }),
+  });
+}
+
+/**
+ * Connects to `/emulator/v1/contention/events` SSE stream and coalesces
+ * `contention` and `resync` events over a 200ms trailing debounce window
+ * with a 1000ms maximum wait ceiling to prevent >5Hz starvation.
+ * @param {{
+ *   onInvalidate?: (events: ContentionSseEvent[]) => void,
+ *   onStatusChange?: (status: 'live' | 'error') => void,
+ * }} handlers
+ * @returns {{ close: () => void }}
+ */
+export function connectContentionEvents(handlers) {
+  return createDebouncedEventStream({
+    url: "/emulator/v1/contention/events",
+    primaryEvent: "contention",
+    debounceMs: 200,
+    maxWaitMs: 1000,
+    onInvalidate: handlers.onInvalidate,
+    onStatusChange: handlers.onStatusChange,
+    makeResyncFallback: () =>
+      /** @type {ContentionSseEvent} */ ({ type: "resync" }),
+  });
 }

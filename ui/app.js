@@ -3,7 +3,10 @@
 import { html, nothing, render } from "./lit-html.js";
 import {
   ApiError,
+  clearContention,
+  connectContentionEvents,
   connectEventStream,
+  getContention,
   getDatabase,
   getDocument,
   listCollectionIds,
@@ -15,6 +18,12 @@ import {
   updateDocument,
 } from "./api.js";
 import { generateAutoId, stringifyProtoJson } from "./values.js";
+import {
+  getDisplayedContentionDatabases,
+  hasContentionWaiters,
+  renderContention,
+  updateWaiterElapsedDom,
+} from "./components/contention.js";
 import {
   computeChangedFieldMask,
   createEditorSession,
@@ -34,6 +43,7 @@ import {
 } from "./components/query.js";
 import {
   getActiveRootPath,
+  isValidPathSegment,
   parseBrowserRoute,
   syncBrowserUrl,
 } from "./router.js";
@@ -45,9 +55,11 @@ import {
   getDbEpoch,
   getNavEpoch,
   isCurrentColSeq,
+  isCurrentContentionSeq,
   isCurrentDbListSeq,
   isCurrentDocSeq,
   nextColSeq,
+  nextContentionSeq,
   nextDbListSeq,
   nextDocSeq,
   pushToast,
@@ -55,6 +67,7 @@ import {
   state,
 } from "./state.js";
 
+/** @typedef {import('./api.js').ContentionSseEvent} ContentionSseEvent */
 /** @typedef {import('./api.js').EmulatorSseEvent} EmulatorSseEvent */
 /** @typedef {import('./components/explorer.js').DocumentLevelState} DocumentLevelState */
 /** @typedef {import('./values.js').FirestoreDocument} FirestoreDocument */
@@ -80,8 +93,184 @@ const emulatorVersion = String(
 let sseQueue = Promise.resolve();
 /** @type {{ close: () => void } | null} */
 let activeEventStream = null;
+/** @type {{ close: () => void } | null} */
+let activeContentionEventStream = null;
+/** @type {object | null} */
+let activeContentionStreamToken = null;
+/** @type {ReturnType<typeof setInterval> | null} */
+let contentionTickerId = null;
+let connectingContention = false;
 
 const MAX_COLLECTION_COLUMN_PAGES = 1000;
+
+/**
+ * Returns true unless the document is currently hidden.
+ * @returns {boolean}
+ */
+function isDocumentVisible() {
+  return (
+    typeof document === "undefined" ||
+    !document ||
+    document.visibilityState !== "hidden"
+  );
+}
+
+/**
+ * Returns true only when `/emulator/v1/contention/events` SSE should be open.
+ * @returns {boolean}
+ */
+function shouldConnectContentionSse() {
+  return Boolean(
+    state.view === "contention" &&
+      !state.ssePaused &&
+      isDocumentVisible() &&
+      state.activeProjectId &&
+      state.activeDatabaseId
+  );
+}
+
+/**
+ * Returns true only when the 1000ms DOM-only waiter elapsed ticker should run.
+ * @returns {boolean}
+ */
+function shouldRunContentionTicker() {
+  if (
+    state.view !== "contention" ||
+    !isDocumentVisible() ||
+    !state.activeProjectId ||
+    !state.activeDatabaseId ||
+    state.contention.lastFetchedAtMs === null
+  ) {
+    return false;
+  }
+  const activeRoot = getActiveRootPath(
+    state.activeProjectId,
+    state.activeDatabaseId
+  );
+  const displayed = getDisplayedContentionDatabases(
+    state.contention,
+    activeRoot
+  );
+  return hasContentionWaiters(displayed);
+}
+
+function stopContentionTicker() {
+  if (contentionTickerId !== null) {
+    clearInterval(contentionTickerId);
+    contentionTickerId = null;
+  }
+}
+
+function syncContentionTicker() {
+  if (!shouldRunContentionTicker()) {
+    stopContentionTicker();
+    return;
+  }
+  if (contentionTickerId === null) {
+    contentionTickerId = setInterval(() => {
+      if (!shouldRunContentionTicker()) {
+        stopContentionTicker();
+        return;
+      }
+      const tickerRoot =
+        workspaceEl ??
+        (typeof document !== "undefined" &&
+        typeof document?.getElementById === "function"
+          ? document.getElementById("workspace")
+          : null) ??
+        (typeof document !== "undefined" ? document : null);
+      updateWaiterElapsedDom(tickerRoot, state.contention, Date.now());
+    }, 1000);
+  }
+}
+
+function closeContentionEventStream() {
+  activeContentionStreamToken = null;
+  if (activeContentionEventStream) {
+    activeContentionEventStream.close();
+    activeContentionEventStream = null;
+  }
+  state.contentionSseStatus = "idle";
+}
+
+function syncContentionConnection() {
+  if (!shouldConnectContentionSse()) {
+    closeContentionEventStream();
+    return;
+  }
+  if (
+    activeContentionEventStream !== null ||
+    connectingContention ||
+    state.contentionSseStatus === "error"
+  ) {
+    return;
+  }
+  connectingContention = true;
+  const token = {};
+  activeContentionStreamToken = token;
+  state.contentionSseStatus = "connecting";
+  try {
+    const stream = connectContentionEvents({
+      onInvalidate(batch) {
+        if (
+          activeContentionStreamToken !== token ||
+          !shouldConnectContentionSse()
+        ) {
+          return;
+        }
+        const activeRoot = getActiveRootPath(
+          state.activeProjectId,
+          state.activeDatabaseId
+        );
+        const relevant =
+          state.contention.scope === "all" ||
+          batch.some(
+            (ev) =>
+              ev &&
+              typeof ev === "object" &&
+              (ev.type === "resync" ||
+                !ev.database ||
+                ev.database === activeRoot)
+          );
+        if (relevant) {
+          void refreshContention();
+        }
+      },
+      onStatusChange(status) {
+        if (activeContentionStreamToken !== token) return;
+        const prevStatus = state.contentionSseStatus;
+        state.contentionSseStatus = status;
+        renderApp();
+        if (
+          prevStatus === "error" &&
+          status === "live" &&
+          activeContentionStreamToken === token &&
+          shouldConnectContentionSse()
+        ) {
+          void refreshContention();
+        }
+      },
+    });
+    if (activeContentionStreamToken === token) {
+      activeContentionEventStream = stream;
+    } else {
+      stream.close();
+    }
+  } catch {
+    if (activeContentionStreamToken === token) {
+      activeContentionStreamToken = null;
+      activeContentionEventStream = null;
+      state.contentionSseStatus = "error";
+    }
+  } finally {
+    connectingContention = false;
+  }
+}
+
+function syncContentionLifecycle() {
+  syncContentionConnection();
+  syncContentionTicker();
+}
 
 /**
  * Enqueues an SSE event batch onto the serialized `sseQueue`.
@@ -104,17 +293,287 @@ export function flushSseQueue() {
 }
 
 /**
- * Toggles live SSE update pausing, triggering a full active-DB resync when unpaused.
+ * Fetches the current contention snapshot according to `state.contention.scope`,
+ * discarding stale responses across rapid refreshes, view leaves, or DB changes.
  * @returns {Promise<void>}
  */
-export function toggleSsePaused() {
+export async function refreshContention() {
+  if (
+    state.view !== "contention" ||
+    !state.activeProjectId ||
+    !state.activeDatabaseId
+  ) {
+    return;
+  }
+  const myDbEpoch = getDbEpoch();
+  const mySeq = nextContentionSeq();
+  const scope = state.contention.scope;
+  const activeRoot = getActiveRootPath(
+    state.activeProjectId,
+    state.activeDatabaseId
+  );
+  const queryDb = scope === "active" && activeRoot ? activeRoot : undefined;
+
+  state.contention.loading = true;
+  state.contention.error = null;
+  renderApp();
+
+  try {
+    const snapshot = await getContention(queryDb);
+    if (
+      myDbEpoch !== getDbEpoch() ||
+      !isCurrentContentionSeq(mySeq) ||
+      state.view !== "contention" ||
+      state.contention.scope !== scope
+    ) {
+      return;
+    }
+    const nowMs = Date.now();
+    state.contention.snapshot = snapshot;
+    state.contention.lastFetchedAtMs = nowMs;
+    state.contention.lastFetchedIso = new Date(nowMs).toISOString();
+    state.contention.error = null;
+  } catch (err) {
+    if (
+      myDbEpoch !== getDbEpoch() ||
+      !isCurrentContentionSeq(mySeq) ||
+      state.view !== "contention" ||
+      state.contention.scope !== scope
+    ) {
+      return;
+    }
+    state.contention.error =
+      err instanceof ApiError
+        ? `[${err.code} ${err.status}] ${err.message}`
+        : err instanceof Error
+          ? err.message
+          : String(err);
+  } finally {
+    if (myDbEpoch === getDbEpoch() && isCurrentContentionSeq(mySeq)) {
+      state.contention.loading = false;
+      syncContentionLifecycle();
+      renderApp();
+    }
+  }
+}
+
+/**
+ * Clears contention summary counters and recent history for the selected scope
+ * without disturbing active locks/waiters, then refreshes the snapshot.
+ * @returns {Promise<void>}
+ */
+export async function clearContentionHistory() {
+  if (
+    state.contention.clearing ||
+    state.view !== "contention" ||
+    !state.activeProjectId ||
+    !state.activeDatabaseId
+  ) {
+    return;
+  }
+  const myDbEpoch = getDbEpoch();
+  const scope = state.contention.scope;
+  const targetProject = state.activeProjectId;
+  const targetDb = state.activeDatabaseId;
+  const activeRoot = getActiveRootPath(targetProject, targetDb);
+  if (scope === "active" && !activeRoot) {
+    return;
+  }
+  const queryDb = scope === "active" ? /** @type {string} */ (activeRoot) : undefined;
+
+  const mySeq = nextContentionSeq();
+  state.contention.loading = false;
+  state.contention.clearing = true;
+  state.contention.error = null;
+  renderApp();
+
+  const isCurrentClearContext = () =>
+    myDbEpoch === getDbEpoch() &&
+    isCurrentContentionSeq(mySeq) &&
+    state.view === "contention" &&
+    state.contention.scope === scope;
+
+  try {
+    await clearContention(queryDb);
+    if (myDbEpoch !== getDbEpoch()) return;
+    notifyToast(
+      queryDb
+        ? `Cleared contention history for ${targetProject}/${targetDb}`
+        : "Cleared contention history for all databases",
+      "success"
+    );
+    if (isCurrentClearContext()) {
+      await refreshContention();
+    }
+  } catch (err) {
+    if (myDbEpoch !== getDbEpoch()) return;
+    const message =
+      err instanceof ApiError
+        ? `[${err.code} ${err.status}] ${err.message}`
+        : err instanceof Error
+          ? err.message
+          : String(err);
+    if (isCurrentClearContext()) {
+      state.contention.error = message;
+    }
+    notifyToast(`Failed to clear contention history: ${message}`, "error");
+  } finally {
+    if (myDbEpoch === getDbEpoch() && state.contention.clearing) {
+      state.contention.clearing = false;
+      renderApp();
+    }
+  }
+}
+
+/**
+ * Switches the active workspace view and synchronizes URL history and contention lifecycle.
+ * @param {'explorer' | 'query' | 'contention'} nextView
+ * @returns {Promise<void>}
+ */
+export async function switchView(nextView) {
+  if (state.view === nextView) {
+    if (
+      nextView === "contention" &&
+      state.activeProjectId &&
+      state.activeDatabaseId
+    ) {
+      syncContentionLifecycle();
+      if (!state.contention.snapshot && !state.contention.loading) {
+        await refreshContention();
+      }
+    }
+    return;
+  }
+  state.view = nextView;
+  if (nextView !== "contention") {
+    nextContentionSeq();
+    state.contention.loading = false;
+    syncContentionLifecycle();
+    syncUrl();
+    renderApp();
+    return;
+  }
+  ensureVisibilityListener();
+  syncUrl();
+  syncContentionLifecycle();
+  renderApp();
+  if (state.activeProjectId && state.activeDatabaseId) {
+    await refreshContention();
+  }
+}
+
+/**
+ * Switches to the Explorer view and navigates to/hydrates the given document resource path.
+ * @param {string} docName
+ * @returns {Promise<void>}
+ */
+export async function openDocumentFromName(docName) {
+  const m = /^projects\/([^/]+)\/databases\/([^/]+)\/documents\/(.+)$/.exec(
+    docName
+  );
+  if (!m) return;
+  const [, targetProject, targetDatabase, relPath] = m;
+  if (
+    !isValidPathSegment(targetProject) ||
+    !isValidPathSegment(targetDatabase)
+  ) {
+    return;
+  }
+  const nextSegments = relPath.split("/");
+  if (
+    nextSegments.length === 0 ||
+    nextSegments.length % 2 !== 0 ||
+    !nextSegments.every(isValidPathSegment)
+  ) {
+    return;
+  }
+
+  nextContentionSeq();
+  state.contention.loading = false;
+  state.view = "explorer";
+  syncContentionLifecycle();
+
+  if (
+    targetProject === state.activeProjectId &&
+    targetDatabase === state.activeDatabaseId
+  ) {
+    const myDbEpoch = getDbEpoch();
+    state.segments = nextSegments;
+    const myNavEpoch = bumpNavEpoch();
+    syncUrl();
+    renderApp();
+    const activeRoot = getActiveRootPath(targetProject, targetDatabase);
+    if (activeRoot && !state.rootCollections.includes(nextSegments[0])) {
+      try {
+        const cols = await listCollectionIds(activeRoot);
+        if (
+          myDbEpoch === getDbEpoch() &&
+          state.activeProjectId === targetProject &&
+          state.activeDatabaseId === targetDatabase
+        ) {
+          state.rootCollections = cols;
+          renderApp();
+        }
+      } catch {
+        // Proceed with path hydration even if root collection refresh fails
+      }
+    }
+    if (myDbEpoch === getDbEpoch() && myNavEpoch === getNavEpoch()) {
+      await hydrateVisiblePath(myDbEpoch, myNavEpoch, nextSegments);
+    }
+    return;
+  }
+
+  await selectDatabase(targetProject, targetDatabase, nextSegments);
+}
+
+/**
+ * Handles browser tab `visibilitychange` transitions for contention SSE and elapsed wait ticks.
+ * @returns {Promise<void>}
+ */
+export async function handleVisibilityChange() {
+  if (!isDocumentVisible()) {
+    syncContentionLifecycle();
+    if (state.view === "contention") {
+      renderApp();
+    }
+    return;
+  }
+  syncContentionLifecycle();
+  if (
+    !state.ssePaused &&
+    state.view === "contention" &&
+    state.activeProjectId &&
+    state.activeDatabaseId
+  ) {
+    await refreshContention();
+  }
+}
+
+/**
+ * Toggles live SSE update pausing, triggering active-DB/contention resyncs when unpaused.
+ * @returns {Promise<void>}
+ */
+export async function toggleSsePaused() {
   const wasPaused = state.ssePaused;
   state.ssePaused = !wasPaused;
+  syncContentionLifecycle();
   renderApp();
   if (wasPaused && !state.ssePaused) {
-    return enqueueSseBatch([{ type: "resync" }]);
+    const epochBefore = getDbEpoch();
+    await enqueueSseBatch([{ type: "resync" }]);
+    if (
+      !state.ssePaused &&
+      state.view === "contention" &&
+      state.activeProjectId &&
+      state.activeDatabaseId
+    ) {
+      syncContentionLifecycle();
+      if (epochBefore === getDbEpoch()) {
+        await refreshContention();
+      }
+    }
   }
-  return Promise.resolve();
 }
 
 /**
@@ -133,7 +592,8 @@ function syncUrl(replace = false) {
     state.activeProjectId,
     state.activeDatabaseId,
     state.segments,
-    replace
+    replace,
+    state.view
   );
 }
 
@@ -176,9 +636,13 @@ export async function selectDatabase(
 
   if (dbChanged) {
     resetDatabaseCaches();
+    if (state.view === "contention") {
+      state.contention.loading = true;
+    }
   }
 
   syncUrl(replaceHistory);
+  syncContentionLifecycle();
   renderApp();
 
   try {
@@ -211,9 +675,15 @@ export async function selectDatabase(
   if (
     myDbEpoch === getDbEpoch() &&
     myNavEpoch === getNavEpoch() &&
-    initialSegments.length > 0
+    initialSegments.length > 0 &&
+    state.view !== "contention"
   ) {
     await hydrateVisiblePath(myDbEpoch, myNavEpoch, initialSegments);
+  }
+
+  if (myDbEpoch === getDbEpoch() && state.view === "contention") {
+    syncContentionLifecycle();
+    await refreshContention();
   }
 }
 
@@ -936,9 +1406,12 @@ export function renderTopbar() {
           @click=${(/** @type {MouseEvent} */ e) => {
             e.preventDefault();
             if (state.activeProjectId && state.activeDatabaseId) {
+              nextContentionSeq();
+              state.contention.loading = false;
               state.view = "explorer";
               state.segments = [];
               bumpNavEpoch();
+              syncContentionLifecycle();
               syncUrl();
               renderApp();
             }
@@ -1015,26 +1488,30 @@ export function renderTopbar() {
       <div class="topbar-right">
         ${state.activeProjectId && state.activeDatabaseId
           ? html`
-              <div class="segmented">
+              <div class="segmented" role="group" aria-label="Workspace view">
                 <button
                   type="button"
                   class=${state.view === "explorer" ? "active" : ""}
-                  @click=${() => {
-                    state.view = "explorer";
-                    renderApp();
-                  }}
+                  aria-pressed=${String(state.view === "explorer")}
+                  @click=${() => switchView("explorer")}
                 >
                   Explorer
                 </button>
                 <button
                   type="button"
                   class=${state.view === "query" ? "active" : ""}
-                  @click=${() => {
-                    state.view = "query";
-                    renderApp();
-                  }}
+                  aria-pressed=${String(state.view === "query")}
+                  @click=${() => switchView("query")}
                 >
                   Query Runner
+                </button>
+                <button
+                  type="button"
+                  class=${state.view === "contention" ? "active" : ""}
+                  aria-pressed=${String(state.view === "contention")}
+                  @click=${() => switchView("contention")}
+                >
+                  Contention
                 </button>
               </div>
 
@@ -1074,7 +1551,7 @@ export function renderTopbar() {
 }
 
 /**
- * Renders the active workspace view (empty hero, Query Runner, or Explorer).
+ * Renders the active workspace view (empty hero, Query Runner, Contention Visualizer, or Explorer).
  * @returns {TemplateResult}
  */
 export function renderWorkspace() {
@@ -1097,6 +1574,29 @@ export function renderWorkspace() {
     `;
   }
 
+  if (state.view === "contention") {
+    return renderContention({
+      projectId: state.activeProjectId,
+      databaseId: state.activeDatabaseId,
+      state: state.contention,
+      sseStatus: state.contentionSseStatus,
+      ssePaused: state.ssePaused,
+      onChangeScope: (nextScope) => {
+        if (state.contention.scope === nextScope) return Promise.resolve();
+        state.contention.scope = nextScope;
+        state.contention.snapshot = null;
+        state.contention.lastFetchedAtMs = null;
+        state.contention.lastFetchedIso = null;
+        state.contention.error = null;
+        syncContentionLifecycle();
+        return refreshContention();
+      },
+      onRefresh: () => refreshContention(),
+      onClearHistory: () => clearContentionHistory(),
+      onOpenDocument: (docName) => openDocumentFromName(docName),
+    });
+  }
+
   if (state.view === "query") {
     return renderQueryRunner({
       projectId: state.activeProjectId,
@@ -1105,18 +1605,7 @@ export function renderWorkspace() {
       state: state.queryState,
       onRerender: renderApp,
       onExecuteQuery: () => void executeCurrentQuery(),
-      onOpenResultDocument: (docName) => {
-        const m =
-          /^projects\/[^/]+\/databases\/[^/]+\/documents\/(.+)$/.exec(docName);
-        if (m) {
-          state.view = "explorer";
-          state.segments = m[1].split("/");
-          bumpNavEpoch();
-          syncUrl();
-          renderApp();
-          void hydrateVisiblePath();
-        }
-      },
+      onOpenResultDocument: (docName) => void openDocumentFromName(docName),
     });
   }
 
@@ -1165,8 +1654,7 @@ export function renderWorkspace() {
         ? parentPath.slice(rootPrefix.length + 1)
         : "";
       state.queryState = createQueryRunnerState(collectionId, parentSubpath);
-      state.view = "query";
-      renderApp();
+      void switchView("query");
     },
     onLoadMoreDocuments: (colPath) => {
       const col = state.collectionColumns.get(colPath);
@@ -1323,20 +1811,47 @@ function renderApp() {
       ? (document.activeElement ?? null)
       : null;
   if (topbarEl) render(renderTopbar(), topbarEl);
-  if (workspaceEl) render(renderWorkspace(), workspaceEl);
+  if (workspaceEl) {
+    render(renderWorkspace(), workspaceEl);
+    if (state.view === "contention") {
+      updateWaiterElapsedDom(workspaceEl, state.contention, Date.now());
+    }
+  }
   if (modalRootEl) render(renderModal(), modalRootEl);
   if (toastRootEl) render(renderToasts(), toastRootEl);
   syncModalAccessibility(wasModalOpen, prevActive);
+  syncContentionLifecycle();
 }
 
 let popstateBound = false;
+let visibilityBound = false;
+
+function ensureVisibilityListener() {
+  if (
+    !visibilityBound &&
+    typeof document !== "undefined" &&
+    typeof document?.addEventListener === "function"
+  ) {
+    visibilityBound = true;
+    document.addEventListener("visibilitychange", () => {
+      void handleVisibilityChange();
+    });
+  }
+}
 
 /**
  * Initializes event listeners, SSE streaming, and initial database/route hydration.
  */
 export async function init() {
   state.sseStatus = "live";
+  nextContentionSeq();
+  closeContentionEventStream();
+  stopContentionTicker();
+  const initialRoute = parseBrowserRoute(window.location.pathname);
+  state.view = initialRoute?.view === "contention" ? "contention" : "explorer";
   renderApp();
+
+  ensureVisibilityListener();
 
   activeEventStream?.close();
   activeEventStream = connectEventStream(
@@ -1358,14 +1873,23 @@ export async function init() {
     window.addEventListener("popstate", () => {
       const route = parseBrowserRoute(window.location.pathname);
       if (route) {
+        const nextView = route.view === "contention" ? "contention" : "explorer";
+        state.view = nextView;
+        if (nextView !== "contention") {
+          nextContentionSeq();
+          state.contention.loading = false;
+        }
         if (
           route.projectId === state.activeProjectId &&
           route.databaseId === state.activeDatabaseId
         ) {
           state.segments = [...route.segments];
           bumpNavEpoch();
+          syncContentionLifecycle();
           renderApp();
-          if (state.segments.length > 0) {
+          if (nextView === "contention") {
+            void refreshContention();
+          } else if (state.segments.length > 0) {
             void hydrateVisiblePath();
           }
         } else {
@@ -1377,8 +1901,14 @@ export async function init() {
           );
         }
       } else {
+        if (state.view === "contention") {
+          nextContentionSeq();
+          state.contention.loading = false;
+          state.view = "explorer";
+        }
         state.segments = [];
         bumpNavEpoch();
+        syncContentionLifecycle();
         renderApp();
       }
     });
@@ -1386,7 +1916,6 @@ export async function init() {
 
   try {
     await refreshDatabaseList();
-    const initialRoute = parseBrowserRoute(window.location.pathname);
     if (initialRoute) {
       await selectDatabase(
         initialRoute.projectId,
