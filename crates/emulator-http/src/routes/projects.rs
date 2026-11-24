@@ -903,7 +903,7 @@ fn parse_bool_param(name: &str, val: &str) -> Result<bool> {
     }
 }
 
-fn percent_decode(input: &str) -> Result<String> {
+pub(super) fn percent_decode(input: &str) -> Result<String> {
     percent_decode_inner(input, true)
 }
 

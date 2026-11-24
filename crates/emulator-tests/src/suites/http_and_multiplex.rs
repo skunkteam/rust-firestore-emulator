@@ -486,6 +486,10 @@ struct Http1SseClient {
 
 impl Http1SseClient {
     async fn connect(addr: SocketAddr) -> Self {
+        Self::connect_path(addr, "/emulator/v1/events").await
+    }
+
+    async fn connect_path(addr: SocketAddr, path: &str) -> Self {
         let stream = TcpStream::connect(addr)
             .await
             .expect("connect HTTP/1.1 SSE TCP stream");
@@ -503,7 +507,7 @@ impl Http1SseClient {
 
         let req = http::Request::builder()
             .method(Method::GET)
-            .uri("/emulator/v1/events")
+            .uri(path)
             .header(header::HOST, addr.to_string())
             .body(Full::new(Bytes::new()))
             .expect("build HTTP/1.1 SSE request");
@@ -748,6 +752,50 @@ async fn loopback_tcp_multiplexer_exits_immediately_on_shutdown_when_idle_despit
         "idle shutdown took {:?}",
         started.elapsed()
     );
+}
+
+#[gtest]
+#[tokio::test]
+async fn loopback_tcp_contention_sse_emits_events_and_closes_promptly_on_shutdown() {
+    let mut db = TestEnv::new().build_db();
+    let project = db.project();
+    let (addr, shutdown_tx, server_task) =
+        spawn_loopback_server(project, Some(Duration::from_millis(200))).await;
+
+    let mut sse_client = Http1SseClient::connect_path(addr, "/emulator/v1/contention/events").await;
+    assert_eq!(project.contention_subscriber_count(), 1);
+
+    // Park a conflicting transaction commit behind an active read lock to emit
+    // `contention_changed`.
+    db.put("mux/contend", fields!({ "v": 0i64 })).await.unwrap();
+    let mut txn1 = db.begin_rw_txn().await.unwrap();
+    let _unused = txn1.get("mux/contend").await.unwrap();
+
+    let mut actor2 = db.clone();
+    let blocked_write = tokio::spawn(async move {
+        let mut txn2 = actor2.begin_rw_txn().await.unwrap();
+        txn2.put("mux/contend", fields!({ "v": 1i64 }));
+        txn2.commit().await
+    });
+
+    sse_client
+        .wait_for_event("\"contention_changed\"", Duration::from_secs(2))
+        .await;
+
+    // Fire shutdown without dropping the SSE client or rolling back `txn1`.
+    shutdown_tx.send(()).expect("send shutdown signal");
+    let run_result = tokio::time::timeout(Duration::from_secs(2), server_task)
+        .await
+        .expect("server exited within 2s with open contention SSE stream")
+        .expect("server task did not panic");
+    assert!(
+        run_result.is_ok(),
+        "firestore_emulator::run returned error: {run_result:?}"
+    );
+
+    sse_client.assert_terminates(Duration::from_secs(2)).await;
+    drop(txn1);
+    let _unused = tokio::time::timeout(Duration::from_secs(2), blocked_write).await;
 }
 
 #[gtest]

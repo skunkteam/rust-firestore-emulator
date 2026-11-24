@@ -14,7 +14,7 @@ pub(crate) use self::registry::{CommitTake, RunningTransactions, TransactionId};
 use super::{
     FirestoreDatabase,
     document::{DocumentContents, StoredDocumentVersion},
-    lock::{LockManager, LockPriority, LockSession, WriteLease},
+    lock::{LockManager, LockPriority, LockSession, SessionKind, WriteLease},
     reference::DocumentRef,
 };
 use crate::{
@@ -228,7 +228,12 @@ impl ConcurrencyMode {
         priority: LockPriority,
         optimistic_concurrency: bool,
     ) -> Self {
-        let session = locks.new_session(Some(id), priority, true, true);
+        let kind = if optimistic_concurrency {
+            SessionKind::OptimisticTxn
+        } else {
+            SessionKind::PessimisticTxn
+        };
+        let session = locks.new_session(Some(id), kind, priority, true, true);
         if optimistic_concurrency {
             ConcurrencyMode::Optimistic(Box::new(OptimisticState {
                 database,

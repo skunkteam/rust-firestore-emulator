@@ -23,7 +23,7 @@ use super::{
     },
     event::DatabaseEvent,
     field_path::FieldPath,
-    lock::{CommitSeal, LockPriority, ReadObservation},
+    lock::{CommitSeal, LockPriority, ReadObservation, SessionKind},
     reference::DocumentRef,
     transaction::{CommitTake, ReadWriteTransaction, TransactionId},
     validation,
@@ -132,9 +132,13 @@ impl FirestoreDatabase {
         Option<Arc<StoredDocumentVersion>>,
     )> {
         self.transactions.reap_if_due();
-        let session = self
-            .locks
-            .new_session(None, LockPriority::NextSeq, false, false);
+        let session = self.locks.new_session(
+            None,
+            SessionKind::SingleWrite,
+            LockPriority::NextSeq,
+            false,
+            false,
+        );
         let lease = session.acquire_write(&doc_ref).await?;
         if self.is_cleared() {
             return Err(AbortReason::DatabaseCleared.into());
@@ -171,14 +175,22 @@ impl FirestoreDatabase {
         }
 
         self.transactions.reap_if_due();
-        let deadline = Instant::now() + self.project.timeouts.write;
+        let batch_start = Instant::now();
+        let deadline = batch_start + self.project.timeouts.write;
         let mut priority = LockPriority::NextSeq;
         let mut wound_retries: u32 = 0;
 
         loop {
-            let session = self.locks.new_session(None, priority, true, true);
+            let session =
+                self.locks
+                    .new_session(None, SessionKind::WriteBatch, priority, true, true);
             let sealed = match session
-                .acquire_writes_all(&validated.target_docs, deadline)
+                .acquire_writes_all_since(
+                    &validated.target_docs,
+                    batch_start,
+                    deadline,
+                    (wound_retries > 0).then_some(wound_retries),
+                )
                 .await
             {
                 Ok(write_leases) => Arc::clone(&session).seal_for_commit(write_leases),
@@ -191,8 +203,12 @@ impl FirestoreDatabase {
                         .await?;
                     return Ok((time, results));
                 }
-                Err(CommitError::Aborted(AbortReason::Wounded { .. })) => {
-                    if let Some(seq) = session.root_seq() {
+                Err(CommitError::Aborted(AbortReason::Wounded {
+                    wounder_txn_id,
+                    wounder_seq,
+                })) => {
+                    let seq = session.root_seq();
+                    if let Some(seq) = seq {
                         priority = LockPriority::Assigned(seq);
                     }
                     session.close();
@@ -200,6 +216,12 @@ impl FirestoreDatabase {
                         return Err(AbortReason::DatabaseCleared.into());
                     }
                     if Instant::now() >= deadline {
+                        self.locks.record_write_batch_timeout(
+                            session.session_id(),
+                            seq,
+                            u64::try_from(batch_start.elapsed().as_millis()).unwrap_or(u64::MAX),
+                            wound_retries,
+                        );
                         return Err(AbortReason::WriteTimeout.into());
                     }
                     if wound_retries == 0 {
@@ -209,13 +231,26 @@ impl FirestoreDatabase {
                             Duration::from_millis((1u64 << (wound_retries - 1).min(4)).min(25));
                         tokio::time::sleep_until((Instant::now() + backoff).min(deadline)).await;
                     }
-                    wound_retries = wound_retries.saturating_add(1);
                     if self.is_cleared() {
                         return Err(AbortReason::DatabaseCleared.into());
                     }
                     if Instant::now() >= deadline {
+                        self.locks.record_write_batch_timeout(
+                            session.session_id(),
+                            seq,
+                            u64::try_from(batch_start.elapsed().as_millis()).unwrap_or(u64::MAX),
+                            wound_retries,
+                        );
                         return Err(AbortReason::WriteTimeout.into());
                     }
+                    wound_retries = wound_retries.saturating_add(1);
+                    self.locks.record_write_batch_retry(
+                        session.session_id(),
+                        seq,
+                        wounder_txn_id,
+                        wounder_seq,
+                        wound_retries,
+                    );
                 }
                 Err(other) => return Err(other.into()),
             }
@@ -259,6 +294,13 @@ impl FirestoreDatabase {
                     if actual != expected_update_time {
                         drop(lease);
                         drop(write_leases);
+                        self.locks.record_upgrade_abort(
+                            session.session_id(),
+                            session.txn_id(),
+                            session.kind(),
+                            session.root_seq(),
+                            &doc_ref,
+                        );
                         return Err(CommitError::Aborted(AbortReason::UpgradeContention));
                     }
                 }

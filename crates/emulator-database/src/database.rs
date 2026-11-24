@@ -24,6 +24,13 @@ use tokio::sync::{
 };
 use tracing::{Level, Span, debug, field::display, instrument};
 
+pub use self::lock::{
+    ContendedDocumentSnapshot, ContentionEvent, ContentionEventKind, ContentionLockMode,
+    ContentionSessionState, ContentionSnapshot, ContentionSseEvent, ContentionSubscriberGuard,
+    ContentionSubscription, ContentionSummary, DatabaseContentionSnapshot, MAX_CONTENTION_HISTORY,
+    MAX_SNAPSHOT_CONTENDED_DOCS, MAX_SNAPSHOT_DOC_PARTICIPANTS, ReaderSnapshot, SessionKind,
+    WaiterSnapshot, WriterSnapshot,
+};
 use self::{
     collection::Collection,
     document::{DocumentContents, DocumentMeta, StoredDocumentVersion},
@@ -81,7 +88,11 @@ impl FirestoreDatabase {
         name: RootRef,
         enterprise_edition: bool,
     ) -> Arc<Self> {
-        let locks = Arc::new(LockManager::new(name.clone(), project.timeouts));
+        let locks = Arc::new(LockManager::with_broadcaster(
+            name.clone(),
+            project.timeouts,
+            project.contention_broadcaster(),
+        ));
         let db = Arc::new_cyclic(|database| FirestoreDatabase {
             project,
             name,
@@ -142,9 +153,13 @@ impl FirestoreDatabase {
                     return Err(AbortReason::DatabaseCleared.into());
                 }
                 self.transactions.reap_if_due();
-                let session = self
-                    .locks
-                    .new_session(None, LockPriority::NextSeq, false, false);
+                let session = self.locks.new_session(
+                    None,
+                    SessionKind::PointRead,
+                    LockPriority::NextSeq,
+                    false,
+                    false,
+                );
                 let lease = session.acquire_read(name).await?;
                 match self.peek_doc_meta(name).await? {
                     Some(meta) => meta.read_with(&lease, |c| c.current_version().cloned())?,
@@ -1133,7 +1148,9 @@ fn parse_list_order_by(order_by: &str) -> Result<Vec<(FieldReference, Direction)
 
 impl Drop for FirestoreDatabase {
     fn drop(&mut self) {
-        self.locks.abort_all(AbortReason::DatabaseDropped);
+        if !self.is_cleared() {
+            self.locks.abort_all(AbortReason::DatabaseDropped);
+        }
         self.transactions.clear_all();
         debug!("Database \"{}\" dropped", self.name);
     }
@@ -1793,252 +1810,299 @@ mod tests {
         }
     }
 
-    #[test]
-    fn parse_list_order_by_handles_quoted_commas_whitespace_and_rejects_invalid_directions() {
-        assert_eq!(parse_list_order_by("   ").unwrap().len(), 0);
+    #[tokio::test(start_paused = true)]
+    async fn contention_commit_records_write_batch_retry_write_timeout_and_upgrade_abort() {
+        use std::time::Duration;
 
-        let parsed = parse_list_order_by(r"`a,b` desc, x.`y, z` asc, `plain desc`, tail").unwrap();
-        assert_eq!(parsed.len(), 4);
-        assert_eq!(parsed[0].0.to_string(), "`a,b`");
-        assert!(matches!(parsed[0].1, Direction::Descending));
-        assert_eq!(parsed[1].0.to_string(), "x.`y, z`");
-        assert!(matches!(parsed[1].1, Direction::Ascending));
-        assert_eq!(parsed[2].0.to_string(), "`plain desc`");
-        assert!(matches!(parsed[2].1, Direction::Ascending));
-        assert_eq!(parsed[3].0.to_string(), "tail");
-        assert!(matches!(parsed[3].1, Direction::Ascending));
+        use futures_util::poll;
+        use tokio::time::advance;
 
-        let escaped = parse_list_order_by(r"`a\`,b` descending").unwrap();
-        assert_eq!(escaped.len(), 1);
-        assert_eq!(escaped[0].0.to_string(), r"`a\`,b`");
-        assert!(matches!(escaped[0].1, Direction::Descending));
+        use crate::database::lock::{ContentionEventKind, LockPriority, SessionKind};
 
-        for bad in [
-            "rank sideways",
-            "rank asc desc",
-            "foo bar",
-            "rank asc, ",
-            ", rank",
-            "a,,b",
-            "`unclosed, comma desc",
-            "`unclosed",
-        ] {
-            assert!(
-                matches!(
-                    parse_list_order_by(bad),
-                    Err(GenericDatabaseError::InvalidArgument(_))
-                ),
-                "expected InvalidArgument for order_by {bad:?}"
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn list_docs_page_token_validation_all_descendants_and_page_size_zero() {
         let project: &'static FirestoreProject =
             Box::leak(Box::new(FirestoreProject::new(FirestoreConfig::default())));
         let root: RootRef = "projects/p/databases/(default)".parse().unwrap();
         let db = project.database(&root).await;
 
-        for path in [
-            "projects/p/databases/(default)/documents/c1/d1",
-            "projects/p/databases/(default)/documents/c1/d2",
-            "projects/p/databases/(default)/documents/c2/d3",
-        ] {
-            let doc_ref: DocumentRef = path.parse().unwrap();
-            db.update_doc(
-                &doc_ref,
-                HashMap::from([("v".to_string(), Value::integer(1))]),
-                None,
-                None,
-                None,
-            )
+        let d_seq: DocumentRef = "projects/p/databases/(default)/documents/c/seq"
+            .parse()
+            .unwrap();
+        let d1: DocumentRef = "projects/p/databases/(default)/documents/c/d1"
+            .parse()
+            .unwrap();
+        let d2: DocumentRef = "projects/p/databases/(default)/documents/c/d2"
+            .parse()
+            .unwrap();
+        let d_upg: DocumentRef = "projects/p/databases/(default)/documents/c/upg"
+            .parse()
+            .unwrap();
+
+        let mk_write = |doc_ref: &DocumentRef, val: i64| Write {
+            operation: Some(write::Operation::Update(Document {
+                name: doc_ref.to_string(),
+                fields: HashMap::from([("v".to_string(), Value::integer(val))]),
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+
+        // 1. WriteBatchRetry: older txn wounds an in-flight 2-doc non-tx batch waiting on d2.
+        let older_txn = db.new_txn(TransactionOptions::READ_WRITE).await.unwrap();
+        // Materialize older_txn's seq eagerly before launching the batch.
+        db.get_doc(&d_seq, ReadConsistency::Transaction(older_txn))
             .await
             .unwrap();
-        }
 
-        // Oversized raw token (> 2 MiB) is rejected before decoding.
-        let huge = "A".repeat(MAX_PAGE_TOKEN_LEN + 1);
-        assert!(matches!(
-            db.list_docs(
-                Ref::Root(root.clone()),
-                "c1".to_string(),
-                2,
-                huge,
-                String::new(),
-                None,
-                false,
-                ReadConsistency::Default,
-            )
-            .await,
-            Err(GenericDatabaseError::InvalidArgument(_))
-        ));
-
-        // Tampered prost payloads: wrong version, missing cursor, before=true, wrong cursor len,
-        // and non-reference / cross-db show_missing cursor.
-        let forged_tokens = [
-            ListDocsPageToken {
-                version: 2,
-                parent: root.to_string(),
-                collection_id: "c1".to_string(),
-                show_missing: false,
-                cursor: Some(Cursor {
-                    values: vec![Value::reference(
-                        "projects/p/databases/(default)/documents/c1/d1".to_string(),
-                    )],
-                    before: false,
-                }),
-                raw_order_by: String::new(),
-                has_mask: false,
-                mask_field_paths: vec![],
-            },
-            ListDocsPageToken {
-                version: 1,
-                parent: root.to_string(),
-                collection_id: "c1".to_string(),
-                show_missing: false,
-                cursor: None,
-                raw_order_by: String::new(),
-                has_mask: false,
-                mask_field_paths: vec![],
-            },
-            ListDocsPageToken {
-                version: 1,
-                parent: root.to_string(),
-                collection_id: "c1".to_string(),
-                show_missing: false,
-                cursor: Some(Cursor {
-                    values: vec![Value::reference(
-                        "projects/p/databases/(default)/documents/c1/d1".to_string(),
-                    )],
-                    before: true,
-                }),
-                raw_order_by: String::new(),
-                has_mask: false,
-                mask_field_paths: vec![],
-            },
-            ListDocsPageToken {
-                version: 1,
-                parent: root.to_string(),
-                collection_id: "c1".to_string(),
-                show_missing: false,
-                cursor: Some(Cursor {
-                    values: vec![],
-                    before: false,
-                }),
-                raw_order_by: String::new(),
-                has_mask: false,
-                mask_field_paths: vec![],
-            },
-            ListDocsPageToken {
-                version: 1,
-                parent: root.to_string(),
-                collection_id: "c1".to_string(),
-                show_missing: true,
-                cursor: Some(Cursor {
-                    values: vec![Value::string("not-a-ref")],
-                    before: false,
-                }),
-                raw_order_by: String::new(),
-                has_mask: false,
-                mask_field_paths: vec![],
-            },
-            ListDocsPageToken {
-                version: 1,
-                parent: root.to_string(),
-                collection_id: "c1".to_string(),
-                show_missing: true,
-                cursor: Some(Cursor {
-                    values: vec![Value::reference(
-                        "projects/p/databases/other/documents/c1/d1".to_string(),
-                    )],
-                    before: false,
-                }),
-                raw_order_by: String::new(),
-                has_mask: false,
-                mask_field_paths: vec![],
-            },
-        ];
-        for tok in forged_tokens {
-            let show_missing = tok.show_missing;
-            let encoded = URL_SAFE_NO_PAD.encode(tok.encode_to_vec());
-            assert!(
-                matches!(
-                    db.list_docs(
-                        Ref::Root(root.clone()),
-                        "c1".to_string(),
-                        2,
-                        encoded,
-                        String::new(),
-                        None,
-                        show_missing,
-                        ReadConsistency::Default,
-                    )
-                    .await,
-                    Err(GenericDatabaseError::InvalidArgument(_))
-                ),
-                "expected InvalidArgument for forged token (show_missing={show_missing})"
-            );
-        }
-
-        // Standard base64 (non-URL-safe / padded) is rejected.
-        assert!(matches!(
-            db.list_docs(
-                Ref::Root(root.clone()),
-                "c1".to_string(),
-                2,
-                "AAAA====".to_string(),
-                String::new(),
-                None,
-                false,
-                ReadConsistency::Default,
-            )
-            .await,
-            Err(GenericDatabaseError::InvalidArgument(_))
-        ));
-
-        // Normalized parent ("projects/p/databases/(default)" vs ".../documents"),
-        // `collection_id == ""` (all_descendants), and `page_size == 0` with `page_token`.
-        let root_no_docs: Ref = "projects/p/databases/(default)".parse().unwrap();
-        let root_with_docs: Ref = "projects/p/databases/(default)/documents".parse().unwrap();
-        let (p1, tok1) = db
-            .list_docs(
-                root_no_docs,
-                String::new(),
-                1,
-                String::new(),
-                String::new(),
-                None,
-                false,
-                ReadConsistency::Default,
-            )
-            .await
-            .unwrap();
-        assert_eq!(p1.len(), 1);
-        assert_eq!(p1[0].name, "projects/p/databases/(default)/documents/c1/d1");
-        assert!(!tok1.is_empty());
-
-        let (rest, tok2) = db
-            .list_docs(
-                root_with_docs,
-                String::new(),
-                0,
-                tok1,
-                String::new(),
-                None,
-                false,
-                ReadConsistency::Default,
-            )
-            .await
-            .unwrap();
-        assert_eq!(
-            rest.iter().map(|d| d.name.as_str()).collect::<Vec<_>>(),
-            vec![
-                "projects/p/databases/(default)/documents/c1/d2",
-                "projects/p/databases/(default)/documents/c2/d3",
-            ]
+        let blocker = db.locks.new_session(
+            None,
+            SessionKind::SingleWrite,
+            LockPriority::NextSeq,
+            false,
+            false,
         );
-        assert_eq!(tok2, "");
+        let held_d2 = blocker.acquire_write(&d2).await.unwrap();
+
+        let mut batch_fut = Box::pin(db.commit(vec![mk_write(&d1, 1), mk_write(&d2, 1)], None));
+        assert!(poll!(&mut batch_fut).is_pending());
+
+        // Older txn reads d1, wounding the batch session (which holds d1 and awaits d2).
+        db.get_doc(&d1, ReadConsistency::Transaction(older_txn))
+            .await
+            .unwrap();
+
+        // Let batch process the wound, log WRITE_BATCH_RETRY, and re-park.
+        tokio::task::yield_now().await;
+        assert!(poll!(&mut batch_fut).is_pending());
+
+        drop(held_d2);
+        blocker.close();
+        db.commit(vec![], Some(older_txn)).await.unwrap();
+        batch_fut.await.unwrap();
+
+        let snap1 = db.locks.contention_snapshot();
+        assert_eq!(snap1.summary.wounds_total, 1);
+        assert_eq!(snap1.summary.write_batch_retries_total, 1);
+        assert_eq!(
+            snap1.recent_events[0].kind,
+            ContentionEventKind::WriteBatchRetry
+        );
+        assert_eq!(snap1.recent_events[0].attempt, Some(1));
+        assert_eq!(snap1.recent_events[1].kind, ContentionEventKind::Wounded);
+
+        // 2. WriteTimeout on batch retry backoff crossing deadline.
+        db.locks.clear_contention_history();
+        let older_a = db.new_txn(TransactionOptions::READ_WRITE).await.unwrap();
+        let older_b = db.new_txn(TransactionOptions::READ_WRITE).await.unwrap();
+        db.get_doc(&d_seq, ReadConsistency::Transaction(older_a))
+            .await
+            .unwrap();
+        db.get_doc(&d_seq, ReadConsistency::Transaction(older_b))
+            .await
+            .unwrap();
+
+        let blocker2 = db.locks.new_session(
+            None,
+            SessionKind::SingleWrite,
+            LockPriority::NextSeq,
+            false,
+            false,
+        );
+        let held2 = blocker2.acquire_write(&d2).await.unwrap();
+
+        let mut batch2 = Box::pin(db.commit(vec![mk_write(&d1, 2), mk_write(&d2, 2)], None));
+        assert!(poll!(&mut batch2).is_pending());
+
+        // First wound at t=0 -> finish yield_now, log retry #1, and park attempt #1 holding d1.
+        db.get_doc(&d1, ReadConsistency::Transaction(older_a))
+            .await
+            .unwrap();
+        assert!(poll!(&mut batch2).is_pending());
+        db.commit(vec![], Some(older_a)).await.unwrap();
+        tokio::task::yield_now().await;
+        assert!(poll!(&mut batch2).is_pending());
+        assert_eq!(
+            db.locks
+                .contention_snapshot()
+                .summary
+                .write_batch_retries_total,
+            1
+        );
+
+        // Advance near deadline (1999ms), then wound attempt #1: backoff sleep crosses deadline!
+        advance(Duration::from_millis(1999)).await;
+        db.get_doc(&d1, ReadConsistency::Transaction(older_b))
+            .await
+            .unwrap();
+        let err = batch2.await.unwrap_err();
+        assert!(matches!(err, GenericDatabaseError::Aborted(_)));
+
+        drop(held2);
+        blocker2.close();
+        db.commit(vec![], Some(older_b)).await.unwrap();
+
+        let snap2 = db.locks.contention_snapshot();
+        assert_eq!(snap2.summary.write_batch_retries_total, 1);
+        assert_eq!(snap2.summary.timeouts_total, 1);
+        assert_eq!(
+            snap2.recent_events[0].kind,
+            ContentionEventKind::WriteTimeout
+        );
+        assert_eq!(snap2.recent_events[0].attempt, Some(1));
+
+        // 3. UpgradeContention recorded via commit_read_write.
+        db.locks.clear_contention_history();
+        let t1 = db.new_txn(TransactionOptions::READ_WRITE).await.unwrap();
+        let t2 = db.new_txn(TransactionOptions::READ_WRITE).await.unwrap();
+        // t1 reads first (older root_seq); both observe None on d_upg.
+        db.get_doc(&d_upg, ReadConsistency::Transaction(t1))
+            .await
+            .unwrap();
+        db.get_doc(&d_upg, ReadConsistency::Transaction(t2))
+            .await
+            .unwrap();
+
+        // Younger t2 tries to commit first -> drops its read hold and parks behind t1.
+        let mut t2_commit = Box::pin(db.commit(vec![mk_write(&d_upg, 2)], Some(t2)));
+        assert!(poll!(&mut t2_commit).is_pending());
+
+        // Older t1 commits cleanly, updating d_upg's timestamp.
+        db.commit(vec![mk_write(&d_upg, 1)], Some(t1))
+            .await
+            .unwrap();
+
+        // t2 wakes, sees last_updated changed, and aborts with UpgradeContention.
+        let t2_err = t2_commit.await.unwrap_err();
+        assert!(matches!(t2_err, GenericDatabaseError::Aborted(_)));
+
+        let snap3 = db.locks.contention_snapshot();
+        assert_eq!(snap3.summary.upgrade_aborts_total, 1);
+        assert_eq!(
+            snap3.recent_events[0].kind,
+            ContentionEventKind::UpgradeAbort
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn contention_commit_records_consistent_write_timeout_on_retried_write_batch() {
+        use std::time::Duration;
+
+        use futures_util::poll;
+        use tokio::time::advance;
+
+        use crate::database::lock::{ContentionEventKind, LockPriority, SessionKind};
+
+        let project: &'static FirestoreProject =
+            Box::leak(Box::new(FirestoreProject::new(FirestoreConfig::default())));
+        let root: RootRef = "projects/p/databases/(default)".parse().unwrap();
+        let db = project.database(&root).await;
+
+        let d_seq: DocumentRef = "projects/p/databases/(default)/documents/c/seq"
+            .parse()
+            .unwrap();
+        let d1: DocumentRef = "projects/p/databases/(default)/documents/c/d1"
+            .parse()
+            .unwrap();
+        let d2: DocumentRef = "projects/p/databases/(default)/documents/c/d2"
+            .parse()
+            .unwrap();
+
+        let mk_write = |doc_ref: &DocumentRef, val: i64| Write {
+            operation: Some(write::Operation::Update(Document {
+                name: doc_ref.to_string(),
+                fields: HashMap::from([("v".to_string(), Value::integer(val))]),
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+
+        // Case A: Retried WriteBatch (wound_retries == 1) times out while parked inside
+        // `acquire_writes_all_since` -> records cumulative `batch_start.elapsed()`,
+        // `attempt: Some(1)`, and `doc_name: Some(d2)`.
+        let older_a = db.new_txn(TransactionOptions::READ_WRITE).await.unwrap();
+        db.get_doc(&d_seq, ReadConsistency::Transaction(older_a))
+            .await
+            .unwrap();
+
+        let blocker = db.locks.new_session(
+            None,
+            SessionKind::SingleWrite,
+            LockPriority::NextSeq,
+            false,
+            false,
+        );
+        let held_d2 = blocker.acquire_write(&d2).await.unwrap();
+
+        let mut batch_parked = Box::pin(db.commit(vec![mk_write(&d1, 1), mk_write(&d2, 1)], None));
+        assert!(poll!(&mut batch_parked).is_pending());
+
+        // Advance 500ms, then wound attempt 0 -> retry #1 parks inside acquire_writes_all at
+        // t=500ms.
+        advance(Duration::from_millis(500)).await;
+        db.get_doc(&d1, ReadConsistency::Transaction(older_a))
+            .await
+            .unwrap();
+        assert!(poll!(&mut batch_parked).is_pending());
+        db.commit(vec![], Some(older_a)).await.unwrap();
+        tokio::task::yield_now().await;
+        assert!(poll!(&mut batch_parked).is_pending());
+        assert_eq!(
+            db.locks
+                .contention_snapshot()
+                .summary
+                .write_batch_retries_total,
+            1
+        );
+
+        // Advance the remaining 1500ms to deadline (t=2000ms) while parked on d2.
+        advance(Duration::from_millis(1500)).await;
+        let err = batch_parked.await.unwrap_err();
+        assert!(matches!(err, GenericDatabaseError::Aborted(_)));
+
+        drop(held_d2);
+        blocker.close();
+
+        let snap_parked = db.locks.contention_snapshot();
+        assert_eq!(snap_parked.summary.write_batch_retries_total, 1);
+        assert_eq!(snap_parked.summary.timeouts_total, 1);
+        let parked_to = &snap_parked.recent_events[0];
+        assert_eq!(parked_to.kind, ContentionEventKind::WriteTimeout);
+        assert_eq!(parked_to.session_kind, SessionKind::WriteBatch);
+        assert_eq!(parked_to.wait_ms, Some(2_000));
+        assert_eq!(parked_to.attempt, Some(1));
+        assert_eq!(parked_to.doc_name.as_deref(), Some(d2.to_string().as_str()));
+
+        // Case B: Unretried WriteBatch (wound_retries == 0) timing out inside acquire_writes_all
+        // keeps `attempt: None` while recording `wait_ms` and `doc_name`.
+        db.locks.clear_contention_history();
+        let blocker_b = db.locks.new_session(
+            None,
+            SessionKind::SingleWrite,
+            LockPriority::NextSeq,
+            false,
+            false,
+        );
+        let held_d2_b = blocker_b.acquire_write(&d2).await.unwrap();
+        let mut batch_initial = Box::pin(db.commit(vec![mk_write(&d1, 2), mk_write(&d2, 2)], None));
+        assert!(poll!(&mut batch_initial).is_pending());
+
+        advance(Duration::from_millis(2000)).await;
+        let err_b = batch_initial.await.unwrap_err();
+        assert!(matches!(err_b, GenericDatabaseError::Aborted(_)));
+        drop(held_d2_b);
+        blocker_b.close();
+
+        let snap_initial = db.locks.contention_snapshot();
+        assert_eq!(snap_initial.summary.write_batch_retries_total, 0);
+        assert_eq!(snap_initial.summary.timeouts_total, 1);
+        let initial_to = &snap_initial.recent_events[0];
+        assert_eq!(initial_to.kind, ContentionEventKind::WriteTimeout);
+        assert_eq!(initial_to.session_kind, SessionKind::WriteBatch);
+        assert_eq!(initial_to.wait_ms, Some(2_000));
+        assert_eq!(initial_to.attempt, None);
+        assert_eq!(
+            initial_to.doc_name.as_deref(),
+            Some(d2.to_string().as_str())
+        );
     }
 
     #[tokio::test]

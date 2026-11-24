@@ -10,7 +10,11 @@ use axum::{
     },
     routing::{delete, get},
 };
-use emulator_database::{FirestoreProject, event::ProjectEvent, reference::Ref};
+use emulator_database::{
+    ContentionSnapshot, ContentionSubscription, FirestoreProject,
+    event::ProjectEvent,
+    reference::{Ref, RootRef},
+};
 use serde_json::json;
 use tokio_stream::{
     Stream, StreamExt,
@@ -23,6 +27,8 @@ pub(crate) fn router() -> Router<&'static FirestoreProject> {
     Router::new()
         .route("/", get(list_databases))
         .route("/events", get(sse_events))
+        .route("/contention", get(get_contention).delete(delete_contention))
+        .route("/contention/events", get(sse_contention_events))
         .route(
             "/{*ref}",
             delete(delete_by_ref).fallback(unmatched_emulator_route),
@@ -64,30 +70,117 @@ async fn sse_events(
                     "updateTime": update_time,
                 }),
             };
-            Event::default()
-                .event("change")
-                .json_data(payload)
-                .ok()
-                .map(Ok)
+            json_sse_event("change", payload)
         }
         Err(BroadcastStreamRecvError::Lagged(skipped)) => {
-            tracing::warn!(skipped, "SSE client lagged behind project event stream");
-            Event::default()
-                .event("resync")
-                .json_data(json!({
-                    "type": "resync",
-                    "skipped": skipped,
-                }))
-                .ok()
-                .map(Ok)
+            lagged_resync_event(skipped, "project event stream")
         }
     });
 
-    Sse::new(stream).keep_alive(
-        KeepAlive::new()
-            .interval(Duration::from_secs(15))
-            .text("heartbeat"),
+    Sse::new(stream).keep_alive(sse_keep_alive())
+}
+
+fn json_sse_event(
+    event_name: &'static str,
+    payload: impl serde::Serialize,
+) -> Option<std::result::Result<Event, Infallible>> {
+    Event::default()
+        .event(event_name)
+        .json_data(payload)
+        .ok()
+        .map(Ok)
+}
+
+fn lagged_resync_event(
+    skipped: u64,
+    stream_name: &str,
+) -> Option<std::result::Result<Event, Infallible>> {
+    tracing::warn!(
+        skipped,
+        stream = stream_name,
+        "SSE client lagged behind stream"
+    );
+    json_sse_event(
+        "resync",
+        json!({
+            "type": "resync",
+            "skipped": skipped,
+        }),
     )
+}
+
+fn sse_keep_alive() -> KeepAlive {
+    KeepAlive::new()
+        .interval(Duration::from_secs(15))
+        .text("heartbeat")
+}
+
+fn parse_database_query(query: Option<&str>) -> Result<Option<RootRef>> {
+    let Some(query) = query else {
+        return Ok(None);
+    };
+    let mut database = None;
+    for pair in query.split('&') {
+        if pair.is_empty() {
+            continue;
+        }
+        let (raw_k, raw_v) = pair.split_once('=').unwrap_or((pair, ""));
+        let key = super::projects::percent_decode(raw_k)?;
+        let val = super::projects::percent_decode(raw_v)?;
+        if key == "database" {
+            if database.is_some() {
+                return Err(RestError::bad_request(
+                    "Duplicate database query parameter is not supported",
+                ));
+            }
+            if val.is_empty() {
+                return Err(RestError::bad_request("database cannot be empty"));
+            }
+            let root: RootRef = val.parse().map_err(|_| {
+                RestError::bad_request(format!("Invalid database resource name: {val}"))
+            })?;
+            database = Some(root);
+        } else {
+            return Err(RestError::bad_request(format!(
+                "Unsupported query parameter: {key}"
+            )));
+        }
+    }
+    Ok(database)
+}
+
+async fn get_contention(
+    State(project): State<&'static FirestoreProject>,
+    uri: Uri,
+) -> Result<Json<ContentionSnapshot>> {
+    let database = parse_database_query(uri.query())?;
+    Ok(Json(project.contention_snapshot(database.as_ref()).await))
+}
+
+async fn delete_contention(
+    State(project): State<&'static FirestoreProject>,
+    uri: Uri,
+) -> Result<Json<serde_json::Value>> {
+    let database = parse_database_query(uri.query())?;
+    project.clear_contention_history(database.as_ref()).await;
+    Ok(Json(json!({})))
+}
+
+async fn sse_contention_events(
+    State(project): State<&'static FirestoreProject>,
+) -> Sse<impl Stream<Item = std::result::Result<Event, Infallible>>> {
+    let ContentionSubscription { rx, guard } = project.subscribe_contention_events();
+    let stream = BroadcastStream::new(rx).filter_map(move |item| {
+        let _keep_alive = &guard;
+        match item {
+            Ok(event) => json_sse_event("contention", event),
+            Err(BroadcastStreamRecvError::Lagged(skipped)) => {
+                lagged_resync_event(skipped, "contention event stream")
+            }
+        }
+    });
+
+    Sse::new(stream).keep_alive(sse_keep_alive())
 }
 
 async fn delete_by_ref(

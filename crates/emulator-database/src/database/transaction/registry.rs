@@ -1566,7 +1566,7 @@ fn is_cleared(database: &Weak<FirestoreDatabase>, locks: &LockManager) -> bool {
 mod tests {
     use super::*;
     use crate::{
-        FirestoreConfig, FirestoreProject,
+        FirestoreConfig, FirestoreProject, SessionKind,
         database::{ReadConsistency, timeouts::Timeouts},
         reference::RootRef,
     };
@@ -2394,9 +2394,13 @@ mod tests {
         //    reap past `effective_expiry`.
         let txns2 = test_txns(Timeouts::FAST);
         let d_p = doc_ref("prec_doc");
-        let seq1_holder = txns2
-            .locks
-            .new_session(None, LockPriority::NextSeq, true, true); // seq = 1
+        let seq1_holder = txns2.locks.new_session(
+            None,
+            SessionKind::PessimisticTxn,
+            LockPriority::NextSeq,
+            true,
+            true,
+        ); // seq = 1
         let victim_id = txns2.start_read_write(false).unwrap();
         let victim_txn = txns2.get_active(victim_id).unwrap();
         let victim_sess = Arc::clone(victim_txn.as_read_write().unwrap().session());
@@ -2594,9 +2598,13 @@ mod tests {
         assert!(waiter_task.await.unwrap().is_ok());
 
         // D. Mid-RPC `Query::once` expires while blocked waiting for a read lock.
-        let lock_holder = db
-            .locks
-            .new_session(None, LockPriority::NextSeq, false, false);
+        let lock_holder = db.locks.new_session(
+            None,
+            SessionKind::SingleWrite,
+            LockPriority::NextSeq,
+            false,
+            false,
+        );
         let held_w = lock_holder.acquire_write(&d1).await.unwrap();
         let query_txn = db.new_txn(TransactionOptions::READ_WRITE).await.unwrap();
         let mut q = QueryBuilder::from(
@@ -2953,9 +2961,13 @@ mod tests {
         let txns = test_txns(Timeouts::FAST);
         let doc = doc_ref("wounded_early_reap");
 
-        let seq1_holder = txns
-            .locks
-            .new_session(None, LockPriority::NextSeq, true, true);
+        let seq1_holder = txns.locks.new_session(
+            None,
+            SessionKind::PessimisticTxn,
+            LockPriority::NextSeq,
+            true,
+            true,
+        );
         let victim_id = txns.start_read_write(false).unwrap();
         let victim_txn = txns.get_active(victim_id).unwrap();
         let victim_weak = Arc::downgrade(&victim_txn);
@@ -3039,9 +3051,13 @@ mod tests {
         let db_a = project_a.database(&root).await;
 
         let d_block = doc_ref("exp_eq_dl_block");
-        let blocker = db_a
-            .locks
-            .new_session(None, LockPriority::NextSeq, false, false);
+        let blocker = db_a.locks.new_session(
+            None,
+            SessionKind::SingleWrite,
+            LockPriority::NextSeq,
+            false,
+            false,
+        );
         let held_w = blocker.acquire_write(&d_block).await.unwrap();
 
         let self_txn = db_a.new_txn(TransactionOptions::READ_WRITE).await.unwrap();
