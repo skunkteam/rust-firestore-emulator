@@ -21,14 +21,32 @@ use tokio_stream::{
     wrappers::{BroadcastStream, errors::BroadcastStreamRecvError},
 };
 
-use crate::error::{RestError, Result};
+use crate::error::{RestError, Result, method_not_allowed_fallback};
 
 pub(crate) fn router() -> Router<&'static FirestoreProject> {
     Router::new()
-        .route("/", get(list_databases))
-        .route("/events", get(sse_events))
-        .route("/contention", get(get_contention).delete(delete_contention))
-        .route("/contention/events", get(sse_contention_events))
+        .route(
+            "/",
+            get(list_databases).fallback(method_not_allowed_fallback("/emulator/v1", "GET, HEAD")),
+        )
+        .route(
+            "/events",
+            get(sse_events).fallback(method_not_allowed_fallback("/emulator/v1", "GET, HEAD")),
+        )
+        .route(
+            "/contention",
+            get(get_contention)
+                .delete(delete_contention)
+                .fallback(method_not_allowed_fallback(
+                    "/emulator/v1",
+                    "GET, HEAD, DELETE",
+                )),
+        )
+        .route(
+            "/contention/events",
+            get(sse_contention_events)
+                .fallback(method_not_allowed_fallback("/emulator/v1", "GET, HEAD")),
+        )
         .route(
             "/{*ref}",
             delete(delete_by_ref).fallback(unmatched_emulator_route),
@@ -194,13 +212,10 @@ async fn delete_by_ref(
         Ref::Root(r) => {
             project.clear_database(&r).await;
         }
-        Ref::Collection(c) => {
-            let db = project.database(&c.root_ref).await;
-            let _deleted = db.delete_prefix(&Ref::Collection(c)).await?;
-        }
-        Ref::Document(d) => {
-            let db = project.database(&d.collection_ref.root_ref).await;
-            let _deleted = db.delete_prefix(&Ref::Document(d)).await?;
+        Ref::Collection(_) | Ref::Document(_) => {
+            if let Some(db) = project.get_existing_database(r.root()).await {
+                let _deleted = db.delete_prefix(&r).await?;
+            }
         }
     }
     Ok(Json(json!({})))

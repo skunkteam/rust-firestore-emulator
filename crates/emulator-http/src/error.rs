@@ -1,8 +1,10 @@
+use std::future::{Ready, ready};
+
 use axum::{
     Json,
     body::Bytes,
     extract::{FromRequest, Request},
-    http::{HeaderMap, StatusCode, header},
+    http::{HeaderMap, HeaderValue, Method, StatusCode, Uri, header},
     response::{IntoResponse, Response},
 };
 use emulator_database::GenericDatabaseError;
@@ -60,8 +62,41 @@ impl RestError {
         Self::new(StatusCode::NOT_IMPLEMENTED, "UNIMPLEMENTED", message)
     }
 
+    pub(crate) fn payload_too_large(message: impl Into<String>) -> Self {
+        Self::new(StatusCode::PAYLOAD_TOO_LARGE, "RESOURCE_EXHAUSTED", message)
+    }
+
+    pub(crate) fn method_not_allowed(method: &Method, path: &str, allow: &'static str) -> Response {
+        let mut resp = Self::new(
+            StatusCode::METHOD_NOT_ALLOWED,
+            "METHOD_NOT_ALLOWED",
+            format!("Method {method} is not allowed for {path}"),
+        )
+        .into_response();
+        resp.headers_mut()
+            .insert(header::ALLOW, HeaderValue::from_static(allow));
+        resp
+    }
+
     pub(crate) fn internal(message: impl Into<String>) -> Self {
         Self::new(StatusCode::INTERNAL_SERVER_ERROR, "INTERNAL", message)
+    }
+}
+
+pub(crate) fn method_not_allowed_fallback(
+    prefix: &'static str,
+    allow: &'static str,
+) -> impl Fn(Method, Uri) -> Ready<Response> + Clone + Send + Sync + 'static {
+    move |method: Method, uri: Uri| {
+        let path = uri.path();
+        let full_path = if prefix.is_empty() {
+            path.to_owned()
+        } else if path == "/" {
+            prefix.to_owned()
+        } else {
+            format!("{prefix}{path}")
+        };
+        ready(RestError::method_not_allowed(&method, &full_path, allow))
     }
 }
 
@@ -150,6 +185,29 @@ pub(crate) fn parse_json_body<T: DeserializeOwned>(headers: &HeaderMap, body: &[
 }
 
 #[derive(Debug)]
+pub(crate) struct RestBytes(pub(crate) Bytes);
+
+impl<S> FromRequest<S> for RestBytes
+where
+    S: Send + Sync,
+{
+    type Rejection = RestError;
+
+    async fn from_request(req: Request, state: &S) -> Result<Self, Self::Rejection> {
+        Bytes::from_request(req, state)
+            .await
+            .map(Self)
+            .map_err(|err| {
+                if err.status() == StatusCode::PAYLOAD_TOO_LARGE {
+                    RestError::payload_too_large(format!("Request body too large: {err}"))
+                } else {
+                    RestError::bad_request(format!("Failed to read request body: {err}"))
+                }
+            })
+    }
+}
+
+#[derive(Debug)]
 pub(crate) struct ApiJson<T>(pub(crate) T);
 
 impl<S, T> FromRequest<S> for ApiJson<T>
@@ -161,9 +219,7 @@ where
 
     async fn from_request(req: Request, state: &S) -> Result<Self, Self::Rejection> {
         let headers = req.headers().clone();
-        let bytes = Bytes::from_request(req, state)
-            .await
-            .map_err(|err| RestError::bad_request(format!("Failed to read request body: {err}")))?;
+        let RestBytes(bytes) = RestBytes::from_request(req, state).await?;
         let parsed = parse_json_body(&headers, &bytes)?;
         Ok(Self(parsed))
     }

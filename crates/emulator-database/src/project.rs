@@ -82,11 +82,9 @@ impl FirestoreProject {
     pub async fn contention_snapshot(&self, database: Option<&RootRef>) -> ContentionSnapshot {
         match database {
             Some(root) => {
-                let db = {
-                    let databases = self.databases.read().await;
-                    databases.get(root).cloned()
-                };
-                let databases = db
+                let databases = self
+                    .get_existing_database(root)
+                    .await
                     .map(|db| vec![db.locks.contention_snapshot()])
                     .unwrap_or_default();
                 ContentionSnapshot { databases }
@@ -111,11 +109,7 @@ impl FirestoreProject {
     pub async fn clear_contention_history(&self, database: Option<&RootRef>) {
         match database {
             Some(root) => {
-                let db = {
-                    let databases = self.databases.read().await;
-                    databases.get(root).cloned()
-                };
-                if let Some(db) = db {
+                if let Some(db) = self.get_existing_database(root).await {
                     db.locks.clear_contention_history();
                 }
             }
@@ -157,6 +151,10 @@ impl FirestoreProject {
                 database: name.clone(),
             });
         drop(database);
+    }
+
+    pub async fn get_existing_database(&self, name: &RootRef) -> Option<Arc<FirestoreDatabase>> {
+        self.databases.read().await.get(name).cloned()
     }
 
     pub async fn database(&'static self, name: &RootRef) -> Arc<FirestoreDatabase> {

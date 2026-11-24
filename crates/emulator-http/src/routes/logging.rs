@@ -10,11 +10,13 @@ use axum::{
     Router,
     body::Bytes,
     extract::{Path, State},
-    routing::post,
+    http::{Method, Uri},
+    response::{IntoResponse, Response},
+    routing::{any, post},
 };
 use emulator_tracing::{DynamicSubscriber, Tracing};
 
-use crate::error::{RestError, Result};
+use crate::error::{RestBytes, RestError, Result, method_not_allowed_fallback};
 
 const DEFAULT_MAX_HANDLES: usize = 64;
 
@@ -231,12 +233,37 @@ pub(crate) fn router(tracing: &'static impl Tracing) -> Router {
     router_with_max_handles(tracing, DEFAULT_MAX_HANDLES)
 }
 
+pub(crate) async fn unmatched_logging_route(method: Method, uri: Uri) -> Response {
+    let path = uri.path();
+    let full_path = if path.starts_with("/emulator/v1/logging") {
+        path.to_owned()
+    } else if path == "/" {
+        "/emulator/v1/logging".to_owned()
+    } else {
+        format!("/emulator/v1/logging{path}")
+    };
+    RestError::not_found_msg(format!("Unknown logging endpoint: {method} {full_path}"))
+        .into_response()
+}
+
+pub(crate) async fn unmounted_logging_route() -> Response {
+    RestError::not_implemented("Dynamic tracing is not enabled").into_response()
+}
+
 fn router_with_max_handles(tracing: &'static impl Tracing, max_handles: usize) -> Router {
     Router::new()
+        .route("/", any(unmatched_logging_route))
         .route(
             "/{name}",
-            post(start_capture_or_poll_logs).delete(stop_capture),
+            post(start_capture_or_poll_logs)
+                .delete(stop_capture)
+                .fallback(method_not_allowed_fallback(
+                    "/emulator/v1/logging",
+                    "POST, DELETE",
+                )),
         )
+        .route("/{name}/{*rest}", any(unmatched_logging_route))
+        .fallback(unmatched_logging_route)
         .with_state(TracingState {
             tracing,
             subscribers: Arc::new(Mutex::new(SubscriberStore::new(max_handles))),
@@ -246,8 +273,10 @@ fn router_with_max_handles(tracing: &'static impl Tracing, max_handles: usize) -
 async fn start_capture_or_poll_logs<S: Tracing + 'static>(
     State(tracing): State<TracingState<S>>,
     Path(name): Path<String>,
-    body: String,
+    RestBytes(raw_body): RestBytes,
 ) -> Result<Bytes> {
+    let body = String::from_utf8(raw_body.into())
+        .map_err(|_| RestError::bad_request("Log directives body must be valid UTF-8"))?;
     if let Some(name) = name.strip_suffix(":poll") {
         return poll_logs(tracing, name);
     }
