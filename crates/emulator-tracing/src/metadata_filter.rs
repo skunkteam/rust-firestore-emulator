@@ -9,11 +9,10 @@ pub enum ParseError {
     InvalidDirective(String),
 }
 
-/// Filter that uses the same syntax as the [`EnvFilter`](tracing_subscriber::EnvFilter), but works
-/// outside of the layer infrastructure. This is a workaround for the following issue:
-/// https://github.com/tokio-rs/tracing/issues/1629 which prevents us from adding layers with filters
-/// after initialization. When that issue is/ fixed we can remove this workaround and simply add a
-/// layer with an ordinary `EnvFilter`.
+/// Filter that uses the same directive syntax as [`EnvFilter`](tracing_subscriber::EnvFilter),
+/// evaluated directly by `DynamicFilteredLayer` without `tracing_subscriber::filter::Filtered`'s
+/// registration-time `FilterId` bitmask (working around
+/// <https://github.com/tokio-rs/tracing/issues/1629> for dynamically reloaded layers).
 #[derive(Debug)]
 pub(crate) struct Filter {
     directives: Vec<Directive>,
@@ -26,6 +25,14 @@ impl Filter {
             .filter(|dir| dir.matches_target(meta))
             .max_by_key(|dir| dir.target.as_deref().map_or(0, str::len))
             .is_some_and(|dir| meta.level() <= &dir.level)
+    }
+
+    pub(crate) fn max_level(&self) -> LevelFilter {
+        self.directives
+            .iter()
+            .map(|dir| dir.level)
+            .max()
+            .unwrap_or(LevelFilter::OFF)
     }
 }
 
@@ -240,5 +247,21 @@ mod tests {
         let global_last_wins: Filter = "debug,info".parse().unwrap();
         expect_false!(global_last_wins.allows(static_meta!("any", Level::DEBUG)));
         expect_true!(global_last_wins.allows(static_meta!("any", Level::INFO)));
+    }
+
+    #[gtest]
+    #[rstest]
+    #[case("info,tower_http=off", tracing::level_filters::LevelFilter::INFO)]
+    #[case("off", tracing::level_filters::LevelFilter::OFF)]
+    #[case("", tracing::level_filters::LevelFilter::OFF)]
+    #[case("warn,emulator_grpc=debug", tracing::level_filters::LevelFilter::DEBUG)]
+    #[case("bare_target", tracing::level_filters::LevelFilter::TRACE)]
+    #[case("error", tracing::level_filters::LevelFilter::ERROR)]
+    fn max_level_returns_highest_directive_verbosity(
+        #[case] directives: &str,
+        #[case] expected: tracing::level_filters::LevelFilter,
+    ) {
+        let filter: Filter = directives.parse().unwrap();
+        expect_eq!(filter.max_level(), expected);
     }
 }
