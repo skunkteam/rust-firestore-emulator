@@ -1,4 +1,10 @@
-use std::{borrow::Cow, collections::HashMap, convert::Infallible, fmt::Display, str::FromStr};
+use std::{
+    borrow::Cow,
+    collections::HashMap,
+    convert::Infallible,
+    fmt::{Display, Write},
+    str::FromStr,
+};
 
 use googleapis::google::firestore::v1::*;
 use itertools::{Itertools, PeekingNext};
@@ -204,9 +210,34 @@ impl FromStr for FieldPath {
     }
 }
 
+fn is_simple_segment(seg: &str) -> bool {
+    !seg.is_empty()
+        && matches!(seg.as_bytes()[0], b'a'..=b'z' | b'A'..=b'Z' | b'_')
+        && seg
+            .bytes()
+            .all(|b| matches!(b, b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'_'))
+}
+
 impl Display for FieldPath {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.0.join("."))
+        for (idx, seg) in self.0.iter().enumerate() {
+            if idx > 0 {
+                f.write_char('.')?;
+            }
+            if is_simple_segment(seg) {
+                f.write_str(seg)?;
+            } else {
+                f.write_char('`')?;
+                for ch in seg.chars() {
+                    if matches!(ch, '`' | '\\') {
+                        f.write_char('\\')?;
+                    }
+                    f.write_char(ch)?;
+                }
+                f.write_char('`')?;
+            }
+        }
+        Ok(())
     }
 }
 
@@ -468,6 +499,29 @@ mod tests {
         );
     }
 
+    #[gtest]
+    fn field_path_display_quotes_non_simple_segments() {
+        assert_eq!(FieldPath(vec!["".to_string()]).to_string(), "``");
+        assert_eq!(
+            FieldPath(vec!["a".to_string(), "".to_string(), "b".to_string()]).to_string(),
+            "a.``.b"
+        );
+        assert_eq!(FieldPath(vec!["0abc".to_string()]).to_string(), "`0abc`");
+        assert_eq!(FieldPath(vec!["a.b".to_string()]).to_string(), "`a.b`");
+        assert_eq!(
+            FieldPath(vec![r"bak`tik\end".to_string()]).to_string(),
+            r"`bak\`tik\\end`"
+        );
+        assert_eq!(
+            FieldPath(vec!["🔥".to_string(), "é".to_string(), "ok_1".to_string()]).to_string(),
+            "`🔥`.`é`.ok_1"
+        );
+        assert_eq!(
+            FieldPath(vec!["__name__".to_string()]).to_string(),
+            "__name__"
+        );
+    }
+
     mod proptests {
         use std::collections::HashMap;
 
@@ -476,34 +530,28 @@ mod tests {
 
         use super::{DOC_NAME, FieldPath, FieldReference};
 
-        fn encode_field_path_for_test(segments: &[String]) -> String {
-            segments
-                .iter()
-                .map(|seg| {
-                    if seg.is_empty() || seg.contains(['.', '`', '\\']) {
-                        let mut quoted = String::with_capacity(seg.len() + 2);
-                        quoted.push('`');
-                        for ch in seg.chars() {
-                            if matches!(ch, '`' | '\\') {
-                                quoted.push('\\');
-                            }
-                            quoted.push(ch);
-                        }
-                        quoted.push('`');
-                        quoted
-                    } else {
-                        seg.clone()
-                    }
-                })
-                .collect::<Vec<_>>()
-                .join(".")
-        }
-
         fn arb_segment() -> impl Strategy<Value = String> {
             prop_oneof![
                 Just(String::new()),
                 Just(DOC_NAME.to_string()),
+                Just("0digit".to_string()),
                 "[a-zA-Z0-9_`\\\\.& -]{1,8}",
+                prop::collection::vec(
+                    prop_oneof![
+                        Just('\0'),
+                        Just('.'),
+                        Just('`'),
+                        Just('\\'),
+                        Just('0'),
+                        Just('a'),
+                        Just('_'),
+                        Just('é'),
+                        Just('🔥'),
+                        any::<char>(),
+                    ],
+                    0..=8,
+                )
+                .prop_map(|chars| chars.into_iter().collect()),
             ]
         }
 
@@ -513,7 +561,8 @@ mod tests {
                 segments in prop::collection::vec(arb_segment(), 1..=5),
                 leaf_val in any::<i64>(),
             ) {
-                let encoded = encode_field_path_for_test(&segments);
+                let fp = FieldPath(segments.clone());
+                let encoded = fp.to_string();
                 let parsed: FieldPath = encoded.parse().unwrap();
                 prop_assert_eq!(&parsed.0, &segments);
 
@@ -524,6 +573,21 @@ mod tests {
                 let deleted = parsed.delete_value(&mut root);
                 prop_assert_eq!(deleted, Some(Value::integer(leaf_val)));
                 prop_assert_eq!(parsed.get_value(&root), None);
+            }
+
+            #[test]
+            fn proptest_field_path_display_roundtrip_and_injectivity(
+                segs1 in prop::collection::vec(arb_segment(), 1..=5),
+                segs2 in prop::collection::vec(arb_segment(), 1..=5),
+            ) {
+                let p1 = FieldPath(segs1);
+                let p2 = FieldPath(segs2);
+                let s1 = p1.to_string();
+                let s2 = p2.to_string();
+
+                prop_assert_eq!(s1.parse::<FieldPath>().unwrap(), p1.clone());
+                prop_assert_eq!(s2.parse::<FieldPath>().unwrap(), p2.clone());
+                prop_assert_eq!(p1 == p2, s1 == s2);
             }
 
             #[test]
@@ -545,7 +609,8 @@ mod tests {
 
             #[test]
             fn proptest_field_reference_doc_name_vs_field_path(
-                seg in "[a-zA-Z0-9_]{1,8}",
+                seg in "[a-zA-Z_][a-zA-Z0-9_]{0,7}",
+                non_simple in arb_segment(),
             ) {
                 let doc_ref: FieldReference = DOC_NAME.parse().unwrap();
                 prop_assert!(doc_ref.is_document_name());
@@ -561,6 +626,16 @@ mod tests {
                     prop_assert!(!parsed.is_document_name());
                     prop_assert_eq!(parsed.to_string(), seg);
                 }
+
+                let fp = FieldPath(vec![non_simple.clone()]);
+                let formatted = fp.to_string();
+                let parsed_ref: FieldReference = formatted.parse().unwrap();
+                if non_simple == DOC_NAME {
+                    prop_assert!(parsed_ref.is_document_name());
+                } else {
+                    prop_assert!(!parsed_ref.is_document_name());
+                }
+                prop_assert_eq!(parsed_ref.to_string(), formatted);
             }
         }
     }

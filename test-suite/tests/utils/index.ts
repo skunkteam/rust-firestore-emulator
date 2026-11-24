@@ -1,14 +1,4 @@
 export * from './common';
 export * from './concurrent';
-export {
-    connection,
-    editions,
-    enterpriseEdition,
-    enterpriseEditionPessimistic,
-    notImplementedInJava,
-    notImplementedInRust,
-    readData,
-    readDataRef,
-    standardEdition,
-    writeData,
-} from './firestore';
+export { connection, notImplementedInJava, notImplementedInRust } from './env';
+export { editions, enterpriseEdition, enterpriseEditionPessimistic, readData, readDataRef, standardEdition, writeData } from './firestore';
