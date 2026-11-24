@@ -1,7 +1,8 @@
 use googleapis::google::{
     firestore::v1::{
-        batch_get_documents_request, execute_pipeline_request, get_document_request,
-        list_documents_request, run_aggregation_query_request, run_query_request,
+        TransactionOptions, batch_get_documents_request, execute_pipeline_request,
+        get_document_request, list_documents_request, run_aggregation_query_request,
+        run_query_request,
     },
     protobuf::Timestamp,
 };
@@ -23,6 +24,14 @@ impl ReadConsistency {
     pub fn is_transaction(&self) -> bool {
         matches!(self, Self::Transaction(..))
     }
+}
+
+/// Decomposed consistency selector for streaming RPCs that may either read under an existing
+/// [`ReadConsistency`] or start a new transaction with [`TransactionOptions`].
+#[derive(Clone, Debug)]
+pub enum StreamingConsistency {
+    Existing(ReadConsistency),
+    NewTransaction(TransactionOptions),
 }
 
 /// Validates a client-supplied `read_time` timestamp against Firestore rules.
@@ -47,7 +56,7 @@ pub(crate) fn validate_read_time(time: Timestamp) -> crate::error::Result<Timest
     Ok(time)
 }
 
-macro_rules! impl_try_from_consistency_selector {
+macro_rules! impl_try_from_read_consistency_selector {
     ($lib:ident) => {
         impl TryFrom<Option<$lib::ConsistencySelector>> for ReadConsistency {
             type Error = GenericDatabaseError;
@@ -61,12 +70,29 @@ macro_rules! impl_try_from_consistency_selector {
                     Some($lib::ConsistencySelector::Transaction(id)) => {
                         Self::Transaction(id.try_into()?)
                     }
-                    #[allow(unreachable_patterns)]
-                    _ => {
-                        return Err(GenericDatabaseError::internal(concat!(
-                            stringify!($lib),
-                            "::ConsistencySelector::NewTransaction should be handled by caller"
-                        )));
+                };
+                Ok(result)
+            }
+        }
+    };
+}
+
+macro_rules! impl_try_from_streaming_consistency_selector {
+    ($lib:ident) => {
+        impl TryFrom<Option<$lib::ConsistencySelector>> for StreamingConsistency {
+            type Error = GenericDatabaseError;
+
+            fn try_from(value: Option<$lib::ConsistencySelector>) -> Result<Self, Self::Error> {
+                let result = match value {
+                    None => Self::Existing(ReadConsistency::Default),
+                    Some($lib::ConsistencySelector::ReadTime(time)) => {
+                        Self::Existing(ReadConsistency::ReadTime(validate_read_time(time)?))
+                    }
+                    Some($lib::ConsistencySelector::Transaction(id)) => {
+                        Self::Existing(ReadConsistency::Transaction(id.try_into()?))
+                    }
+                    Some($lib::ConsistencySelector::NewTransaction(opts)) => {
+                        Self::NewTransaction(opts)
                     }
                 };
                 Ok(result)
@@ -75,12 +101,13 @@ macro_rules! impl_try_from_consistency_selector {
     };
 }
 
-impl_try_from_consistency_selector!(batch_get_documents_request);
-impl_try_from_consistency_selector!(get_document_request);
-impl_try_from_consistency_selector!(list_documents_request);
-impl_try_from_consistency_selector!(run_query_request);
-impl_try_from_consistency_selector!(run_aggregation_query_request);
-impl_try_from_consistency_selector!(execute_pipeline_request);
+impl_try_from_read_consistency_selector!(get_document_request);
+impl_try_from_read_consistency_selector!(list_documents_request);
+
+impl_try_from_streaming_consistency_selector!(batch_get_documents_request);
+impl_try_from_streaming_consistency_selector!(run_query_request);
+impl_try_from_streaming_consistency_selector!(run_aggregation_query_request);
+impl_try_from_streaming_consistency_selector!(execute_pipeline_request);
 
 #[cfg(test)]
 mod tests {
@@ -152,6 +179,61 @@ mod tests {
                 seconds: 0,
                 nanos:   0,
             })
+        ));
+    }
+
+    #[test]
+    fn streaming_consistency_decomposes_all_streaming_selectors() {
+        let epoch = Timestamp {
+            seconds: 0,
+            nanos:   0,
+        };
+        let opts = TransactionOptions::READ_WRITE;
+
+        assert!(matches!(
+            StreamingConsistency::try_from(
+                None::<batch_get_documents_request::ConsistencySelector>
+            )
+            .unwrap(),
+            StreamingConsistency::Existing(ReadConsistency::Default)
+        ));
+        assert!(matches!(
+            StreamingConsistency::try_from(Some(
+                batch_get_documents_request::ConsistencySelector::NewTransaction(opts.clone())
+            ))
+            .unwrap(),
+            StreamingConsistency::NewTransaction(_)
+        ));
+        assert!(matches!(
+            StreamingConsistency::try_from(Some(run_query_request::ConsistencySelector::ReadTime(
+                epoch
+            )))
+            .unwrap(),
+            StreamingConsistency::Existing(ReadConsistency::ReadTime(Timestamp {
+                seconds: 0,
+                nanos:   0,
+            }))
+        ));
+        assert!(matches!(
+            StreamingConsistency::try_from(Some(
+                run_aggregation_query_request::ConsistencySelector::NewTransaction(opts.clone())
+            ))
+            .unwrap(),
+            StreamingConsistency::NewTransaction(_)
+        ));
+        assert!(matches!(
+            StreamingConsistency::try_from(Some(
+                execute_pipeline_request::ConsistencySelector::NewTransaction(opts)
+            ))
+            .unwrap(),
+            StreamingConsistency::NewTransaction(_)
+        ));
+        assert!(matches!(
+            StreamingConsistency::try_from(Some(
+                execute_pipeline_request::ConsistencySelector::Transaction(vec![1, 2, 3])
+            ))
+            .unwrap_err(),
+            GenericDatabaseError::InvalidArgument(_)
         ));
     }
 }

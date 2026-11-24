@@ -8,7 +8,7 @@ macro_rules! unimplemented {
     ($name:expr) => {{
         use tonic::Status;
         let msg = format!("{} is not supported yet ({}:{})", $name, file!(), line!());
-        eprintln!("{msg}");
+        tracing::warn!("{msg}");
         return Err(Status::unimplemented(msg));
     }};
 }
