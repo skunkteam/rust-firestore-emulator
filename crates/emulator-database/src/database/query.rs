@@ -856,20 +856,12 @@ impl Query {
                 }
             }
 
-            let last_dir = self
-                .order_by
-                .last()
-                .map_or(Direction::Ascending, |o| o.direction);
-
             if !enterprise_edition {
+                let last_dir = self
+                    .order_by
+                    .last()
+                    .map_or(Direction::Ascending, |o| o.direction);
                 self.synthesize_standard_order_by(last_dir);
-            } else if self.from.iter().any(|selector| selector.all_descendants)
-                && !self.order_by.iter().any(|o| o.field.is_document_name())
-            {
-                self.order_by.push(Order {
-                    field:     FieldReference::DocumentName,
-                    direction: last_dir,
-                });
             }
         }
 
@@ -1020,7 +1012,13 @@ impl Query {
             }
 
             if self.order_by.is_empty() {
-                buffer.sort_unstable_by_key(|&(col_idx, orig_idx, _)| (col_idx, orig_idx));
+                if self.from.iter().any(|selector| selector.all_descendants) {
+                    buffer.sort_unstable_by(|(_, _, a), (_, _, b)| {
+                        a.version.name.cmp_firestore_order(&b.version.name)
+                    });
+                } else {
+                    buffer.sort_unstable_by_key(|&(col_idx, orig_idx, _)| (col_idx, orig_idx));
+                }
             } else {
                 buffer.sort_unstable_by(|(_, _, a), (_, _, b)| {
                     self.order_by_cmp(&a.version, &b.version)

@@ -1413,5 +1413,163 @@ describe.each(editions)('$description', fs => {
                     ).resolves.toBeDefined();
                 }
             });
+
+            test.concurrent('validates allDescendants order_by, cursors, and multi-leaf Enterprise ordering', async () => {
+                const scopeDoc = fs.collection.doc();
+                const scopeDocPath = `${docsRoot}/${scopeDoc.path}`;
+                const cgId = `cg_val_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
+
+                // Create multiple leaves per parent in scrambled order so leaf order != __name__ ASC/DESC.
+                const specs = [
+                    { parent: 'p_b', id: 'd3', tie: 10 },
+                    { parent: 'p_a', id: 'd2', tie: 10 },
+                    { parent: 'p_b', id: 'd1', tie: 10 },
+                    { parent: 'p_a', id: 'd3', tie: 10 },
+                    { parent: 'p_b', id: 'd2', tie: 10 },
+                    { parent: 'p_a', id: 'd1', tie: 10 },
+                    { parent: 'p_a', id: 'd0', tie: 5 },
+                    { parent: 'p_b', id: 'd9', tie: 20 },
+                ];
+                await Promise.all(
+                    specs.map(s =>
+                        scopeDoc
+                            .collection('parents')
+                            .doc(s.parent)
+                            .collection(cgId)
+                            .doc(s.id)
+                            .set(writeData({ tie: s.tie })),
+                    ),
+                );
+
+                const cursorRef = `${scopeDocPath}/parents/p_b/${cgId}/d2`;
+                const runDesc = (parent: string, structuredQuery: Record<string, unknown>, label: string) =>
+                    rawRunQuery(fs.firestore, { parent, structuredQuery }, label);
+                const relDescPaths = async (parent: string, structuredQuery: Record<string, unknown>, label: string): Promise<string[]> => {
+                    const chunks = await runDesc(parent, structuredQuery, label);
+                    return chunks
+                        .filter(c => c.document?.name)
+                        .map(c =>
+                            c
+                                .document!.name!.slice(scopeDocPath.length + 1)
+                                .replace('parents/', '')
+                                .replace(`/${cgId}/`, '/'),
+                        );
+                };
+
+                // (a) orderBy: [tie DESC] + 2-value startAt cursor [10, docRef] is rejected on both editions
+                for (const before of [true, false]) {
+                    await expectRpcCode(
+                        () =>
+                            runDesc(
+                                docsRoot,
+                                {
+                                    from: [{ collectionId: cgId, allDescendants: true }],
+                                    orderBy: [{ field: { fieldPath: 'tie' }, direction: 'DESCENDING' }],
+                                    startAt: { values: [{ integerValue: '10' }, { referenceValue: cursorRef }], before },
+                                },
+                                `desc-tie-2val-cursor-before-${before}`,
+                            ),
+                        3,
+                        `desc-tie-2val-cursor-before-${before}`,
+                    );
+                }
+                await expectRpcCode(
+                    () =>
+                        runDesc(
+                            scopeDocPath,
+                            {
+                                from: [{ allDescendants: true }],
+                                orderBy: [{ field: { fieldPath: 'tie' }, direction: 'DESCENDING' }],
+                                startAt: { values: [{ integerValue: '10' }, { referenceValue: cursorRef }], before: true },
+                            },
+                            'desc-kindless-tie-2val-cursor',
+                        ),
+                    3,
+                    'desc-kindless-tie-2val-cursor',
+                );
+
+                // (b) orderBy: [] + 1-value startAt cursor [docRef] is rejected on both editions
+                for (const parent of [docsRoot, scopeDocPath]) {
+                    await expectRpcCode(
+                        () =>
+                            runDesc(
+                                parent,
+                                {
+                                    from: [{ collectionId: cgId, allDescendants: true }],
+                                    startAt: { values: [{ referenceValue: cursorRef }], before: true },
+                                },
+                                `desc-no-orderby-1val-cursor-${parent === docsRoot ? 'root' : 'doc'}`,
+                            ),
+                        3,
+                        `desc-no-orderby-1val-cursor-${parent === docsRoot ? 'root' : 'doc'}`,
+                    );
+                }
+
+                // (c) Multi-leaf-per-parent allDescendants with no orderBy returns all docs; explicit __name__ ASC orders lexicographically
+                const expectedAsc = ['p_a/d0', 'p_a/d1', 'p_a/d2', 'p_a/d3', 'p_b/d1', 'p_b/d2', 'p_b/d3', 'p_b/d9'];
+                const noOrderPaths = await relDescPaths(
+                    docsRoot,
+                    { from: [{ collectionId: cgId, allDescendants: true }] },
+                    'desc-multi-leaf-no-orderby',
+                );
+                if (fs.enterprise) {
+                    expect(noOrderPaths).toIncludeSameMembers(expectedAsc);
+                } else {
+                    expect(noOrderPaths).toEqual(expectedAsc);
+                }
+
+                const explicitNameAsc = await relDescPaths(
+                    docsRoot,
+                    {
+                        from: [{ collectionId: cgId, allDescendants: true }],
+                        orderBy: [{ field: { fieldPath: '__name__' }, direction: 'ASCENDING' }],
+                    },
+                    'desc-multi-leaf-explicit-name-asc',
+                );
+                expect(explicitNameAsc).toEqual(expectedAsc);
+
+                // (d) Enterprise explicit 2-field orderBy (tie DESC, __name__ DESC/ASC) + 2-value cursor obeys explicit __name__ direction
+                if (fs.enterprise) {
+                    const oneValStartAt = await relDescPaths(
+                        docsRoot,
+                        {
+                            from: [{ collectionId: cgId, allDescendants: true }],
+                            orderBy: [{ field: { fieldPath: 'tie' }, direction: 'DESCENDING' }],
+                            startAt: { values: [{ integerValue: '10' }], before: true },
+                        },
+                        'ent-desc-tie-1val-cursor',
+                    );
+                    expect(oneValStartAt.slice(0, 6)).toIncludeSameMembers(['p_a/d1', 'p_a/d2', 'p_a/d3', 'p_b/d1', 'p_b/d2', 'p_b/d3']);
+                    expect(oneValStartAt[6]).toBe('p_a/d0');
+
+                    const descNameDescCursor = await relDescPaths(
+                        docsRoot,
+                        {
+                            from: [{ collectionId: cgId, allDescendants: true }],
+                            orderBy: [
+                                { field: { fieldPath: 'tie' }, direction: 'DESCENDING' },
+                                { field: { fieldPath: '__name__' }, direction: 'DESCENDING' },
+                            ],
+                            startAt: { values: [{ integerValue: '10' }, { referenceValue: cursorRef }], before: true },
+                        },
+                        'ent-desc-tie-desc-name-desc-cursor',
+                    );
+                    expect(descNameDescCursor).toEqual(['p_b/d2', 'p_b/d1', 'p_a/d3', 'p_a/d2', 'p_a/d1', 'p_a/d0']);
+
+                    const descNameAscCursor = await relDescPaths(
+                        docsRoot,
+                        {
+                            from: [{ collectionId: cgId, allDescendants: true }],
+                            orderBy: [
+                                { field: { fieldPath: 'tie' }, direction: 'DESCENDING' },
+                                { field: { fieldPath: '__name__' }, direction: 'ASCENDING' },
+                            ],
+                            startAt: { values: [{ integerValue: '10' }, { referenceValue: cursorRef }], before: true },
+                        },
+                        'ent-desc-tie-desc-name-asc-cursor',
+                    );
+                    expect(descNameAscCursor).toEqual(['p_b/d2', 'p_b/d3', 'p_a/d0']);
+                }
+            });
         });
 });

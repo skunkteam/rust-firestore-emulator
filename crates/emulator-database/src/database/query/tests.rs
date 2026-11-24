@@ -403,20 +403,80 @@ async fn implicit_order_by_matches_firestore_semantics() -> Result<()> {
         vec!["document-3", "document-2", "document-1"]
     );
 
-    // 2. Enterprise Edition `all_descendants` with `orderBy('tie', 'desc')` appends `__name__ DESC`
-    let q_ent_desc = QueryBuilder::from(
-        database.name.clone().into(),
-        vec![CollectionSelector {
-            collection_id:   col.to_string(),
-            all_descendants: true,
-        }],
-    )
-    .enterprise_edition(true)
-    .order_by("tie".parse()?, Direction::Descending)
-    .build()?;
+    // 2. Enterprise Edition `all_descendants` does NOT synthesize implicit `__name__` ordering
+    //    (matching live Cloud Firestore): `order_by` remains unchanged, extra cursor values are
+    //    rejected, and explicit `(tie DESC, __name__ ASC/DESC)` cursors obey their direction.
+    let ent_from = vec![CollectionSelector {
+        collection_id:   col.to_string(),
+        all_descendants: true,
+    }];
+    let q_ent_no_order = QueryBuilder::from(database.name.clone().into(), ent_from.clone())
+        .enterprise_edition(true)
+        .build()?;
+    assert!(q_ent_no_order.order_by().is_empty());
+
+    let q_ent_desc = QueryBuilder::from(database.name.clone().into(), ent_from.clone())
+        .enterprise_edition(true)
+        .order_by("tie".parse()?, Direction::Descending)
+        .build()?;
+    assert_eq!(q_ent_desc.order_by().len(), 1);
+    let mut ent_desc_ids = ids_of(q_ent_desc)?;
+    ent_desc_ids.sort();
+    assert_eq!(ent_desc_ids, vec!["document-1", "document-2", "document-3"]);
+
+    let doc2_ref = format!("{}/{col}/document-2", database.name);
+    assert_that!(
+        QueryBuilder::from(database.name.clone().into(), ent_from.clone())
+            .enterprise_edition(true)
+            .order_by("tie".parse()?, Direction::Descending)
+            .start_at(Cursor {
+                values: vec![Value::integer(5), Value::reference(doc2_ref.clone())],
+                before: true,
+            })
+            .build(),
+        err(eq(&GenericDatabaseError::invalid_argument(
+            "Cursor has too many values."
+        )))
+    );
+    assert_that!(
+        QueryBuilder::from(database.name.clone().into(), ent_from.clone())
+            .enterprise_edition(true)
+            .start_at(Cursor {
+                values: vec![Value::reference(doc2_ref.clone())],
+                before: true,
+            })
+            .build(),
+        err(eq(&GenericDatabaseError::invalid_argument(
+            "Cursor has too many values."
+        )))
+    );
+
+    let q_ent_explicit_desc = QueryBuilder::from(database.name.clone().into(), ent_from.clone())
+        .enterprise_edition(true)
+        .order_by("tie".parse()?, Direction::Descending)
+        .order_by("__name__".parse()?, Direction::Descending)
+        .start_at(Cursor {
+            values: vec![Value::integer(5), Value::reference(doc2_ref.clone())],
+            before: true,
+        })
+        .build()?;
     assert_eq!(
-        ids_of(q_ent_desc)?,
-        vec!["document-3", "document-2", "document-1"]
+        ids_of(q_ent_explicit_desc)?,
+        vec!["document-2", "document-1"]
+    );
+
+    let q_ent_explicit_asc = QueryBuilder::from(database.name.clone().into(), ent_from)
+        .enterprise_edition(true)
+        .order_by("tie".parse()?, Direction::Descending)
+        .order_by("__name__".parse()?, Direction::Ascending)
+        .start_at(Cursor {
+            values: vec![Value::integer(5), Value::reference(doc2_ref)],
+            before: true,
+        })
+        .build()?;
+    assert_eq!(
+        ids_of(q_ent_explicit_asc)?,
+        vec!["document-2", "document-3"]
     );
 
     // 3. `WHERE __name__ > ... AND a > 0` orders by `a ASC, __name__ ASC`, not `__name__` first
@@ -1549,6 +1609,131 @@ fn collection_cache_guards_against_foreign_database_roots() -> Result<()> {
     let mut query_foreign_first = QueryBuilder::from_collection(col_a).build()?;
     assert!(!query_foreign_first.includes_document(&doc_b)?);
     assert!(query_foreign_first.includes_document(&doc_a)?);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn enterprise_all_descendants_empty_order_by_is_deterministic_in_firestore_order()
+-> Result<()> {
+    use std::collections::HashMap;
+
+    use googleapis::google::firestore::v1::{
+        Document, TransactionOptions, Write, transaction_options, write,
+    };
+
+    use crate::{database::DocumentRef, query::QueryMatch};
+
+    let database = fresh_database()?;
+    database.set_config(true, true);
+
+    // Seed multiple docs per parent and `-` vs `/` parent names (`doc/sub/...` < `doc-1/sub/...`).
+    for (col_path, doc_id) in [
+        ("parents/doc-1/sub", "d2"),
+        ("parents/doc-1/sub", "d1"),
+        ("parents/doc/sub", "d3"),
+        ("parents/doc/sub", "d1"),
+        ("parents/doc/sub", "d2"),
+    ] {
+        let doc_ref: DocumentRef = format!("{}/{col_path}/{doc_id}", database.name).parse()?;
+        database
+            .update_doc(
+                &doc_ref,
+                HashMap::from([("tag".to_string(), Value::string("keep"))]),
+                None,
+                None,
+                None,
+            )
+            .await?;
+    }
+
+    let root_prefix = format!("{}/", database.name);
+    let make_query = |consistency: ReadConsistency| -> Result<Query> {
+        Ok(QueryBuilder::from(
+            database.name.clone().into(),
+            vec![CollectionSelector {
+                collection_id:   "sub".to_string(),
+                all_descendants: true,
+            }],
+        )
+        .enterprise_edition(true)
+        .filter(Filter::Field(FieldFilter {
+            field: "tag".parse()?,
+            op:    FieldOperator::Equal,
+            value: Value::string("keep"),
+        }))
+        .consistency(consistency)
+        .build()?)
+    };
+
+    // 1. Validate stays unsynthesized (`order_by` empty) while execution orders deterministically
+    //    via `cmp_firestore_order` (`doc/sub/...` before `doc-1/sub/...`, and `d1 < d2 < d3`).
+    let mut q = make_query(ReadConsistency::Default)?;
+    assert!(q.order_by().is_empty());
+    let (_, matches) = q.once(&database).await?;
+    let rel_paths = |ms: &[QueryMatch]| {
+        ms.iter()
+            .map(|m| {
+                m.version
+                    .name
+                    .to_string()
+                    .strip_prefix(&root_prefix)
+                    .unwrap()
+                    .to_string()
+            })
+            .collect_vec()
+    };
+    let expected = vec![
+        "parents/doc/sub/d1",
+        "parents/doc/sub/d2",
+        "parents/doc/sub/d3",
+        "parents/doc-1/sub/d1",
+        "parents/doc-1/sub/d2",
+    ];
+    assert_eq!(rel_paths(&matches), expected);
+
+    // 2. Under an optimistic transaction, concurrent non-matching inserts that force HashMap
+    //    rehashing of `Collection::documents` must NOT permute result order or trigger a false
+    //    `OptimisticWriteSkew` abort.
+    let txn_id = database
+        .new_txn(TransactionOptions {
+            mode: Some(transaction_options::Mode::ReadWrite(
+                transaction_options::ReadWrite::default(),
+            )),
+        })
+        .await?;
+    let mut txn_q = make_query(ReadConsistency::Transaction(txn_id))?;
+    let (_, txn_matches) = txn_q.once(&database).await?;
+    assert_eq!(rel_paths(&txn_matches), expected);
+
+    for i in 0..64 {
+        let noise_ref: DocumentRef =
+            format!("{}/parents/doc/sub/noise-{i}", database.name).parse()?;
+        database
+            .update_doc(
+                &noise_ref,
+                HashMap::from([("tag".to_string(), Value::string("noise"))]),
+                None,
+                None,
+                None,
+            )
+            .await?;
+    }
+
+    let other_ref: DocumentRef = format!("{}/other/out", database.name).parse()?;
+    database
+        .commit(
+            vec![Write {
+                operation: Some(write::Operation::Update(Document {
+                    name: other_ref.to_string(),
+                    fields: HashMap::from([("ok".to_string(), Value::boolean(true))]),
+                    ..Default::default()
+                })),
+                ..Default::default()
+            }],
+            Some(txn_id),
+        )
+        .await?;
 
     Ok(())
 }
