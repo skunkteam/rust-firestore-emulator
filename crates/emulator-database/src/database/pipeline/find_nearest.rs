@@ -1,7 +1,7 @@
 use std::str::FromStr;
 
 use googleapis::{
-    VectorClassification, classify_vector_map, cmp_reference_paths,
+    cmp_reference_paths,
     google::firestore::v1::{Document, Value, pipeline::Stage, value::ValueType},
 };
 use itertools::Itertools;
@@ -88,27 +88,12 @@ pub(super) fn execute(stage: Stage, docs: Vec<Document>) -> Result<Vec<Document>
         }
     };
 
-    let query_vector: Vec<f64> = match vector_arg.value_type.as_ref() {
-        Some(ValueType::MapValue(map)) => match classify_vector_map(&map.fields) {
-            VectorClassification::Valid(vals) => vals.iter().filter_map(Value::as_double).collect(),
-            VectorClassification::Invalid(err) => {
-                return Err(GenericDatabaseError::invalid_argument(
-                    err.as_error_message(),
-                ));
-            }
-            VectorClassification::NotVectorMap => {
-                return Err(GenericDatabaseError::invalid_argument(
-                    "Expected vector to be VectorValue, but was MapValue.",
-                ));
-            }
-        },
-        _ => {
-            return Err(GenericDatabaseError::invalid_argument(format!(
-                "Expected vector to be VectorValue, but was {}.",
-                proto_pascal_type_name(vector_arg)
-            )));
-        }
-    };
+    let query_vector = vector::extract_vector_coords(vector_arg, |v| {
+        format!(
+            "Expected vector to be VectorValue, but was {}.",
+            proto_pascal_type_name(v)
+        )
+    })?;
 
     let distance_measure = match measure_arg.value_type.as_ref() {
         Some(ValueType::StringValue(s)) => DistanceMeasure::from_pipeline_str(s)?,
@@ -119,13 +104,7 @@ pub(super) fn execute(stage: Stage, docs: Vec<Document>) -> Result<Vec<Document>
         }
     };
 
-    if distance_measure == DistanceMeasure::Cosine {
-        vector::compute_distance(
-            DistanceMeasure::Cosine,
-            query_vector.iter().copied(),
-            query_vector.iter().copied(),
-        )?;
-    }
+    vector::validate_query_vector_for_measure(&query_vector, distance_measure, true)?;
 
     let unknown: Vec<&str> = stage
         .options
@@ -146,7 +125,11 @@ pub(super) fn execute(stage: Stage, docs: Vec<Document>) -> Result<Vec<Document>
     let limit = match stage.options.get("limit") {
         None => None,
         Some(v) => match v.value_type.as_ref() {
-            Some(ValueType::IntegerValue(n)) if (1..=1000).contains(n) => Some(*n as usize),
+            Some(ValueType::IntegerValue(n))
+                if (1..=vector::MAX_FIND_NEAREST_LIMIT as i64).contains(n) =>
+            {
+                Some(*n as usize)
+            }
             _ => {
                 return Err(GenericDatabaseError::invalid_argument(
                     "find_nearest limit must be an integer between 1 and 1000",
@@ -251,5 +234,78 @@ mod tests {
             execute(stage_opt, vec![]),
             Err(GenericDatabaseError::NotImplemented(_))
         ));
+    }
+
+    #[test]
+    fn find_nearest_preserves_pipeline_vector_and_limit_diagnostics() {
+        let make_stage = |vector_arg: Value, measure: &str, limit: Option<Value>| Stage {
+            name:    "find_nearest".to_string(),
+            args:    vec![
+                Value {
+                    value_type: Some(ValueType::FieldReferenceValue("emb".to_string())),
+                },
+                vector_arg,
+                Value::string(measure),
+            ],
+            options: limit
+                .map(|l| HashMap::from([("limit".to_string(), l)]))
+                .unwrap_or_default(),
+        };
+
+        assert_eq!(
+            execute(make_stage(Value::integer(1), "euclidean", None), vec![]).unwrap_err(),
+            GenericDatabaseError::invalid_argument(
+                "Expected vector to be VectorValue, but was IntegerValue."
+            )
+        );
+        assert_eq!(
+            execute(
+                make_stage(
+                    Value::map(HashMap::from([("k".to_string(), Value::integer(1))])),
+                    "euclidean",
+                    None
+                ),
+                vec![]
+            )
+            .unwrap_err(),
+            GenericDatabaseError::invalid_argument(
+                "Expected vector to be VectorValue, but was MapValue."
+            )
+        );
+        assert_eq!(
+            execute(make_stage(Value::vector([]), "euclidean", None), vec![]).unwrap_err(),
+            GenericDatabaseError::invalid_argument("Cannot have a zero length vector.")
+        );
+        assert_eq!(
+            execute(
+                make_stage(Value::vector([0.0, 0.0]), "cosine", None),
+                vec![]
+            )
+            .unwrap_err(),
+            GenericDatabaseError::invalid_argument("cosine_distance(...) result is NaN.")
+        );
+        for bad_limit in [Value::integer(0), Value::integer(1001), Value::double(1.0)] {
+            assert_eq!(
+                execute(
+                    make_stage(Value::vector([1.0, 0.0]), "euclidean", Some(bad_limit)),
+                    vec![]
+                )
+                .unwrap_err(),
+                GenericDatabaseError::invalid_argument(
+                    "find_nearest limit must be an integer between 1 and 1000"
+                )
+            );
+        }
+        assert!(
+            execute(
+                make_stage(
+                    Value::vector([1.0, 0.0]),
+                    "euclidean",
+                    Some(Value::integer(1000))
+                ),
+                vec![]
+            )
+            .is_ok()
+        );
     }
 }

@@ -85,15 +85,12 @@ impl FindNearest {
                 VectorFormatError::NanElement.as_error_message(),
             ));
         }
-        if self.distance_measure == DistanceMeasure::Cosine {
-            vector::compute_query_distance(
-                DistanceMeasure::Cosine,
-                enterprise_edition,
-                self.query_vector.iter().copied(),
-                self.query_vector.iter().copied(),
-            )?;
-        }
-        if !(1..=1000).contains(&self.limit) {
+        vector::validate_query_vector_for_measure(
+            &self.query_vector,
+            self.distance_measure,
+            enterprise_edition,
+        )?;
+        if !(1..=vector::MAX_FIND_NEAREST_LIMIT).contains(&self.limit) {
             return Err(GenericDatabaseError::invalid_argument(
                 "find_nearest limit must be between 1 and 1000",
             ));
@@ -140,7 +137,7 @@ impl FindNearest {
 
         let limit = proto
             .limit
-            .filter(|v| (1..=1000).contains(&v.value))
+            .filter(|v| (1..=vector::MAX_FIND_NEAREST_LIMIT as i32).contains(&v.value))
             .map(|v| v.value as usize)
             .ok_or_else(|| {
                 GenericDatabaseError::invalid_argument(
