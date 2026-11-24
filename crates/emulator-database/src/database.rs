@@ -309,10 +309,22 @@ impl FirestoreDatabase {
     ) -> Result<(Timestamp, HashMap<String, Value>)> {
         self.ensure_owns_root(parent.root())?;
         unimplemented_option!(query.select);
-        let mut query =
-            Query::from_structured(parent, query, consistency, self.enterprise_edition())?;
+        let enterprise = self.enterprise_edition();
+        let is_unordered = query.order_by.is_empty() && query.find_nearest.is_none();
+        let mut query = Query::from_structured(parent, query, consistency, enterprise)?;
         debug!(?query);
-        let (read_time, docs) = query.once(self).await?;
+        let (read_time, mut docs) = query.once(self).await?;
+        let has_sum_or_avg = aggregations.iter().any(|agg| {
+            matches!(
+                agg.operator,
+                Some(aggregation::Operator::Sum(_) | aggregation::Operator::Avg(_))
+            )
+        });
+        if enterprise && is_unordered && has_sum_or_avg {
+            // Enterprise checked integer sums depend on scan order; sort by canonical `__name__`
+            // for deterministic primary-key scan order.
+            docs.sort_by(|a, b| a.version.name.cmp_firestore_order(&b.version.name));
+        }
         let result = aggregations
             .into_iter()
             .map(|agg| {
@@ -337,19 +349,14 @@ impl FirestoreDatabase {
                     // * If the aggregated values contain `NaN`, returns `NaN`. Infinity math
                     //   follows IEEE-754 standards.
                     //
-                    // * If the aggregated value set is empty, returns 0.
+                    // * Standard Edition returns `0` on empty numeric sets and accumulates integers
+                    //   in `i128` (promoting to `DoubleValue` only if the final sum overflows
+                    //   `i64`).
                     //
-                    // * Returns a 64-bit integer if all aggregated numbers are integers and the sum
-                    //   result does not overflow. Otherwise, the result is returned as a double.
-                    //   Note that even if all the aggregated values are integers, the result is
-                    //   returned as a double if it cannot fit within a 64-bit signed integer. When
-                    //   this occurs, the returned value will lose precision.
-                    //
-                    // * When underflow occurs, floating-point aggregation is non-deterministic.
-                    //   This means that running the same query repeatedly without any changes to
-                    //   the underlying values could produce slightly different results each time.
-                    //   In those cases, values should be stored as integers over floating-point
-                    //   numbers.
+                    // * Enterprise Edition returns `NULL` on empty numeric sets and accumulates
+                    //   sequentially in `i64` before any `DoubleValue`, failing with
+                    //   `InvalidArgument` (`"Long overflow"`) on intermediate or final `i64`
+                    //   overflow.
                     Operator::Sum(Sum { field }) => {
                         let field_ref: FieldReference = field
                             .as_ref()
@@ -370,10 +377,10 @@ impl FirestoreDatabase {
                             })
                             .filter(Value::is_number)
                             .peekable();
-                        if self.enterprise_edition() && values.peek().is_none() {
+                        if enterprise && values.peek().is_none() {
                             Value::null()
                         } else {
-                            values.sum()
+                            sum_aggregation_values(enterprise, values)?
                         }
                     }
                     // Average of the values of the requested field.
@@ -386,7 +393,8 @@ impl FirestoreDatabase {
                     //
                     // * If the aggregated value set is empty, returns `NULL`.
                     //
-                    // * Always returns the result as a double.
+                    // * Always returns the result as a double (Enterprise Edition applies the same
+                    //   sequential `Long overflow` check to its numerator sum).
                     Operator::Avg(Avg { field }) => {
                         let field_ref: FieldReference = field
                             .as_ref()
@@ -411,8 +419,8 @@ impl FirestoreDatabase {
                             Value::null()
                         } else {
                             let len = values.len();
-                            let sum: Value = values.into_iter().sum();
-                            Value::double(sum.as_double().unwrap() / len as f64)
+                            let sum = sum_aggregation_values(enterprise, values)?;
+                            Value::double(sum.as_double().unwrap_or(0.0) / len as f64)
                         }
                     }
                 };
@@ -886,6 +894,22 @@ impl FirestoreDatabase {
                     database: self.name.clone(),
                 });
         }
+    }
+}
+
+pub(crate) fn sum_enterprise_checked(values: impl IntoIterator<Item = Value>) -> Result<Value> {
+    Value::try_checked_sum(values)
+        .ok_or_else(|| GenericDatabaseError::invalid_argument("Long overflow"))
+}
+
+fn sum_aggregation_values(
+    enterprise: bool,
+    values: impl IntoIterator<Item = Value>,
+) -> Result<Value> {
+    if enterprise {
+        sum_enterprise_checked(values)
+    } else {
+        Ok(values.into_iter().sum())
     }
 }
 
