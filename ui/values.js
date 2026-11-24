@@ -408,16 +408,21 @@ export function decodeBytes(base64Str, mode) {
   }
 }
 
+const BASE64_CHUNK_SIZE = 0x8000;
+
 /**
+ * Encodes a byte array into standard padded Base64 in 32 KiB chunks.
  * @param {Uint8Array} bytes
  * @returns {string}
  */
-function uint8ToBase64(bytes) {
-  let binary = "";
-  for (let i = 0; i < bytes.length; i++) {
-    binary += String.fromCharCode(bytes[i]);
+export function uint8ToBase64(bytes) {
+  /** @type {string[]} */
+  const chunks = [];
+  for (let i = 0; i < bytes.length; i += BASE64_CHUNK_SIZE) {
+    const slice = bytes.subarray(i, i + BASE64_CHUNK_SIZE);
+    chunks.push(String.fromCharCode(...slice));
   }
-  return btoa(binary);
+  return btoa(chunks.join(""));
 }
 
 /**

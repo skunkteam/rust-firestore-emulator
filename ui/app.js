@@ -22,7 +22,11 @@ import {
   syncSessionWithDocument,
 } from "./components/editor.js";
 import { renderExplorer } from "./components/explorer.js";
-import { renderModal as renderModalView } from "./components/modals.js";
+import {
+  getModalFocusableElements,
+  handleModalKeydown,
+  renderModal as renderModalView,
+} from "./components/modals.js";
 import {
   buildStructuredQueryFromVisual,
   createQueryRunnerState,
@@ -53,6 +57,7 @@ import {
 
 /** @typedef {import('./api.js').EmulatorSseEvent} EmulatorSseEvent */
 /** @typedef {import('./components/explorer.js').DocumentLevelState} DocumentLevelState */
+/** @typedef {import('./values.js').FirestoreDocument} FirestoreDocument */
 /** @typedef {import('./lit-html.js').TemplateResult} TemplateResult */
 
 export { state, parseBrowserRoute };
@@ -73,6 +78,44 @@ const emulatorVersion = String(
 
 /** @type {Promise<void>} */
 let sseQueue = Promise.resolve();
+/** @type {{ close: () => void } | null} */
+let activeEventStream = null;
+
+const MAX_COLLECTION_COLUMN_PAGES = 1000;
+
+/**
+ * Enqueues an SSE event batch onto the serialized `sseQueue`.
+ * @param {EmulatorSseEvent[]} batch
+ * @returns {Promise<void>}
+ */
+function enqueueSseBatch(batch) {
+  sseQueue = sseQueue
+    .then(() => handleSseBatch(batch))
+    .catch(() => {});
+  return sseQueue;
+}
+
+/**
+ * Returns the tail promise of the serialized SSE processing queue.
+ * @returns {Promise<void>}
+ */
+export function flushSseQueue() {
+  return sseQueue;
+}
+
+/**
+ * Toggles live SSE update pausing, triggering a full active-DB resync when unpaused.
+ * @returns {Promise<void>}
+ */
+export function toggleSsePaused() {
+  const wasPaused = state.ssePaused;
+  state.ssePaused = !wasPaused;
+  renderApp();
+  if (wasPaused && !state.ssePaused) {
+    return enqueueSseBatch([{ type: "resync" }]);
+  }
+  return Promise.resolve();
+}
 
 /**
  * @param {string} text
@@ -144,7 +187,8 @@ export async function selectDatabase(
     const [meta, cols] = await Promise.all([
       getDatabase(projectId, databaseId),
       listCollectionIds(
-        `projects/${projectId}/databases/${databaseId}/documents`
+        `projects/${projectId}/databases/${databaseId}/documents`,
+        { shouldAbort: () => myDbEpoch !== getDbEpoch() }
       ),
     ]);
     if (myDbEpoch !== getDbEpoch()) return;
@@ -220,6 +264,19 @@ export async function hydrateVisiblePath(
 }
 
 /**
+ * @param {FirestoreDocument[]} docs
+ * @returns {Array<{ id: string, fullName: string, phantom: boolean }>}
+ */
+function mapColumnDocuments(docs) {
+  return docs.map((doc) => {
+    const fullName = doc.name ?? "";
+    const id = fullName.slice(fullName.lastIndexOf("/") + 1);
+    const phantom = !doc.createTime && !doc.updateTime;
+    return { id, fullName, phantom };
+  });
+}
+
+/**
  * @param {string} colPath
  * @param {string} parentPath
  * @param {string} colId
@@ -254,25 +311,65 @@ export async function loadCollectionColumn(
   renderApp();
 
   try {
-    const res = await listDocuments(parentPath, colId, {
-      showMissing: true,
-      maskFieldPaths: ["__name__"],
-      pageSize: 200,
-      pageToken: appendPage ? colState.nextPageToken : undefined,
-    });
-    if (expectedDbEpoch !== getDbEpoch() || !isCurrentColSeq(colPath, seq)) {
-      return;
+    if (appendPage) {
+      const res = await listDocuments(parentPath, colId, {
+        showMissing: true,
+        maskFieldPaths: ["__name__"],
+        pageSize: 200,
+        pageToken: colState.nextPageToken,
+      });
+      if (expectedDbEpoch !== getDbEpoch() || !isCurrentColSeq(colPath, seq)) {
+        return;
+      }
+      const mapped = mapColumnDocuments(res.documents);
+      colState.documents = [...colState.documents, ...mapped];
+      colState.nextPageToken = res.nextPageToken;
+    } else {
+      const priorCount = colState.documents.length;
+      /** @type {Set<string>} */
+      const seenTokens = new Set();
+      /** @type {Array<{ id: string, fullName: string, phantom: boolean }>} */
+      const collected = [];
+      /** @type {string | undefined} */
+      let pageToken = undefined;
+      let nextToken = "";
+
+      for (let page = 0; page < MAX_COLLECTION_COLUMN_PAGES; page++) {
+        const pageSize =
+          page === 0
+            ? Math.max(200, priorCount)
+            : Math.max(1, priorCount - collected.length);
+        const res = await listDocuments(parentPath, colId, {
+          showMissing: true,
+          maskFieldPaths: ["__name__"],
+          pageSize,
+          pageToken,
+        });
+        if (
+          expectedDbEpoch !== getDbEpoch() ||
+          !isCurrentColSeq(colPath, seq)
+        ) {
+          return;
+        }
+        const mapped = mapColumnDocuments(res.documents);
+        for (const doc of mapped) {
+          collected.push(doc);
+        }
+        nextToken = res.nextPageToken;
+        if (!nextToken || seenTokens.has(nextToken) || mapped.length === 0) {
+          nextToken = "";
+          break;
+        }
+        if (collected.length >= priorCount) {
+          break;
+        }
+        seenTokens.add(nextToken);
+        pageToken = nextToken;
+      }
+
+      colState.documents = collected;
+      colState.nextPageToken = nextToken;
     }
-    const mapped = res.documents.map((doc) => {
-      const fullName = doc.name ?? "";
-      const id = fullName.slice(fullName.lastIndexOf("/") + 1);
-      const phantom = !doc.createTime && !doc.updateTime;
-      return { id, fullName, phantom };
-    });
-    colState.documents = appendPage
-      ? [...colState.documents, ...mapped]
-      : mapped;
-    colState.nextPageToken = res.nextPageToken;
   } catch (err) {
     if (expectedDbEpoch !== getDbEpoch() || !isCurrentColSeq(colPath, seq)) {
       return;
@@ -307,6 +404,7 @@ export async function loadDocumentLevel(
   const projectId = state.activeProjectId;
   const databaseId = state.activeDatabaseId;
   const seq = nextDocSeq(docPath);
+  const myNavEpoch = getNavEpoch();
 
   let level = state.documentLevels.get(docPath);
   if (!level) {
@@ -335,9 +433,18 @@ export async function loadDocumentLevel(
           throw err;
         }
       ),
-      listCollectionIds(docPath),
+      listCollectionIds(docPath, {
+        shouldAbort: () =>
+          expectedDbEpoch !== getDbEpoch() ||
+          !isCurrentDocSeq(docPath, seq) ||
+          myNavEpoch !== getNavEpoch(),
+      }),
     ]);
-    if (expectedDbEpoch !== getDbEpoch() || !isCurrentDocSeq(docPath, seq)) {
+    if (
+      expectedDbEpoch !== getDbEpoch() ||
+      !isCurrentDocSeq(docPath, seq) ||
+      myNavEpoch !== getNavEpoch()
+    ) {
       return;
     }
 
@@ -376,7 +483,11 @@ export async function loadDocumentLevel(
       }
     }
   } catch (err) {
-    if (expectedDbEpoch !== getDbEpoch() || !isCurrentDocSeq(docPath, seq)) {
+    if (
+      expectedDbEpoch !== getDbEpoch() ||
+      !isCurrentDocSeq(docPath, seq) ||
+      myNavEpoch !== getNavEpoch()
+    ) {
       return;
     }
     notifyToast(
@@ -455,8 +566,35 @@ export async function handleSseBatch(events) {
   }
 
   if (shouldRefreshDbList) {
-    const applied = await refreshDatabaseList();
+    let applied = false;
+    try {
+      applied = await refreshDatabaseList();
+    } catch (err) {
+      if (myDbEpoch !== getDbEpoch()) return;
+      fullResyncActiveDb = false;
+      notifyToast(
+        `Failed to refresh database list: ${err instanceof Error ? err.message : String(err)}`,
+        "error"
+      );
+    }
     if (myDbEpoch !== getDbEpoch()) return;
+    if (
+      applied &&
+      fullResyncActiveDb &&
+      activeRoot &&
+      !clearedActiveDb &&
+      !state.rootLoading &&
+      state.activeDbMeta !== null &&
+      !state.databases.some((db) => db.rootPath === activeRoot)
+    ) {
+      // Clear cached state WITHOUT calling getDatabase(), which would lazily recreate the cleared DB!
+      myDbEpoch = bumpDbEpoch();
+      bumpNavEpoch();
+      clearedActiveDb = true;
+      clearActiveDatabaseState();
+      syncUrl(true);
+      notifyToast(`Database ${activeRoot} was cleared`, "info");
+    }
     // If no active DB is selected and a DB now exists, auto-select the first one cleanly.
     if (applied && !state.activeProjectId && state.databases.length > 0) {
       const first = state.databases[0];
@@ -468,6 +606,7 @@ export async function handleSseBatch(events) {
 
   if (
     clearedActiveDb ||
+    state.rootLoading ||
     myDbEpoch !== getDbEpoch() ||
     !state.activeProjectId ||
     !state.activeDatabaseId ||
@@ -499,7 +638,12 @@ export async function handleSseBatch(events) {
 
   if (fullResyncActiveDb || changedPaths.size > 0) {
     try {
-      const cols = await listCollectionIds(activeRoot);
+      const cols = await listCollectionIds(activeRoot, {
+        shouldAbort: () =>
+          myDbEpoch !== getDbEpoch() ||
+          getActiveRootPath(state.activeProjectId, state.activeDatabaseId) !==
+            activeRoot,
+      });
       if (
         myDbEpoch !== getDbEpoch() ||
         getActiveRootPath(state.activeProjectId, state.activeDatabaseId) !==
@@ -762,7 +906,11 @@ export function openCreateDocumentModal(
   renderApp();
 }
 
-function renderTopbar() {
+/**
+ * Renders the top navigation bar.
+ * @returns {TemplateResult}
+ */
+export function renderTopbar() {
   const activeKey =
     state.activeProjectId && state.activeDatabaseId
       ? `projects/${state.activeProjectId}/databases/${state.activeDatabaseId}/documents`
@@ -805,6 +953,7 @@ function renderTopbar() {
           ? html`
               <select
                 class="select mono"
+                aria-label="Select database"
                 .value=${activeKey}
                 @change=${(/** @type {Event} */ e) => {
                   const val = /** @type {HTMLSelectElement} */ (e.target).value;
@@ -914,10 +1063,7 @@ function renderTopbar() {
           type="button"
           class="sse-badge"
           title="Click to pause or resume live SSE updates"
-          @click=${() => {
-            state.ssePaused = !state.ssePaused;
-            renderApp();
-          }}
+          @click=${toggleSsePaused}
         >
           <span class="sse-dot ${dotClass}"></span>
           <span>${sseLabel}</span>
@@ -1059,7 +1205,11 @@ export function renderModal() {
   });
 }
 
-function renderToasts() {
+/**
+ * Renders active toast notifications.
+ * @returns {TemplateResult}
+ */
+export function renderToasts() {
   return html`
     ${state.toasts.map(
       (t) => html`
@@ -1069,6 +1219,7 @@ function renderToasts() {
             type="button"
             class="btn btn-sm btn-ghost"
             style="color: inherit; padding: 0 4px;"
+            aria-label="Dismiss notification"
             @click=${() => {
               dismissToast(t.id);
               renderApp();
@@ -1082,58 +1233,156 @@ function renderToasts() {
   `;
 }
 
+let wasModalOpen = false;
+/** @type {Element | null} */
+let previousModalFocus = null;
+/** @type {((e: KeyboardEvent) => void) | null} */
+let modalKeydownListener = null;
+
+function closeActiveModal() {
+  if (!state.modal || state.modal.busy) return;
+  state.modal = null;
+  renderApp();
+}
+
+/**
+ * Manages modal Escape/Tab keyboard listener, initial focus, and focus restoration.
+ * @param {boolean} wasOpenBefore
+ * @param {Element | null} prevActiveBeforeRender
+ */
+function syncModalAccessibility(wasOpenBefore, prevActiveBeforeRender) {
+  const isOpenNow = state.modal !== null;
+  if (!wasOpenBefore && isOpenNow) {
+    previousModalFocus = prevActiveBeforeRender;
+    if (
+      typeof document !== "undefined" &&
+      typeof document?.addEventListener === "function" &&
+      !modalKeydownListener
+    ) {
+      modalKeydownListener = (e) => {
+        handleModalKeydown(e, state, modalRootEl, closeActiveModal);
+      };
+      document.addEventListener("keydown", modalKeydownListener);
+    }
+    const focusEntry = () => {
+      if (!state.modal) return;
+      const dialogEl =
+        typeof modalRootEl?.querySelector === "function"
+          ? modalRootEl.querySelector('[role="dialog"]')
+          : null;
+      if (!dialogEl) return;
+      const initialField =
+        typeof dialogEl.querySelector === "function"
+          ? dialogEl.querySelector(
+              'input:not([disabled]):not([type="hidden"]), select:not([disabled]), textarea:not([disabled])'
+            )
+          : null;
+      const fallback = getModalFocusableElements(dialogEl)[0] ?? dialogEl;
+      const target = /** @type {Partial<HTMLElement>} */ (
+        initialField ?? fallback
+      );
+      if (typeof target?.focus === "function") {
+        target.focus();
+      }
+    };
+    if (typeof requestAnimationFrame === "function") {
+      requestAnimationFrame(focusEntry);
+    } else {
+      focusEntry();
+    }
+  } else if (wasOpenBefore && !isOpenNow) {
+    if (
+      typeof document !== "undefined" &&
+      typeof document?.removeEventListener === "function" &&
+      modalKeydownListener
+    ) {
+      document.removeEventListener("keydown", modalKeydownListener);
+      modalKeydownListener = null;
+    }
+    const toRestore = /** @type {(Element & Partial<HTMLElement>) | null} */ (
+      previousModalFocus
+    );
+    previousModalFocus = null;
+    if (
+      toRestore &&
+      typeof toRestore.focus === "function" &&
+      toRestore.isConnected !== false
+    ) {
+      toRestore.focus();
+    }
+  }
+  wasModalOpen = isOpenNow;
+}
+
 function renderApp() {
+  const prevActive =
+    !wasModalOpen &&
+    state.modal !== null &&
+    typeof document !== "undefined" &&
+    document
+      ? (document.activeElement ?? null)
+      : null;
   if (topbarEl) render(renderTopbar(), topbarEl);
   if (workspaceEl) render(renderWorkspace(), workspaceEl);
   if (modalRootEl) render(renderModal(), modalRootEl);
   if (toastRootEl) render(renderToasts(), toastRootEl);
+  syncModalAccessibility(wasModalOpen, prevActive);
 }
+
+let popstateBound = false;
 
 /**
  * Initializes event listeners, SSE streaming, and initial database/route hydration.
  */
 export async function init() {
+  state.sseStatus = "live";
   renderApp();
 
-  connectEventStream(
+  activeEventStream?.close();
+  activeEventStream = connectEventStream(
     (batch) => {
-      sseQueue = sseQueue
-        .then(() => handleSseBatch(batch))
-        .catch(() => {});
+      void enqueueSseBatch(batch);
     },
     (status) => {
+      const prevStatus = state.sseStatus;
       state.sseStatus = status;
       renderApp();
+      if (prevStatus === "error" && status === "live") {
+        void enqueueSseBatch([{ type: "resync" }]);
+      }
     }
   );
 
-  window.addEventListener("popstate", () => {
-    const route = parseBrowserRoute(window.location.pathname);
-    if (route) {
-      if (
-        route.projectId === state.activeProjectId &&
-        route.databaseId === state.activeDatabaseId
-      ) {
-        state.segments = [...route.segments];
-        bumpNavEpoch();
-        renderApp();
-        if (state.segments.length > 0) {
-          void hydrateVisiblePath();
+  if (!popstateBound) {
+    popstateBound = true;
+    window.addEventListener("popstate", () => {
+      const route = parseBrowserRoute(window.location.pathname);
+      if (route) {
+        if (
+          route.projectId === state.activeProjectId &&
+          route.databaseId === state.activeDatabaseId
+        ) {
+          state.segments = [...route.segments];
+          bumpNavEpoch();
+          renderApp();
+          if (state.segments.length > 0) {
+            void hydrateVisiblePath();
+          }
+        } else {
+          void selectDatabase(
+            route.projectId,
+            route.databaseId,
+            route.segments,
+            true
+          );
         }
       } else {
-        void selectDatabase(
-          route.projectId,
-          route.databaseId,
-          route.segments,
-          true
-        );
+        state.segments = [];
+        bumpNavEpoch();
+        renderApp();
       }
-    } else {
-      state.segments = [];
-      bumpNavEpoch();
-      renderApp();
-    }
-  });
+    });
+  }
 
   try {
     await refreshDatabaseList();
