@@ -1,31 +1,26 @@
 use std::sync::Arc;
 
-use googleapis::google::firestore::v1::{Document, pipeline::Stage};
+use googleapis::google::{
+    firestore::v1::{Document, pipeline::Stage},
+    protobuf::Timestamp,
+};
 
+use super::single_arg_stage;
 use crate::{
     FirestoreDatabase, GenericDatabaseError,
     database::{query::QueryBuilder, reference::CollectionRef},
     error::Result,
-    pipeline::get_exact_expr_args,
     read_consistency::ReadConsistency,
     reference::RootRef,
-    unimplemented_collection,
 };
 
 pub(super) async fn execute(
     database: &Arc<FirestoreDatabase>,
     root_ref: &RootRef,
-    Stage {
-        name,
-        args,
-        options,
-    }: Stage,
+    stage: Stage,
     read_consistency: ReadConsistency,
-) -> Result<Vec<Document>> {
-    assert_eq!(name, "collection");
-    unimplemented_collection!(options);
-
-    let [arg] = get_exact_expr_args(&args, "collection")?;
+) -> Result<(Timestamp, Vec<Document>)> {
+    let arg = single_arg_stage(&stage, "collection")?;
 
     let collection_path = arg.as_reference().ok_or_else(|| {
         GenericDatabaseError::invalid_argument("collection stage expects a ReferenceValue argument")
@@ -46,7 +41,5 @@ pub(super) async fn execute(
         .consistency(read_consistency)
         .build()?;
 
-    let (_, docs) = database.run_query(&mut query).await?;
-
-    Ok(docs)
+    database.run_query(&mut query).await
 }

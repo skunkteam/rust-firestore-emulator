@@ -1,30 +1,14 @@
 use googleapis::google::firestore::v1::{Document, pipeline::Stage};
 
-use super::{expressions, parse_projection_paths};
-use crate::{
-    GenericDatabaseError, error::Result, pipeline::get_exact_expr_args, unimplemented_collection,
-};
+use super::{expressions, parse_projection_paths, single_map_stage};
+use crate::error::Result;
 
 /// Executes the `add_fields` pipeline stage.
 ///
 /// This stage evaluates expressions mapped by aliases and appends or overwrites them into the
 /// existing row stream.
-pub(super) fn execute(
-    Stage {
-        name,
-        args,
-        options,
-    }: Stage,
-    docs: Vec<Document>,
-) -> Result<Vec<Document>> {
-    assert_eq!(name, "add_fields");
-    unimplemented_collection!(options);
-
-    let [arg] = get_exact_expr_args(&args, "add_fields")?;
-
-    let projection_map = arg.as_map().ok_or_else(|| {
-        GenericDatabaseError::invalid_argument("add_fields stage expects a MapValue argument")
-    })?;
+pub(super) fn execute(stage: Stage, docs: Vec<Document>) -> Result<Vec<Document>> {
+    let projection_map = single_map_stage(&stage, "add_fields")?;
     let targets = parse_projection_paths(projection_map)?;
 
     docs.into_iter()
