@@ -828,11 +828,12 @@ input[type="checkbox"]:focus-visible {
 
 @media (max-width: 900px) {
   .query-workspace {
-    grid-template-columns: 1fr;
+    grid-template-columns: minmax(0, 1fr);
     overflow-y: auto;
   }
 
   .query-results-pane {
+    min-width: 0;
     overflow: visible;
   }
 }

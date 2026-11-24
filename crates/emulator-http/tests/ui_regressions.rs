@@ -4717,16 +4717,53 @@ fn regression_editor_key_value_errors_bytes_mode_error_and_narrow_query_overflow
         "@media (max-width: 900px) must appear after base .query-results-pane rule to override \
          overflow: hidden"
     );
-    let media_slice = &css[media_900_idx..];
-    let media_end = media_slice
-        .find("\n\n.")
-        .or_else(|| media_slice.find("\n.query-section"))
-        .unwrap_or(media_slice.len());
-    let media_block = &media_slice[..media_end];
+    let slice_brace_block = |src: &str, start_idx: usize, label: &str| -> String {
+        let tail = &src[start_idx..];
+        let open_rel = tail
+            .find('{')
+            .unwrap_or_else(|| panic!("{label} must open a brace block"));
+        let mut depth = 0usize;
+        for (rel, ch) in tail[open_rel..].char_indices() {
+            match ch {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return tail[..=open_rel + rel].to_owned();
+                    }
+                }
+                _ => {}
+            }
+        }
+        panic!("unterminated brace block for {label}");
+    };
+    let media_block = slice_brace_block(&css, media_900_idx, "@media (max-width: 900px)");
+    let nested_workspace_idx = media_block
+        .find(".query-workspace {")
+        .expect("@media (max-width: 900px) must include .query-workspace");
+    let nested_workspace_block = slice_brace_block(
+        &media_block,
+        nested_workspace_idx,
+        "@media (max-width: 900px) .query-workspace",
+    );
     assert!(
-        media_block.contains(".query-results-pane") && media_block.contains("overflow: visible;"),
-        "@media (max-width: 900px) must set .query-results-pane {{ overflow: visible; }}, \
-         got:\n{media_block}"
+        nested_workspace_block.contains("grid-template-columns: minmax(0, 1fr);"),
+        "@media (max-width: 900px) .query-workspace must set minmax(0, 1fr), \
+         got:\n{nested_workspace_block}"
+    );
+    let nested_results_idx = media_block
+        .find(".query-results-pane {")
+        .expect("@media (max-width: 900px) must include .query-results-pane");
+    let nested_results_block = slice_brace_block(
+        &media_block,
+        nested_results_idx,
+        "@media (max-width: 900px) .query-results-pane",
+    );
+    assert!(
+        nested_results_block.contains("overflow: visible;")
+            && nested_results_block.contains("min-width: 0;"),
+        "@media (max-width: 900px) .query-results-pane must set min-width: 0 and overflow: \
+         visible, got:\n{nested_results_block}"
     );
 
     let script = format!(
