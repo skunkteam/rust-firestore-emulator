@@ -1,24 +1,10 @@
 use googleapis::google::firestore::v1::{Document, Value, pipeline::Stage};
 
-use crate::{
-    GenericDatabaseError,
-    error::Result,
-    pipeline::{expressions, get_exact_expr_args},
-    unimplemented_collection,
-};
+use super::{expressions, single_arg_stage};
+use crate::{GenericDatabaseError, error::Result};
 
-pub(super) fn execute(
-    Stage {
-        name,
-        args,
-        options,
-    }: Stage,
-    docs: Vec<Document>,
-) -> Result<Vec<Document>> {
-    assert_eq!(name, "where");
-    unimplemented_collection!(options);
-
-    let [arg] = get_exact_expr_args(&args, "where")?;
+pub(super) fn execute(stage: Stage, docs: Vec<Document>) -> Result<Vec<Document>> {
+    let arg = single_arg_stage(&stage, "where")?;
 
     let mut filtered_docs = Vec::new();
     for doc in docs {
