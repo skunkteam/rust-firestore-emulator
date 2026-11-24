@@ -1,5 +1,7 @@
 #[cfg(all(feature = "ui", debug_assertions))]
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
+#[cfg(feature = "ui")]
+use std::path::{Component, Path};
 
 #[cfg(feature = "ui")]
 use axum::extract::Path as AxumPath;
@@ -7,6 +9,7 @@ use axum::extract::Path as AxumPath;
 use axum::routing::get;
 use axum::{
     Router,
+    body::Body,
     http::{HeaderValue, Method, StatusCode, Uri, header},
     response::{IntoResponse, Response},
 };
@@ -73,42 +76,54 @@ impl RouterBuilder {
 
 async fn root_fallback(method: Method, uri: Uri) -> Response {
     let path = uri.path();
-    if path == "/v1"
+    let mut resp = if path == "/v1"
         || path.starts_with("/v1/")
         || path == "/emulator"
         || path.starts_with("/emulator/")
     {
-        return RestError::not_found_msg(format!("Unknown API endpoint: {method} {path}"))
-            .into_response();
-    }
+        RestError::not_found_msg(format!("Unknown API endpoint: {method} {path}")).into_response()
+    } else {
+        #[cfg(feature = "ui")]
+        {
+            if path == "/ui" || path.starts_with("/ui/") {
+                (StatusCode::NOT_FOUND, "UI asset not found").into_response()
+            } else if matches!(method, Method::GET | Method::HEAD) {
+                serve_ui_asset("index.html")
+            } else {
+                RestError::not_found_msg(format!("Not found: {method} {path}")).into_response()
+            }
+        }
 
-    #[cfg(feature = "ui")]
-    {
-        if path == "/ui" || path.starts_with("/ui/") {
-            return (StatusCode::NOT_FOUND, "UI asset not found").into_response();
+        #[cfg(not(feature = "ui"))]
+        {
+            if matches!(method, Method::GET | Method::HEAD) {
+                (StatusCode::OK, "OK").into_response()
+            } else {
+                RestError::not_found().into_response()
+            }
         }
-        if method == Method::GET {
-            return serve_ui_asset("index.html");
-        }
-        RestError::not_found_msg(format!("Not found: {method} {path}")).into_response()
-    }
+    };
 
-    #[cfg(not(feature = "ui"))]
-    {
-        if method == Method::GET {
-            return (StatusCode::OK, "OK").into_response();
-        }
-        RestError::not_found().into_response()
+    if method == Method::HEAD {
+        *resp.body_mut() = Body::empty();
     }
+    resp
 }
 
 #[cfg(feature = "ui")]
 fn serve_ui_asset(rel_path: &str) -> Response {
     let trimmed = rel_path.trim_start_matches('/');
     if trimmed.is_empty()
-        || trimmed
-            .split('/')
-            .any(|seg| seg.is_empty() || seg == "." || seg == "..")
+        || trimmed.contains('\\')
+        || trimmed.split('/').any(|seg| {
+            seg.is_empty()
+                || seg == "."
+                || seg == ".."
+                || matches!(seg.as_bytes(), [drive, b':', ..] if drive.is_ascii_alphabetic())
+        })
+        || !Path::new(trimmed)
+            .components()
+            .all(|c| matches!(c, Component::Normal(_)))
         || trimmed.ends_with(".d.ts")
         || trimmed.ends_with(".md")
     {
@@ -165,5 +180,36 @@ fn mime_for_rel_path(rel_path: &str) -> Option<&'static str> {
         "css" => Some("text/css; charset=utf-8"),
         "svg" => Some("image/svg+xml"),
         _ => None,
+    }
+}
+
+#[cfg(all(test, feature = "ui"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn serve_ui_asset_rejects_backslashes() {
+        for path in [
+            r"components\editor.js",
+            r"\app.js",
+            r"..\Cargo.toml",
+            r"..\..\Cargo.toml",
+        ] {
+            let resp = serve_ui_asset(path);
+            assert_eq!(resp.status(), StatusCode::NOT_FOUND, "path: {path}");
+        }
+    }
+
+    #[test]
+    fn serve_ui_asset_rejects_drive_prefixes() {
+        for path in [
+            "C:/index.html",
+            "C:index.html",
+            "d:/components/editor.js",
+            "sub/C:index.html",
+        ] {
+            let resp = serve_ui_asset(path);
+            assert_eq!(resp.status(), StatusCode::NOT_FOUND, "path: {path}");
+        }
     }
 }
