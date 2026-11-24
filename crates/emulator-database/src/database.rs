@@ -230,33 +230,6 @@ impl FirestoreDatabase {
         }
     }
 
-    /// Get all the collections that reside directly under the given parent. This means that:
-    /// - the IDs will not contain a `/`
-    /// - the result will be empty if `parent` is a [`Ref::Collection`].
-    #[instrument(level = Level::DEBUG, skip_all)]
-    pub async fn get_collection_ids(&self, parent: &Ref) -> Result<BTreeSet<String>> {
-        self.ensure_owns_root(parent.root())?;
-        if self.is_cleared() {
-            return Err(AbortReason::DatabaseCleared.into());
-        }
-        // Cannot use `filter_map` because of the `await`.
-        let mut result = BTreeSet::new();
-        if matches!(parent, Ref::Collection(_)) {
-            return Ok(result);
-        }
-        for col in self.get_all_collections().await {
-            let Some(path) = col.name.strip_prefix(parent) else {
-                continue;
-            };
-            let id = path.split('/').next().unwrap();
-            if !result.contains(id) && col.has_doc().await? {
-                result.insert(id.to_string());
-            }
-        }
-        debug!(result_count = result.len());
-        Ok(result)
-    }
-
     /// Lists direct child collection IDs underneath a root or document parent in lexicographical
     /// order, applying optional `page_size` and opaque `page_token` pagination.
     #[instrument(level = Level::DEBUG, skip_all, err(level = Level::DEBUG))]
@@ -293,7 +266,19 @@ impl FirestoreDatabase {
             )?)
         };
 
-        let all_ids = self.get_collection_ids(parent).await?;
+        // Cannot use `filter_map` because of the `await`.
+        let mut all_ids = BTreeSet::new();
+        for col in self.get_all_collections().await {
+            let Some(path) = col.name.strip_prefix(parent) else {
+                continue;
+            };
+            let id = path.split('/').next().unwrap();
+            if !all_ids.contains(id) && col.has_doc().await? {
+                all_ids.insert(id.to_string());
+            }
+        }
+        debug!(result_count = all_ids.len());
+
         let iter = match after.as_deref() {
             Some(after_id) => all_ids.range::<str, _>((
                 std::ops::Bound::Excluded(after_id),
