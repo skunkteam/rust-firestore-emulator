@@ -1,6 +1,10 @@
 :root {
+  color-scheme: light dark;
+
   --bg-app: #f8fafc;
   --bg-surface: #ffffff;
+  --bg-surface-alt: #fafbfc;
+  --bg-card-subtle: #fcfdff;
   --bg-subtle: #f1f5f9;
   --bg-hover: #e2e8f0;
   --bg-selected: #eff6ff;
@@ -9,19 +13,72 @@
   --text-main: #0f172a;
   --text-muted: #475569;
   --text-faint: #64748b;
+  --text-on-solid: #ffffff;
+
   --accent: #ea580c;
   --accent-hover: #c2410c;
   --accent-soft: #ffedd5;
+  --accent-border: #fdba74;
+  --accent-text: #9a3412;
+
   --primary: #2563eb;
   --primary-hover: #1d4ed8;
+  --primary-link: #2563eb;
   --primary-soft: #dbeafe;
+  --primary-border: #93c5fd;
+  --primary-text: #1e40af;
+
   --danger: #dc2626;
   --danger-hover: #b91c1c;
+  --danger-fg: #dc2626;
   --danger-soft: #fee2e2;
+  --danger-border: #fca5a5;
+  --danger-text: #991b1b;
+
   --warning: #d97706;
   --warning-soft: #fef3c7;
+  --warning-border: #fcd34d;
+  --warning-text: #92400e;
+
   --success: #16a34a;
   --success-soft: #dcfce7;
+
+  --focus-ring: rgba(37, 99, 235, 0.14);
+  --input-error-bg: #fffafa;
+  --sse-dot-idle: #94a3b8;
+  --modal-backdrop: rgba(15, 23, 42, 0.45);
+
+  --toast-bg: #0f172a;
+  --toast-text: #f8fafc;
+  --toast-border: transparent;
+  --toast-error-bg: #991b1b;
+  --toast-error-border: transparent;
+  --toast-success-bg: #166534;
+  --toast-success-border: transparent;
+
+  --badge-int-bg: #dbeafe;
+  --badge-int-text: #1e40af;
+  --badge-double-bg: #e0e7ff;
+  --badge-double-text: #3730a3;
+  --badge-string-bg: #dcfce7;
+  --badge-string-text: #166534;
+  --badge-bool-bg: #fef3c7;
+  --badge-bool-text: #92400e;
+  --badge-null-bg: #f1f5f9;
+  --badge-null-text: #475569;
+  --badge-ts-bg: #fae8ff;
+  --badge-ts-text: #86198f;
+  --badge-ref-bg: #ffedd5;
+  --badge-ref-text: #9a3412;
+  --badge-bytes-bg: #f3e8ff;
+  --badge-bytes-text: #6b21a8;
+  --badge-geo-bg: #ccfbf1;
+  --badge-geo-text: #115e59;
+  --badge-struct-bg: #e2e8f0;
+  --badge-struct-text: #334155;
+  --badge-vector-bg: #cffafe;
+  --badge-vector-text: #155e75;
+
   --font-sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Inter, sans-serif;
   --font-mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
   --radius-sm: 5px;
@@ -29,6 +86,91 @@
   --radius-lg: 12px;
   --shadow-sm: 0 1px 2px rgba(15, 23, 42, 0.06);
   --shadow-md: 0 8px 24px rgba(15, 23, 42, 0.12);
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg-app: #0b1120;
+    --bg-surface: #111827;
+    --bg-surface-alt: #0f172a;
+    --bg-card-subtle: #162033;
+    --bg-subtle: #1e293b;
+    --bg-hover: #334155;
+    --bg-selected: #172554;
+    --border: #273449;
+    --border-strong: #475569;
+    --text-main: #f1f5f9;
+    --text-muted: #cbd5e1;
+    --text-faint: #94a3b8;
+    --text-on-solid: #ffffff;
+
+    --accent: #c2410c;
+    --accent-hover: #9a3412;
+    --accent-soft: #3d1c0a;
+    --accent-border: #9a3412;
+    --accent-text: #fdba74;
+
+    --primary: #2563eb;
+    --primary-hover: #1d4ed8;
+    --primary-link: #60a5fa;
+    --primary-soft: #172554;
+    --primary-border: #1d4ed8;
+    --primary-text: #93c5fd;
+
+    --danger: #dc2626;
+    --danger-hover: #b91c1c;
+    --danger-fg: #f87171;
+    --danger-soft: #3b1116;
+    --danger-border: #7f1d1d;
+    --danger-text: #fca5a5;
+
+    --warning: #fbbf24;
+    --warning-soft: #3a2408;
+    --warning-border: #92400e;
+    --warning-text: #fde68a;
+
+    --success: #4ade80;
+    --success-soft: #0f2e1d;
+
+    --focus-ring: rgba(96, 165, 250, 0.28);
+    --input-error-bg: #2b1216;
+    --sse-dot-idle: #64748b;
+    --modal-backdrop: rgba(2, 6, 23, 0.72);
+
+    --toast-bg: #1e293b;
+    --toast-text: #f8fafc;
+    --toast-border: #334155;
+    --toast-error-bg: #7f1d1d;
+    --toast-error-border: #991b1b;
+    --toast-success-bg: #14532d;
+    --toast-success-border: #166534;
+
+    --badge-int-bg: #172554;
+    --badge-int-text: #93c5fd;
+    --badge-double-bg: #1e1b4b;
+    --badge-double-text: #a5b4fc;
+    --badge-string-bg: #052e16;
+    --badge-string-text: #86efac;
+    --badge-bool-bg: #451a03;
+    --badge-bool-text: #fde68a;
+    --badge-null-bg: #1e293b;
+    --badge-null-text: #cbd5e1;
+    --badge-ts-bg: #3b0764;
+    --badge-ts-text: #f0abfc;
+    --badge-ref-bg: #431407;
+    --badge-ref-text: #fdba74;
+    --badge-bytes-bg: #2e1065;
+    --badge-bytes-text: #d8b4fe;
+    --badge-geo-bg: #042f2e;
+    --badge-geo-text: #5eead4;
+    --badge-struct-bg: #1e293b;
+    --badge-struct-text: #cbd5e1;
+    --badge-vector-bg: #083344;
+    --badge-vector-text: #67e8f9;
+
+    --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.45);
+    --shadow-md: 0 10px 28px rgba(0, 0, 0, 0.6);
+  }
 }
 
 * {
@@ -152,7 +294,7 @@ textarea {
 .btn-primary {
   background: var(--primary);
   border-color: var(--primary);
-  color: #ffffff;
+  color: var(--text-on-solid);
 }
 
 .btn-primary:hover:not(:disabled) {
@@ -163,7 +305,7 @@ textarea {
 .btn-accent {
   background: var(--accent);
   border-color: var(--accent);
-  color: #ffffff;
+  color: var(--text-on-solid);
 }
 
 .btn-accent:hover:not(:disabled) {
@@ -174,7 +316,7 @@ textarea {
 .btn-danger {
   background: var(--danger);
   border-color: var(--danger);
-  color: #ffffff;
+  color: var(--text-on-solid);
 }
 
 .btn-danger:hover:not(:disabled) {
@@ -207,28 +349,28 @@ textarea {
 .input:focus,
 .select:focus,
 .textarea:focus {
-  border-color: var(--primary);
-  box-shadow: 0 0 0 2px rgba(37, 99, 235, 0.14);
+  border-color: var(--primary-link);
+  box-shadow: 0 0 0 2px var(--focus-ring);
 }
 
 button:focus-visible,
 a:focus-visible,
 [tabindex]:focus-visible,
 input[type="checkbox"]:focus-visible {
-  outline: 2px solid var(--primary);
+  outline: 2px solid var(--primary-link);
   outline-offset: 2px;
 }
 
 .col-item:focus-visible,
 .crumb:focus-visible,
 .segmented button:focus-visible {
-  outline: 2px solid var(--primary);
+  outline: 2px solid var(--primary-link);
   outline-offset: -2px;
 }
 
 .input-error {
-  border-color: var(--danger) !important;
-  background: #fffafa;
+  border-color: var(--danger-fg) !important;
+  background: var(--input-error-bg);
 }
 
 .mono {
@@ -277,14 +419,14 @@ input[type="checkbox"]:focus-visible {
 
 .config-pill.enterprise {
   background: var(--primary-soft);
-  border-color: #93c5fd;
-  color: #1e40af;
+  border-color: var(--primary-border);
+  color: var(--primary-text);
 }
 
 .config-pill.optimistic {
   background: var(--accent-soft);
-  border-color: #fdba74;
-  color: #9a3412;
+  border-color: var(--accent-border);
+  color: var(--accent-text);
 }
 
 .sse-badge {
@@ -296,6 +438,7 @@ input[type="checkbox"]:focus-visible {
   border-radius: 999px;
   border: 1px solid var(--border);
   background: var(--bg-subtle);
+  color: var(--text-main);
   cursor: pointer;
 }
 
@@ -303,7 +446,7 @@ input[type="checkbox"]:focus-visible {
   width: 8px;
   height: 8px;
   border-radius: 50%;
-  background: #94a3b8;
+  background: var(--sse-dot-idle);
 }
 
 .sse-dot.live {
@@ -315,7 +458,7 @@ input[type="checkbox"]:focus-visible {
 }
 
 .sse-dot.error {
-  background: var(--danger);
+  background: var(--danger-fg);
 }
 
 /* Workspace */
@@ -507,7 +650,7 @@ input[type="checkbox"]:focus-visible {
 
 .col-item.selected {
   background: var(--bg-selected);
-  color: var(--primary);
+  color: var(--primary-link);
   font-weight: 600;
 }
 
@@ -517,7 +660,7 @@ input[type="checkbox"]:focus-visible {
 }
 
 .col-item.selected.phantom .item-label {
-  color: var(--primary);
+  color: var(--primary-link);
 }
 
 .item-label {
@@ -556,7 +699,7 @@ input[type="checkbox"]:focus-visible {
   flex: 0 0 auto;
   padding: 8px 12px;
   border-bottom: 1px solid var(--border);
-  background: #fafbfc;
+  background: var(--bg-surface-alt);
 }
 
 .subcollections-header {
@@ -598,7 +741,7 @@ input[type="checkbox"]:focus-visible {
 .subcol-chip.active {
   background: var(--primary);
   border-color: var(--primary);
-  color: #ffffff;
+  color: var(--text-on-solid);
 }
 
 /* Document Editor */
@@ -642,8 +785,8 @@ input[type="checkbox"]:focus-visible {
   gap: 10px;
   padding: 8px 12px;
   background: var(--warning-soft);
-  border-bottom: 1px solid #fcd34d;
-  color: #92400e;
+  border-bottom: 1px solid var(--warning-border);
+  color: var(--warning-text);
   font-size: 12.5px;
 }
 
@@ -651,8 +794,8 @@ input[type="checkbox"]:focus-visible {
   flex: 0 0 auto;
   padding: 8px 12px;
   background: var(--danger-soft);
-  border-bottom: 1px solid #fca5a5;
-  color: #991b1b;
+  border-bottom: 1px solid var(--danger-border);
+  color: var(--danger-text);
   font-size: 12.5px;
 }
 
@@ -679,7 +822,7 @@ input[type="checkbox"]:focus-visible {
 .field-node.nested {
   margin-top: 6px;
   margin-left: 16px;
-  background: #fcfdff;
+  background: var(--bg-card-subtle);
 }
 
 .field-row {
@@ -733,7 +876,7 @@ input[type="checkbox"]:focus-visible {
 .field-error-text {
   width: 100%;
   font-size: 11.5px;
-  color: var(--danger);
+  color: var(--danger-fg);
   margin-top: 2px;
 }
 
@@ -749,18 +892,18 @@ input[type="checkbox"]:focus-visible {
   color: var(--text-muted);
 }
 
-.type-badge.integerValue { background: #dbeafe; color: #1e40af; }
-.type-badge.doubleValue { background: #e0e7ff; color: #3730a3; }
-.type-badge.stringValue { background: #dcfce7; color: #166534; }
-.type-badge.booleanValue { background: #fef3c7; color: #92400e; }
-.type-badge.nullValue { background: #f1f5f9; color: #475569; }
-.type-badge.timestampValue { background: #fae8ff; color: #86198f; }
-.type-badge.referenceValue { background: #ffedd5; color: #9a3412; }
-.type-badge.bytesValue { background: #f3e8ff; color: #6b21a8; }
-.type-badge.geoPointValue { background: #ccfbf1; color: #115e59; }
+.type-badge.integerValue { background: var(--badge-int-bg); color: var(--badge-int-text); }
+.type-badge.doubleValue { background: var(--badge-double-bg); color: var(--badge-double-text); }
+.type-badge.stringValue { background: var(--badge-string-bg); color: var(--badge-string-text); }
+.type-badge.booleanValue { background: var(--badge-bool-bg); color: var(--badge-bool-text); }
+.type-badge.nullValue { background: var(--badge-null-bg); color: var(--badge-null-text); }
+.type-badge.timestampValue { background: var(--badge-ts-bg); color: var(--badge-ts-text); }
+.type-badge.referenceValue { background: var(--badge-ref-bg); color: var(--badge-ref-text); }
+.type-badge.bytesValue { background: var(--badge-bytes-bg); color: var(--badge-bytes-text); }
+.type-badge.geoPointValue { background: var(--badge-geo-bg); color: var(--badge-geo-text); }
 .type-badge.arrayValue,
-.type-badge.mapValue { background: #e2e8f0; color: #334155; }
-.type-badge.vector { background: #cffafe; color: #155e75; }
+.type-badge.mapValue { background: var(--badge-struct-bg); color: var(--badge-struct-text); }
+.type-badge.vector { background: var(--badge-vector-bg); color: var(--badge-vector-text); }
 
 /* Raw JSON Editor */
 .raw-json-wrap {
@@ -842,7 +985,7 @@ input[type="checkbox"]:focus-visible {
   border: 1px solid var(--border);
   border-radius: var(--radius-md);
   padding: 10px 12px;
-  background: #fcfdff;
+  background: var(--bg-card-subtle);
   display: flex;
   flex-direction: column;
   gap: 8px;
@@ -919,7 +1062,7 @@ input[type="checkbox"]:focus-visible {
 .modal-backdrop {
   position: fixed;
   inset: 0;
-  background: rgba(15, 23, 42, 0.45);
+  background: var(--modal-backdrop);
   display: flex;
   align-items: center;
   justify-content: center;
@@ -1014,8 +1157,9 @@ input[type="checkbox"]:focus-visible {
   max-width: 400px;
   padding: 9px 13px;
   border-radius: var(--radius-md);
-  background: #0f172a;
-  color: #f8fafc;
+  background: var(--toast-bg);
+  color: var(--toast-text);
+  border: 1px solid var(--toast-border);
   font-size: 12.5px;
   box-shadow: var(--shadow-md);
   display: flex;
@@ -1025,11 +1169,13 @@ input[type="checkbox"]:focus-visible {
 }
 
 .toast.error {
-  background: #991b1b;
+  background: var(--toast-error-bg);
+  border-color: var(--toast-error-border);
 }
 
 .toast.success {
-  background: #166534;
+  background: var(--toast-success-bg);
+  border-color: var(--toast-success-border);
 }
 
 /* Contention Visualizer */
@@ -1076,10 +1222,11 @@ input[type="checkbox"]:focus-visible {
   border-radius: 999px;
   border: 1px solid var(--border);
   background: var(--bg-subtle);
+  color: var(--text-main);
 }
 
 .sse-dot.idle {
-  background: #94a3b8;
+  background: var(--sse-dot-idle);
 }
 
 .contention-summary-grid {
@@ -1089,7 +1236,7 @@ input[type="checkbox"]:focus-visible {
   gap: 10px;
   padding: 12px 16px;
   border-bottom: 1px solid var(--border);
-  background: #fafbfc;
+  background: var(--bg-surface-alt);
 }
 
 .contention-stat-card {
@@ -1105,7 +1252,7 @@ input[type="checkbox"]:focus-visible {
 }
 
 .contention-stat-card.tone-wound {
-  border-left-color: var(--danger);
+  border-left-color: var(--danger-fg);
 }
 
 .contention-stat-card.tone-timeout {
@@ -1117,7 +1264,7 @@ input[type="checkbox"]:focus-visible {
 }
 
 .contention-stat-card.tone-retry {
-  border-left-color: var(--primary);
+  border-left-color: var(--primary-link);
 }
 
 .contention-stat-label {
@@ -1172,7 +1319,7 @@ input[type="checkbox"]:focus-visible {
 }
 
 .contention-truncated-banner {
-  border: 1px solid #fcd34d;
+  border: 1px solid var(--warning-border);
   border-radius: var(--radius-md);
 }
 
@@ -1218,7 +1365,7 @@ input[type="checkbox"]:focus-visible {
   flex-direction: column;
   align-items: center;
   gap: 10px;
-  color: #991b1b;
+  color: var(--danger-text);
 }
 
 .contention-error-text {
@@ -1236,7 +1383,7 @@ input[type="checkbox"]:focus-visible {
   border: 1px solid var(--border);
   border-radius: var(--radius-sm);
   padding: 10px;
-  background: #fcfdff;
+  background: var(--bg-card-subtle);
   display: flex;
   flex-direction: column;
   gap: 8px;
@@ -1256,7 +1403,7 @@ input[type="checkbox"]:focus-visible {
   padding: 2px 4px;
   margin: -2px -4px;
   border-radius: 4px;
-  color: var(--primary);
+  color: var(--primary-link);
   font-size: 12.5px;
   font-weight: 600;
   cursor: pointer;
@@ -1266,6 +1413,7 @@ input[type="checkbox"]:focus-visible {
 
 .contention-doc-link:hover {
   background: var(--primary-soft);
+  color: var(--primary-text);
   text-decoration: underline;
 }
 
@@ -1333,12 +1481,12 @@ input[type="checkbox"]:focus-visible {
 
 .contention-pill.mode-write {
   background: var(--danger-soft);
-  color: #991b1b;
+  color: var(--danger-text);
 }
 
 .contention-pill.mode-read {
   background: var(--primary-soft);
-  color: #1e40af;
+  color: var(--primary-text);
 }
 
 .contention-kind-tag,
@@ -1370,7 +1518,7 @@ input[type="checkbox"]:focus-visible {
   border: 1px solid var(--border);
   border-radius: var(--radius-sm);
   padding: 8px 10px;
-  background: #fcfdff;
+  background: var(--bg-card-subtle);
   display: flex;
   flex-direction: column;
   gap: 5px;
@@ -1400,29 +1548,29 @@ input[type="checkbox"]:focus-visible {
 }
 
 .contention-wounder-label {
-  color: var(--danger);
+  color: var(--danger-fg);
   font-weight: 600;
 }
 
 .contention-event-badge.kind-wounded {
   background: var(--danger-soft);
-  color: #991b1b;
+  color: var(--danger-text);
 }
 
 .contention-event-badge.kind-read_timeout,
 .contention-event-badge.kind-write_timeout {
   background: var(--warning-soft);
-  color: #92400e;
+  color: var(--warning-text);
 }
 
 .contention-event-badge.kind-upgrade_abort {
   background: var(--accent-soft);
-  color: #9a3412;
+  color: var(--accent-text);
 }
 
 .contention-event-badge.kind-write_batch_retry {
   background: var(--primary-soft);
-  color: #1e40af;
+  color: var(--primary-text);
 }
 
 .contention-event-badge.kind-transaction_expired {
