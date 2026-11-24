@@ -37,9 +37,17 @@ import {
  *   latText: string,
  *   lngText: string,
  *   bytesMode: 'base64' | 'utf8' | 'hex',
+ *   bytesModeError?: string,
  *   rawVectorValue?: FirestoreValue,
  *   children: DraftNode[],
  * }} DraftNode
+ */
+
+/**
+ * @typedef {{
+ *   keyError?: string,
+ *   valueError?: string,
+ * }} NodeValidationError
  */
 
 /**
@@ -151,14 +159,62 @@ function valueToDraftNode(key, val) {
 }
 
 /**
+ * @param {Map<number, NodeValidationError>} errors
+ * @param {number} nodeId
+ * @param {string} message
+ */
+function setKeyError(errors, nodeId, message) {
+  const existing = errors.get(nodeId) ?? {};
+  existing.keyError = message;
+  errors.set(nodeId, existing);
+}
+
+/**
+ * @param {Map<number, NodeValidationError>} errors
+ * @param {number} nodeId
+ * @param {string} message
+ */
+function setValueError(errors, nodeId, message) {
+  const existing = errors.get(nodeId) ?? {};
+  existing.valueError = message;
+  errors.set(nodeId, existing);
+}
+
+/**
+ * @param {Map<number, NodeValidationError>} errors
+ * @returns {string | undefined}
+ */
+function firstValidationError(errors) {
+  for (const entry of errors.values()) {
+    if (entry.keyError) return entry.keyError;
+    if (entry.valueError) return entry.valueError;
+  }
+  return undefined;
+}
+
+/**
+ * @param {DraftNode[]} nodes
+ */
+function clearBytesModeErrors(nodes) {
+  for (const node of nodes) {
+    if (node.bytesModeError !== undefined) {
+      node.bytesModeError = undefined;
+    }
+    if (node.children.length > 0) {
+      clearBytesModeErrors(node.children);
+    }
+  }
+}
+
+/**
  * Validates a DraftNode list as a map and converts it to a ProtoJSON fields object.
  * @param {DraftNode[]} nodes
  * @param {string} projectId
  * @param {string} databaseId
- * @returns {{ valid: boolean, fields?: Record<string, FirestoreValue>, errors: Map<number, string> }}
+ * @returns {{ valid: boolean, fields?: Record<string, FirestoreValue>, errors: Map<number, NodeValidationError> }}
  */
 export function draftNodesToFields(nodes, projectId, databaseId) {
-  /** @type {Map<number, string>} */
+  /** @type {Map<number, NodeValidationError>} */
   const errors = new Map();
   const fields = collectMapNodes(nodes, projectId, databaseId, errors);
   return {
@@ -172,7 +228,7 @@ export function draftNodesToFields(nodes, projectId, databaseId) {
  * @param {DraftNode[]} nodes
  * @param {string} projectId
  * @param {string} databaseId
- * @param {Map<number, string>} errors
+ * @param {Map<number, NodeValidationError>} errors
  * @returns {Record<string, FirestoreValue>}
  */
 function collectMapNodes(nodes, projectId, databaseId, errors) {
@@ -184,9 +240,9 @@ function collectMapNodes(nodes, projectId, databaseId, errors) {
   for (const node of nodes) {
     const key = node.key;
     if (!key) {
-      errors.set(node.id, "Field name is required");
+      setKeyError(errors, node.id, "Field name is required");
     } else if (seenKeys.has(key)) {
-      errors.set(node.id, `Duplicate field name "${key}"`);
+      setKeyError(errors, node.id, `Duplicate field name "${key}"`);
     } else {
       seenKeys.add(key);
     }
@@ -203,7 +259,7 @@ function collectMapNodes(nodes, projectId, databaseId, errors) {
  * @param {string} projectId
  * @param {string} databaseId
  * @param {boolean} inArray
- * @param {Map<number, string>} errors
+ * @param {Map<number, NodeValidationError>} errors
  * @returns {FirestoreValue | null}
  */
 function convertSingleNode(node, projectId, databaseId, inArray, errors) {
@@ -220,7 +276,7 @@ function convertSingleNode(node, projectId, databaseId, inArray, errors) {
     case "integerValue": {
       const check = validateInteger64(node.text);
       if (!check.valid || !check.canonical) {
-        errors.set(node.id, check.error ?? "Invalid int64");
+        setValueError(errors, node.id, check.error ?? "Invalid int64");
         return null;
       }
       return { integerValue: check.canonical };
@@ -229,7 +285,7 @@ function convertSingleNode(node, projectId, databaseId, inArray, errors) {
     case "doubleValue": {
       const check = validateDouble(node.text);
       if (!check.valid || check.value === undefined) {
-        errors.set(node.id, check.error ?? "Invalid double");
+        setValueError(errors, node.id, check.error ?? "Invalid double");
         return null;
       }
       return { doubleValue: check.value };
@@ -238,7 +294,7 @@ function convertSingleNode(node, projectId, databaseId, inArray, errors) {
     case "timestampValue": {
       const check = validateTimestamp(node.text);
       if (!check.valid) {
-        errors.set(node.id, check.error ?? "Invalid timestamp");
+        setValueError(errors, node.id, check.error ?? "Invalid timestamp");
         return null;
       }
       return { timestampValue: node.text.trim() };
@@ -247,7 +303,7 @@ function convertSingleNode(node, projectId, databaseId, inArray, errors) {
     case "referenceValue": {
       const check = normalizeReference(node.text, projectId, databaseId);
       if (!check.valid || !check.fullPath) {
-        errors.set(node.id, check.error ?? "Invalid reference");
+        setValueError(errors, node.id, check.error ?? "Invalid reference");
         return null;
       }
       return { referenceValue: check.fullPath };
@@ -256,7 +312,7 @@ function convertSingleNode(node, projectId, databaseId, inArray, errors) {
     case "bytesValue": {
       const check = encodeBytes(node.text, node.bytesMode);
       if (!check.valid || check.base64 === undefined) {
-        errors.set(node.id, check.error ?? "Invalid bytes");
+        setValueError(errors, node.id, check.error ?? "Invalid bytes");
         return null;
       }
       return { bytesValue: check.base64 };
@@ -265,7 +321,7 @@ function convertSingleNode(node, projectId, databaseId, inArray, errors) {
     case "geoPointValue": {
       const check = validateGeoPoint(node.latText, node.lngText);
       if (!check.valid) {
-        errors.set(node.id, check.error ?? "Invalid geopoint");
+        setValueError(errors, node.id, check.error ?? "Invalid geopoint");
         return null;
       }
       return {
@@ -278,7 +334,11 @@ function convertSingleNode(node, projectId, databaseId, inArray, errors) {
 
     case "arrayValue": {
       if (inArray) {
-        errors.set(node.id, "Nested arrays inside arrays are not allowed");
+        setValueError(
+          errors,
+          node.id,
+          "Nested arrays inside arrays are not allowed"
+        );
         return null;
       }
       /** @type {FirestoreValue[]} */
@@ -370,7 +430,7 @@ export function extractSessionFields(session) {
     session.databaseId
   );
   if (!treeRes.valid || !treeRes.fields) {
-    const firstErr = treeRes.errors.values().next().value;
+    const firstErr = firstValidationError(treeRes.errors);
     return {
       valid: false,
       error: firstErr ?? "Fix validation errors highlighted in red",
@@ -460,11 +520,12 @@ export function renderHybridEditor(props) {
         session.databaseId
       );
       if (!check.valid || !check.fields) {
-        const firstErr = check.errors.values().next().value;
+        const firstErr = firstValidationError(check.errors);
         session.saveError = `Cannot switch to Raw ProtoJSON until field errors are fixed: ${firstErr}`;
         onChange();
         return;
       }
+      clearBytesModeErrors(session.nodes);
       session.rawText = session.isDirty
         ? stringifyProtoJson({ fields: check.fields }, 2)
         : session.cleanJson;
@@ -482,6 +543,8 @@ export function renderHybridEditor(props) {
         session.nodes = fieldsToDraftNodes(session.cleanDoc?.fields ?? {});
       } else if (session.rawText !== session.rawBaselineText) {
         session.nodes = fieldsToDraftNodes(rawCheck.fields);
+      } else {
+        clearBytesModeErrors(session.nodes);
       }
       session.rawError = null;
       session.mode = "structured";
@@ -703,7 +766,7 @@ export function renderHybridEditor(props) {
  * @param {EditorSession} session
  * @param {DraftNode[]} nodes
  * @param {boolean} parentIsArray
- * @param {Map<number, string>} errors
+ * @param {Map<number, NodeValidationError>} errors
  * @param {() => void} onChange
  * @returns {TemplateResult}
  */
@@ -733,7 +796,7 @@ function renderStructuredTree(session, nodes, parentIsArray, errors, onChange) {
  * @param {DraftNode} node
  * @param {number} index
  * @param {boolean} parentIsArray
- * @param {Map<number, string>} errors
+ * @param {Map<number, NodeValidationError>} errors
  * @param {() => void} onChange
  * @returns {TemplateResult}
  */
@@ -746,7 +809,13 @@ function renderDraftNode(
   errors,
   onChange
 ) {
-  const errText = errors.get(node.id);
+  const nodeErr = errors.get(node.id);
+  const keyError = nodeErr?.keyError;
+  const valueError = nodeErr?.valueError;
+  const bytesModeError = node.bytesModeError;
+  const errorMessages = [keyError, valueError, bytesModeError].filter(
+    /** @returns {msg is string} */ (msg) => Boolean(msg)
+  );
   const allowedTypes = parentIsArray
     ? VALUE_TYPES.filter((t) => t.key !== "arrayValue")
     : VALUE_TYPES;
@@ -765,6 +834,7 @@ function renderDraftNode(
     node.latText = fresh.latText;
     node.lngText = fresh.lngText;
     node.bytesMode = "base64";
+    node.bytesModeError = undefined;
     node.children = fresh.children;
     session.saveError = null;
     recomputeDirty(session);
@@ -814,7 +884,7 @@ function renderDraftNode(
           : html`
               <input
                 type="text"
-                class="input field-key-input ${!node.key ? "input-error" : ""}"
+                class="input field-key-input ${keyError ? "input-error" : ""}"
                 aria-label=${`Field name ${index + 1}`}
                 placeholder="field name"
                 .value=${node.key}
@@ -854,7 +924,7 @@ function renderDraftNode(
         </span>
 
         <div class="field-value-wrap">
-          ${renderValueEditorControl(session, node, Boolean(errText), onChange)}
+          ${renderValueEditorControl(session, node, Boolean(valueError), onChange)}
         </div>
 
         ${node.type === "mapValue" || node.type === "arrayValue"
@@ -879,7 +949,9 @@ function renderDraftNode(
           ✕
         </button>
 
-        ${errText ? html`<div class="field-error-text">${errText}</div>` : nothing}
+        ${errorMessages.map(
+          (msg) => html`<div class="field-error-text">${msg}</div>`
+        )}
       </div>
 
       ${node.type === "mapValue" || node.type === "arrayValue"
@@ -911,6 +983,7 @@ function renderValueEditorControl(session, node, hasError, onChange) {
 
   const updateText = (/** @type {Event} */ e) => {
     node.text = /** @type {HTMLInputElement} */ (e.target).value;
+    node.bytesModeError = undefined;
     session.saveError = null;
     recomputeDirty(session);
     onChange();
@@ -1013,33 +1086,53 @@ function renderValueEditorControl(session, node, hasError, onChange) {
       `;
 
     case "bytesValue": {
-      const switchBytesMode = (/** @type {'base64' | 'utf8' | 'hex'} */ nextMode) => {
-        if (node.bytesMode === nextMode) return;
+      const switchBytesMode = (
+        /** @type {'base64' | 'utf8' | 'hex'} */ nextMode,
+        /** @type {HTMLSelectElement | null} */ selectEl
+      ) => {
+        if (node.bytesMode === nextMode) {
+          if (node.bytesModeError !== undefined) {
+            node.bytesModeError = undefined;
+            onChange();
+          }
+          return;
+        }
         const encoded = encodeBytes(node.text, node.bytesMode);
         if (encoded.valid && encoded.base64 !== undefined) {
           const decoded = decodeBytes(encoded.base64, nextMode);
           if (decoded.ok) {
             node.text = decoded.text;
             node.bytesMode = nextMode;
+            node.bytesModeError = undefined;
+          } else {
+            node.bytesModeError =
+              nextMode === "utf8"
+                ? "Cannot switch to UTF-8: bytes are not valid UTF-8"
+                : `Cannot switch bytes mode to ${nextMode}`;
+            if (selectEl) {
+              selectEl.value = node.bytesMode;
+            }
           }
         } else {
           node.bytesMode = nextMode;
+          node.bytesModeError = undefined;
         }
         onChange();
       };
 
       return html`
         <select
-          class="select"
+          class="select ${node.bytesModeError ? "input-error" : ""}"
           style="flex: 0 0 auto; font-size: 11.5px;"
           aria-label="Bytes encoding mode"
           .value=${node.bytesMode}
-          @change=${(/** @type {Event} */ e) =>
+          @change=${(/** @type {Event} */ e) => {
+            const target = /** @type {HTMLSelectElement} */ (e.target);
             switchBytesMode(
-              /** @type {'base64' | 'utf8' | 'hex'} */ (
-                /** @type {HTMLSelectElement} */ (e.target).value
-              )
-            )}
+              /** @type {'base64' | 'utf8' | 'hex'} */ (target.value),
+              target
+            );
+          }}
         >
           <option value="base64" ?selected=${node.bytesMode === "base64"}>
             Base64
