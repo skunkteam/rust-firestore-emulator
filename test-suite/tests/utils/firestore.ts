@@ -1,19 +1,14 @@
 import { DocumentData, DocumentReference, Firestore, Timestamp, WithFieldValue } from '@google-cloud/firestore';
 import assert from 'assert';
+import { connection, notImplementedInJava, notImplementedInRust } from './env';
+
+export { connection, notImplementedInJava, notImplementedInRust };
 
 const ONE_HOUR_MS = 60 * 60 * 1_000;
 const projectId = 'firestore-test-406503';
 const standard = new Firestore({ projectId });
 const enterprise = new Firestore({ projectId, databaseId: 'enterprise' });
 const enterprisePessimistic = new Firestore({ projectId, databaseId: 'enterprise-pessimistic' });
-
-export const connection = process.env.FIRESTORE_EMULATOR_HOST
-    ? process.env.RUST_EMULATOR
-        ? 'RUST EMULATOR'
-        : 'JAVA EMULATOR'
-    : 'CLOUD FIRESTORE';
-export const notImplementedInRust = connection === 'RUST EMULATOR' ? [] : undefined;
-export const notImplementedInJava = connection === 'JAVA EMULATOR' ? [] : undefined;
 
 // create a separate collection for each test, use TTL on the field `ttl` to delete every document in the collection group `collection`
 // after a set time as a fallback, if the tests did not get the chance to delete itself

@@ -13,7 +13,80 @@ import {
     Timestamp,
 } from '@google-cloud/firestore';
 import { differenceWith, isEqual, omit, orderBy, sortedUniq, uniq } from 'lodash';
-import { RawProtoValue, callRawStreamRpc, connection, editions, readData, toRunQueryProto, writeData } from './utils';
+import {
+    RawDocument,
+    RawProtoValue,
+    callRawStreamRpc,
+    callRawUnaryRpc,
+    connection,
+    editions,
+    expectRpcCode,
+    readData,
+    toRunQueryProto,
+    writeData,
+} from './utils';
+
+interface RawListDocumentsRequest {
+    parent: string;
+    collectionId?: string;
+    pageSize?: number;
+    pageToken?: string;
+    orderBy?: string;
+    mask?: { fieldPaths: string[] };
+    showMissing?: boolean;
+    readTime?: Timestamp;
+}
+
+interface RawListDocument extends RawDocument {
+    createTime?: unknown;
+    updateTime?: unknown;
+}
+
+interface RawListDocumentsResponse {
+    documents?: RawListDocument[];
+    nextPageToken?: string;
+}
+
+interface InternalListDocumentsClient {
+    initializeIfNeeded(requestTag: string): Promise<void>;
+    createCallOptions(methodName: string): Record<string, unknown>;
+    _clientPool: {
+        run<T>(
+            requestTag: string,
+            requiresGrpc: boolean,
+            op: (gapicClient: {
+                listDocuments(
+                    req: RawListDocumentsRequest,
+                    options: Record<string, unknown>,
+                ): Promise<[RawListDocument[], RawListDocumentsRequest | null, RawListDocumentsResponse]>;
+            }) => Promise<T>,
+        ): Promise<T>;
+    };
+}
+
+async function listDocumentsPage(
+    firestore: (typeof editions)[number]['firestore'],
+    req: RawListDocumentsRequest,
+    tag = 'listDocumentsPage',
+): Promise<{ documents: RawListDocument[]; nextPageToken: string }> {
+    const client = firestore as unknown as InternalListDocumentsClient;
+    await client.initializeIfNeeded(tag);
+    const callOptions = client.createCallOptions('listDocuments');
+    const [documents, , rawResponse] = await client._clientPool.run(tag, false, gapicClient =>
+        gapicClient.listDocuments(req, { ...callOptions, autoPaginate: false }),
+    );
+    return {
+        documents: rawResponse.documents ?? documents ?? [],
+        nextPageToken: rawResponse.nextPageToken ?? '',
+    };
+}
+
+function docIdsFromRaw(docs: RawDocument[]): string[] {
+    return docs.map(d => {
+        const name = d.name ?? '';
+        return name.slice(name.lastIndexOf('/') + 1);
+    });
+}
 
 describe.each(editions)('$description', fs => {
     interface Data {
@@ -561,6 +634,598 @@ describe.each(editions)('$description', fs => {
 
             expect((await scope.listDocuments()).map(c => c.id)).toIncludeSameMembers(['foo', 'bar', 'baz']);
         });
+
+        test('listDocuments pagination, boundary mutations, masks, orderBy, showMissing, and token validation', async () => {
+            const parentDoc = fs.collection.doc();
+            const dbRoot = (fs.firestore as unknown as { formattedName: string }).formattedName;
+            const parent = `${dbRoot}/documents/${parentDoc.path}`;
+            const collectionId = 'pagedDocs';
+            const col = parentDoc.collection(collectionId);
+
+            // Common 1. Malformed/garbage pageToken on an empty collection -> 3 INVALID_ARGUMENT.
+            await expectRpcCode(
+                () => listDocumentsPage(fs.firestore, { parent, collectionId, pageSize: 2, pageToken: 'garbage-token' }),
+                3,
+                'empty-collection-garbage-token',
+            );
+            await expectRpcCode(
+                () => callRawUnaryRpc(fs.firestore, 'listDocuments', { parent, collectionId, pageToken: 'garbage-token' }),
+                3,
+                'empty-collection-raw-unary-garbage-token',
+            );
+
+            // Seed documents for default, orderBy, and mask tests.
+            const seedDocs: Record<string, Record<string, unknown>> = {
+                a: { 'rank': 1, 'other': 40, 'label': 'la', 'a,b': 10 },
+                b: { 'rank': 2, 'other': 30, 'label': 'lb', 'a,b': 20 },
+                c: { 'rank': 3, 'other': 20, 'label': 'lc', 'a,b': 30 },
+                d: { 'rank': 4, 'other': 10, 'label': 'ld', 'a,b': 40 },
+            };
+            await Promise.all(Object.entries(seedDocs).map(([id, doc]) => col.doc(id).set(writeData(doc))));
+
+            // Common 2. Malformed/garbage and raw-doc-path pageToken on non-empty collection -> 3 INVALID_ARGUMENT.
+            await expectRpcCode(
+                () => listDocumentsPage(fs.firestore, { parent, collectionId, pageSize: 2, pageToken: 'garbage-token' }),
+                3,
+                'non-empty-garbage-token',
+            );
+            await expectRpcCode(
+                () =>
+                    listDocumentsPage(fs.firestore, {
+                        parent,
+                        collectionId,
+                        pageSize: 2,
+                        pageToken: `${parent}/${collectionId}/a`,
+                    }),
+                3,
+                'raw-doc-path-token',
+            );
+
+            // Common 3. Default orderBy: '' pagination with deleted returned boundary doc & altered pageSize.
+            const defaultP1 = await listDocumentsPage(fs.firestore, { parent, collectionId, pageSize: 2 });
+            const defaultP1Ids = docIdsFromRaw(defaultP1.documents);
+            expect(defaultP1Ids).toHaveLength(2);
+            expect(defaultP1.nextPageToken).not.toBe('');
+
+            const deletedBoundaryId = defaultP1Ids[defaultP1Ids.length - 1];
+            await col.doc(deletedBoundaryId).delete();
+            const defaultP2AfterDel = await listDocumentsPage(fs.firestore, {
+                parent,
+                collectionId,
+                pageSize: 2,
+                pageToken: defaultP1.nextPageToken,
+            });
+            const defaultP2Ids = docIdsFromRaw(defaultP2AfterDel.documents);
+            expect(defaultP2AfterDel.nextPageToken).toBe('');
+            if (!fs.enterprise) {
+                expect(defaultP1Ids).toEqual(['a', 'b']);
+                expect(defaultP2Ids).toEqual(['c', 'd']);
+            } else {
+                expect(defaultP2Ids).toHaveLength(2);
+                expect(defaultP2Ids).not.toContain(deletedBoundaryId);
+                expect([...defaultP1Ids, ...defaultP2Ids]).toIncludeSameMembers(['a', 'b', 'c', 'd']);
+            }
+
+            // Restore deleted boundary doc, then verify altering pageSize (1 -> 3) succeeds.
+            await col.doc(deletedBoundaryId).set(writeData(seedDocs[deletedBoundaryId]));
+            const size1P1 = await listDocumentsPage(fs.firestore, { parent, collectionId, pageSize: 1 });
+            expect(size1P1.documents).toHaveLength(1);
+            expect(size1P1.nextPageToken).not.toBe('');
+            const size3P2 = await listDocumentsPage(fs.firestore, {
+                parent,
+                collectionId,
+                pageSize: 3,
+                pageToken: size1P1.nextPageToken,
+            });
+            expect(size3P2.documents).toHaveLength(3);
+            expect(size3P2.nextPageToken).toBe('');
+            expect([...docIdsFromRaw(size1P1.documents), ...docIdsFromRaw(size3P2.documents)]).toIncludeSameMembers(['a', 'b', 'c', 'd']);
+
+            // Common 4. Reusing showMissing: false token with showMissing: true -> 3 INVALID_ARGUMENT,
+            //           and showMissing: true + orderBy: '__name__' -> 3 INVALID_ARGUMENT.
+            await expectRpcCode(
+                () =>
+                    listDocumentsPage(fs.firestore, {
+                        parent,
+                        collectionId,
+                        pageSize: 2,
+                        showMissing: true,
+                        pageToken: size1P1.nextPageToken,
+                    }),
+                3,
+                'reuse-show-missing-false-to-true',
+            );
+
+            const missColId = 'missingPaged';
+            const missCol = parentDoc.collection(missColId);
+            await Promise.all([
+                missCol.doc('d1').set(writeData({ v: 1 })),
+                missCol
+                    .doc('d2')
+                    .collection('sub')
+                    .doc('s1')
+                    .set(writeData({ v: 2 })),
+                missCol
+                    .doc('d3')
+                    .collection('sub')
+                    .doc('s1')
+                    .set(writeData({ v: 3 })),
+                missCol.doc('d4').set(writeData({ v: 4 })),
+            ]);
+
+            await expectRpcCode(
+                () =>
+                    listDocumentsPage(fs.firestore, {
+                        parent,
+                        collectionId: missColId,
+                        showMissing: true,
+                        orderBy: '__name__',
+                    }),
+                3,
+                'show-missing-with-order-by',
+            );
+
+            if (!fs.enterprise) {
+                // Standard: garbage pageToken with orderBy -> 3 INVALID_ARGUMENT.
+                await expectRpcCode(
+                    () =>
+                        listDocumentsPage(fs.firestore, {
+                            parent,
+                            collectionId,
+                            pageSize: 2,
+                            orderBy: 'rank asc',
+                            pageToken: 'garbage-token',
+                        }),
+                    3,
+                    'non-empty-orderby-garbage-token',
+                );
+
+                // Standard: deleted & mutated boundary doc under orderBy ASC.
+                const ascP1 = await listDocumentsPage(fs.firestore, { parent, collectionId, pageSize: 2, orderBy: 'rank asc' });
+                expect(docIdsFromRaw(ascP1.documents)).toEqual(['a', 'b']);
+                expect(ascP1.nextPageToken).not.toBe('');
+
+                await col.doc('b').delete();
+                const ascP2AfterDel = await listDocumentsPage(fs.firestore, {
+                    parent,
+                    collectionId,
+                    pageSize: 2,
+                    orderBy: 'rank asc',
+                    pageToken: ascP1.nextPageToken,
+                });
+                expect(docIdsFromRaw(ascP2AfterDel.documents)).toEqual(['c', 'd']);
+                expect(ascP2AfterDel.nextPageToken).toBe('');
+
+                await col.doc('b').set(writeData(seedDocs.b));
+                const ascP1Reset = await listDocumentsPage(fs.firestore, { parent, collectionId, pageSize: 2, orderBy: 'rank asc' });
+                expect(docIdsFromRaw(ascP1Reset.documents)).toEqual(['a', 'b']);
+
+                await col.doc('b').update({ rank: 0 });
+                const ascP2MovedEarlier = await listDocumentsPage(fs.firestore, {
+                    parent,
+                    collectionId,
+                    pageSize: 2,
+                    orderBy: 'rank asc',
+                    pageToken: ascP1Reset.nextPageToken,
+                });
+                expect(docIdsFromRaw(ascP2MovedEarlier.documents)).toEqual(['c', 'd']);
+
+                await col.doc('b').update({ rank: 5 });
+                const ascP2MovedLater = await listDocumentsPage(fs.firestore, {
+                    parent,
+                    collectionId,
+                    pageSize: 3,
+                    orderBy: 'rank asc',
+                    pageToken: ascP1Reset.nextPageToken,
+                });
+                expect(docIdsFromRaw(ascP2MovedLater.documents)).toEqual(['c', 'd', 'b']);
+                await col.doc('b').update({ rank: 2 });
+
+                // Standard: deleted & mutated boundary doc under orderBy DESC.
+                const descP1 = await listDocumentsPage(fs.firestore, { parent, collectionId, pageSize: 2, orderBy: 'rank desc' });
+                expect(docIdsFromRaw(descP1.documents)).toEqual(['d', 'c']);
+                expect(descP1.nextPageToken).not.toBe('');
+
+                await col.doc('c').delete();
+                const descP2AfterDel = await listDocumentsPage(fs.firestore, {
+                    parent,
+                    collectionId,
+                    pageSize: 2,
+                    orderBy: 'rank desc',
+                    pageToken: descP1.nextPageToken,
+                });
+                expect(docIdsFromRaw(descP2AfterDel.documents)).toEqual(['b', 'a']);
+                expect(descP2AfterDel.nextPageToken).toBe('');
+
+                await col.doc('c').set(writeData(seedDocs.c));
+                const descP1Reset = await listDocumentsPage(fs.firestore, { parent, collectionId, pageSize: 2, orderBy: 'rank desc' });
+                await col.doc('c').update({ rank: 5 });
+                const descP2MovedEarlier = await listDocumentsPage(fs.firestore, {
+                    parent,
+                    collectionId,
+                    pageSize: 2,
+                    orderBy: 'rank desc',
+                    pageToken: descP1Reset.nextPageToken,
+                });
+                expect(docIdsFromRaw(descP2MovedEarlier.documents)).toEqual(['b', 'a']);
+
+                await col.doc('c').update({ rank: 0 });
+                const descP2MovedLater = await listDocumentsPage(fs.firestore, {
+                    parent,
+                    collectionId,
+                    pageSize: 3,
+                    orderBy: 'rank desc',
+                    pageToken: descP1Reset.nextPageToken,
+                });
+                expect(docIdsFromRaw(descP2MovedLater.documents)).toEqual(['b', 'a', 'c']);
+                await col.doc('c').update({ rank: 3 });
+
+                // Standard: mask omitting order_by field (and empty mask).
+                const maskedP1 = await listDocumentsPage(fs.firestore, {
+                    parent,
+                    collectionId,
+                    pageSize: 2,
+                    orderBy: 'rank desc',
+                    mask: { fieldPaths: ['label'] },
+                });
+                expect(docIdsFromRaw(maskedP1.documents)).toEqual(['d', 'c']);
+                expect(Object.keys(maskedP1.documents[0].fields ?? {})).toEqual(['label']);
+                const maskedP2 = await listDocumentsPage(fs.firestore, {
+                    parent,
+                    collectionId,
+                    pageSize: 3,
+                    orderBy: 'rank desc',
+                    mask: { fieldPaths: ['label'] },
+                    pageToken: maskedP1.nextPageToken,
+                });
+                expect(docIdsFromRaw(maskedP2.documents)).toEqual(['b', 'a']);
+                expect(Object.keys(maskedP2.documents[0].fields ?? {})).toEqual(['label']);
+
+                const emptyMaskP1 = await listDocumentsPage(fs.firestore, {
+                    parent,
+                    collectionId,
+                    pageSize: 2,
+                    orderBy: 'rank asc',
+                    mask: { fieldPaths: [] },
+                });
+                expect(docIdsFromRaw(emptyMaskP1.documents)).toEqual(['a', 'b']);
+                expect(emptyMaskP1.documents[0].fields ?? {}).toEqual({});
+                const emptyMaskP2 = await listDocumentsPage(fs.firestore, {
+                    parent,
+                    collectionId,
+                    pageSize: 2,
+                    orderBy: 'rank asc',
+                    mask: { fieldPaths: [] },
+                    pageToken: emptyMaskP1.nextPageToken,
+                });
+                expect(docIdsFromRaw(emptyMaskP2.documents)).toEqual(['c', 'd']);
+
+                // Standard: tied sort keys (ASC and DESC) with deleted boundary doc.
+                const tieColId = 'tiedDocs';
+                const tieCol = parentDoc.collection(tieColId);
+                await Promise.all([
+                    tieCol.doc('t1').set(writeData({ rank: 10 })),
+                    tieCol.doc('t2').set(writeData({ rank: 10 })),
+                    tieCol.doc('t3').set(writeData({ rank: 10 })),
+                    tieCol.doc('t4').set(writeData({ rank: 10 })),
+                ]);
+
+                const tieAscP1 = await listDocumentsPage(fs.firestore, {
+                    parent,
+                    collectionId: tieColId,
+                    pageSize: 2,
+                    orderBy: 'rank asc',
+                });
+                expect(docIdsFromRaw(tieAscP1.documents)).toEqual(['t1', 't2']);
+                await tieCol.doc('t2').delete();
+                const tieAscP2 = await listDocumentsPage(fs.firestore, {
+                    parent,
+                    collectionId: tieColId,
+                    pageSize: 2,
+                    orderBy: 'rank asc',
+                    pageToken: tieAscP1.nextPageToken,
+                });
+                expect(docIdsFromRaw(tieAscP2.documents)).toEqual(['t3', 't4']);
+
+                await tieCol.doc('t2').set(writeData({ rank: 10 }));
+                const tieDescP1 = await listDocumentsPage(fs.firestore, {
+                    parent,
+                    collectionId: tieColId,
+                    pageSize: 2,
+                    orderBy: 'rank desc',
+                });
+                expect(docIdsFromRaw(tieDescP1.documents)).toEqual(['t4', 't3']);
+                await tieCol.doc('t3').delete();
+                const tieDescP2 = await listDocumentsPage(fs.firestore, {
+                    parent,
+                    collectionId: tieColId,
+                    pageSize: 2,
+                    orderBy: 'rank desc',
+                    pageToken: tieDescP1.nextPageToken,
+                });
+                expect(docIdsFromRaw(tieDescP2.documents)).toEqual(['t2', 't1']);
+
+                // Standard: multi-clause `orderBy: 'rank asc, other desc'` with tied `rank` and tied `other`
+                // values across page boundaries (proving 3-element cursors and implicit `__name__ DESC`).
+                const multiColId = 'multiOrderDocs';
+                const multiCol = parentDoc.collection(multiColId);
+                await Promise.all([
+                    multiCol.doc('m1').set(writeData({ rank: 1, other: 20 })),
+                    multiCol.doc('m2').set(writeData({ rank: 1, other: 20 })),
+                    multiCol.doc('m3').set(writeData({ rank: 1, other: 20 })),
+                    multiCol.doc('m4').set(writeData({ rank: 1, other: 10 })),
+                    multiCol.doc('m7').set(writeData({ rank: 1, other: 10 })),
+                    multiCol.doc('m5').set(writeData({ rank: 2, other: 30 })),
+                    multiCol.doc('m6').set(writeData({ rank: 2, other: 30 })),
+                ]);
+
+                const multiP1 = await listDocumentsPage(fs.firestore, {
+                    parent,
+                    collectionId: multiColId,
+                    pageSize: 2,
+                    orderBy: 'rank asc, other desc',
+                });
+                expect(docIdsFromRaw(multiP1.documents)).toEqual(['m3', 'm2']);
+                expect(multiP1.nextPageToken).not.toBe('');
+
+                await multiCol.doc('m2').delete();
+                const multiP2 = await listDocumentsPage(fs.firestore, {
+                    parent,
+                    collectionId: multiColId,
+                    pageSize: 2,
+                    orderBy: 'rank asc, other desc',
+                    pageToken: multiP1.nextPageToken,
+                });
+                expect(docIdsFromRaw(multiP2.documents)).toEqual(['m1', 'm7']);
+                expect(multiP2.nextPageToken).not.toBe('');
+
+                const multiP3 = await listDocumentsPage(fs.firestore, {
+                    parent,
+                    collectionId: multiColId,
+                    pageSize: 2,
+                    orderBy: 'rank asc, other desc',
+                    pageToken: multiP2.nextPageToken,
+                });
+                expect(docIdsFromRaw(multiP3.documents)).toEqual(['m4', 'm6']);
+                expect(multiP3.nextPageToken).not.toBe('');
+
+                const multiP4 = await listDocumentsPage(fs.firestore, {
+                    parent,
+                    collectionId: multiColId,
+                    pageSize: 2,
+                    orderBy: 'rank asc, other desc',
+                    pageToken: multiP3.nextPageToken,
+                });
+                expect(docIdsFromRaw(multiP4.documents)).toEqual(['m5']);
+                expect(multiP4.nextPageToken).toBe('');
+
+                // Standard: backtick-quoted comma field in orderBy and invalid direction -> 3 INVALID_ARGUMENT.
+                const commaP1 = await listDocumentsPage(fs.firestore, {
+                    parent,
+                    collectionId,
+                    pageSize: 2,
+                    orderBy: '`a,b` desc',
+                });
+                expect(docIdsFromRaw(commaP1.documents)).toEqual(['d', 'c']);
+                const commaP2 = await listDocumentsPage(fs.firestore, {
+                    parent,
+                    collectionId,
+                    pageSize: 2,
+                    orderBy: '`a,b` desc',
+                    pageToken: commaP1.nextPageToken,
+                });
+                expect(docIdsFromRaw(commaP2.documents)).toEqual(['b', 'a']);
+
+                await expectRpcCode(
+                    () => listDocumentsPage(fs.firestore, { parent, collectionId, orderBy: 'rank sideways' }),
+                    3,
+                    'invalid-order-by-direction',
+                );
+
+                // Standard: reusing pageToken with altered orderBy (including `'rank'` or `'rank asc, __name__ asc'`),
+                //           mask, collectionId, or parent -> 3 INVALID_ARGUMENT; altering pageSize succeeds.
+                const probeToken = ascP1Reset.nextPageToken;
+                for (const [label, badOrder] of [
+                    ['reuse-altered-direction', 'rank desc'],
+                    ['reuse-altered-field', 'other asc'],
+                    ['reuse-omitted-orderby', ''],
+                    ['reuse-implicit-dir-orderby', 'rank'],
+                    ['reuse-explicit-name-orderby', 'rank asc, __name__ asc'],
+                ] as const) {
+                    await expectRpcCode(
+                        () =>
+                            listDocumentsPage(fs.firestore, {
+                                parent,
+                                collectionId,
+                                pageSize: 2,
+                                orderBy: badOrder,
+                                pageToken: probeToken,
+                            }),
+                        3,
+                        label,
+                    );
+                }
+                await expectRpcCode(
+                    () =>
+                        listDocumentsPage(fs.firestore, {
+                            parent,
+                            collectionId,
+                            pageSize: 2,
+                            orderBy: 'rank desc',
+                            mask: { fieldPaths: ['other'] },
+                            pageToken: maskedP1.nextPageToken,
+                        }),
+                    3,
+                    'reuse-altered-mask',
+                );
+                await expectRpcCode(
+                    () =>
+                        listDocumentsPage(fs.firestore, {
+                            parent,
+                            collectionId,
+                            pageSize: 2,
+                            orderBy: 'rank desc',
+                            pageToken: maskedP1.nextPageToken,
+                        }),
+                    3,
+                    'reuse-omitted-mask',
+                );
+                await expectRpcCode(
+                    () =>
+                        listDocumentsPage(fs.firestore, {
+                            parent,
+                            collectionId: tieColId,
+                            pageSize: 2,
+                            orderBy: 'rank asc',
+                            pageToken: probeToken,
+                        }),
+                    3,
+                    'reuse-altered-collection-id',
+                );
+                const otherParent = `${dbRoot}/documents/${fs.collection.doc().path}`;
+                await expectRpcCode(
+                    () =>
+                        listDocumentsPage(fs.firestore, {
+                            parent: otherParent,
+                            collectionId,
+                            pageSize: 2,
+                            orderBy: 'rank asc',
+                            pageToken: probeToken,
+                        }),
+                    3,
+                    'reuse-altered-parent',
+                );
+
+                const alteredPageSize = await listDocumentsPage(fs.firestore, {
+                    parent,
+                    collectionId,
+                    pageSize: 1,
+                    orderBy: 'rank asc',
+                    pageToken: probeToken,
+                });
+                expect(docIdsFromRaw(alteredPageSize.documents)).toEqual(['c']);
+
+                // Standard: showMissing = true pagination across phantom docs + deleted phantom boundary doc.
+                const missP1 = await listDocumentsPage(fs.firestore, {
+                    parent,
+                    collectionId: missColId,
+                    pageSize: 2,
+                    showMissing: true,
+                });
+                expect(docIdsFromRaw(missP1.documents)).toEqual(['d1', 'd2']);
+                expect(missP1.documents[0].createTime).toBeDefined();
+                expect(missP1.documents[1].createTime).toBeNil();
+                expect(missP1.nextPageToken).not.toBe('');
+
+                await expectRpcCode(
+                    () =>
+                        listDocumentsPage(fs.firestore, {
+                            parent,
+                            collectionId: missColId,
+                            pageSize: 2,
+                            showMissing: false,
+                            pageToken: missP1.nextPageToken,
+                        }),
+                    3,
+                    'reuse-show-missing-true-to-false',
+                );
+
+                await missCol.doc('d2').collection('sub').doc('s1').delete();
+                const missP2 = await listDocumentsPage(fs.firestore, {
+                    parent,
+                    collectionId: missColId,
+                    pageSize: 2,
+                    showMissing: true,
+                    pageToken: missP1.nextPageToken,
+                });
+                expect(docIdsFromRaw(missP2.documents)).toEqual(['d3', 'd4']);
+                expect(missP2.documents[0].createTime).toBeNil();
+                expect(missP2.documents[1].createTime).toBeDefined();
+                expect(missP2.nextPageToken).toBe('');
+            } else {
+                // Enterprise Edition rejects ALL non-empty orderBy in ListDocuments.
+                for (const badOrder of ['__name__', 'rank asc', '`a,b` desc', 'rank sideways']) {
+                    await expectRpcCode(
+                        () => listDocumentsPage(fs.firestore, { parent, collectionId, orderBy: badOrder }),
+                        3,
+                        `enterprise-rejects-orderby-${badOrder}`,
+                    );
+                }
+
+                // Enterprise: showMissing = false omits phantom docs, and unpaginated showMissing = true
+                // returns all real + phantom docs.
+                const noPhantom = await listDocumentsPage(fs.firestore, {
+                    parent,
+                    collectionId: missColId,
+                    showMissing: false,
+                });
+                expect(docIdsFromRaw(noPhantom.documents)).toIncludeSameMembers(['d1', 'd4']);
+
+                const allWithMissing = await listDocumentsPage(fs.firestore, {
+                    parent,
+                    collectionId: missColId,
+                    showMissing: true,
+                });
+                expect(docIdsFromRaw(allWithMissing.documents)).toIncludeSameMembers(['d1', 'd2', 'd3', 'd4']);
+                expect(allWithMissing.nextPageToken).toBe('');
+                for (const doc of allWithMissing.documents) {
+                    const id = doc.name?.slice(doc.name.lastIndexOf('/') + 1);
+                    if (id === 'd1' || id === 'd4') {
+                        expect(doc.createTime).toBeDefined();
+                    } else {
+                        expect(doc.createTime).toBeNil();
+                    }
+                }
+
+                // Cloud Enterprise drops phantom docs once paginated with pageSize, whereas the Rust
+                // emulator preserves phantom docs across pages (required by the Web UI).
+                const missP1 = await listDocumentsPage(fs.firestore, {
+                    parent,
+                    collectionId: missColId,
+                    pageSize: 2,
+                    showMissing: true,
+                });
+                expect(missP1.documents).toHaveLength(2);
+                expect(missP1.nextPageToken).not.toBe('');
+
+                await expectRpcCode(
+                    () =>
+                        listDocumentsPage(fs.firestore, {
+                            parent,
+                            collectionId: missColId,
+                            pageSize: 2,
+                            showMissing: false,
+                            pageToken: missP1.nextPageToken,
+                        }),
+                    3,
+                    'enterprise-reuse-show-missing-true-to-false',
+                );
+
+                const missP2 = await listDocumentsPage(fs.firestore, {
+                    parent,
+                    collectionId: missColId,
+                    pageSize: 3,
+                    showMissing: true,
+                    pageToken: missP1.nextPageToken,
+                });
+                expect(missP2.nextPageToken).toBe('');
+                const allMissingDocs = [...missP1.documents, ...missP2.documents];
+                const allMissingIds = docIdsFromRaw(allMissingDocs);
+                expect(uniq(allMissingIds)).toHaveLength(allMissingIds.length);
+                expect(['d1', 'd2', 'd3', 'd4']).toIncludeAllMembers(allMissingIds);
+                if (connection !== 'CLOUD FIRESTORE') {
+                    expect(allMissingIds).toIncludeSameMembers(['d1', 'd2', 'd3', 'd4']);
+                }
+                for (const doc of allMissingDocs) {
+                    const id = doc.name?.slice(doc.name.lastIndexOf('/') + 1);
+                    if (id === 'd1' || id === 'd4') {
+                        expect(doc.createTime).toBeDefined();
+                    } else {
+                        expect(doc.createTime).toBeNil();
+                    }
+                }
+            }
+        }, 30_000);
 
         test('listCollections', async () => {
             const scope = fs.collection.doc();
