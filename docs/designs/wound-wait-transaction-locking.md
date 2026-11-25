@@ -1,7 +1,7 @@
 # Wound-Wait Transaction Locking & Internal Lock Module
 
 *   **Author:** Paco
-*   **Status:** Draft (Post-Round-2 Revision)
+*   **Status:** Implemented
 *   **Date:** 2026-11-19
 
 --------------------------------------------------------------------------------

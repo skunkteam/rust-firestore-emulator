@@ -57,6 +57,7 @@
             nixfmt-rfc-style
             # Additional project dependencies.
             just
+            nodejs
             cargo-llvm-cov
             cargo-mutants
             cargo-nextest
@@ -77,7 +78,7 @@
         #
         # You can even run the emulator without manually doing a local checkout of this repository
         # with `nix run github:skunkteam/rust-firestore-emulator -- ARGS`.
-        defaultPackage = rust-builder.buildPackage {
+        packages.default = rust-builder.buildPackage {
           src = self;
           # Naersk can't deal with `version = { workspace = true }` for the root package, so extract
           # it manually:

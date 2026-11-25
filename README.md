@@ -14,16 +14,19 @@ This repository provides a Rust alternative to the official Java-based Firebase 
 
 ### Missing Features
 
-Because the implementation is driven by consumed features, some advanced or edge-case features remain unimplemented:
+Because the implementation is driven by consumed features, several advanced or out-of-scope features remain unimplemented. Unimplemented gRPC and database features use custom crate macros (not panicking `std::unimplemented!`) that log a warning and return structured `UNIMPLEMENTED` (`gRPC 12` / `HTTP 501`) errors:
 
-- Some updates with Transforms (such as `Maximum` and `Minimum`)
-- Multiplexing listeners in a single stream (used by frontend Firestore SDKs; `Listener` enforces a single active target with `target_id == 1`)
-- Explain options
-- Additional unimplemented gRPC endpoints (`partition_query`, `write`) or request options guarded by `unimplemented!` macros across the codebase.
+- **Enterprise Edition pipelines (partial support)**: 8 pipeline stages remain unimplemented (`collectionGroup`, `database`, `documents`, `createFrom`, `replaceWith`, `sample`, `union`, `unnest`), along with ~70% of scalar/logic/search expressions, 6 of 12 aggregate accumulators (`countIf`, `countDistinct`, `first`, `last`, `arrayAgg`, `arrayAggDistinct`), `VariableReferenceValue`/`PipelineValue`, and `auto_commit_transaction`.
+- **REST API Phase-2 endpoints (`501 UNIMPLEMENTED`)**: 8 custom verbs (`:commit`, `:batchGet`, `:batchWrite`, `:beginTransaction`, `:rollback`, `:runAggregationQuery`, `:executePipeline`, `:partitionQuery`), transactional reads/`:runQuery`, REST `findNearest`, REST `:listCollectionIds` with `readTime`, and Admin API `firestoreDataAccessMode`/`mongodbCompatibleDataAccessMode`/`realtimeUpdatesMode` fields.
+- **No Firebase Web/Mobile client SDK (`firebase/firestore`) support**: The bidirectional `Write` gRPC stream is unimplemented, and `Listen` enforces a single active target (`target_id == 1`, a single document in `DocumentsTarget`, no `RemoveTarget`, and no `once`/`expected_count` options).
+- **Non-goals / out-of-scope Cloud features**: No Security Rules or Authentication emulation, no on-disk persistence or import/export, and no Standard Edition composite index enforcement.
+- **Other unimplemented gRPC / database options**: `Maximum` and `Minimum` field transforms (and standalone `Write.operation = Transform`), `PartitionQuery`, `explain_options`, `request_options`, `TransactionOptions.read_write.concurrency_mode`, and `ListDocuments` with `show_missing` when `collection_id` is empty.
 
 ### Usage & Development Workflow
 
 #### Prerequisites
+
+When building from source, initialize the `crates/googleapis/include` protobuf submodule (`git clone --recursive` or `git submodule update --init`) and install `protoc`:
 
 ```shell
 brew install protobuf
@@ -34,6 +37,52 @@ For executing the test-suite and development tools, `just` and `node` are recomm
 ```shell
 brew install just node
 ```
+
+#### Installation & Standalone Server
+
+Download the prebuilt Linux x86_64 headless GitHub Release tarball (compiled with `--no-default-features` for CI runners):
+
+```shell
+curl -fsSL https://github.com/skunkteam/rust-firestore-emulator/releases/latest/download/firestore-emulator.tar.gz | tar -xz
+FIRESTORE_EMULATOR_HOST=127.0.0.1:8080 ./firestore-emulator
+```
+
+Or run directly with Nix (includes the default `ui` Web UI feature):
+
+```shell
+nix run github:skunkteam/rust-firestore-emulator -- --host-port 127.0.0.1:8080
+```
+
+Or install via Cargo (requires `protoc`; includes the default `ui` feature for local use):
+
+```shell
+# From GitHub:
+cargo install --git https://github.com/skunkteam/rust-firestore-emulator
+
+# Or from a local checkout (after `git submodule update --init`):
+cargo install --path .
+
+FIRESTORE_EMULATOR_HOST=127.0.0.1:8080 firestore-emulator
+```
+
+Run locally from source in debug or release mode:
+
+```shell
+FIRESTORE_EMULATOR_HOST=127.0.0.1:8080 cargo run
+FIRESTORE_EMULATOR_HOST=127.0.0.1:8080 cargo run --release
+```
+
+#### CLI Flags & Environment Variables
+
+| CLI Flag | Environment Variable | Description |
+| :--- | :--- | :--- |
+| `--host-port <HOST:PORT>` | `FIRESTORE_EMULATOR_HOST` | Required `SocketAddr` to bind the multiplexed gRPC/HTTP listener (use `127.0.0.1:0` for an ephemeral port). |
+| `--long-contention-timeout` | `FIRESTORE_EMULATOR_LONG_CONTENTION_TIMEOUT` | Use Cloud-like lock contention timeouts (`15s` write / `16s` read) instead of fast test defaults (`2s` write / `5s` read). |
+| `--default-enterprise` | `FIRESTORE_EMULATOR_DEFAULT_ENTERPRISE` | Default newly created databases to Enterprise Edition (optimistic concurrency) instead of Standard Edition. |
+| `--transaction-idle-timeout-ms <MS>` | `FIRESTORE_EMULATOR_TRANSACTION_IDLE_TIMEOUT_MS` | Optional positive override (ms) for active transaction idle timeout (defaults to `60s` unused / `120s` used minimum). |
+| `--transaction-max-lifetime-ms <MS>` | `FIRESTORE_EMULATOR_TRANSACTION_MAX_LIFETIME_MS` | Optional positive override (ms) for active transaction maximum lifetime (defaults to `270s`). |
+
+Additional runtime environment variables: `RUST_LOG` controls tracing verbosity (e.g. `RUST_LOG=info`), and in debug builds with the `ui` feature enabled, `FIRESTORE_EMULATOR_UI_DIR` overrides the on-disk `ui/` asset directory.
 
 #### Building and Testing
 
@@ -83,27 +132,6 @@ npm run test:rust-emulator
 ```shell
 cd test-suite/
 npm run test:java-emulator
-```
-
-#### Standalone Server Starts
-
-Run locally in debug-mode:
-
-```shell
-FIRESTORE_EMULATOR_HOST=127.0.0.1:8080 cargo run
-```
-
-Run locally in release-mode:
-
-```shell
-FIRESTORE_EMULATOR_HOST=127.0.0.1:8080 cargo run --release
-```
-
-Install directly via Cargo (includes the default `ui` feature for local use; prebuilt GitHub Release tarballs omit `ui` via `--no-default-features` for headless CI environments):
-
-```shell
-cargo install --path .
-FIRESTORE_EMULATOR_HOST=127.0.0.1:8080 firestore-emulator
 ```
 
 ## Subdirectories & System Boundaries
