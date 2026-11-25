@@ -706,7 +706,7 @@ impl FirestoreDatabase {
             .transpose()?;
 
         let mut query = builder.build()?;
-        let (_, found_docs) = query.once(self).await?;
+        let (read_time, found_docs) = query.once(self).await?;
         let mut documents: Vec<Document> = found_docs
             .iter()
             .filter(|v| {
@@ -718,7 +718,10 @@ impl FirestoreDatabase {
             .collect();
 
         let existing_names: HashSet<String> = documents.iter().map(|d| d.name.clone()).collect();
-        for missing_name in query.missing_docs_after(self, cursor_name).await? {
+        for missing_name in query
+            .missing_docs_at(self, Some(read_time), cursor_name)
+            .await?
+        {
             if !existing_names.contains(&missing_name) {
                 documents.push(Document {
                     name: missing_name,
@@ -2544,7 +2547,7 @@ mod tests {
         assert_eq!(miss_tok, "");
         assert!(
             db.peek_doc_meta(&d1_ref).await.unwrap().is_none(),
-            "missing_docs_after must not invoke get_doc on skipped ancestor <= cursor"
+            "missing_docs_at must not allocate DocumentMeta on skipped ancestor <= cursor"
         );
     }
 

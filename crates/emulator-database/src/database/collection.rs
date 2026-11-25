@@ -1,5 +1,6 @@
 use std::{collections::HashMap, ops::Deref, sync::Arc};
 
+use googleapis::google::protobuf::Timestamp;
 use string_cache::DefaultAtom;
 use tokio::sync::RwLock;
 use tracing::{Level, instrument};
@@ -67,5 +68,15 @@ impl Collection {
         &self,
     ) -> tokio::sync::RwLockWriteGuard<'_, HashMap<DefaultAtom, Arc<DocumentMeta>>> {
         self.documents.write().await
+    }
+
+    /// Checks if this collection has a document existing at `time` without acquiring `LockTable`
+    /// locks.
+    pub(crate) async fn has_doc_at(&self, time: Timestamp) -> bool {
+        self.documents
+            .read()
+            .await
+            .values()
+            .any(|doc| doc.read_mvcc_at(time).is_some())
     }
 }

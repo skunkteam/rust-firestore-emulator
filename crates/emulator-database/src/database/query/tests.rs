@@ -1737,3 +1737,186 @@ async fn enterprise_all_descendants_empty_order_by_is_deterministic_in_firestore
 
     Ok(())
 }
+
+#[gtest]
+#[tokio::test]
+async fn missing_docs_and_list_docs_default_do_not_block_on_held_write_locks() -> Result<()> {
+    use googleapis::google::protobuf::Timestamp;
+
+    use crate::{database::DocumentRef, reference::Ref};
+
+    let database = fresh_database()?;
+    let t_before = Timestamp::now();
+
+    let existing_ref: DocumentRef = format!("{}/users/existing", database.name).parse()?;
+    let phantom_a_ref: DocumentRef = format!("{}/users/phantom-a", database.name).parse()?;
+    let child_a_ref: DocumentRef =
+        format!("{}/users/phantom-a/sub/child", database.name).parse()?;
+    let phantom_b_ref: DocumentRef = format!("{}/users/phantom-b", database.name).parse()?;
+    let child_b_ref: DocumentRef =
+        format!("{}/users/phantom-b/sub/child", database.name).parse()?;
+    let phantom_c_ref: DocumentRef = format!("{}/users/phantom-c", database.name).parse()?;
+    let child_c_ref: DocumentRef =
+        format!("{}/users/phantom-c/sub/child", database.name).parse()?;
+
+    let write_doc = |doc_ref: &DocumentRef, val: i64| {
+        let name = doc_ref.to_string();
+        assert_ready_ok!(
+            spawn(database.write(Write {
+                operation: Some(write::Operation::Update(Document {
+                    name,
+                    fields: [("v".to_string(), Value::integer(val))].into(),
+                    ..Default::default()
+                })),
+                ..Default::default()
+            }))
+            .poll_until_idle()
+        );
+    };
+
+    write_doc(&existing_ref, 1);
+    write_doc(&child_a_ref, 2);
+    let t_mid = Timestamp::now();
+
+    write_doc(&child_b_ref, 3);
+    write_doc(&child_c_ref, 4);
+    let t_all = Timestamp::now();
+
+    assert_ready_ok!(spawn(database.delete_doc(&child_c_ref, None)).poll_until_idle());
+
+    // Directly acquire exclusive WriteLeases on the phantom ancestor, its child doc, and a
+    // materialized sibling to verify MVCC paths never enter `LockTable` wait queues.
+    let lock_session = database.locks.new_session(
+        None,
+        SessionKind::SingleWrite,
+        LockPriority::NextSeq,
+        false,
+        false,
+    );
+    let lease_phantom =
+        assert_ready_ok!(spawn(lock_session.acquire_write(&phantom_a_ref)).poll_until_idle());
+    let lease_child =
+        assert_ready_ok!(spawn(lock_session.acquire_write(&child_a_ref)).poll_until_idle());
+    let lease_existing =
+        assert_ready_ok!(spawn(lock_session.acquire_write(&existing_ref)).poll_until_idle());
+
+    // Confirm a lock-acquiring `get_doc(Default)` blocks on the held write lock.
+    {
+        let mut blocked_read = spawn(database.get_doc(&phantom_a_ref, ReadConsistency::Default));
+        assert!(blocked_read.poll_until_idle().is_pending());
+    }
+
+    // `Collection::has_doc_at` evaluates MVCC snapshots directly without touching `LockTable`.
+    let sub_a_col = assert_ready!(
+        spawn(database.get_collection(&child_a_ref.collection_ref)).poll_until_idle()
+    );
+    let sub_b_col = assert_ready!(
+        spawn(database.get_collection(&child_b_ref.collection_ref)).poll_until_idle()
+    );
+    let sub_c_col = assert_ready!(
+        spawn(database.get_collection(&child_c_ref.collection_ref)).poll_until_idle()
+    );
+    assert!(!assert_ready!(
+        spawn(sub_a_col.has_doc_at(t_before)).poll_until_idle()
+    ));
+    assert!(assert_ready!(
+        spawn(sub_a_col.has_doc_at(t_mid)).poll_until_idle()
+    ));
+    assert!(!assert_ready!(
+        spawn(sub_b_col.has_doc_at(t_mid)).poll_until_idle()
+    ));
+    assert!(assert_ready!(
+        spawn(sub_c_col.has_doc_at(t_all)).poll_until_idle()
+    ));
+    assert!(!assert_ready!(
+        spawn(sub_c_col.has_doc_at(Timestamp::now())).poll_until_idle()
+    ));
+
+    // `Query::missing_docs` and `missing_docs_at` under `ReadConsistency::Default` complete
+    // immediately without blocking on the held write locks.
+    let users_col = CollectionRef::new(database.name.clone(), "users");
+    let default_query = QueryBuilder::from_collection(users_col.clone()).build()?;
+    let missing_default =
+        assert_ready_ok!(spawn(default_query.missing_docs(&database)).poll_until_idle());
+    assert_eq!(
+        missing_default,
+        vec![phantom_a_ref.to_string(), phantom_b_ref.to_string()]
+    );
+
+    let missing_after_a = assert_ready_ok!(
+        spawn(default_query.missing_docs_at(&database, None, Some(&phantom_a_ref.to_string())))
+            .poll_until_idle()
+    );
+    assert_eq!(missing_after_a, vec![phantom_b_ref.to_string()]);
+
+    // `FirestoreDatabase::list_docs(..., show_missing: true)` under `ReadConsistency::Default`
+    // completes immediately without blocking.
+    let (listed_default, next_tok) = assert_ready_ok!(
+        spawn(database.list_docs(
+            Ref::Root(database.name.clone()),
+            "users".to_string(),
+            0,
+            String::new(),
+            String::new(),
+            None,
+            true,
+            ReadConsistency::Default,
+        ))
+        .poll_until_idle()
+    );
+    assert_eq!(next_tok, "");
+    assert_eq!(
+        listed_default.iter().map(|d| d.name.as_str()).collect_vec(),
+        vec![
+            existing_ref.to_string(),
+            phantom_a_ref.to_string(),
+            phantom_b_ref.to_string(),
+        ]
+    );
+    assert!(listed_default[0].create_time.is_some());
+    assert!(listed_default[1].create_time.is_none());
+    assert!(listed_default[2].create_time.is_none());
+
+    // Historical `ReadTime` also completes lock-free and filters phantom ancestors by child MVCC
+    // existence at the requested timestamp.
+    let mid_query = QueryBuilder::from_collection(users_col)
+        .consistency(ReadConsistency::ReadTime(t_mid))
+        .build()?;
+    assert_eq!(
+        assert_ready_ok!(spawn(mid_query.missing_docs(&database)).poll_until_idle()),
+        vec![phantom_a_ref.to_string()]
+    );
+
+    let (listed_all, _) = assert_ready_ok!(
+        spawn(database.list_docs(
+            Ref::Root(database.name.clone()),
+            "users".to_string(),
+            0,
+            String::new(),
+            String::new(),
+            None,
+            true,
+            ReadConsistency::ReadTime(t_all),
+        ))
+        .poll_until_idle()
+    );
+    assert_eq!(
+        listed_all.iter().map(|d| d.name.as_str()).collect_vec(),
+        vec![
+            existing_ref.to_string(),
+            phantom_a_ref.to_string(),
+            phantom_b_ref.to_string(),
+            phantom_c_ref.to_string(),
+        ]
+    );
+
+    drop((lease_phantom, lease_child, lease_existing));
+    lock_session.close();
+
+    let unblocked = assert_ready_ok!(
+        spawn(database.get_doc(&phantom_a_ref, ReadConsistency::Default)).poll_until_idle()
+    );
+    assert!(unblocked.is_none());
+
+    Ok(())
+}

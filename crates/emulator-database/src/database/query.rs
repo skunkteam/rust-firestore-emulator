@@ -1050,14 +1050,18 @@ impl Query {
     /// Get the names of missing documents that match this query. A document is missing if it does
     /// not exist, but there are sub-documents nested underneath it.
     pub async fn missing_docs(&self, db: &FirestoreDatabase) -> Result<Vec<String>> {
-        self.missing_docs_after(db, None).await
+        self.missing_docs_at(db, None, None).await
     }
 
-    /// Like [`Query::missing_docs`], optionally skipping candidate ancestor paths `<= after_cursor`
-    /// in Firestore reference order before locking or reading documents via `db.get_doc`.
-    pub(crate) async fn missing_docs_after(
+    /// Like [`Query::missing_docs`], evaluating lock-free MVCC snapshots for
+    /// [`ReadConsistency::Default`] and [`ReadConsistency::ReadTime`] (using `snapshot_time`
+    /// when supplied, or resolving via [`FirestoreDatabase::get_read_time`]) while optionally
+    /// skipping candidate ancestor paths `<= after_cursor` in Firestore reference order before
+    /// inspecting collection or document state.
+    pub(crate) async fn missing_docs_at(
         &self,
         db: &FirestoreDatabase,
+        snapshot_time: Option<Timestamp>,
         after_cursor: Option<&str>,
     ) -> Result<Vec<String>> {
         let not_supported = [
@@ -1087,6 +1091,20 @@ impl Query {
             return Err(AbortReason::DatabaseCleared.into());
         }
 
+        let lock_free_ts = match self.consistency {
+            ReadConsistency::Default | ReadConsistency::ReadTime(_) => Some(match snapshot_time {
+                Some(ts) => {
+                    if db.is_cleared() {
+                        return Err(AbortReason::DatabaseCleared.into());
+                    }
+                    db.transactions.reap_if_due();
+                    ts
+                }
+                None => db.get_read_time(self.consistency).await?,
+            }),
+            ReadConsistency::Transaction(_) => None,
+        };
+
         // Checked above that self.from has exactly one non empty collection_id.
         // Lazy conversion using String rep, maybe replace with dedicated methods on refs.
         let parent: CollectionRef =
@@ -1115,14 +1133,26 @@ impl Query {
                     continue;
                 }
             }
-            if !col.has_doc().await? {
+            let has_doc = match lock_free_ts {
+                Some(ts) => col.has_doc_at(ts).await,
+                None => col.has_doc().await?,
+            };
+            if !has_doc {
                 continue;
             }
             all_docs.insert(DocumentRef::new(parent.clone(), document_id));
         }
         let mut result = vec![];
         for name in all_docs {
-            if db.get_doc(&name, self.consistency).await?.is_none() {
+            let is_missing = match lock_free_ts {
+                Some(ts) => db
+                    .peek_doc_meta(&name)
+                    .await?
+                    .and_then(|meta| meta.read_mvcc_at(ts))
+                    .is_none(),
+                None => db.get_doc(&name, self.consistency).await?.is_none(),
+            };
+            if is_missing {
                 result.push(name.to_string());
             }
         }
