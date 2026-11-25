@@ -1667,7 +1667,7 @@ async fn enterprise_all_descendants_empty_order_by_is_deterministic_in_firestore
     };
 
     // 1. Validate stays unsynthesized (`order_by` empty) while execution orders deterministically
-    //    via `cmp_firestore_order` (`doc/sub/...` before `doc-1/sub/...`, and `d1 < d2 < d3`).
+    //    via `DocumentRef::Ord` (`doc/sub/...` before `doc-1/sub/...`, and `d1 < d2 < d3`).
     let mut q = make_query(ReadConsistency::Default)?;
     assert!(q.order_by().is_empty());
     let (_, matches) = q.once(&database).await?;
