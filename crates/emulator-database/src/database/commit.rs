@@ -311,6 +311,13 @@ impl FirestoreDatabase {
             return Err(CommitError::Aborted(AbortReason::DatabaseCleared));
         }
 
+        if writes.is_empty() {
+            debug_assert!(write_leases.is_empty());
+            let time = session.commit_empty()?;
+            drop(_optimistic_guard);
+            return Ok((time, Vec::new()));
+        }
+
         let seal = Arc::clone(session).seal_for_commit(write_leases)?;
         let (time, results, _) = self.apply_sealed_commit_writes(seal, writes).await?;
         drop(_optimistic_guard);
@@ -1998,5 +2005,319 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(b_err, GenericDatabaseError::Aborted(_)));
+    }
+
+    #[tokio::test]
+    async fn strict_2pl_retains_read_locks_across_apply_sealed_commit_preserving_mvcc_and_event_order()
+     {
+        use tokio::sync::broadcast::error::TryRecvError;
+
+        let (_project, _root, db) = test_db().await;
+        db.set_config(false, false);
+
+        let c1_doc1: DocumentRef = "projects/p/databases/(default)/documents/c1/doc1"
+            .parse()
+            .unwrap();
+        let c2_doc2: DocumentRef = "projects/p/databases/(default)/documents/c2/doc2"
+            .parse()
+            .unwrap();
+
+        db.update_doc(
+            &c1_doc1,
+            HashMap::from([("v".to_string(), Value::integer(1))]),
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        db.update_doc(
+            &c2_doc2,
+            HashMap::from([("v".to_string(), Value::integer(1))]),
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let mut events = db.subscribe();
+        let col_c2 = db.get_collection(&c2_doc2.collection_ref).await;
+
+        let txn_a = db.new_txn(rw_txn_opts()).await.unwrap();
+        let read_a = db
+            .get_doc(&c1_doc1, ReadConsistency::Transaction(txn_a))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(read_a.fields.get("v"), Some(&Value::integer(1)));
+
+        // Hold `col_c2.documents.write()` so `txn_a` pauses inside `apply_sealed_commit_writes`
+        // AFTER `seal_for_commit` and BEFORE `DocumentMeta::apply_sealed_commit`.
+        let c2_guard = col_c2.documents_write().await;
+        let mut a_fut = Box::pin(db.commit(
+            vec![update_write(
+                &c2_doc2,
+                HashMap::from([("v".to_string(), Value::integer(2))]),
+                None,
+            )],
+            Some(txn_a),
+        ));
+        assert!(futures_util::poll!(&mut a_fut).is_pending());
+
+        let txn_b = db.new_txn(rw_txn_opts()).await.unwrap();
+        let db_b = std::sync::Arc::clone(&db);
+        let b_doc = c1_doc1.clone();
+        let b_handle = tokio::spawn(async move {
+            db_b.commit(
+                vec![update_write(
+                    &b_doc,
+                    HashMap::from([("v".to_string(), Value::integer(20))]),
+                    None,
+                )],
+                Some(txn_b),
+            )
+            .await
+        });
+
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(db.locks.contention_snapshot().total_contended_documents, 1);
+        assert!(
+            !b_handle.is_finished(),
+            "txn_b writing c1/doc1 must remain blocked while txn_a holds CommitSeal"
+        );
+
+        drop(c2_guard);
+        let (a_ts, _) = a_fut.await.unwrap();
+        let (b_ts, _) = b_handle.await.unwrap().unwrap();
+        assert!(
+            a_ts < b_ts,
+            "Strict 2PL requires commit_time(A) {a_ts:?} < commit_time(B) {b_ts:?}"
+        );
+
+        let ev_a = events.try_recv().expect("event A");
+        let ev_b = events.try_recv().expect("event B");
+        assert!(matches!(events.try_recv(), Err(TryRecvError::Empty)));
+        assert_eq!(ev_a.update_time, a_ts);
+        assert!(ev_a.updates.contains_key(&c2_doc2));
+        assert!(!ev_a.updates.contains_key(&c1_doc1));
+        assert_eq!(ev_b.update_time, b_ts);
+        assert!(ev_b.updates.contains_key(&c1_doc1));
+        assert!(!ev_b.updates.contains_key(&c2_doc2));
+
+        let snap_doc1_at_a = db
+            .get_doc(&c1_doc1, ReadConsistency::ReadTime(a_ts))
+            .await
+            .unwrap()
+            .unwrap();
+        let snap_doc2_at_a = db
+            .get_doc(&c2_doc2, ReadConsistency::ReadTime(a_ts))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(snap_doc1_at_a.fields.get("v"), Some(&Value::integer(1)));
+        assert_eq!(snap_doc2_at_a.fields.get("v"), Some(&Value::integer(2)));
+
+        let snap_doc1_at_b = db
+            .get_doc(&c1_doc1, ReadConsistency::ReadTime(b_ts))
+            .await
+            .unwrap()
+            .unwrap();
+        let snap_doc2_at_b = db
+            .get_doc(&c2_doc2, ReadConsistency::ReadTime(b_ts))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(snap_doc1_at_b.fields.get("v"), Some(&Value::integer(20)));
+        assert_eq!(snap_doc2_at_b.fields.get("v"), Some(&Value::integer(2)));
+        assert_eq!(db.locks.table_counts(), (0, 0));
+    }
+
+    #[tokio::test]
+    async fn empty_write_rw_commit_orders_before_blocked_writer_and_handles_optimistic_mode() {
+        let (_project, _root, db) = test_db().await;
+        db.set_config(false, false);
+
+        let c1_doc1: DocumentRef = "projects/p/databases/(default)/documents/c1/empty"
+            .parse()
+            .unwrap();
+        db.update_doc(
+            &c1_doc1,
+            HashMap::from([("v".to_string(), Value::integer(1))]),
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let txn_a = db.new_txn(rw_txn_opts()).await.unwrap();
+        let read_a = db
+            .get_doc(&c1_doc1, ReadConsistency::Transaction(txn_a))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(read_a.fields.get("v"), Some(&Value::integer(1)));
+
+        let txn_b = db.new_txn(rw_txn_opts()).await.unwrap();
+        let db_b = std::sync::Arc::clone(&db);
+        let b_doc = c1_doc1.clone();
+        let b_handle = tokio::spawn(async move {
+            db_b.commit(
+                vec![update_write(
+                    &b_doc,
+                    HashMap::from([("v".to_string(), Value::integer(2))]),
+                    None,
+                )],
+                Some(txn_b),
+            )
+            .await
+        });
+
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(db.locks.contention_snapshot().total_contended_documents, 1);
+        assert!(!b_handle.is_finished());
+
+        let (a_ts, a_res) = db.commit(vec![], Some(txn_a)).await.unwrap();
+        assert!(a_res.is_empty());
+        let (b_ts, _) = b_handle.await.unwrap().unwrap();
+        assert!(a_ts < b_ts);
+
+        assert!(matches!(
+            db.rollback(txn_a).await,
+            Err(GenericDatabaseError::Aborted(_))
+        ));
+
+        let at_a = db
+            .get_doc(&c1_doc1, ReadConsistency::ReadTime(a_ts))
+            .await
+            .unwrap()
+            .unwrap();
+        let at_b = db
+            .get_doc(&c1_doc1, ReadConsistency::ReadTime(b_ts))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(at_a.fields.get("v"), Some(&Value::integer(1)));
+        assert_eq!(at_b.fields.get("v"), Some(&Value::integer(2)));
+
+        // Optimistic empty-write RW commit succeeds even after an observed document changed.
+        db.set_config(true, true);
+        let txn_opt = db.new_txn(rw_txn_opts()).await.unwrap();
+        let read_opt = db
+            .get_doc(&c1_doc1, ReadConsistency::Transaction(txn_opt))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(read_opt.fields.get("v"), Some(&Value::integer(2)));
+        db.update_doc(
+            &c1_doc1,
+            HashMap::from([("v".to_string(), Value::integer(3))]),
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let (opt_ts, opt_res) = db.commit(vec![], Some(txn_opt)).await.unwrap();
+        assert!(opt_res.is_empty());
+        assert!(opt_ts > b_ts);
+        assert_eq!(db.locks.table_counts(), (0, 0));
+    }
+
+    #[tokio::test]
+    async fn sealed_commit_precondition_failure_releases_retained_reads_on_drop() {
+        let (_project, _root, db) = test_db().await;
+        db.set_config(false, false);
+
+        let c1_doc1: DocumentRef = "projects/p/databases/(default)/documents/c1/precond"
+            .parse()
+            .unwrap();
+        let c2_doc2: DocumentRef = "projects/p/databases/(default)/documents/c2/precond"
+            .parse()
+            .unwrap();
+        db.update_doc(
+            &c1_doc1,
+            HashMap::from([("v".to_string(), Value::integer(1))]),
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        db.update_doc(
+            &c2_doc2,
+            HashMap::from([("v".to_string(), Value::integer(1))]),
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let col_c2 = db.get_collection(&c2_doc2.collection_ref).await;
+        let txn_a = db.new_txn(rw_txn_opts()).await.unwrap();
+        let _unused = db
+            .get_doc(&c1_doc1, ReadConsistency::Transaction(txn_a))
+            .await
+            .unwrap()
+            .unwrap();
+
+        let c2_guard = col_c2.documents_write().await;
+        let mut a_fut = Box::pin(db.commit(
+            vec![update_write(
+                &c2_doc2,
+                HashMap::from([("v".to_string(), Value::integer(99))]),
+                Some(Precondition {
+                    condition_type: Some(precondition::ConditionType::Exists(false)),
+                }),
+            )],
+            Some(txn_a),
+        ));
+        assert!(futures_util::poll!(&mut a_fut).is_pending());
+
+        let txn_b = db.new_txn(rw_txn_opts()).await.unwrap();
+        let db_b = std::sync::Arc::clone(&db);
+        let b_doc = c1_doc1.clone();
+        let b_handle = tokio::spawn(async move {
+            db_b.commit(
+                vec![update_write(
+                    &b_doc,
+                    HashMap::from([("v".to_string(), Value::integer(2))]),
+                    None,
+                )],
+                Some(txn_b),
+            )
+            .await
+        });
+
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(db.locks.contention_snapshot().total_contended_documents, 1);
+        assert!(!b_handle.is_finished());
+
+        drop(c2_guard);
+        let err = a_fut.await.unwrap_err();
+        assert!(matches!(err, GenericDatabaseError::AlreadyExists(_)));
+
+        let _unused = b_handle.await.unwrap().unwrap();
+        let doc1 = db
+            .get_doc(&c1_doc1, ReadConsistency::Default)
+            .await
+            .unwrap()
+            .unwrap();
+        let doc2 = db
+            .get_doc(&c2_doc2, ReadConsistency::Default)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(doc1.fields.get("v"), Some(&Value::integer(2)));
+        assert_eq!(doc2.fields.get("v"), Some(&Value::integer(1)));
+        assert_eq!(db.locks.table_counts(), (0, 0));
     }
 }

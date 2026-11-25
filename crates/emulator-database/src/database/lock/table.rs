@@ -10,8 +10,8 @@ use googleapis::google::protobuf::Timestamp;
 use tokio::sync::oneshot;
 
 use super::{
-    ReadLease, STATE_CLEARED, STATE_COMMITTING, STATE_EXPIRED, STATE_TIMED_OUT, STATE_WOUNDED,
-    SessionAbortState, SessionSharedState, WriteLease,
+    ReadLease, STATE_CLEARED, STATE_CLOSED, STATE_COMMITTING, STATE_EXPIRED, STATE_TIMED_OUT,
+    STATE_WOUNDED, SessionAbortState, SessionSharedState, WriteLease,
     contention::{
         ContendedDocumentSnapshot, ContentionSessionState, MAX_SNAPSHOT_CONTENDED_DOCS,
         MAX_SNAPSHOT_DOC_PARTICIPANTS, ReaderSnapshot, SessionKind, WaiterSnapshot, WriterSnapshot,
@@ -789,22 +789,17 @@ impl LockTable {
             }
             garbage.grant_maps.push(promoted);
 
-            let held_reads = std::mem::take(&mut rec.held_reads);
-            for doc_ref in &held_reads {
-                if let Some(doc) = self.docs.get_mut(doc_ref)
-                    && doc.readers.remove(&session_id).is_some()
-                {
-                    if !doc.waiters.is_empty() {
-                        notify_contention = true;
-                    }
-                    if doc.writer.is_none() && !doc.waiters.is_empty() {
-                        docs_to_wake.push(doc_ref.clone());
-                    } else if doc.is_empty() {
-                        self.docs.remove(doc_ref);
-                    }
-                }
+            if !notify_contention {
+                notify_contention =
+                    rec.held_reads
+                        .iter()
+                        .chain(rec.held_writes.iter())
+                        .any(|doc_ref| {
+                            self.docs
+                                .get(doc_ref)
+                                .is_some_and(|d| !d.waiters.is_empty())
+                        });
             }
-            garbage.doc_sets.push(held_reads);
 
             let parked = std::mem::take(&mut rec.parked_waiters);
             for (doc_ref, key) in parked.values() {
@@ -835,6 +830,33 @@ impl LockTable {
             garbage.doc_vecs.push(docs_to_wake);
         }
         Ok(notify_contention)
+    }
+
+    pub(super) fn commit_empty(
+        &mut self,
+        session_id: u64,
+        shared: &SessionSharedState,
+        garbage: &mut LockTableGarbage,
+    ) -> Result<(Timestamp, bool), CommitError> {
+        if self.cleared {
+            return Err(CommitError::Aborted(AbortReason::DatabaseCleared));
+        }
+        {
+            let Some(rec) = self.sessions.get(&session_id) else {
+                return Err(missing_session_error(shared));
+            };
+            if rec.state != SessionState::Active {
+                return Err(inactive_record_error(rec));
+            }
+        }
+
+        // Stamp `commit_time` under `Mutex<LockTable>` before releasing held read locks and waking
+        // waiters so any unblocked writer receives a strictly greater `Timestamp::now()`.
+        let commit_time = Timestamp::now();
+        let notify_state_change = self
+            .close_session_inner(session_id, CloseDisposition::Normal(STATE_CLOSED), garbage)
+            .is_some_and(|(_, notify)| notify);
+        Ok((commit_time, notify_state_change))
     }
 
     pub(super) fn close_session(

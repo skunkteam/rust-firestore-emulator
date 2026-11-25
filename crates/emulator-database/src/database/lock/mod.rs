@@ -754,6 +754,32 @@ impl LockSession {
         Ok(CommitSeal::new(self, writes))
     }
 
+    pub(crate) fn commit_empty(&self) -> Result<Timestamp, CommitError> {
+        self.check_active()?;
+
+        let mut garbage = LockTableGarbage::default();
+        let res = {
+            let mut table = self.lock_table();
+            table.commit_empty(self.session_id, &self.shared, &mut garbage)
+        };
+        drop(garbage);
+        let (commit_time, notify) = res?;
+        if notify {
+            self.manager.notify_contention_changed();
+        }
+
+        tracing::debug!(
+            target: "emulator_database::lock",
+            database = %self.manager.database,
+            txn_id = self.txn_id.map(tracing::field::display),
+            session_id = self.session_id,
+            root_seq = self.root_seq(),
+            "committed empty session"
+        );
+
+        Ok(commit_time)
+    }
+
     pub(crate) async fn acquire_read(
         self: &Arc<Self>,
         doc_ref: &DocumentRef,
