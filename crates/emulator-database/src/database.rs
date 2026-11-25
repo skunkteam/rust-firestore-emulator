@@ -355,7 +355,7 @@ impl FirestoreDatabase {
         if enterprise && is_unordered && has_sum_or_avg {
             // Enterprise checked integer sums depend on scan order; sort by canonical `__name__`
             // for deterministic primary-key scan order.
-            docs.sort_by(|a, b| a.version.name.cmp_firestore_order(&b.version.name));
+            docs.sort_by(|a, b| a.version.name.cmp(&b.version.name));
         }
         let result = aggregations
             .into_iter()

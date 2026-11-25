@@ -556,7 +556,7 @@ mod tests {
         select_and_sort_nearest(&mut candidates, Some(3), |(ra, da), (rb, db)| {
             DistanceMeasure::Euclidean
                 .cmp_distance(*da, *db)
-                .then_with(|| ra.cmp_firestore_order(rb))
+                .then_with(|| ra.cmp(rb))
         });
 
         let ordered_names: Vec<String> = candidates.iter().map(|(r, _)| r.to_string()).collect();

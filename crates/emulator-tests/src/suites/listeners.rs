@@ -761,7 +761,7 @@ async fn listen_query_target_standard_multi_doc_batch_emits_deterministic_firest
     }
     handle.close().await;
 
-    // 2. Collection-group multi-doc incremental batch must use segment-wise `cmp_firestore_order`
+    // 2. Collection-group multi-doc incremental batch must use segment-wise `DocumentRef::Ord`
     //    (`parents/doc/grp/x` < `parents/doc-1/grp/x` because segment `"doc"` < `"doc-1"` even
     //    though `'/'` > `'-'` in raw ASCII).
     let cg_paths = ["grp/a", "grp/z", "parents/doc/grp/x", "parents/doc-1/grp/x"];

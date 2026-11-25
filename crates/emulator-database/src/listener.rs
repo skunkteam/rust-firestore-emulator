@@ -83,7 +83,7 @@ fn document_remove(document: &DocumentRef, read_time: Timestamp) -> ResponseType
 }
 
 /// Accumulates `(doc_ref, item)` pairs without allocating or sorting when at most one item is
-/// collected; sorts deterministically by `DocumentRef::cmp_firestore_order` when `len > 1`.
+/// collected; sorts deterministically by [`DocumentRef`] (`Ord`) when `len > 1`.
 enum OrderedUpdates<'a, T> {
     Empty,
     One(&'a DocumentRef, T),
@@ -109,7 +109,7 @@ impl<'a, T> OrderedUpdates<'a, T> {
             Self::Empty => Vec::new(),
             Self::One(_, item) => vec![map(item)],
             Self::Many(mut items) => {
-                items.sort_unstable_by(|(a, _), (b, _)| a.cmp_firestore_order(b));
+                items.sort_unstable_by(|(a, _), (b, _)| a.cmp(b));
                 items.into_iter().map(|(_, item)| map(item)).collect()
             }
         }

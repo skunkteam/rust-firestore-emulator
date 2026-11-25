@@ -952,7 +952,7 @@ impl Query {
             let mut candidates = vec![];
             for col in collections {
                 let mut docs = col.docs().await;
-                docs.sort_by(|a, b| a.name.cmp_firestore_order(&b.name));
+                docs.sort_by(|a, b| a.name.cmp(&b.name));
                 for meta in docs {
                     if let Some(mut doc) = lock_strategy.read(&meta).await? {
                         if self.enterprise_edition
@@ -1001,7 +1001,7 @@ impl Query {
             let mut buffer = vec![];
             for (col_idx, col) in collections.into_iter().enumerate() {
                 let mut ordered = col.docs().await.into_iter().enumerate().collect_vec();
-                ordered.sort_by(|(_, a), (_, b)| a.name.cmp_firestore_order(&b.name));
+                ordered.sort_by(|(_, a), (_, b)| a.name.cmp(&b.name));
                 for (orig_idx, meta) in ordered {
                     if let Some(doc) = lock_strategy.read(&meta).await?
                         && self.includes_document(&doc.version)?
@@ -1013,8 +1013,11 @@ impl Query {
 
             if self.order_by.is_empty() {
                 if self.from.iter().any(|selector| selector.all_descendants) {
+                    // CollectionRef("sub") < CollectionRef("sub/a/sub") even though
+                    // DocumentRef("sub/a/sub/x") < DocumentRef("sub/z"), so cross-collection
+                    // results still need a final DocumentRef sort.
                     buffer.sort_unstable_by(|(_, _, a), (_, _, b)| {
-                        a.version.name.cmp_firestore_order(&b.version.name)
+                        a.version.name.cmp(&b.version.name)
                     });
                 } else {
                     buffer.sort_unstable_by_key(|&(col_idx, orig_idx, _)| (col_idx, orig_idx));
@@ -1269,7 +1272,7 @@ impl Query {
                 return ord;
             }
         }
-        a.name.cmp_firestore_order(&b.name)
+        a.name.cmp(&b.name)
     }
 
     pub fn project(&self, item: &QueryMatch) -> Document {
@@ -1314,7 +1317,7 @@ impl Query {
         use cmp::Ordering::*;
         for order in &self.order_by {
             let result = match &order.field {
-                FieldReference::DocumentName => a.name.cmp_firestore_order(&b.name),
+                FieldReference::DocumentName => a.name.cmp(&b.name),
                 FieldReference::FieldPath(path) => {
                     path.get_value(&a.fields).cmp(&path.get_value(&b.fields))
                 }

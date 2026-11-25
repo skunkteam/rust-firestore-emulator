@@ -417,10 +417,43 @@ impl RootRef {
     }
 }
 
-#[derive(Clone, Debug, Hash, PartialEq, Eq, PartialOrd, Ord)]
+/// A reference to a Firestore collection or subcollection.
+///
+/// Ordered lexicographically by `(root_ref, collection_id segments)` using segment-wise `'/'`
+/// comparison rather than flat-string byte ordering so subcollections compare identically to
+/// Cloud Firestore resource ordering (for example, `parents/doc/sub` sorts before
+/// `parents/doc-1/sub` because `"doc" < "doc-1"`, even though `'-' < '/'` in ASCII).
+///
+/// Direct `.split('/')` segment comparison is used instead of `googleapis::cmp_reference_segments`
+/// so [`Ord`] remains strictly coherent with [`Eq`] and [`Hash`] across all `pub`-constructed
+/// instances without `REFERENCE_NAME_MIN_ID` (`"__id-9223372036854775808__"`) sentinel
+/// normalization; sentinel normalization lives in `googleapis::cmp_reference_*` for query
+/// `ReferenceValue` comparisons, while valid parsed references reject `__.*__` and empty
+/// segments.
+#[derive(Clone, Debug, Hash, PartialEq, Eq)]
 pub struct CollectionRef {
     pub root_ref:      RootRef,
     pub collection_id: DefaultAtom,
+}
+
+impl Ord for CollectionRef {
+    fn cmp(&self, other: &Self) -> cmp::Ordering {
+        if self.root_ref != other.root_ref {
+            return self.root_ref.cmp(&other.root_ref);
+        }
+        if self.collection_id == other.collection_id {
+            return cmp::Ordering::Equal;
+        }
+        self.collection_id
+            .split('/')
+            .cmp(other.collection_id.split('/'))
+    }
+}
+
+impl PartialOrd for CollectionRef {
+    fn partial_cmp(&self, other: &Self) -> Option<cmp::Ordering> {
+        Some(self.cmp(other))
+    }
 }
 
 impl FromStr for CollectionRef {
@@ -572,10 +605,62 @@ impl CollectionRef {
     }
 }
 
-#[derive(Clone, Debug, Hash, PartialEq, Eq, PartialOrd, Ord)]
+/// A reference to a Firestore document.
+///
+/// Ordered lexicographically by `(root_ref, path segments)` — chaining
+/// `collection_ref.collection_id.split('/')` with `document_id` — rather than comparing
+/// `collection_ref` first or comparing flat paths byte-by-byte. This matches live Cloud
+/// Firestore document ordering across subcollection nesting and punctuation (for example,
+/// `col/doc < col/doc/sub/x < col/doc-1 < col/doc-1/sub/x`).
+///
+/// Same-collection comparisons short-circuit via `O(1)` `DefaultAtom` equality checks to
+/// `document_id` ordering without `.split('/')` overhead on `BTreeMap` hot paths.
+///
+/// Direct `.split('/')` segment comparison is used instead of `googleapis::cmp_reference_segments`
+/// so [`Ord`] remains strictly coherent with [`Eq`] and [`Hash`] (and transitive with the
+/// same-collection fast path) across all `pub`-constructed instances. `REFERENCE_NAME_MIN_ID`
+/// (`"__id-9223372036854775808__"`) sentinel normalization lives in `googleapis::cmp_reference_*`
+/// for query `ReferenceValue` comparisons; valid parsed `DocumentRef`s forbid `__.*__` and empty
+/// segments, so [`Ord`] matches Cloud Firestore order on all valid document references.
+#[derive(Clone, Debug, Hash, PartialEq, Eq)]
 pub struct DocumentRef {
     pub collection_ref: CollectionRef,
     pub document_id:    DefaultAtom,
+}
+
+impl Ord for DocumentRef {
+    fn cmp(&self, other: &Self) -> cmp::Ordering {
+        if self.collection_ref == other.collection_ref {
+            return if self.document_id == other.document_id {
+                cmp::Ordering::Equal
+            } else {
+                self.document_id.cmp(&other.document_id)
+            };
+        }
+        if self.collection_ref.root_ref != other.collection_ref.root_ref {
+            return self
+                .collection_ref
+                .root_ref
+                .cmp(&other.collection_ref.root_ref);
+        }
+        self.collection_ref
+            .collection_id
+            .split('/')
+            .chain(iter::once(self.document_id.as_str()))
+            .cmp(
+                other
+                    .collection_ref
+                    .collection_id
+                    .split('/')
+                    .chain(iter::once(other.document_id.as_str())),
+            )
+    }
+}
+
+impl PartialOrd for DocumentRef {
+    fn partial_cmp(&self, other: &Self) -> Option<cmp::Ordering> {
+        Some(self.cmp(other))
+    }
 }
 
 impl FromStr for DocumentRef {
@@ -600,25 +685,6 @@ impl DocumentRef {
             collection_ref,
             document_id: document_id.into(),
         }
-    }
-
-    pub(crate) fn cmp_firestore_order(&self, other: &Self) -> cmp::Ordering {
-        self.collection_ref
-            .root_ref
-            .cmp(&other.collection_ref.root_ref)
-            .then_with(|| {
-                googleapis::cmp_reference_segments(
-                    self.collection_ref
-                        .collection_id
-                        .split('/')
-                        .chain(iter::once(self.document_id.as_str())),
-                    other
-                        .collection_ref
-                        .collection_id
-                        .split('/')
-                        .chain(iter::once(other.document_id.as_str())),
-                )
-            })
     }
 }
 
@@ -873,7 +939,182 @@ mod tests {
         }
     }
 
+    fn assert_strictly_ordered<T: Ord + Eq + Clone + std::fmt::Debug>(ordered: &[T]) {
+        for (i, a) in ordered.iter().enumerate() {
+            for (j, b) in ordered.iter().enumerate() {
+                let expected = i.cmp(&j);
+                assert_eq!(
+                    a.cmp(b),
+                    expected,
+                    "cmp mismatch at ({i}, {j}): {a:?} vs {b:?}"
+                );
+                assert_eq!(
+                    a.partial_cmp(b),
+                    Some(expected),
+                    "partial_cmp mismatch at ({i}, {j}): {a:?} vs {b:?}"
+                );
+                assert_eq!(a == b, i == j);
+            }
+        }
+        let mut reversed = ordered.to_vec();
+        reversed.reverse();
+        reversed.sort();
+        assert_eq!(reversed, ordered);
+
+        let set: std::collections::BTreeSet<T> = ordered.iter().rev().cloned().collect();
+        let collected: Vec<T> = set.into_iter().collect();
+        assert_eq!(collected, ordered);
+    }
+
+    #[gtest]
+    fn document_ref_ord_matches_live_cloud_firestore_order() {
+        let root = "projects/p/databases/(default)/documents";
+        let ordered: Vec<DocumentRef> = [
+            "col/doc",
+            "col/doc/mid/m/sub/x",
+            "col/doc/mid-1/m/sub/x",
+            "col/doc/sub/x",
+            "col/doc/sub-1/x",
+            "col/doc!1/sub/x",
+            "col/doc-1",
+            "col/doc-1/sub/x",
+            "col/doc.1/sub/x",
+            "col/doc0/sub/x",
+        ]
+        .into_iter()
+        .map(|rel| format!("{root}/{rel}").parse().unwrap())
+        .collect();
+
+        assert_strictly_ordered(&ordered);
+    }
+
+    #[gtest]
+    fn collection_ref_ord_segment_and_nesting_order() {
+        let root = "projects/p/databases/(default)/documents";
+        let ordered: Vec<CollectionRef> = [
+            "col",
+            "col/doc/sub",
+            "col/doc/sub/m/leaf",
+            "col/doc/sub-1",
+            "col/doc!1/sub",
+            "col/doc-1/sub",
+            "col/doc.1/sub",
+            "col/doc0/sub",
+            "col-1",
+            "col-1/doc/sub",
+        ]
+        .into_iter()
+        .map(|rel| format!("{root}/{rel}").parse().unwrap())
+        .collect();
+
+        assert_strictly_ordered(&ordered);
+    }
+
+    #[gtest]
+    fn ref_ord_cross_root_and_all_descendants_nesting() {
+        let docs_cross_root: Vec<DocumentRef> = [
+            "projects/a/databases/(default)/documents/z/z/sub/z",
+            "projects/a/databases/db-1/documents/a/a",
+            "projects/a/databases/db-1/documents/z/z",
+            "projects/a-1/databases/(default)/documents/a/a",
+            "projects/a-1/databases/(default)/documents/z/z",
+            "projects/b/databases/(default)/documents/a/a",
+        ]
+        .into_iter()
+        .map(|s| s.parse().unwrap())
+        .collect();
+        assert_strictly_ordered(&docs_cross_root);
+
+        let cols_cross_root: Vec<CollectionRef> = [
+            "projects/a/databases/(default)/documents/z/z/sub",
+            "projects/a/databases/db-1/documents/a",
+            "projects/a/databases/db-1/documents/z",
+            "projects/a-1/databases/(default)/documents/a",
+            "projects/b/databases/(default)/documents/a",
+        ]
+        .into_iter()
+        .map(|s| s.parse().unwrap())
+        .collect();
+        assert_strictly_ordered(&cols_cross_root);
+
+        let mixed_nesting: Vec<DocumentRef> = [
+            "projects/p/databases/(default)/documents/col/a",
+            "projects/p/databases/(default)/documents/col/a/sub/b",
+            "projects/p/databases/(default)/documents/col/c",
+        ]
+        .into_iter()
+        .map(|s| s.parse().unwrap())
+        .collect();
+        assert_strictly_ordered(&mixed_nesting);
+
+        // Even with segment-ordered CollectionRef, collection-group `all_descendants` queries
+        // must still sort the final document buffer because CollectionRef("sub") <
+        // CollectionRef("sub/a/sub") while DocumentRef("sub/a/sub/x") < DocumentRef("sub/z").
+        let parent_col: CollectionRef = "projects/p/databases/(default)/documents/sub"
+            .parse()
+            .unwrap();
+        let nested_col: CollectionRef = "projects/p/databases/(default)/documents/sub/a/sub"
+            .parse()
+            .unwrap();
+        let nested_doc: DocumentRef = "projects/p/databases/(default)/documents/sub/a/sub/x"
+            .parse()
+            .unwrap();
+        let parent_doc: DocumentRef = "projects/p/databases/(default)/documents/sub/z"
+            .parse()
+            .unwrap();
+        expect_lt!(parent_col, &nested_col);
+        expect_lt!(nested_doc, &parent_doc);
+    }
+
+    #[gtest]
+    fn ord_eq_hash_coherence_on_synthetic_edge_cases() {
+        let root = RootRef::new("p", "(default)");
+        // Covers the transitivity trap that would occur if DocumentRef::Ord normalized
+        // "__id-9223372036854775808__" -> "" while fast-pathing same-collection comparisons,
+        // plus empty segments and raw '/' inside manually constructed document_id values.
+        let ordered_docs = [
+            DocumentRef::new(CollectionRef::new(root.clone(), "c"), ""),
+            DocumentRef::new(CollectionRef::new(root.clone(), "c/!/d"), "z"),
+            DocumentRef::new(CollectionRef::new(root.clone(), "c"), "A"),
+            DocumentRef::new(
+                CollectionRef::new(root.clone(), "c"),
+                "__id-9223372036854775808__",
+            ),
+            DocumentRef::new(CollectionRef::new(root.clone(), "c/d"), "s"),
+            DocumentRef::new(CollectionRef::new(root.clone(), "c"), "d/s"),
+        ];
+        assert_strictly_ordered(&ordered_docs);
+
+        let mut doc_map = std::collections::BTreeMap::new();
+        for (idx, d) in ordered_docs.iter().enumerate() {
+            doc_map.insert(d.clone(), idx);
+        }
+        for (idx, d) in ordered_docs.iter().enumerate() {
+            assert_eq!(doc_map.get(d), Some(&idx));
+        }
+
+        let ordered_cols = [
+            CollectionRef::new(root.clone(), ""),
+            CollectionRef::new(root.clone(), "__id-9223372036854775808__"),
+            CollectionRef::new(root.clone(), "c"),
+            CollectionRef::new(root.clone(), "c/!/d"),
+            CollectionRef::new(root.clone(), "c/d"),
+            CollectionRef::new(root, "c-1/d"),
+        ];
+        assert_strictly_ordered(&ordered_cols);
+
+        let mut col_map = std::collections::BTreeMap::new();
+        for (idx, c) in ordered_cols.iter().enumerate() {
+            col_map.insert(c.clone(), idx);
+        }
+        for (idx, c) in ordered_cols.iter().enumerate() {
+            assert_eq!(col_map.get(c), Some(&idx));
+        }
+    }
+
     mod proptests {
+        use std::{cmp::Ordering, iter};
+
         use proptest::{prelude::*, sample::select};
 
         use super::{CollectionRef, DocumentRef, Ref, RootRef};
@@ -884,6 +1125,114 @@ mod tests {
             "users", "orders", "items", "events", "rooms", "msgs", "alpha", "beta", "doc-1",
             "doc_2", "d3", "d4", "a", "b", "__half", "x__y",
         ];
+        const VALID_ORDER_VOCAB: &[&str] = &[
+            "col", "doc", "doc-1", "doc!1", "doc.1", "doc0", "mid", "mid-1", "sub", "sub-1", "a",
+            "b", "z",
+        ];
+        const SYNTHETIC_SEG_VOCAB: &[&str] = &[
+            "",
+            "__id-9223372036854775808__",
+            "__id0__",
+            "A",
+            "doc",
+            "doc-1",
+            "doc!1",
+            "doc.1",
+            "a/b",
+            "/",
+            "a",
+            "z",
+        ];
+
+        fn arb_root() -> impl Strategy<Value = RootRef> {
+            (select(PROJECT_VOCAB), select(DB_VOCAB)).prop_map(|(p, d)| RootRef::new(p, d))
+        }
+
+        fn arb_synthetic_col() -> impl Strategy<Value = CollectionRef> {
+            (
+                arb_root(),
+                prop::collection::vec(select(SYNTHETIC_SEG_VOCAB), 1..=4),
+            )
+                .prop_map(|(root, segs)| CollectionRef::new(root, segs.join("/")))
+        }
+
+        fn arb_synthetic_doc() -> impl Strategy<Value = DocumentRef> {
+            (arb_synthetic_col(), select(SYNTHETIC_SEG_VOCAB))
+                .prop_map(|(col, doc_id)| DocumentRef::new(col, doc_id))
+        }
+
+        fn arb_parsed_col() -> impl Strategy<Value = CollectionRef> {
+            (
+                select(PROJECT_VOCAB),
+                select(DB_VOCAB),
+                prop_oneof![
+                    prop::collection::vec(select(VALID_ORDER_VOCAB), 1..=1),
+                    prop::collection::vec(select(VALID_ORDER_VOCAB), 3..=3),
+                    prop::collection::vec(select(VALID_ORDER_VOCAB), 5..=5),
+                ],
+            )
+                .prop_map(|(p, d, segs)| {
+                    format!("projects/{p}/databases/{d}/documents/{}", segs.join("/"))
+                        .parse()
+                        .unwrap()
+                })
+        }
+
+        fn arb_parsed_doc() -> impl Strategy<Value = DocumentRef> {
+            (
+                select(PROJECT_VOCAB),
+                select(DB_VOCAB),
+                prop_oneof![
+                    prop::collection::vec(select(VALID_ORDER_VOCAB), 2..=2),
+                    prop::collection::vec(select(VALID_ORDER_VOCAB), 4..=4),
+                    prop::collection::vec(select(VALID_ORDER_VOCAB), 6..=6),
+                ],
+            )
+                .prop_map(|(p, d, segs)| {
+                    format!("projects/{p}/databases/{d}/documents/{}", segs.join("/"))
+                        .parse()
+                        .unwrap()
+                })
+        }
+
+        fn assert_total_order_and_coherence<T: Ord + Eq + Clone + std::fmt::Debug>(
+            a: &T,
+            b: &T,
+            c: &T,
+        ) -> Result<(), TestCaseError> {
+            for (x, y) in [(a, a), (b, b), (c, c), (a, b), (b, c), (a, c)] {
+                let cmp_xy = x.cmp(y);
+                let cmp_yx = y.cmp(x);
+                prop_assert_eq!(x.partial_cmp(y), Some(cmp_xy));
+                prop_assert_eq!(cmp_xy, cmp_yx.reverse());
+                prop_assert_eq!(x == y, cmp_xy == Ordering::Equal);
+            }
+
+            let mut sorted = [a.clone(), b.clone(), c.clone()];
+            sorted.sort();
+            prop_assert!(sorted[0] <= sorted[1]);
+            prop_assert!(sorted[1] <= sorted[2]);
+            prop_assert!(sorted[0] <= sorted[2]);
+
+            let ab = a.cmp(b);
+            let bc = b.cmp(c);
+            let ac = a.cmp(c);
+            if ab != Ordering::Greater && bc != Ordering::Greater {
+                if ab == Ordering::Less || bc == Ordering::Less {
+                    prop_assert_eq!(ac, Ordering::Less);
+                } else {
+                    prop_assert_eq!(ac, Ordering::Equal);
+                }
+            }
+            if ab != Ordering::Less && bc != Ordering::Less {
+                if ab == Ordering::Greater || bc == Ordering::Greater {
+                    prop_assert_eq!(ac, Ordering::Greater);
+                } else {
+                    prop_assert_eq!(ac, Ordering::Equal);
+                }
+            }
+            Ok(())
+        }
 
         proptest! {
             #[test]
@@ -955,6 +1304,64 @@ mod tests {
                     all.join("/")
                 );
                 prop_assert!(path.parse::<Ref>().is_err());
+            }
+
+            #[test]
+            fn proptest_collection_ref_ord_total_order_and_eq_coherence(
+                a in arb_synthetic_col(),
+                b in arb_synthetic_col(),
+                c in arb_synthetic_col(),
+            ) {
+                assert_total_order_and_coherence(&a, &b, &c)?;
+            }
+
+            #[test]
+            fn proptest_document_ref_ord_total_order_and_eq_coherence(
+                a in arb_synthetic_doc(),
+                b in arb_synthetic_doc(),
+                c in arb_synthetic_doc(),
+                same_col_doc_id in select(SYNTHETIC_SEG_VOCAB),
+            ) {
+                assert_total_order_and_coherence(&a, &b, &c)?;
+                // Explicitly exercise the same-collection fast path against a third arbitrary doc.
+                let a_sibling = DocumentRef::new(a.collection_ref.clone(), same_col_doc_id);
+                assert_total_order_and_coherence(&a, &a_sibling, &c)?;
+            }
+
+            #[test]
+            fn proptest_ref_ord_matches_googleapis_cmp_reference_segments_on_valid_refs(
+                col_a in arb_parsed_col(),
+                col_b in arb_parsed_col(),
+                doc_a in arb_parsed_doc(),
+                doc_b in arb_parsed_doc(),
+            ) {
+                let expected_col = col_a.root_ref.cmp(&col_b.root_ref).then_with(|| {
+                    googleapis::cmp_reference_segments(
+                        col_a.collection_id.split('/'),
+                        col_b.collection_id.split('/'),
+                    )
+                });
+                prop_assert_eq!(col_a.cmp(&col_b), expected_col);
+
+                let expected_doc = doc_a
+                    .collection_ref
+                    .root_ref
+                    .cmp(&doc_b.collection_ref.root_ref)
+                    .then_with(|| {
+                        googleapis::cmp_reference_segments(
+                            doc_a
+                                .collection_ref
+                                .collection_id
+                                .split('/')
+                                .chain(iter::once(doc_a.document_id.as_str())),
+                            doc_b
+                                .collection_ref
+                                .collection_id
+                                .split('/')
+                                .chain(iter::once(doc_b.document_id.as_str())),
+                        )
+                    });
+                prop_assert_eq!(doc_a.cmp(&doc_b), expected_doc);
             }
         }
     }
