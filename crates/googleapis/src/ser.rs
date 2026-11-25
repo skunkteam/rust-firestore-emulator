@@ -17,9 +17,15 @@ use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use crate::{
     google::{
         firestore::v1::{
-            ArrayValue, Cursor, Document, ListCollectionIdsRequest, MapValue, Precondition,
-            RunQueryRequest, RunQueryResponse, StructuredQuery, Value, list_collection_ids_request,
-            precondition, run_query_request, run_query_response,
+            AggregationResult, ArrayValue, Cursor, Document, ListCollectionIdsRequest, MapValue,
+            Precondition, RunAggregationQueryRequest, RunAggregationQueryResponse, RunQueryRequest,
+            RunQueryResponse, StructuredAggregationQuery, StructuredQuery, Value,
+            list_collection_ids_request, precondition, run_aggregation_query_request,
+            run_query_request, run_query_response,
+            structured_aggregation_query::{
+                self, Aggregation,
+                aggregation::{Avg, Count, Operator, Sum},
+            },
             structured_query::{
                 CollectionSelector, CompositeFilter, Direction, FieldFilter, FieldReference,
                 Filter, Order, Projection, UnaryFilter, composite_filter, field_filter, filter,
@@ -27,7 +33,7 @@ use crate::{
             },
             value::ValueType,
         },
-        protobuf::{Int32Value, Timestamp},
+        protobuf::{Int32Value, Int64Value, Timestamp},
         r#type::LatLng,
     },
     timestamp_ext::{MAX_TIMESTAMP_SECONDS, MIN_TIMESTAMP_SECONDS},
@@ -954,26 +960,65 @@ impl<'de> Deserialize<'de> for StructuredQuery {
     }
 }
 
+fn check_unsupported_query_serialize<E: serde::ser::Error>(
+    msg_name: &str,
+    has_explain_options: bool,
+    has_request_options: bool,
+    has_new_transaction: bool,
+) -> Result<(), E> {
+    if has_explain_options {
+        return Err(E::custom(format!(
+            "{msg_name}.explainOptions ProtoJSON serialization is not supported"
+        )));
+    }
+    if has_request_options {
+        return Err(E::custom(format!(
+            "{msg_name}.requestOptions ProtoJSON serialization is not supported"
+        )));
+    }
+    if has_new_transaction {
+        return Err(E::custom(format!(
+            "{msg_name}.newTransaction ProtoJSON serialization is not supported"
+        )));
+    }
+    Ok(())
+}
+
+fn check_unsupported_query_envelope_fields<E: de::Error>(
+    msg_name: &str,
+    new_transaction: &Option<IgnoredAny>,
+    explain_options: &Option<IgnoredAny>,
+    request_options: &Option<IgnoredAny>,
+) -> Result<(), E> {
+    if new_transaction.is_some() {
+        return Err(E::custom(format!(
+            "{msg_name}.newTransaction is not implemented"
+        )));
+    }
+    if explain_options.is_some() {
+        return Err(E::custom(format!(
+            "{msg_name}.explainOptions is not implemented"
+        )));
+    }
+    if request_options.is_some() {
+        return Err(E::custom(format!(
+            "{msg_name}.requestOptions is not implemented"
+        )));
+    }
+    Ok(())
+}
+
 impl Serialize for RunQueryRequest {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        if self.explain_options.is_some() {
-            return Err(serde::ser::Error::custom(
-                "RunQueryRequest.explainOptions ProtoJSON serialization is not supported",
-            ));
-        }
-        if self.request_options.is_some() {
-            return Err(serde::ser::Error::custom(
-                "RunQueryRequest.requestOptions ProtoJSON serialization is not supported",
-            ));
-        }
-        if matches!(
-            self.consistency_selector,
-            Some(run_query_request::ConsistencySelector::NewTransaction(_))
-        ) {
-            return Err(serde::ser::Error::custom(
-                "RunQueryRequest.newTransaction ProtoJSON serialization is not supported",
-            ));
-        }
+        check_unsupported_query_serialize::<S::Error>(
+            "RunQueryRequest",
+            self.explain_options.is_some(),
+            self.request_options.is_some(),
+            matches!(
+                self.consistency_selector,
+                Some(run_query_request::ConsistencySelector::NewTransaction(_))
+            ),
+        )?;
         let mut map = serializer.serialize_map(None)?;
         if !self.parent.is_empty() {
             map.serialize_entry("parent", &self.parent)?;
@@ -1004,8 +1049,17 @@ impl<'de> Deserialize<'de> for RunQueryRequest {
             structured_query: Option<StructuredQuery>,
             read_time: Option<Timestamp>,
             transaction: Option<DecodedBytes>,
+            new_transaction: Option<IgnoredAny>,
+            explain_options: Option<IgnoredAny>,
+            request_options: Option<IgnoredAny>,
         }
         let helper = RunQueryRequestDe::deserialize(deserializer)?;
+        check_unsupported_query_envelope_fields(
+            "RunQueryRequest",
+            &helper.new_transaction,
+            &helper.explain_options,
+            &helper.request_options,
+        )?;
         let consistency_selector = match (helper.read_time, helper.transaction) {
             (Some(_), Some(_)) => {
                 return Err(de::Error::custom(
@@ -1074,6 +1128,325 @@ impl<'de> Deserialize<'de> for RunQueryResponse {
             continuation_selector: helper
                 .done
                 .map(run_query_response::ContinuationSelector::Done),
+            explain_metrics: None,
+        })
+    }
+}
+
+impl Serialize for Count {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        #[derive(Serialize)]
+        #[serde(rename_all = "camelCase")]
+        struct CountSer {
+            #[serde(skip_serializing_if = "Option::is_none")]
+            up_to: Option<String>,
+        }
+        CountSer {
+            up_to: self.up_to.map(|v| v.value.to_string()),
+        }
+        .serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for Count {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize, Default)]
+        #[serde(rename_all = "camelCase", default, deny_unknown_fields)]
+        struct CountDe {
+            up_to: Option<ProtoInt64>,
+        }
+        let helper = CountDe::deserialize(deserializer)?;
+        Ok(Count {
+            up_to: helper.up_to.map(|v| Int64Value { value: v.0 }),
+        })
+    }
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct FieldAggregationSer<'a> {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    field: &'a Option<FieldReference>,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(rename_all = "camelCase", default, deny_unknown_fields)]
+struct FieldAggregationDe {
+    field: Option<FieldReference>,
+}
+
+impl Serialize for Sum {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        FieldAggregationSer { field: &self.field }.serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for Sum {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let helper = FieldAggregationDe::deserialize(deserializer)?;
+        Ok(Sum {
+            field: helper.field,
+        })
+    }
+}
+
+impl Serialize for Avg {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        FieldAggregationSer { field: &self.field }.serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for Avg {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let helper = FieldAggregationDe::deserialize(deserializer)?;
+        Ok(Avg {
+            field: helper.field,
+        })
+    }
+}
+
+impl Serialize for Aggregation {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let Some(ref op) = self.operator else {
+            return Err(serde::ser::Error::custom("Aggregation is missing operator"));
+        };
+        let len = 1 + usize::from(!self.alias.is_empty());
+        let mut map = serializer.serialize_map(Some(len))?;
+        match op {
+            Operator::Count(c) => map.serialize_entry("count", c)?,
+            Operator::Sum(s) => map.serialize_entry("sum", s)?,
+            Operator::Avg(a) => map.serialize_entry("avg", a)?,
+        }
+        if !self.alias.is_empty() {
+            map.serialize_entry("alias", &self.alias)?;
+        }
+        map.end()
+    }
+}
+
+impl<'de> Deserialize<'de> for Aggregation {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize, Default)]
+        #[serde(rename_all = "camelCase", default, deny_unknown_fields)]
+        struct AggregationDe {
+            count: Option<Count>,
+            sum:   Option<Sum>,
+            avg:   Option<Avg>,
+            #[serde(deserialize_with = "deserialize_null_default")]
+            alias: String,
+        }
+        let helper = AggregationDe::deserialize(deserializer)?;
+        let operator = match (helper.count, helper.sum, helper.avg) {
+            (Some(c), None, None) => Operator::Count(c),
+            (None, Some(s), None) => Operator::Sum(s),
+            (None, None, Some(a)) => Operator::Avg(a),
+            (None, None, None) => {
+                return Err(de::Error::custom(
+                    "Aggregation must specify one of 'count', 'sum', or 'avg'",
+                ));
+            }
+            _ => {
+                return Err(de::Error::custom(
+                    "Aggregation cannot specify more than one operator",
+                ));
+            }
+        };
+        Ok(Aggregation {
+            alias:    helper.alias,
+            operator: Some(operator),
+        })
+    }
+}
+
+impl Serialize for StructuredAggregationQuery {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        #[derive(Serialize)]
+        #[serde(rename_all = "camelCase")]
+        struct StructuredAggregationQuerySer<'a> {
+            #[serde(skip_serializing_if = "Option::is_none")]
+            structured_query: Option<&'a StructuredQuery>,
+            #[serde(skip_serializing_if = "Vec::is_empty")]
+            aggregations:     &'a Vec<Aggregation>,
+        }
+        let structured_query = self.query_type.as_ref().map(|qt| match qt {
+            structured_aggregation_query::QueryType::StructuredQuery(sq) => sq,
+        });
+        StructuredAggregationQuerySer {
+            structured_query,
+            aggregations: &self.aggregations,
+        }
+        .serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for StructuredAggregationQuery {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize, Default)]
+        #[serde(rename_all = "camelCase", default, deny_unknown_fields)]
+        struct StructuredAggregationQueryDe {
+            structured_query: Option<StructuredQuery>,
+            #[serde(deserialize_with = "deserialize_null_default")]
+            aggregations:     Vec<Aggregation>,
+        }
+        let helper = StructuredAggregationQueryDe::deserialize(deserializer)?;
+        Ok(StructuredAggregationQuery {
+            aggregations: helper.aggregations,
+            query_type:   helper
+                .structured_query
+                .map(structured_aggregation_query::QueryType::StructuredQuery),
+        })
+    }
+}
+
+impl Serialize for RunAggregationQueryRequest {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        check_unsupported_query_serialize::<S::Error>(
+            "RunAggregationQueryRequest",
+            self.explain_options.is_some(),
+            self.request_options.is_some(),
+            matches!(
+                self.consistency_selector,
+                Some(run_aggregation_query_request::ConsistencySelector::NewTransaction(_))
+            ),
+        )?;
+        let mut map = serializer.serialize_map(None)?;
+        if !self.parent.is_empty() {
+            map.serialize_entry("parent", &self.parent)?;
+        }
+        if let Some(run_aggregation_query_request::QueryType::StructuredAggregationQuery(ref saq)) =
+            self.query_type
+        {
+            map.serialize_entry("structuredAggregationQuery", saq)?;
+        }
+        match &self.consistency_selector {
+            Some(run_aggregation_query_request::ConsistencySelector::Transaction(tx)) => {
+                map.serialize_entry("transaction", &Base64Bytes(tx))?;
+            }
+            Some(run_aggregation_query_request::ConsistencySelector::ReadTime(rt)) => {
+                map.serialize_entry("readTime", rt)?;
+            }
+            Some(run_aggregation_query_request::ConsistencySelector::NewTransaction(_)) | None => {}
+        }
+        map.end()
+    }
+}
+
+impl<'de> Deserialize<'de> for RunAggregationQueryRequest {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize, Default)]
+        #[serde(rename_all = "camelCase", default, deny_unknown_fields)]
+        struct RunAggregationQueryRequestDe {
+            #[serde(deserialize_with = "deserialize_null_default")]
+            parent: String,
+            structured_aggregation_query: Option<StructuredAggregationQuery>,
+            read_time: Option<Timestamp>,
+            transaction: Option<DecodedBytes>,
+            new_transaction: Option<IgnoredAny>,
+            explain_options: Option<IgnoredAny>,
+            request_options: Option<IgnoredAny>,
+        }
+        let helper = RunAggregationQueryRequestDe::deserialize(deserializer)?;
+        check_unsupported_query_envelope_fields(
+            "RunAggregationQueryRequest",
+            &helper.new_transaction,
+            &helper.explain_options,
+            &helper.request_options,
+        )?;
+        let consistency_selector = match (helper.read_time, helper.transaction) {
+            (Some(_), Some(_)) => {
+                return Err(de::Error::custom(
+                    "RunAggregationQueryRequest cannot specify both 'readTime' and 'transaction'",
+                ));
+            }
+            (Some(rt), None) => {
+                Some(run_aggregation_query_request::ConsistencySelector::ReadTime(rt))
+            }
+            (None, Some(tx)) => {
+                Some(run_aggregation_query_request::ConsistencySelector::Transaction(tx.0.to_vec()))
+            }
+            (None, None) => None,
+        };
+        Ok(RunAggregationQueryRequest {
+            parent: helper.parent,
+            query_type: helper
+                .structured_aggregation_query
+                .map(run_aggregation_query_request::QueryType::StructuredAggregationQuery),
+            consistency_selector,
+            explain_options: None,
+            request_options: None,
+        })
+    }
+}
+
+impl Serialize for AggregationResult {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        #[derive(Serialize)]
+        #[serde(rename_all = "camelCase")]
+        struct AggregationResultSer<'a> {
+            #[serde(
+                skip_serializing_if = "HashMap::is_empty",
+                serialize_with = "serialize_sorted_map"
+            )]
+            aggregate_fields: &'a HashMap<String, Value>,
+        }
+        AggregationResultSer {
+            aggregate_fields: &self.aggregate_fields,
+        }
+        .serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for AggregationResult {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize, Default)]
+        #[serde(rename_all = "camelCase", default)]
+        struct AggregationResultDe {
+            #[serde(deserialize_with = "deserialize_null_default")]
+            aggregate_fields: HashMap<String, Value>,
+        }
+        let helper = AggregationResultDe::deserialize(deserializer)?;
+        Ok(AggregationResult {
+            aggregate_fields: helper.aggregate_fields,
+        })
+    }
+}
+
+impl Serialize for RunAggregationQueryResponse {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        if self.explain_metrics.is_some() {
+            return Err(serde::ser::Error::custom(
+                "RunAggregationQueryResponse.explainMetrics ProtoJSON serialization is not \
+                 supported",
+            ));
+        }
+        let mut map = serializer.serialize_map(None)?;
+        if let Some(ref result) = self.result {
+            map.serialize_entry("result", result)?;
+        }
+        if !self.transaction.is_empty() {
+            map.serialize_entry("transaction", &Base64Bytes(&self.transaction))?;
+        }
+        if let Some(ref rt) = self.read_time {
+            map.serialize_entry("readTime", rt)?;
+        }
+        map.end()
+    }
+}
+
+impl<'de> Deserialize<'de> for RunAggregationQueryResponse {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize, Default)]
+        #[serde(rename_all = "camelCase", default)]
+        struct RunAggregationQueryResponseDe {
+            result:      Option<AggregationResult>,
+            transaction: Option<DecodedBytes>,
+            read_time:   Option<Timestamp>,
+        }
+        let helper = RunAggregationQueryResponseDe::deserialize(deserializer)?;
+        Ok(RunAggregationQueryResponse {
+            result: helper.result,
+            transaction: helper.transaction.map_or_else(Vec::new, |b| b.0.to_vec()),
+            read_time: helper.read_time,
             explain_metrics: None,
         })
     }
@@ -2259,6 +2632,539 @@ mod tests {
             })
             .unwrap()["op"],
             json!("OPERATOR_UNSPECIFIED")
+        );
+    }
+
+    #[gtest]
+    fn aggregation_query_request_and_response_roundtrip() {
+        let rt: Timestamp = datetime!(2026-11-24 10:15:30.250 UTC).into();
+        let req = RunAggregationQueryRequest {
+            parent: "projects/p/databases/(default)/documents".to_string(),
+            query_type: Some(
+                run_aggregation_query_request::QueryType::StructuredAggregationQuery(
+                    StructuredAggregationQuery {
+                        query_type:   Some(
+                            structured_aggregation_query::QueryType::StructuredQuery(
+                                StructuredQuery {
+                                    from: vec![CollectionSelector {
+                                        collection_id:   "orders".to_string(),
+                                        all_descendants: false,
+                                    }],
+                                    limit: Some(Int32Value { value: 50 }),
+                                    ..Default::default()
+                                },
+                            ),
+                        ),
+                        aggregations: vec![
+                            Aggregation {
+                                alias:    "".to_string(),
+                                operator: Some(Operator::Count(Count { up_to: None })),
+                            },
+                            Aggregation {
+                                alias:    "capped".to_string(),
+                                operator: Some(Operator::Count(Count {
+                                    up_to: Some(Int64Value { value: 100 }),
+                                })),
+                            },
+                            Aggregation {
+                                alias:    "revenue".to_string(),
+                                operator: Some(Operator::Sum(Sum {
+                                    field: Some(FieldReference {
+                                        field_path: "totalCents".to_string(),
+                                    }),
+                                })),
+                            },
+                            Aggregation {
+                                alias:    "avg_order".to_string(),
+                                operator: Some(Operator::Avg(Avg {
+                                    field: Some(FieldReference {
+                                        field_path: "totalCents".to_string(),
+                                    }),
+                                })),
+                            },
+                        ],
+                    },
+                ),
+            ),
+            consistency_selector: Some(
+                run_aggregation_query_request::ConsistencySelector::ReadTime(rt),
+            ),
+            explain_options: None,
+            request_options: None,
+        };
+
+        let req_json = serde_json::to_value(&req).unwrap();
+        expect_eq!(
+            req_json,
+            json!({
+                "parent": "projects/p/databases/(default)/documents",
+                "structuredAggregationQuery": {
+                    "structuredQuery": {
+                        "from": [{ "collectionId": "orders", "allDescendants": false }],
+                        "limit": 50
+                    },
+                    "aggregations": [
+                        { "count": {} },
+                        { "count": { "upTo": "100" }, "alias": "capped" },
+                        { "sum": { "field": { "fieldPath": "totalCents" } }, "alias": "revenue" },
+                        { "avg": { "field": { "fieldPath": "totalCents" } }, "alias": "avg_order" }
+                    ]
+                },
+                "readTime": "2026-11-24T10:15:30.250Z"
+            })
+        );
+        let roundtrip_req: RunAggregationQueryRequest = serde_json::from_value(req_json).unwrap();
+        expect_eq!(roundtrip_req, req);
+
+        // Transaction consistency selector on RunAggregationQueryRequest
+        let tx_req = RunAggregationQueryRequest {
+            parent: "projects/p/databases/(default)/documents".to_string(),
+            query_type: Some(
+                run_aggregation_query_request::QueryType::StructuredAggregationQuery(
+                    StructuredAggregationQuery {
+                        query_type:   None,
+                        aggregations: vec![Aggregation {
+                            alias:    "total".to_string(),
+                            operator: Some(Operator::Count(Count { up_to: None })),
+                        }],
+                    },
+                ),
+            ),
+            consistency_selector: Some(
+                run_aggregation_query_request::ConsistencySelector::Transaction(vec![0, 1, 2]),
+            ),
+            explain_options: None,
+            request_options: None,
+        };
+        let tx_json = serde_json::to_value(&tx_req).unwrap();
+        expect_eq!(
+            tx_json,
+            json!({
+                "parent": "projects/p/databases/(default)/documents",
+                "structuredAggregationQuery": {
+                    "aggregations": [{ "count": {}, "alias": "total" }]
+                },
+                "transaction": "AAEC"
+            })
+        );
+        expect_eq!(
+            serde_json::from_value::<RunAggregationQueryRequest>(tx_json).unwrap(),
+            tx_req
+        );
+
+        // RunAggregationQueryResponse full and minimal round-trips
+        let resp = RunAggregationQueryResponse {
+            result: Some(AggregationResult {
+                aggregate_fields: HashMap::from([
+                    ("field_1".to_string(), Value::integer(12)),
+                    ("avg_order".to_string(), Value::double(42.5)),
+                ]),
+            }),
+            transaction: vec![0, 1, 2],
+            read_time: Some(rt),
+            explain_metrics: None,
+        };
+        let resp_json = serde_json::to_value(&resp).unwrap();
+        expect_eq!(
+            resp_json,
+            json!({
+                "result": {
+                    "aggregateFields": {
+                        "avg_order": { "doubleValue": 42.5 },
+                        "field_1": { "integerValue": "12" }
+                    }
+                },
+                "transaction": "AAEC",
+                "readTime": "2026-11-24T10:15:30.250Z"
+            })
+        );
+        let roundtrip_resp: RunAggregationQueryResponse =
+            serde_json::from_value(resp_json).unwrap();
+        expect_eq!(roundtrip_resp.transaction, resp.transaction);
+        expect_eq!(roundtrip_resp.read_time, resp.read_time);
+        expect_true!(Value::fields_storage_eq(
+            &roundtrip_resp.result.unwrap().aggregate_fields,
+            &resp.result.unwrap().aggregate_fields
+        ));
+
+        let min_resp = RunAggregationQueryResponse {
+            result: None,
+            transaction: Vec::new(),
+            read_time: Some(rt),
+            explain_metrics: None,
+        };
+        expect_eq!(
+            serde_json::to_value(&min_resp).unwrap(),
+            json!({ "readTime": "2026-11-24T10:15:30.250Z" })
+        );
+
+        // Unknown fields on response and result are ignored (no deny_unknown_fields)
+        let permissive_resp: RunAggregationQueryResponse = serde_json::from_value(json!({
+            "result": {
+                "aggregateFields": { "c": { "integerValue": "7" } },
+                "futureResultField": "ignored"
+            },
+            "explainMetrics": { "planSummary": {} },
+            "transaction": null,
+            "readTime": "2026-11-24T10:15:30.250Z",
+            "futureResponseField": true
+        }))
+        .unwrap();
+        expect_true!(permissive_resp.transaction.is_empty());
+        expect_eq!(permissive_resp.read_time, Some(rt));
+        expect_eq!(permissive_resp.explain_metrics, None);
+        expect_eq!(
+            permissive_resp
+                .result
+                .unwrap()
+                .aggregate_fields
+                .get("c")
+                .and_then(Value::as_integer),
+            Some(7)
+        );
+
+        // Sum/Avg omit unset field and accept null/omitted field on deserialize;
+        // StructuredAggregationQuery defaults on null/empty
+        expect_eq!(
+            serde_json::to_value(Sum { field: None }).unwrap(),
+            json!({})
+        );
+        expect_eq!(
+            serde_json::to_value(Avg { field: None }).unwrap(),
+            json!({})
+        );
+        expect_eq!(
+            serde_json::from_value::<Sum>(json!({ "field": null })).unwrap(),
+            Sum { field: None }
+        );
+        expect_eq!(
+            serde_json::from_value::<Avg>(json!({ "field": null })).unwrap(),
+            Avg { field: None }
+        );
+        let saq_empty = StructuredAggregationQuery::default();
+        expect_eq!(serde_json::to_value(&saq_empty).unwrap(), json!({}));
+        expect_eq!(
+            serde_json::from_value::<StructuredAggregationQuery>(json!({
+                "structuredQuery": null,
+                "aggregations": null
+            }))
+            .unwrap(),
+            saq_empty
+        );
+        expect_that!(
+            serde_json::from_value::<StructuredAggregationQuery>(json!({
+                "aggregations": [null]
+            })),
+            err(anything())
+        );
+
+        // Aggregation accepts explicit null for alias and non-selected oneof branches
+        let agg_null_fields: Aggregation = serde_json::from_value(json!({
+            "count": {},
+            "sum": null,
+            "avg": null,
+            "alias": null
+        }))
+        .unwrap();
+        expect_eq!(
+            agg_null_fields,
+            Aggregation {
+                alias:    String::new(),
+                operator: Some(Operator::Count(Count { up_to: None })),
+            }
+        );
+    }
+
+    #[gtest]
+    fn run_query_and_aggregation_request_null_and_unsupported_envelope_fields() {
+        use crate::google::firestore::v1::{
+            ExplainOptions, RequestOptions, TransactionOptions, structured_query::FindNearest,
+        };
+
+        // Canonical camelCase null envelope fields are accepted on both RunQueryRequest and
+        // RunAggregationQueryRequest
+        let rq_nulls: RunQueryRequest = serde_json::from_value(json!({
+            "parent": null,
+            "structuredQuery": null,
+            "readTime": null,
+            "transaction": null,
+            "newTransaction": null,
+            "explainOptions": null,
+            "requestOptions": null
+        }))
+        .unwrap();
+        expect_eq!(rq_nulls, RunQueryRequest::default());
+
+        let raq_nulls: RunAggregationQueryRequest = serde_json::from_value(json!({
+            "parent": null,
+            "structuredAggregationQuery": null,
+            "readTime": null,
+            "transaction": null,
+            "newTransaction": null,
+            "explainOptions": null,
+            "requestOptions": null
+        }))
+        .unwrap();
+        expect_eq!(raq_nulls, RunAggregationQueryRequest::default());
+
+        // Non-null unsupported envelope fields are rejected on deserialize for both request types
+        for key in ["newTransaction", "explainOptions", "requestOptions"] {
+            for non_null in [json!({}), json!(true), json!("abc"), json!(1), json!([])] {
+                let payload = serde_json::json!({ key: non_null });
+                expect_that!(
+                    serde_json::from_value::<RunQueryRequest>(payload.clone()),
+                    err(anything())
+                );
+                expect_that!(
+                    serde_json::from_value::<RunAggregationQueryRequest>(payload),
+                    err(anything())
+                );
+            }
+        }
+
+        // Snake-case envelope keys (even null) are rejected by camelCase + deny_unknown_fields
+        for snake_key in ["new_transaction", "explain_options", "request_options"] {
+            let payload = serde_json::json!({ snake_key: null });
+            expect_that!(
+                serde_json::from_value::<RunQueryRequest>(payload.clone()),
+                err(anything())
+            );
+            expect_that!(
+                serde_json::from_value::<RunAggregationQueryRequest>(payload),
+                err(anything())
+            );
+        }
+
+        // Unsupported RunAggregationQueryRequest fields fail serialization
+        let raq_new_txn = RunAggregationQueryRequest {
+            consistency_selector: Some(
+                run_aggregation_query_request::ConsistencySelector::NewTransaction(
+                    TransactionOptions::READ_WRITE,
+                ),
+            ),
+            ..Default::default()
+        };
+        expect_that!(serde_json::to_string(&raq_new_txn), err(anything()));
+
+        let raq_explain = RunAggregationQueryRequest {
+            explain_options: Some(ExplainOptions::default()),
+            ..Default::default()
+        };
+        expect_that!(serde_json::to_string(&raq_explain), err(anything()));
+
+        let raq_req_opts = RunAggregationQueryRequest {
+            request_options: Some(RequestOptions::default()),
+            ..Default::default()
+        };
+        expect_that!(serde_json::to_string(&raq_req_opts), err(anything()));
+
+        let raq_find_nearest = RunAggregationQueryRequest {
+            query_type: Some(
+                run_aggregation_query_request::QueryType::StructuredAggregationQuery(
+                    StructuredAggregationQuery {
+                        query_type:   Some(
+                            structured_aggregation_query::QueryType::StructuredQuery(
+                                StructuredQuery {
+                                    find_nearest: Some(FindNearest::default()),
+                                    ..Default::default()
+                                },
+                            ),
+                        ),
+                        aggregations: vec![],
+                    },
+                ),
+            ),
+            ..Default::default()
+        };
+        expect_that!(serde_json::to_string(&raq_find_nearest), err(anything()));
+
+        // Conflicting readTime + transaction and malformed base64 transaction are rejected
+        expect_that!(
+            serde_json::from_value::<RunAggregationQueryRequest>(json!({
+                "parent": "projects/p/databases/(default)/documents",
+                "readTime": "2026-11-24T10:00:00Z",
+                "transaction": "AAEC"
+            })),
+            err(anything())
+        );
+        expect_that!(
+            serde_json::from_value::<RunAggregationQueryRequest>(json!({
+                "transaction": "not!valid!base64!"
+            })),
+            err(anything())
+        );
+    }
+
+    #[gtest]
+    fn aggregation_count_up_to_bounds_and_formats() {
+        for (input, expected) in [
+            (json!({}), None),
+            (json!({ "upTo": null }), None),
+            (json!({ "upTo": 0 }), Some(0)),
+            (json!({ "upTo": "0" }), Some(0)),
+            (json!({ "upTo": 42 }), Some(42)),
+            (json!({ "upTo": "42" }), Some(42)),
+            (json!({ "upTo": -5 }), Some(-5)),
+            (json!({ "upTo": "-5" }), Some(-5)),
+            (json!({ "upTo": i64::MIN }), Some(i64::MIN)),
+            (json!({ "upTo": i64::MIN.to_string() }), Some(i64::MIN)),
+            (json!({ "upTo": i64::MAX }), Some(i64::MAX)),
+            (json!({ "upTo": i64::MAX.to_string() }), Some(i64::MAX)),
+        ] {
+            let count: Count = serde_json::from_value(input).unwrap();
+            expect_eq!(count.up_to.map(|v| v.value), expected);
+            let encoded = serde_json::to_value(count).unwrap();
+            match expected {
+                Some(n) => expect_eq!(encoded, json!({ "upTo": n.to_string() })),
+                None => expect_eq!(encoded, json!({})),
+            }
+        }
+
+        for bad in [
+            json!({ "upTo": "9223372036854775808" }),
+            json!({ "upTo": 9_223_372_036_854_775_808_u64 }),
+            json!({ "upTo": "-9223372036854775809" }),
+            json!({ "upTo": 1.5 }),
+            json!({ "upTo": true }),
+            json!({ "upTo": "not-an-i64" }),
+        ] {
+            expect_that!(serde_json::from_value::<Count>(bad), err(anything()));
+        }
+    }
+
+    #[gtest]
+    fn aggregation_result_sorted_and_empty_aggregate_fields() {
+        let empty = AggregationResult::default();
+        expect_eq!(serde_json::to_value(&empty).unwrap(), json!({}));
+        expect_eq!(
+            serde_json::from_value::<AggregationResult>(json!({})).unwrap(),
+            empty
+        );
+        expect_eq!(
+            serde_json::from_value::<AggregationResult>(json!({ "aggregateFields": null }))
+                .unwrap(),
+            empty
+        );
+        expect_that!(
+            serde_json::from_value::<AggregationResult>(json!({
+                "aggregateFields": { "k": null }
+            })),
+            err(anything())
+        );
+
+        let result = AggregationResult {
+            aggregate_fields: HashMap::from([
+                ("zeta".to_string(), Value::integer(99)),
+                ("alpha".to_string(), Value::double(-0.0)),
+                ("field_1".to_string(), Value::null()),
+            ]),
+        };
+        let encoded = serde_json::to_string(&result).unwrap();
+        let alpha_idx = encoded.find(r#""alpha""#).unwrap();
+        let field1_idx = encoded.find(r#""field_1""#).unwrap();
+        let zeta_idx = encoded.find(r#""zeta""#).unwrap();
+        expect_lt!(alpha_idx, field1_idx);
+        expect_lt!(field1_idx, zeta_idx);
+        expect_that!(encoded, contains_substring("-0.0"));
+        expect_that!(encoded, contains_substring(r#""integerValue":"99""#));
+
+        let decoded: AggregationResult = serde_json::from_str(&encoded).unwrap();
+        expect_true!(Value::fields_storage_eq(
+            &decoded.aggregate_fields,
+            &result.aggregate_fields
+        ));
+    }
+
+    #[gtest]
+    fn aggregation_validation_errors_and_deny_unknown_fields() {
+        use crate::google::firestore::v1::ExplainMetrics;
+
+        // Missing or multiple operators on Aggregation fail deserialize
+        for bad_agg in [
+            json!({}),
+            json!({ "alias": "only_alias" }),
+            json!({ "count": null, "sum": null, "avg": null }),
+            json!({ "count": {}, "sum": { "field": { "fieldPath": "a" } } }),
+            json!({ "count": {}, "avg": { "field": { "fieldPath": "a" } } }),
+            json!({ "sum": { "field": { "fieldPath": "a" } }, "avg": { "field": { "fieldPath": "a" } } }),
+            json!({ "count": {}, "sum": {}, "avg": {} }),
+        ] {
+            expect_that!(
+                serde_json::from_value::<Aggregation>(bad_agg),
+                err(anything())
+            );
+        }
+
+        // Missing operator on Aggregation fails serialize
+        expect_that!(
+            serde_json::to_string(&Aggregation {
+                alias:    "x".to_string(),
+                operator: None,
+            }),
+            err(anything())
+        );
+        expect_that!(
+            serde_json::to_string(&Aggregation::default()),
+            err(anything())
+        );
+
+        // explainMetrics on RunAggregationQueryResponse fails serialize
+        let resp_explain = RunAggregationQueryResponse {
+            explain_metrics: Some(ExplainMetrics::default()),
+            ..Default::default()
+        };
+        expect_that!(serde_json::to_string(&resp_explain), err(anything()));
+
+        // deny_unknown_fields across request and query aggregation types
+        expect_that!(
+            serde_json::from_value::<RunQueryRequest>(json!({ "unknown": 1 })),
+            err(anything())
+        );
+        expect_that!(
+            serde_json::from_value::<RunAggregationQueryRequest>(json!({ "unknown": 1 })),
+            err(anything())
+        );
+        expect_that!(
+            serde_json::from_value::<RunAggregationQueryRequest>(json!({
+                "structured_aggregation_query": {}
+            })),
+            err(anything())
+        );
+        expect_that!(
+            serde_json::from_value::<StructuredAggregationQuery>(json!({ "unknown": 1 })),
+            err(anything())
+        );
+        expect_that!(
+            serde_json::from_value::<StructuredAggregationQuery>(json!({
+                "structured_query": {}
+            })),
+            err(anything())
+        );
+        expect_that!(
+            serde_json::from_value::<Aggregation>(json!({ "count": {}, "unknown": 1 })),
+            err(anything())
+        );
+        expect_that!(
+            serde_json::from_value::<Count>(json!({ "upTo": "1", "unknown": 1 })),
+            err(anything())
+        );
+        expect_that!(
+            serde_json::from_value::<Count>(json!({ "up_to": "1" })),
+            err(anything())
+        );
+        expect_that!(
+            serde_json::from_value::<Sum>(json!({
+                "field": { "fieldPath": "a" },
+                "unknown": 1
+            })),
+            err(anything())
+        );
+        expect_that!(
+            serde_json::from_value::<Avg>(json!({
+                "field": { "fieldPath": "a" },
+                "unknown": 1
+            })),
+            err(anything())
         );
     }
 
