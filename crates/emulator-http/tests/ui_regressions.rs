@@ -5183,10 +5183,12 @@ fn regression_dark_theme_css_tokens_and_wcag_contrast() {
         "ui/index.html",
         "ui/styles.css",
         "ui/app.js",
+        "ui/components/combobox.js",
         "ui/components/editor.js",
         "ui/components/explorer.js",
         "ui/components/modals.js",
         "ui/components/query.js",
+        "ui/components/query-suggestions.js",
         "ui/components/contention.js",
     ];
 
@@ -6057,6 +6059,1387 @@ const makeProps = (qState) => ({{
 }}
 
 console.log("slice1_modes_limit_raw_validation_and_execution_isolation passed");
+"#
+    );
+
+    run_node_ui_test(&script);
+}
+
+#[test]
+fn slice2_discovery_suggestions() {
+    let script = format!(
+        r#"{NODE_BOOTSTRAP}
+const query = await import("./ui/components/query.js");
+const qsugg = await import("./ui/components/query-suggestions.js");
+
+const rootPath = "projects/p/databases/(default)/documents";
+
+const findComboboxInputHandlers = (node, id) => {{
+  if (!node || typeof node !== "object") return null;
+  if (Array.isArray(node)) {{
+    for (const item of node) {{
+      const hit = findComboboxInputHandlers(item, id);
+      if (hit) return hit;
+    }}
+    return null;
+  }}
+  if (Array.isArray(node.strings) && Array.isArray(node.values)) {{
+    for (let i = 0; i < node.values.length; i++) {{
+      if (node.values[i] === id && /\bid=\s*$/.test(node.strings[i])) {{
+        const handlers = {{}};
+        for (let k = i + 1; k < node.values.length; k++) {{
+          const s = node.strings[k];
+          if (s.includes(">")) break;
+          const m = /@([a-z]+)=\s*$/.exec(s);
+          if (m && typeof node.values[k] === "function") {{
+            handlers[m[1]] = node.values[k];
+          }}
+        }}
+        return handlers;
+      }}
+    }}
+    for (const v of node.values) {{
+      const hit = findComboboxInputHandlers(v, id);
+      if (hit) return hit;
+    }}
+  }}
+  return null;
+}};
+
+const findOptionByLabel = (node, labelText) => {{
+  const click = findClickHandler(node, labelText);
+  return click ? {{ click }} : null;
+}};
+
+// 1. Key-only collection-group :runQuery (limit 500), phantom ancestors, uniform direct child seeding,
+//    Partial footer, empty [{{readTime}}] doc count 0, and odd-segment/invalid parentSubpath skip.
+{{
+  const store = qsugg.createQuerySuggestionStore();
+  const requests = [];
+  let rerenders = 0;
+  const ctx = {{
+    rootPath,
+    rootCollections: ["empty_root", "orgs"],
+    onRerender: () => {{ rerenders++; }},
+  }};
+
+  let mode = "root_500";
+  fetchImpl = async (url, init) => {{
+    requests.push({{ url, method: init.method ?? "GET", body: init.body ? JSON.parse(init.body) : null, hasSignal: Boolean(init.signal) }});
+    if (url === `/v1/${{rootPath}}:runQuery` && mode === "root_500") {{
+      const rows = Array.from({{ length: 499 }}, (_, i) => ({{
+        document: {{ name: `${{rootPath}}/orgs/org-${{i}}/projects/p-${{i}}/tasks/t-${{i}}` }},
+        readTime: "2026-01-01T00:00:00Z",
+      }}));
+      rows.push({{
+        document: {{ name: `${{rootPath}}/orgs/acme/audit/a1` }},
+        readTime: "2026-01-01T00:00:00Z",
+      }});
+      return jsonResponse(rows);
+    }}
+    if (url === `/v1/${{rootPath}}/orgs/acme:listCollectionIds`) {{
+      return jsonResponse({{ collectionIds: ["empty_subcol", "projects"] }});
+    }}
+    if (url === `/v1/${{rootPath}}/orgs/acme:runQuery`) {{
+      return jsonResponse([{{ readTime: "2026-01-01T00:00:00Z" }}]);
+    }}
+    throw new Error("unexpected fetch in 1: " + url);
+  }};
+
+  // Odd-segment and invalid parentSubpaths must skip network calls.
+  for (const badParent of ["orgs", "orgs/acme/projects", "__bad__/doc", "./a", "../a", "a..b"]) {{
+    const skipped = await qsugg.ensureCollectionGroups(store, ctx, badParent);
+    assert.deepEqual(skipped.items, []);
+  }}
+  assert.equal(requests.length, 0);
+
+  // Root collection group discovery: 1 key-only :runQuery (limit 500), seeded with rootCollections.
+  const rootEntry = await qsugg.ensureCollectionGroups(store, ctx, "");
+  assert.equal(requests.length, 1);
+  assert.equal(requests[0].hasSignal, true);
+  assert.deepEqual(requests[0].body, {{
+    structuredQuery: {{
+      from: [{{ collectionId: "", allDescendants: true }}],
+      select: {{ fields: [{{ fieldPath: "__name__" }}] }},
+      limit: 500,
+    }},
+  }});
+  assert.deepEqual(
+    rootEntry.items.map((i) => i.value),
+    ["audit", "empty_root", "orgs", "projects", "tasks"]
+  );
+  assert.equal(rootEntry.partial, true);
+  assert.equal(qsugg.formatSuggestionFooter(rootEntry), "Partial");
+  assert.ok(store.collectionGroupsByParent.has(""));
+  assert.ok(rerenders >= 2);
+
+  // Non-root parentSubpath with empty [{{readTime}}] result: doc count 0, partial false, uniform subcol seeding!
+  mode = "sub_empty";
+  const subEntry = await qsugg.ensureCollectionGroups(store, ctx, "/orgs/acme/");
+  assert.equal(subEntry.partial, false);
+  assert.equal(qsugg.formatSuggestionFooter(subEntry), "");
+  assert.deepEqual(
+    subEntry.items.map((i) => i.value),
+    ["empty_subcol", "projects"]
+  );
+  assert.ok(store.collectionGroupsByParent.has("orgs/acme"));
+  assert.ok(store.subcollectionsByParent.has("orgs/acme"));
+}}
+
+// 2. Slash-triggered parentSubpath alternating listDocuments(showMissing=true) and :listCollectionIds,
+//    dynamic keepOpenOnSelect (col/ stays open + fetches children + resets activeIndex; col/doc closes),
+//    and zero Explorer cache dependency.
+{{
+  const store = qsugg.createQuerySuggestionStore();
+  const qState = query.createQueryRunnerState();
+  const requests = [];
+  let rerenderCount = 0;
+
+  fetchImpl = async (url, init) => {{
+    requests.push({{ url, method: init.method ?? "GET" }});
+    if (url.startsWith(`/v1/${{rootPath}}/orgs?`)) {{
+      assert.ok(url.includes("showMissing=true"));
+      assert.ok(url.includes("mask.fieldPaths=__name__"));
+      assert.ok(url.includes("pageSize=100"));
+      return jsonResponse({{
+        documents: [
+          {{ name: `${{rootPath}}/orgs/acme` }},
+          {{ name: `${{rootPath}}/orgs/beta` }},
+        ],
+        nextPageToken: "tok-2",
+      }});
+    }}
+    if (url === `/v1/${{rootPath}}/orgs/acme:listCollectionIds`) {{
+      return jsonResponse({{ collectionIds: ["projects"] }});
+    }}
+    if (url.startsWith(`/v1/${{rootPath}}/orgs/acme/projects?`)) {{
+      return jsonResponse({{
+        documents: [{{ name: `${{rootPath}}/orgs/acme/projects/p1` }}],
+      }});
+    }}
+    throw new Error("unexpected fetch in 2: " + url);
+  }};
+
+  const renderFn = () => query.renderQueryRunner({{
+    projectId: "p",
+    databaseId: "(default)",
+    knownCollections: ["orgs", "users"],
+    suggestions: store,
+    state: qState,
+    onRerender: () => {{ rerenderCount++; }},
+    onExecuteQuery: () => {{}},
+    onOpenResultDocument: () => {{}},
+  }});
+
+  // Invalid prefixes skip network calls.
+  for (const invalidPrefix of ["/orgs/", "orgs//acme/", "./", "../", "__res__/"]) {{
+    const res = await qsugg.ensureParentSubpathSuggestions(
+      store,
+      {{ rootPath, rootCollections: ["orgs"], onRerender: () => {{}} }},
+      invalidPrefix
+    );
+    assert.deepEqual(res.items, []);
+  }}
+  assert.equal(requests.length, 0);
+
+  // Root Collection ID (!allDescendants, parentSubpath "") serves knownCollections with 0 fetches.
+  const tpl0 = renderFn();
+  const colHandlers = findComboboxInputHandlers(tpl0, "query-collection-id");
+  assert.ok(colHandlers);
+  colHandlers.focus({{ currentTarget: {{ getBoundingClientRect: () => ({{ top: 100, bottom: 130, left: 10, width: 200 }}) }} }});
+  assert.equal(store.comboboxUi.openId, "query-collection-id");
+  assert.equal(requests.length, 0, "root Collection ID must use knownCollections with 0 HTTP calls");
+  const colMarkup = renderTemplateMarkup(renderFn());
+  assert.ok(colMarkup.includes(">orgs<") || colMarkup.includes("orgs"));
+
+  // Focus parentSubpath (no slash yet -> synchronous rootCollections/, 0 HTTP calls).
+  const parentHandlers = findComboboxInputHandlers(renderFn(), "query-parent-subpath");
+  assert.ok(parentHandlers);
+  parentHandlers.focus({{ currentTarget: {{ getBoundingClientRect: () => ({{ top: 50, bottom: 80, left: 10, width: 200 }}) }} }});
+  assert.equal(store.comboboxUi.openId, "query-parent-subpath");
+  assert.equal(requests.length, 0);
+
+  // Select "orgs/" via Enter with ArrowDown -> keepOpenOnSelect keeps popup open, resets activeIndex,
+  // and immediately fetches listDocuments for "orgs".
+  findComboboxInputHandlers(renderFn(), "query-parent-subpath").keydown({{
+    key: "ArrowDown",
+    preventDefault() {{}},
+    currentTarget: {{ getBoundingClientRect: () => ({{ top: 50, bottom: 80, left: 10, width: 200 }}) }},
+  }});
+  assert.equal(store.comboboxUi.activeIndex, 0);
+  const parentHandlersOpen = findComboboxInputHandlers(renderFn(), "query-parent-subpath");
+  parentHandlersOpen.keydown({{
+    key: "Enter",
+    preventDefault() {{}},
+    currentTarget: {{ getBoundingClientRect: () => ({{ top: 50, bottom: 80, left: 10, width: 200 }}) }},
+  }});
+  assert.equal(qState.parentSubpath, "orgs/");
+  assert.equal(store.comboboxUi.openId, "query-parent-subpath", "col/ selection must keep popup open");
+  assert.equal(store.comboboxUi.activeIndex, -1, "keepOpenOnSelect must reset activeIndex to -1");
+
+  await new Promise((r) => setTimeout(r, 0));
+  assert.equal(requests.length, 1);
+  const docEntry = store.docIdsByCollection.get("orgs");
+  assert.equal(docEntry.partial, true, "nextPageToken must mark docIdsByCollection entry partial");
+  assert.deepEqual(docEntry.items.map((i) => i.value), ["orgs/acme", "orgs/beta"]);
+
+  const orgsTpl = renderFn();
+  const orgsMarkup = renderTemplateMarkup(orgsTpl);
+  assert.ok(orgsMarkup.includes("Partial"));
+  assert.ok(orgsMarkup.includes("acme"));
+
+  // Select "orgs/acme" (no trailing slash) -> closes popup and sets parentSubpath = "orgs/acme".
+  const acmeOpt = findOptionByLabel(orgsTpl, "acme");
+  assert.ok(acmeOpt);
+  acmeOpt.click();
+  assert.equal(qState.parentSubpath, "orgs/acme");
+  assert.equal(store.comboboxUi.openId, null, "col/doc selection must close popup");
+
+  // Typing "/" after "orgs/acme" triggers :listCollectionIds via ensureSubcollections cache.
+  const parentHandlers2 = findComboboxInputHandlers(renderFn(), "query-parent-subpath");
+  parentHandlers2.input({{
+    target: {{ value: "orgs/acme/" }},
+    currentTarget: {{ getBoundingClientRect: () => ({{ top: 50, bottom: 80, left: 10, width: 200 }}) }},
+  }});
+  await new Promise((r) => setTimeout(r, 0));
+  assert.equal(requests.length, 2);
+  assert.deepEqual(store.subcollectionsByParent.get("orgs/acme").items.map((i) => i.value), ["projects"]);
+
+  // Direct subcollection Collection ID reuses subcollectionsByParent with 0 extra fetches!
+  qState.parentSubpath = "orgs/acme";
+  const subColTpl = renderFn();
+  const subColHandlers = findComboboxInputHandlers(subColTpl, "query-collection-id");
+  subColHandlers.focus({{ currentTarget: {{ getBoundingClientRect: () => ({{ top: 100, bottom: 130, left: 10, width: 200 }}) }} }});
+  await new Promise((r) => setTimeout(r, 0));
+  assert.equal(requests.length, 2, "direct subcollection Collection ID shares subcollectionsByParent cache");
+  assert.ok(renderTemplateMarkup(renderFn()).includes("projects"));
+}}
+
+console.log("slice2_discovery_suggestions passed");
+"#
+    );
+
+    run_node_ui_test(&script);
+}
+
+#[test]
+fn slice2_field_sampling_and_auto_type() {
+    let script = format!(
+        r#"{NODE_BOOTSTRAP}
+const query = await import("./ui/components/query.js");
+const qsugg = await import("./ui/components/query-suggestions.js");
+
+const rootPath = "projects/p/databases/(default)/documents";
+
+const findComboboxInputHandlers = (node, id) => {{
+  if (!node || typeof node !== "object") return null;
+  if (Array.isArray(node)) {{
+    for (const item of node) {{
+      const hit = findComboboxInputHandlers(item, id);
+      if (hit) return hit;
+    }}
+    return null;
+  }}
+  if (Array.isArray(node.strings) && Array.isArray(node.values)) {{
+    for (let i = 0; i < node.values.length; i++) {{
+      if (node.values[i] === id && /\bid=\s*$/.test(node.strings[i])) {{
+        const handlers = {{}};
+        for (let k = i + 1; k < node.values.length; k++) {{
+          const s = node.strings[k];
+          if (s.includes(">")) break;
+          const m = /@([a-z]+)=\s*$/.exec(s);
+          if (m && typeof node.values[k] === "function") {{
+            handlers[m[1]] = node.values[k];
+          }}
+        }}
+        return handlers;
+      }}
+    }}
+    for (const v of node.values) {{
+      const hit = findComboboxInputHandlers(v, id);
+      if (hit) return hit;
+    }}
+  }}
+  return null;
+}};
+
+const findSelectChangeByAriaLabel = (node, ariaLabel) => {{
+  if (!node || typeof node !== "object") return null;
+  if (Array.isArray(node)) {{
+    for (const item of node) {{
+      const hit = findSelectChangeByAriaLabel(item, ariaLabel);
+      if (hit) return hit;
+    }}
+    return null;
+  }}
+  if (Array.isArray(node.strings) && Array.isArray(node.values)) {{
+    for (let i = 0; i < node.strings.length; i++) {{
+      const matchedStatic = node.strings[i].includes(`aria-label="${{ariaLabel}}"`);
+      const matchedDynamic =
+        i < node.values.length &&
+        node.values[i] === ariaLabel &&
+        /\baria-label=\s*$/.test(node.strings[i]);
+      if (matchedStatic || matchedDynamic) {{
+        for (let k = i; k < node.values.length; k++) {{
+          const s = node.strings[k];
+          if (k > i && s.includes(">")) break;
+          if (/@change=\s*$/.test(s) && typeof node.values[k] === "function") {{
+            return node.values[k];
+          }}
+        }}
+      }}
+    }}
+    for (const v of node.values) {{
+      const hit = findSelectChangeByAriaLabel(v, ariaLabel);
+      if (hit) return hit;
+    }}
+  }}
+  return null;
+}};
+
+const findOptionByValueMatch = (node, textSubstr) => {{
+  const click = findClickHandler(node, textSubstr);
+  return click ? {{ click }} : null;
+}};
+
+// 1. Field sampling depth 5, vector stop, 32-item array cap, escaping, Map prototype safety,
+//    nullable/mixed/null badges, reserved newline names, __name__ placement, empty collection skip.
+{{
+  const store = qsugg.createQuerySuggestionStore();
+  const requests = [];
+  const ctx = {{ rootPath, rootCollections: ["products"], onRerender: () => {{}} }};
+
+  // Array with 32 integers followed by 40 strings -> 32-item cap must pick integerValue!
+  const cappedArray = [
+    ...Array.from({{ length: 32 }}, () => ({{ integerValue: "1" }})),
+    ...Array.from({{ length: 40 }}, () => ({{ stringValue: "later" }})),
+  ];
+
+  // Tie-breaking array (1 stringValue, 1 integerValue) -> stringValue wins by SCALAR_FILTER_TYPES order.
+  const tiedArray = [{{ integerValue: "5" }}, {{ stringValue: "a" }}];
+
+  const protoDocFields = JSON.parse('{{}}');
+  protoDocFields["__proto__"] = {{ stringValue: "ignored-reserved" }};
+  protoDocFields["__a\\nb__"] = {{ stringValue: "ignored-newline-reserved" }};
+  protoDocFields["____"] = {{ stringValue: "allowed-4-underscores" }};
+  protoDocFields["constructor"] = {{ stringValue: "safe-key" }};
+  protoDocFields["price"] = {{ doubleValue: 19.99 }};
+  protoDocFields["nullableInt"] = {{ nullValue: null }};
+  protoDocFields["allNull"] = {{ nullValue: null }};
+  protoDocFields["mixedVal"] = {{ integerValue: "1" }};
+  protoDocFields["active"] = {{ booleanValue: true }};
+  protoDocFields["tiedScalar"] = {{ integerValue: "1" }};
+  protoDocFields["cappedArr"] = {{ arrayValue: {{ values: cappedArray }} }};
+  protoDocFields["tiedArr"] = {{ arrayValue: {{ values: tiedArray }} }};
+  protoDocFields["embedding"] = {{
+    mapValue: {{
+      fields: {{
+        __type__: {{ stringValue: "__vector__" }},
+        value: {{ arrayValue: {{ values: [{{ doubleValue: 0.5 }}] }} }},
+      }},
+    }},
+  }};
+  protoDocFields["meta"] = {{
+    mapValue: {{
+      fields: {{
+        "display.name": {{ stringValue: "Widget" }},
+        d2: {{
+          mapValue: {{
+            fields: {{
+              d3: {{
+                mapValue: {{
+                  fields: {{
+                    d4: {{
+                      mapValue: {{
+                        fields: {{
+                          d5: {{
+                            mapValue: {{
+                              fields: {{
+                                d6: {{ stringValue: "too-deep" }},
+                              }},
+                            }},
+                          }},
+                        }},
+                      }},
+                    }},
+                  }},
+                }},
+              }},
+            }},
+          }},
+        }},
+      }},
+    }},
+  }};
+
+  const doc2Fields = {{
+    nullableInt: {{ integerValue: "42" }},
+    allNull: {{ nullValue: null }},
+    mixedVal: {{ stringValue: "two" }},
+    tiedScalar: {{ stringValue: "wins-tie" }},
+    mixedScalarAndArr: {{ booleanValue: true }},
+  }};
+
+  const doc3Fields = {{
+    mixedScalarAndArr: {{ arrayValue: {{ values: [{{ geoPointValue: {{ latitude: 1, longitude: 2 }} }}] }} }},
+  }};
+
+  let nextMockMode = "three";
+  fetchImpl = async (url, init) => {{
+    requests.push({{ url, body: JSON.parse(init.body) }});
+    if (nextMockMode === "empty") {{
+      return jsonResponse([{{ readTime: "2026-01-01T00:00:00Z" }}]);
+    }}
+    if (nextMockMode === "one") {{
+      return jsonResponse([{{ document: {{ name: `${{rootPath}}/one/d1`, fields: {{ a: {{ integerValue: "1" }} }} }} }}]);
+    }}
+    if (nextMockMode === "twenty_five") {{
+      return jsonResponse(
+        Array.from({{ length: 25 }}, (_, i) => ({{
+          document: {{ name: `${{rootPath}}/full/d${{i}}`, fields: {{ k: {{ integerValue: String(i) }} }} }},
+        }}))
+      );
+    }}
+    return jsonResponse([
+      {{ document: {{ name: `${{rootPath}}/products/p1`, fields: protoDocFields }} }},
+      {{ document: {{ name: `${{rootPath}}/products/p2`, fields: doc2Fields }} }},
+      {{ document: {{ name: `${{rootPath}}/products/p3`, fields: doc3Fields }} }},
+    ]);
+  }};
+
+  // Empty collectionId and invalid parentSubpath skip HTTP calls.
+  await qsugg.ensureFieldSuggestions(store, ctx, {{ parentSubpath: "", collectionId: "  ", allDescendants: false }});
+  await qsugg.ensureFieldSuggestions(store, ctx, {{ parentSubpath: "orgs", collectionId: "products", allDescendants: false }});
+  assert.equal(requests.length, 0);
+
+  const entry = await qsugg.ensureFieldSuggestions(store, ctx, {{ parentSubpath: "", collectionId: "products", allDescendants: false }});
+  assert.equal(requests.length, 1);
+  assert.deepEqual(requests[0].body, {{
+    structuredQuery: {{
+      from: [{{ collectionId: "products", allDescendants: false }}],
+      limit: 25,
+    }},
+  }});
+  assert.equal(entry.sampledDocs, 3);
+  assert.equal(entry.partial, false);
+  assert.equal(qsugg.formatSuggestionFooter(entry), "Sampled 3 docs");
+
+  const values = entry.items.map((i) => i.value);
+  assert.equal(values.includes("__proto__"), false);
+  assert.equal(values.includes("__a\\nb__"), false);
+  assert.equal(values.includes("____"), true);
+  assert.equal(values.includes("constructor"), true);
+  assert.equal(values.includes("embedding"), true);
+  assert.equal(values.includes("embedding.__type__"), false, "vector map must not expand");
+  assert.equal(values.includes("embedding.value"), false, "vector map must not expand");
+  assert.equal(values.includes("meta"), true);
+  assert.equal(values.includes("meta.`display.name`"), true);
+  assert.equal(values.includes("meta.d2.d3.d4.d5"), true, "depth 5 included");
+  assert.equal(values.includes("meta.d2.d3.d4.d5.d6"), false, "depth 6 excluded");
+  assert.equal(values[values.length - 1], "__name__", "__name__ pinned last in items");
+  assert.equal(entry.aggItems.some((i) => i.value === "__name__"), false, "__name__ excluded from aggItems");
+  assert.equal(entry.aggItems[0].value, "mixedVal", "numeric priority in aggItems (mixedVal has integerValue)");
+  assert.equal(entry.aggItems[1].value, "nullableInt", "numeric priority in aggItems");
+  assert.equal(entry.aggItems[2].value, "price", "numeric priority in aggItems");
+  assert.equal(entry.fieldHints.get("__proto__"), undefined, "Map prototype safety");
+
+  // Badges: nullable int -> int64, 2+ non-null -> mixed, all null -> null, vector -> vector.
+  const byVal = new Map(entry.items.map((i) => [i.value, i]));
+  assert.equal(byVal.get("nullableInt").badge, "int64");
+  assert.equal(byVal.get("mixedVal").badge, "mixed");
+  assert.equal(byVal.get("allNull").badge, "null");
+  assert.equal(byVal.get("embedding").badge, "vector");
+  assert.equal(byVal.get("meta.`display.name`").matchText, "meta.display.name");
+
+  // Array 32-item cap and tie-breaking checks on hints.
+  assert.equal(entry.fieldHints.get("cappedArr").arrayElementType, "integerValue");
+  assert.equal(entry.fieldHints.get("tiedArr").arrayElementType, "stringValue");
+  assert.equal(entry.fieldHints.get("tiedScalar").scalarType, "stringValue");
+
+  // Footer formatting across 0, 1, 25 docs and Stale.
+  nextMockMode = "empty";
+  const emptyEntry = await qsugg.ensureFieldSuggestions(store, ctx, {{ parentSubpath: "", collectionId: "empty", allDescendants: false }});
+  assert.equal(emptyEntry.sampledDocs, 0);
+  assert.equal(qsugg.formatSuggestionFooter(emptyEntry), "Sampled 0 docs");
+
+  nextMockMode = "one";
+  const oneEntry = await qsugg.ensureFieldSuggestions(store, ctx, {{ parentSubpath: "", collectionId: "one", allDescendants: false }});
+  assert.equal(qsugg.formatSuggestionFooter(oneEntry), "Sampled 1 doc");
+
+  nextMockMode = "twenty_five";
+  const fullEntry = await qsugg.ensureFieldSuggestions(store, ctx, {{ parentSubpath: "", collectionId: "full", allDescendants: false }});
+  assert.equal(fullEntry.partial, true);
+  assert.equal(qsugg.formatSuggestionFooter(fullEntry), "Sampled 25 docs · Partial");
+  fullEntry.stale = true;
+  assert.equal(qsugg.formatSuggestionFooter(fullEntry), "Sampled 25 docs · Partial · Stale");
+
+  // 2. Non-clobbering Where filter auto-type detection & booleanValue normalization in renderQueryRunner.
+  const qState = query.createQueryRunnerState("products");
+  const f = query.createFilterRow();
+  assert.equal(f.valueTypeManuallySet, false);
+  assert.equal(f.valueUserEdited, false);
+  qState.filters.push(f);
+
+  const renderFn = () => query.renderQueryRunner({{
+    projectId: "p",
+    databaseId: "(default)",
+    knownCollections: ["products"],
+    suggestions: store,
+    state: qState,
+    onRerender: () => {{}},
+    onExecuteQuery: () => {{}},
+    onOpenResultDocument: () => {{}},
+  }});
+
+  // Open filter field combobox and filter both raw "display.name" and backtick-escaped "`display.name`" -> matches "meta.`display.name`".
+  const filterId = `query-filter-field-${{f.id}}`;
+  findComboboxInputHandlers(renderFn(), filterId).focus({{ currentTarget: {{ getBoundingClientRect: () => ({{ top: 100, bottom: 130, left: 10, width: 200 }}) }} }});
+  findComboboxInputHandlers(renderFn(), filterId).input({{ target: {{ value: "display.name" }} }});
+  assert.ok(renderTemplateMarkup(renderFn()).includes("meta.`display.name`"));
+  findComboboxInputHandlers(renderFn(), filterId).input({{ target: {{ value: "`display.name`" }} }});
+  assert.ok(renderTemplateMarkup(renderFn()).includes("meta.`display.name`"));
+
+  // Clear filter input and select "active" (booleanValue) -> sets booleanValue and valueText = "true" without valueUserEdited.
+  findComboboxInputHandlers(renderFn(), filterId).input({{ target: {{ value: "active" }} }});
+  findOptionByValueMatch(renderFn(), "active").click();
+  assert.equal(f.fieldPath, "active");
+  assert.equal(f.valueType, "booleanValue");
+  assert.equal(f.valueText, "true");
+  assert.equal(f.valueUserEdited, false);
+
+  // Switch operator EQUAL -> IN (valueText -> "[]"), then IN -> EQUAL -> normalizes valueText back to "true" without setting valueUserEdited!
+  findSelectChangeByAriaLabel(renderFn(), "Filter operator")({{ target: {{ value: "IN" }} }});
+  assert.equal(f.valueText, "[]");
+  assert.equal(f.valueUserEdited, false);
+  findSelectChangeByAriaLabel(renderFn(), "Filter operator")({{ target: {{ value: "EQUAL" }} }});
+  assert.equal(f.valueType, "booleanValue");
+  assert.equal(f.valueText, "true");
+  assert.equal(f.valueUserEdited, false);
+
+  // Same for NOT_IN -> EQUAL and ARRAY_CONTAINS_ANY -> EQUAL even when valueTypeManuallySet is true.
+  f.valueTypeManuallySet = true;
+  findSelectChangeByAriaLabel(renderFn(), "Filter operator")({{ target: {{ value: "ARRAY_CONTAINS_ANY" }} }});
+  assert.equal(f.valueText, "[]");
+  findSelectChangeByAriaLabel(renderFn(), "Filter operator")({{ target: {{ value: "EQUAL" }} }});
+  assert.equal(f.valueText, "true");
+  f.valueTypeManuallySet = false;
+
+  // Selecting "price" while !valueUserEdited auto-types to doubleValue and clears unedited boolean text "true" -> "".
+  findComboboxInputHandlers(renderFn(), filterId).focus({{ currentTarget: {{ getBoundingClientRect: () => ({{ top: 100, bottom: 130, left: 10, width: 200 }}) }} }});
+  findComboboxInputHandlers(renderFn(), filterId).input({{ target: {{ value: "price" }} }});
+  findOptionByValueMatch(renderFn(), "price").click();
+  assert.equal(f.valueType, "doubleValue");
+  assert.equal(f.valueText, "");
+
+  // Switching to ARRAY_CONTAINS on mixedScalarAndArr picks arrayElementType ("geoPointValue"), while IN picks scalarType ("booleanValue"),
+  // and IS_NULL / IS_NAN leave valueType unchanged!
+  findComboboxInputHandlers(renderFn(), filterId).focus({{ currentTarget: {{ getBoundingClientRect: () => ({{ top: 100, bottom: 130, left: 10, width: 200 }}) }} }});
+  findComboboxInputHandlers(renderFn(), filterId).input({{ target: {{ value: "mixedScalarAndArr" }} }});
+  findOptionByValueMatch(renderFn(), "mixedScalarAndArr").click();
+  assert.equal(f.valueType, "booleanValue");
+  assert.equal(f.valueText, "true");
+
+  findSelectChangeByAriaLabel(renderFn(), "Filter operator")({{ target: {{ value: "ARRAY_CONTAINS" }} }});
+  assert.equal(f.valueType, "geoPointValue");
+  assert.equal(f.valueText, "");
+
+  findSelectChangeByAriaLabel(renderFn(), "Filter operator")({{ target: {{ value: "ARRAY_CONTAINS_ANY" }} }});
+  assert.equal(f.valueType, "geoPointValue");
+  assert.equal(f.valueText, "[]");
+
+  findSelectChangeByAriaLabel(renderFn(), "Filter operator")({{ target: {{ value: "IS_NULL" }} }});
+  assert.equal(f.valueType, "geoPointValue", "unary IS_NULL preserves valueType");
+  findSelectChangeByAriaLabel(renderFn(), "Filter operator")({{ target: {{ value: "IS_NAN" }} }});
+  assert.equal(f.valueType, "geoPointValue", "unary IS_NAN preserves valueType");
+
+  findSelectChangeByAriaLabel(renderFn(), "Filter operator")({{ target: {{ value: "NOT_IN" }} }});
+  assert.equal(f.valueType, "booleanValue");
+  assert.equal(f.valueText, "[]");
+
+  // Switching back to EQUAL -> booleanValue normalizes to "true"; editing boolean select sets valueUserEdited = true and blocks further auto-typing!
+  findSelectChangeByAriaLabel(renderFn(), "Filter operator")({{ target: {{ value: "EQUAL" }} }});
+  assert.equal(f.valueText, "true");
+  findSelectChangeByAriaLabel(renderFn(), "Filter boolean value")({{ target: {{ value: "false" }} }});
+  assert.equal(f.valueUserEdited, true);
+  assert.equal(f.valueText, "false");
+
+  findComboboxInputHandlers(renderFn(), filterId).focus({{ currentTarget: {{ getBoundingClientRect: () => ({{ top: 100, bottom: 130, left: 10, width: 200 }}) }} }});
+  findComboboxInputHandlers(renderFn(), filterId).input({{ target: {{ value: "price" }} }});
+  findOptionByValueMatch(renderFn(), "price").click();
+  assert.equal(f.valueType, "booleanValue", "valueUserEdited must prevent auto-type clobbering");
+  assert.equal(f.valueText, "false");
+
+  // Second filter row: manual valueType select sets valueTypeManuallySet = true; lat/lng sets valueUserEdited = true.
+  const f2 = query.createFilterRow();
+  qState.filters.push(f2);
+  const f2Id = `query-filter-field-${{f2.id}}`;
+  const row2TypeSelects = [];
+  const collectSelects = (node) => {{
+    if (!node || typeof node !== "object") return;
+    if (Array.isArray(node)) {{ node.forEach(collectSelects); return; }}
+    if (Array.isArray(node.strings) && Array.isArray(node.values)) {{
+      for (let i = 0; i < node.strings.length; i++) {{
+        if (node.strings[i].includes('aria-label="Filter value type"')) {{
+          for (let k = i; k < node.values.length; k++) {{
+            if (k > i && node.strings[k].includes(">")) break;
+            if (/@change=\s*$/.test(node.strings[k])) row2TypeSelects.push(node.values[k]);
+          }}
+        }}
+      }}
+      node.values.forEach(collectSelects);
+    }}
+  }};
+  collectSelects(renderFn());
+  row2TypeSelects[1]({{ target: {{ value: "geoPointValue" }} }});
+  assert.equal(f2.valueTypeManuallySet, true);
+  findComboboxInputHandlers(renderFn(), f2Id).focus({{ currentTarget: {{ getBoundingClientRect: () => ({{ top: 100, bottom: 130, left: 10, width: 200 }}) }} }});
+  findComboboxInputHandlers(renderFn(), f2Id).input({{ target: {{ value: "price" }} }});
+  findOptionByValueMatch(renderFn(), "price").click();
+  assert.equal(f2.valueType, "geoPointValue", "valueTypeManuallySet must prevent auto-type clobbering");
+  const latInput = findInputHandler(renderFn(), 'aria-label="Filter latitude"');
+  assert.ok(latInput);
+  latInput({{ target: {{ value: "52.3" }} }});
+  assert.equal(f2.valueUserEdited, true);
+}}
+
+console.log("slice2_field_sampling_and_auto_type passed");
+"#
+    );
+
+    run_node_ui_test(&script);
+}
+
+#[test]
+fn slice2_combobox_aria_geometry_and_reconciliation() {
+    let script = format!(
+        r#"{NODE_BOOTSTRAP}
+const combobox = await import("./ui/components/combobox.js");
+const query = await import("./ui/components/query.js");
+const qsugg = await import("./ui/components/query-suggestions.js");
+const app = await import("./ui/app.js");
+
+const findHandlersByTag = (node, tagNeedle) => {{
+  if (!node || typeof node !== "object") return null;
+  if (Array.isArray(node)) {{
+    for (const item of node) {{
+      const hit = findHandlersByTag(item, tagNeedle);
+      if (hit) return hit;
+    }}
+    return null;
+  }}
+  if (Array.isArray(node.strings) && Array.isArray(node.values)) {{
+    for (let i = 0; i < node.strings.length; i++) {{
+      if (node.strings[i].includes(tagNeedle)) {{
+        const handlers = {{}};
+        for (let k = i; k < node.values.length; k++) {{
+          if (k > i && node.strings[k].includes(">")) break;
+          const m = /@([a-z]+)=\s*$/.exec(node.strings[k]);
+          if (m && typeof node.values[k] === "function") {{
+            handlers[m[1]] = node.values[k];
+          }}
+        }}
+        if (Object.keys(handlers).length > 0) return handlers;
+      }}
+    }}
+    for (const v of node.values) {{
+      const hit = findHandlersByTag(v, tagNeedle);
+      if (hit) return hit;
+    }}
+  }}
+  return null;
+}};
+
+// 1. WAI-ARIA 1.2 bindings, listbox child purity, filtered-empty Loading vs No matching,
+//    keyboard navigation (ArrowDown/Up/Home/End/Enter/Escape/Tab), mousedown preventDefault, blur guard,
+//    flipUp threshold/positioning, capture-phase scroll/resize repositioning & clip-bounds dismissal.
+{{
+  const winListeners = new Map();
+  let mockRect = {{ top: 100, bottom: 130, left: 24, width: 300, right: 324 }};
+  let mockTopbarRect = {{ top: 0, bottom: 52, left: 0, width: 1200 }};
+  let mockPaneRect = {{ top: 52, bottom: 780, left: 0, width: 450 }};
+  let anchorConnected = true;
+  let scrollIntoViewCalls = 0;
+
+  globalThis.window.innerHeight = 800;
+  globalThis.window.innerWidth = 1200;
+  globalThis.window.addEventListener = (type, fn, opts) => {{
+    const list = winListeners.get(type) ?? [];
+    list.push({{ fn, opts }});
+    winListeners.set(type, list);
+  }};
+  globalThis.window.removeEventListener = (type, fn, opts) => {{
+    const list = winListeners.get(type) ?? [];
+    const idx = list.findIndex((x) => x.fn === fn && Boolean(x.opts?.capture) === Boolean(opts?.capture));
+    if (idx >= 0) list.splice(idx, 1);
+  }};
+  globalThis.document.getElementById = (id) => {{
+    if (id === "cb-test") {{
+      return {{
+        isConnected: anchorConnected,
+        getBoundingClientRect: () => mockRect,
+      }};
+    }}
+    if (id === "topbar") {{
+      return {{ getBoundingClientRect: () => mockTopbarRect }};
+    }}
+    if (id === "cb-test-listbox-opt-0" || id === "cb-test-listbox-opt-1") {{
+      return {{
+        scrollIntoView: () => {{ scrollIntoViewCalls++; }},
+      }};
+    }}
+    return null;
+  }};
+  globalThis.document.querySelector = (sel) => {{
+    if (sel === ".query-builder-pane") {{
+      return {{ getBoundingClientRect: () => mockPaneRect }};
+    }}
+    return null;
+  }};
+  globalThis.requestAnimationFrame = (fn) => fn();
+
+  const uiState = combobox.createComboboxUiState();
+  let val = "";
+  let loading = true;
+  let items = [];
+  let opened = 0;
+  let refreshed = 0;
+  let selected = [];
+  let rerenders = 0;
+
+  const renderBox = () => combobox.renderCombobox({{
+    id: "cb-test",
+    value: val,
+    placeholder: "Pick field",
+    ariaLabel: "Field path",
+    items,
+    uiState,
+    footerText: "Sampled 2 docs",
+    loading,
+    onInput: (next) => {{ val = next; }},
+    onSelect: (item) => {{ val = item.value; selected.push(item.value); }},
+    onOpen: () => {{ opened++; }},
+    onRefresh: () => {{ refreshed++; }},
+    onRerender: () => {{ rerenders++; }},
+  }});
+
+  // Closed state: aria-expanded="false", NO .combobox-popup, NO aria-controls, NO aria-activedescendant.
+  const closedMarkup = renderTemplateMarkup(renderBox());
+  assert.ok(closedMarkup.includes('role="combobox"'));
+  assert.ok(closedMarkup.includes('aria-autocomplete="list"'));
+  assert.ok(closedMarkup.includes('aria-expanded="false"'));
+  assert.equal(closedMarkup.includes("combobox-popup"), false);
+  assert.equal(closedMarkup.includes("aria-controls"), false);
+  assert.equal(closedMarkup.includes("aria-activedescendant"), false);
+
+  // Open while loading && items.length === 0 -> renders sibling .combobox-empty "Loading..." outside <ul>.
+  findHandlersByTag(renderBox(), 'role="combobox"').focus({{
+    currentTarget: {{ getBoundingClientRect: () => mockRect }},
+  }});
+  assert.equal(opened, 1);
+  assert.equal(uiState.openId, "cb-test");
+  assert.equal(uiState.activeIndex, -1);
+  assert.equal((winListeners.get("scroll") ?? []).length, 1);
+  assert.equal(winListeners.get("scroll")[0].opts.capture, true);
+  assert.equal((winListeners.get("resize") ?? []).length, 1);
+
+  const loadingMarkup = renderTemplateMarkup(renderBox()).replace(/\s+/g, " ");
+  assert.ok(loadingMarkup.includes('aria-expanded="true"'));
+  assert.ok(loadingMarkup.includes('aria-controls="cb-test-listbox"'));
+  assert.ok(loadingMarkup.includes('<ul id="cb-test-listbox" class="combobox-listbox" role="listbox"> </ul>'));
+  assert.ok(loadingMarkup.includes('<div class="combobox-empty" role="status">Loading...</div>'));
+  assert.ok(loadingMarkup.includes('class="combobox-refresh-btn" tabindex="-1"'));
+
+  // Filtered-empty state when items.length > 0 and loading === true: must show "No matching suggestions" (NOT "Loading...").
+  items = [
+    {{ value: "alpha", label: "alpha", badge: "string", badgeClass: "stringValue" }},
+    {{ value: "beta", label: "beta", badge: "int64", badgeClass: "integerValue" }},
+  ];
+  val = "nomatch";
+  const filteredEmptyMarkup = renderTemplateMarkup(renderBox());
+  assert.ok(filteredEmptyMarkup.includes("No matching suggestions"));
+  assert.equal(filteredEmptyMarkup.includes("Loading..."), false);
+
+  // Valid <ul role="listbox"> containing strictly <li role="option"> children only.
+  loading = false;
+  val = "";
+  const openTpl = renderBox();
+  const openMarkup = renderTemplateMarkup(openTpl).replace(/\s+/g, " ");
+  const ulMatch = /<ul [^>]*role="listbox">(.*?)<\/ul>/.exec(openMarkup);
+  assert.ok(ulMatch, "expected <ul role=listbox>");
+  assert.equal(ulMatch[1].includes("<div"), false, "ul must contain only <li role=option> children");
+  assert.ok(ulMatch[1].includes('role="option"'));
+
+  // Keyboard navigation: ArrowDown, End, Home, ArrowUp, Enter free-form vs Enter active.
+  let prevented = 0;
+  let stopped = 0;
+  const key = (k) => findHandlersByTag(renderBox(), 'role="combobox"').keydown({{
+    key: k,
+    preventDefault: () => {{ prevented++; }},
+    stopPropagation: () => {{ stopped++; }},
+    currentTarget: {{ getBoundingClientRect: () => mockRect }},
+  }});
+  key("ArrowDown");
+  assert.equal(uiState.activeIndex, 0);
+  assert.ok(scrollIntoViewCalls >= 1);
+  assert.ok(renderTemplateMarkup(renderBox()).includes('aria-activedescendant="cb-test-listbox-opt-0"'));
+  key("End");
+  assert.equal(uiState.activeIndex, 1);
+  key("Home");
+  assert.equal(uiState.activeIndex, 0);
+  key("ArrowUp");
+  assert.equal(uiState.activeIndex, 1);
+
+  // Enter when activeIndex === -1 closes popup without calling onSelect and preserves typed text!
+  val = "custom-typed";
+  uiState.activeIndex = -1;
+  key("Enter");
+  assert.equal(uiState.openId, null);
+  assert.equal(val, "custom-typed");
+  assert.equal(selected.length, 0);
+
+  // ArrowUp when closed opens and sets activeIndex = items.length - 1; Tab closes without preventDefault!
+  val = "";
+  key("ArrowUp");
+  assert.equal(uiState.openId, "cb-test");
+  assert.equal(uiState.activeIndex, 1);
+  const prevBeforeTab = prevented;
+  key("Tab");
+  assert.equal(uiState.openId, null);
+  assert.equal(prevented, prevBeforeTab, "Tab must not call preventDefault");
+
+  // Re-open, Escape calls preventDefault & stopPropagation.
+  key("ArrowDown");
+  assert.equal(uiState.openId, "cb-test");
+  const prevBeforeEsc = prevented;
+  key("Escape");
+  assert.equal(uiState.openId, null);
+  assert.equal(prevented, prevBeforeEsc + 1);
+  assert.equal(stopped, 1);
+
+  // mousedown preventDefault on option and Refresh button; Refresh calls onRefresh without closing.
+  key("ArrowDown");
+  const optHandlers = findHandlersByTag(renderBox(), 'class="combobox-option');
+  const refreshHandlers = findHandlersByTag(renderBox(), 'class="combobox-refresh-btn"');
+  let mdPrevented = 0;
+  optHandlers.mousedown({{ preventDefault: () => {{ mdPrevented++; }} }});
+  refreshHandlers.mousedown({{ preventDefault: () => {{ mdPrevented++; }} }});
+  assert.equal(mdPrevented, 2);
+  refreshHandlers.click();
+  assert.equal(refreshed, 1);
+  assert.equal(uiState.openId, "cb-test");
+
+  // @blur active-ID guard: blur when openId !== id does nothing; when openId === id closes & removes listeners!
+  uiState.openId = "other-id";
+  findHandlersByTag(renderBox(), 'role="combobox"').blur();
+  assert.equal(uiState.openId, "other-id");
+  uiState.openId = "cb-test";
+  findHandlersByTag(renderBox(), 'role="combobox"').blur();
+  assert.equal(uiState.openId, null);
+  assert.equal((winListeners.get("scroll") ?? []).length, 0, "capture scroll listener must be removed");
+  assert.equal((winListeners.get("resize") ?? []).length, 0);
+
+  // flipUp threshold/positioning: availableBelow < 280 && availableAbove > availableBelow.
+  mockRect = {{ top: 600, bottom: 630, left: 24, width: 150, right: 174 }};
+  findHandlersByTag(renderBox(), 'role="combobox"').focus({{
+    currentTarget: {{ getBoundingClientRect: () => mockRect }},
+  }});
+  assert.equal(uiState.rect.flipUp, true);
+  const flippedMarkup = renderTemplateMarkup(renderBox());
+  assert.ok(flippedMarkup.includes("width: 220px; bottom: 202px; top: auto;"));
+
+  // Scroll inside .combobox-listbox is ignored; external scroll repositions; clipped past #topbar or pane dismisses!
+  const scrollFn = winListeners.get("scroll")[0].fn;
+  const resizeFn = winListeners.get("resize")[0].fn;
+  scrollFn({{ target: {{ classList: {{ contains: (c) => c === "combobox-listbox" }} }} }});
+  scrollFn({{ target: {{ closest: (s) => (s === ".combobox-listbox" ? {{}} : null) }} }});
+  assert.equal(uiState.openId, "cb-test");
+
+  mockRect = {{ top: 150, bottom: 180, left: 30, width: 260, right: 290 }};
+  scrollFn({{ target: {{}} }});
+  assert.equal(uiState.rect.flipUp, false);
+  assert.equal(uiState.rect.top, 150);
+
+  // Clipped behind #topbar (rect.top < topbar.bottom)
+  mockRect = {{ top: 40, bottom: 70, left: 30, width: 260, right: 290 }};
+  scrollFn({{ target: {{}} }});
+  assert.equal(uiState.openId, null, "clipped behind #topbar must dismiss popup");
+
+  // Reopen, clipped past .query-builder-pane bottom via resize -> dismisses!
+  mockRect = {{ top: 150, bottom: 180, left: 30, width: 260, right: 290 }};
+  findHandlersByTag(renderBox(), 'role="combobox"').focus({{
+    currentTarget: {{ getBoundingClientRect: () => mockRect }},
+  }});
+  mockRect = {{ top: 785, bottom: 815, left: 30, width: 260, right: 290 }};
+  resizeFn();
+  assert.equal(uiState.openId, null);
+
+  // Detached anchor dismisses.
+  mockRect = {{ top: 150, bottom: 180, left: 30, width: 260, right: 290 }};
+  findHandlersByTag(renderBox(), 'role="combobox"').focus({{
+    currentTarget: {{ getBoundingClientRect: () => mockRect }},
+  }});
+  anchorConnected = false;
+  winListeners.get("scroll")[0].fn({{ target: {{}} }});
+  assert.equal(uiState.openId, null);
+
+  // Per-member Node guards when window/document members are stripped.
+  delete globalThis.window.innerHeight;
+  delete globalThis.document.getElementById;
+  delete globalThis.document.querySelector;
+  delete globalThis.requestAnimationFrame;
+  findHandlersByTag(renderBox(), 'role="combobox"').focus({{
+    currentTarget: {{ getBoundingClientRect: () => mockRect }},
+  }});
+  key("ArrowDown");
+  assert.equal(uiState.openId, "cb-test");
+  combobox.closeActiveCombobox(uiState);
+}}
+
+// 2. Stable row.id keying, reconcileComboboxUi dismissal across row removal, COUNT op, raw-mode renderQueryRunner,
+//    and renderApp (view switch / modal open).
+{{
+  const store = qsugg.createQuerySuggestionStore();
+  const qState = query.createQueryRunnerState("orders");
+  const r1 = query.createFilterRow();
+  const r2 = query.createFilterRow();
+  qState.filters.push(r1, r2);
+
+  const renderQ = () => query.renderQueryRunner({{
+    projectId: "p",
+    databaseId: "(default)",
+    knownCollections: ["orders"],
+    suggestions: store,
+    state: qState,
+    onRerender: () => {{}},
+    onExecuteQuery: () => {{}},
+    onOpenResultDocument: () => {{}},
+  }});
+
+  let cleaned = 0;
+  store.comboboxUi.openId = `query-filter-field-${{r2.id}}`;
+  store.comboboxUi.cleanup = () => {{ cleaned++; }};
+
+  // Removing r1 keeps r2 open (stable row.id keying)!
+  qState.filters.splice(0, 1);
+  renderQ();
+  assert.equal(store.comboboxUi.openId, `query-filter-field-${{r2.id}}`);
+  assert.equal(cleaned, 0);
+
+  // Removing r2 closes popup and runs cleanup via reconcileComboboxUi!
+  qState.filters.splice(0, 1);
+  renderQ();
+  assert.equal(store.comboboxUi.openId, null);
+  assert.equal(cleaned, 1);
+
+  // Switching agg row from SUM to COUNT closes agg combobox via reconcileComboboxUi.
+  qState.queryKind = "aggregations";
+  qState.aggregations[0].op = "SUM";
+  store.comboboxUi.openId = `query-agg-field-${{qState.aggregations[0].id}}`;
+  renderQ();
+  assert.equal(store.comboboxUi.openId, `query-agg-field-${{qState.aggregations[0].id}}`);
+  qState.aggregations[0].op = "COUNT";
+  renderQ();
+  assert.equal(store.comboboxUi.openId, null);
+
+  // Rendering renderQueryRunner in "raw" mode closes open combobox (even parentSubpath).
+  qState.mode = "visual";
+  store.comboboxUi.openId = "query-parent-subpath";
+  renderQ();
+  assert.equal(store.comboboxUi.openId, "query-parent-subpath");
+  qState.mode = "raw";
+  renderQ();
+  assert.equal(store.comboboxUi.openId, null);
+
+  // renderApp closes open combobox on view switch and modal open.
+  app.state.activeProjectId = "p";
+  app.state.activeDatabaseId = "(default)";
+  app.state.view = "query";
+  app.state.queryState = query.createQueryRunnerState("orders");
+  app.state.querySuggestions.comboboxUi.openId = "query-collection-id";
+  await app.switchView("explorer");
+  assert.equal(app.state.querySuggestions.comboboxUi.openId, null);
+
+  app.state.view = "query";
+  app.state.querySuggestions.comboboxUi.openId = "query-collection-id";
+  app.openCreateDocumentModal("projects/p/databases/(default)/documents", "orders");
+  assert.equal(app.state.querySuggestions.comboboxUi.openId, null);
+  app.state.modal = null;
+}}
+
+console.log("slice2_combobox_aria_geometry_and_reconciliation passed");
+"#
+    );
+
+    run_node_ui_test(&script);
+}
+
+#[test]
+fn slice2_cache_and_sse_lifecycle() {
+    let script = format!(
+        r#"{NODE_BOOTSTRAP}
+let lastEs = null;
+globalThis.EventSource = class {{
+  constructor(url) {{
+    this.url = url;
+    this.listeners = new Map();
+    lastEs = this;
+  }}
+  addEventListener(type, fn) {{
+    const list = this.listeners.get(type) ?? [];
+    list.push(fn);
+    this.listeners.set(type, list);
+  }}
+  emit(type, data) {{
+    for (const fn of this.listeners.get(type) ?? []) {{
+      fn(data);
+    }}
+  }}
+  close() {{}}
+}};
+
+const api = await import("./ui/api.js");
+const app = await import("./ui/app.js");
+const qsugg = await import("./ui/components/query-suggestions.js");
+const stateMod = await import("./ui/state.js");
+
+const rootPath = "projects/p/databases/db1/documents";
+
+// 1. connectEventStream: immediate FIFO flush of database_cleared and resync, plus MAX_WAIT_MS = 1000 ceiling.
+{{
+  const origSetTimeout = globalThis.setTimeout;
+  const origClearTimeout = globalThis.clearTimeout;
+  let nextTimerId = 1;
+  const timers = new Map();
+  const batches = [];
+
+  globalThis.setTimeout = (fn, ms) => {{
+    const id = nextTimerId++;
+    timers.set(id, {{ fn, ms }});
+    return id;
+  }};
+  globalThis.clearTimeout = (id) => {{
+    timers.delete(id);
+  }};
+
+  try {{
+    const esHandle = api.connectEventStream((b) => batches.push(b), () => {{}});
+
+    // Buffer documents_changed, then database_cleared -> immediately flushes [documents_changed, database_cleared] FIFO!
+    lastEs.emit("change", {{ data: JSON.stringify({{ type: "documents_changed", database: rootPath, paths: ["a"] }}) }});
+    assert.equal(batches.length, 0);
+    assert.equal(timers.size, 2, "debounce (150ms) and maxWait (1000ms) timers must both be armed");
+    lastEs.emit("change", {{ data: JSON.stringify({{ type: "database_cleared", database: rootPath }}) }});
+    assert.equal(batches.length, 1);
+    assert.deepEqual(batches[0].map((e) => e.type), ["documents_changed", "database_cleared"]);
+    assert.equal(timers.size, 0, "all timers cleared on urgent flush");
+
+    // Buffer documents_changed, then resync -> immediately flushes [documents_changed, resync] FIFO!
+    lastEs.emit("change", {{ data: JSON.stringify({{ type: "documents_changed", database: rootPath, paths: ["b"] }}) }});
+    lastEs.emit("resync", {{ data: JSON.stringify({{ type: "resync" }}) }});
+    assert.equal(batches.length, 2);
+    assert.deepEqual(batches[1].map((e) => e.type), ["documents_changed", "resync"]);
+    assert.equal(timers.size, 0);
+
+    // Sustained documents_changed stream resets 150ms debounce repeatedly, while 1000ms maxWait timer fires!
+    lastEs.emit("change", {{ data: JSON.stringify({{ type: "documents_changed", database: rootPath, paths: ["c1"] }}) }});
+    const maxEntry = Array.from(timers.entries()).find(([, t]) => t.ms === 1000);
+    assert.ok(maxEntry, "expected 1000ms maxWait timer");
+    lastEs.emit("change", {{ data: JSON.stringify({{ type: "documents_changed", database: rootPath, paths: ["c2"] }}) }});
+    assert.equal(timers.has(maxEntry[0]), true, "maxWait timer must NOT be reset on subsequent events");
+    maxEntry[1].fn();
+    assert.equal(batches.length, 3);
+    assert.deepEqual(batches[2].map((e) => e.paths[0]), ["c1", "c2"]);
+    assert.equal(timers.size, 0);
+    esHandle.close();
+  }} finally {{
+    globalThis.setTimeout = origSetTimeout;
+    globalThis.clearTimeout = origClearTimeout;
+  }}
+}}
+
+// 2. applySyncSseBatch preempts in-flight applyAsyncSseRefresh & active Explorer reads via getDbSignal()
+//    with zero post-notification /v1 calls while preserving state.ssePaused.
+{{
+  const fetched = [];
+  const abortedUrls = [];
+  const slowDb1Meta = deferred();
+  const slowDb1Cols = deferred();
+
+  fetchImpl = async (url, init) => {{
+    fetched.push(url);
+    if (init.signal) {{
+      init.signal.addEventListener("abort", () => abortedUrls.push(url));
+    }}
+    if (url === "/emulator/v1") return jsonResponse([rootPath, "projects/p/databases/db2/documents"]);
+    if (url === "/v1/projects/p/databases/db1") return slowDb1Meta.promise;
+    if (url === "/v1/projects/p/databases/db1/documents:listCollectionIds") return slowDb1Cols.promise;
+    if (url === "/v1/projects/p/databases/db2") {{
+      return jsonResponse({{
+        name: "projects/p/databases/db2",
+        uid: "u2",
+        type: "FIRESTORE_NATIVE",
+        databaseEdition: "STANDARD",
+        concurrencyMode: "PESSIMISTIC",
+      }});
+    }}
+    if (url === "/v1/projects/p/databases/db2/documents:listCollectionIds") {{
+      return jsonResponse({{ collectionIds: [] }});
+    }}
+    throw new Error("unexpected url in 2A: " + url);
+  }};
+
+  // Switching DB aborts prior selectDatabase's getDatabase and listCollectionIds signals and suppresses AbortError.
+  const pDb1 = app.selectDatabase("p", "db1", [], true);
+  const pDb2 = app.selectDatabase("p", "db2", [], true);
+  assert.ok(abortedUrls.includes("/v1/projects/p/databases/db1"));
+  assert.ok(abortedUrls.includes("/v1/projects/p/databases/db1/documents:listCollectionIds"));
+  const abortErrA = new Error("Aborted");
+  abortErrA.name = "AbortError";
+  slowDb1Meta.reject(abortErrA);
+  slowDb1Cols.reject(abortErrA);
+  await pDb1;
+  await pDb2;
+  assert.equal(app.state.toasts.some((t) => t.tone === "error"), false);
+
+  // Reset cleanly for direct applySyncSseBatch / applyAsyncSseRefresh preemption test:
+  fetched.length = 0;
+  abortedUrls.length = 0;
+  app.state.activeProjectId = "p";
+  app.state.activeDatabaseId = "db1";
+  app.state.activeDbMeta = {{
+    name: "projects/p/databases/db1",
+    uid: "u1",
+    type: "FIRESTORE_NATIVE",
+    databaseEdition: "STANDARD",
+    concurrencyMode: "PESSIMISTIC",
+  }};
+  app.state.segments = ["users", "alice"];
+  app.state.rootCollections = ["users"];
+  app.state.querySuggestions.fieldsByScope.set("|users|0", {{
+    items: [],
+    aggItems: [],
+    fieldHints: new Map(),
+    scope: {{ parentSubpath: "", collectionId: "users", allDescendants: false }},
+    loading: false,
+    stale: false,
+    partial: false,
+    sampledDocs: 1,
+  }});
+
+  const inflightGetDoc = deferred();
+  const inflightDocCols = deferred();
+  const inflightSignals = [];
+  fetchImpl = async (url, init) => {{
+    fetched.push(url);
+    if (init.signal) inflightSignals.push({{ url, signal: init.signal }});
+    if (url === `/v1/${{rootPath}}:listCollectionIds`) {{
+      return jsonResponse({{ collectionIds: ["users"] }});
+    }}
+    if (url.startsWith(`/v1/${{rootPath}}/users?`)) {{
+      return jsonResponse({{ documents: [{{ name: `${{rootPath}}/users/alice` }}] }});
+    }}
+    if (url === `/v1/${{rootPath}}/users/alice`) {{
+      return inflightGetDoc.promise;
+    }}
+    if (url === `/v1/${{rootPath}}/users/alice:listCollectionIds`) {{
+      return inflightDocCols.promise;
+    }}
+    if (url === "/emulator/v1") return jsonResponse([]);
+    throw new Error("unexpected url in preemption test: " + url);
+  }};
+
+  const plan1 = app.applySyncSseBatch([{{
+    type: "documents_changed",
+    database: rootPath,
+    paths: [`${{rootPath}}/users/alice`],
+  }}]);
+  assert.ok(plan1);
+  assert.equal(app.state.querySuggestions.fieldsByScope.get("|users|0").stale, true);
+
+  const pRefresh1 = app.applyAsyncSseRefresh(plan1);
+  for (let tick = 0; tick < 5 && !inflightSignals.some((s) => s.url.endsWith("/users/alice")); tick++) {{
+    await new Promise((r) => setTimeout(r, 0));
+  }}
+  assert.ok(inflightSignals.some((s) => s.url.endsWith(":listCollectionIds")));
+  assert.ok(inflightSignals.some((s) => s.url.includes("/users?")));
+  assert.ok(inflightSignals.some((s) => s.url.endsWith("/users/alice")));
+
+  const fetchedBeforeClear = fetched.length;
+  // Synchronous database_cleared preemption while plan1 is awaiting getDocument:
+  const plan2 = app.applySyncSseBatch([{{
+    type: "database_cleared",
+    database: rootPath,
+  }}]);
+  assert.ok(plan2);
+  assert.equal(plan1.signal.aborted, true, "applySyncSseBatch must abort prior DB signal synchronously");
+  assert.equal(app.state.activeProjectId, null);
+  assert.equal(app.state.activeDatabaseId, null);
+  assert.equal(app.state.querySuggestions.fieldsByScope.size, 0);
+
+  // Reject aborted getDocument + listCollectionIds with AbortError; no error toast, no further /v1 calls!
+  const abortErr = new Error("Aborted");
+  abortErr.name = "AbortError";
+  inflightGetDoc.reject(abortErr);
+  inflightDocCols.reject(abortErr);
+  await pRefresh1;
+  await app.applyAsyncSseRefresh(plan2);
+
+  const postClearV1Calls = fetched.slice(fetchedBeforeClear).filter((u) => u.startsWith("/v1/"));
+  assert.deepEqual(postClearV1Calls, [], "zero post-notification /v1 calls allowed against cleared DB");
+  assert.equal(app.state.toasts.some((t) => t.tone === "error"), false);
+
+  // state.ssePaused preserved & blocks applySyncSseBatch.
+  app.state.ssePaused = true;
+  assert.equal(app.applySyncSseBatch([{{ type: "resync" }}]), null);
+  assert.equal(app.state.ssePaused, true);
+  app.state.ssePaused = false;
+}}
+
+// 3. resetQuerySuggestionStore (closes combobox, epoch stale-response drop) and markSuggestionsStale exact boundaries.
+{{
+  const store = qsugg.createQuerySuggestionStore();
+  let cleaned = 0;
+  store.comboboxUi.openId = "query-collection-id";
+  store.comboboxUi.cleanup = () => {{ cleaned++; }};
+
+  const slowRunQuery = deferred();
+  let sugSignal = null;
+  fetchImpl = async (_url, init) => {{
+    sugSignal = init.signal;
+    return slowRunQuery.promise;
+  }};
+
+  const pField = qsugg.ensureFieldSuggestions(
+    store,
+    {{ rootPath, rootCollections: [], onRerender: () => {{}} }},
+    {{ parentSubpath: "", collectionId: "orders", allDescendants: false }}
+  );
+  assert.equal(sugSignal.aborted, false);
+  const epochBefore = store.epoch;
+
+  qsugg.resetQuerySuggestionStore(store);
+  assert.equal(sugSignal.aborted, true);
+  assert.equal(store.epoch, epochBefore + 1);
+  assert.equal(store.fieldsByScope.size, 0);
+  assert.equal(store.comboboxUi.openId, null);
+  assert.equal(cleaned, 1);
+
+  // Resolving stale suggestion fetch after reset must NOT repopulate cache.
+  slowRunQuery.resolve(jsonResponse([{{ document: {{ name: `${{rootPath}}/orders/o1`, fields: {{ total: {{ integerValue: "1" }} }} }} }}]));
+  await pField;
+  assert.equal(store.fieldsByScope.size, 0);
+
+  // Exact segment-boundary markSuggestionsStale across all 4 caches (including ancestor docIdsByCollection).
+  const mkEntry = (scope) => ({{
+    items: [],
+    aggItems: [],
+    fieldHints: new Map(),
+    scope,
+    loading: false,
+    stale: false,
+    partial: false,
+    sampledDocs: 0,
+  }});
+  store.subcollectionsByParent.set("orgs/acme", {{ items: [], loading: false, stale: false, partial: false }});
+  store.subcollectionsByParent.set("orgs/acme/projects/p1", {{ items: [], loading: false, stale: false, partial: false }});
+  store.subcollectionsByParent.set("orgs/acme2", {{ items: [], loading: false, stale: false, partial: false }});
+
+  store.docIdsByCollection.set("orgs/acme/projects/p1/tasks", {{ items: [], loading: false, stale: false, partial: false }});
+  store.docIdsByCollection.set("orgs/acme/projects", {{ items: [], loading: false, stale: false, partial: false }});
+  store.docIdsByCollection.set("orgs", {{ items: [], loading: false, stale: false, partial: false }});
+  store.docIdsByCollection.set("orgs/acme/projects2", {{ items: [], loading: false, stale: false, partial: false }});
+
+  store.collectionGroupsByParent.set("", {{ items: [], loading: false, stale: false, partial: false }});
+  store.collectionGroupsByParent.set("orgs/acme", {{ items: [], loading: false, stale: false, partial: false }});
+  store.collectionGroupsByParent.set("orgs/other", {{ items: [], loading: false, stale: false, partial: false }});
+
+  store.fieldsByScope.set("orgs/acme/projects/p1|tasks|0", mkEntry({{ parentSubpath: "orgs/acme/projects/p1", collectionId: "tasks", allDescendants: false }}));
+  store.fieldsByScope.set("orgs/acme|tasks|1", mkEntry({{ parentSubpath: "orgs/acme", collectionId: "tasks", allDescendants: true }}));
+  store.fieldsByScope.set("|tasks|1", mkEntry({{ parentSubpath: "", collectionId: "tasks", allDescendants: true }}));
+  store.fieldsByScope.set("orgs/other|tasks|1", mkEntry({{ parentSubpath: "orgs/other", collectionId: "tasks", allDescendants: true }}));
+  store.fieldsByScope.set("orgs/acme/projects/p1|tasks_v2|0", mkEntry({{ parentSubpath: "orgs/acme/projects/p1", collectionId: "tasks_v2", allDescendants: false }}));
+
+  qsugg.markSuggestionsStale(
+    store,
+    new Set([`${{rootPath}}/orgs/acme/projects/p1/tasks/t1`])
+  );
+
+  assert.equal(store.subcollectionsByParent.get("orgs/acme").stale, true);
+  assert.equal(store.subcollectionsByParent.get("orgs/acme/projects/p1").stale, true);
+  assert.equal(store.subcollectionsByParent.get("orgs/acme2").stale, false);
+
+  assert.equal(store.docIdsByCollection.get("orgs/acme/projects/p1/tasks").stale, true);
+  assert.equal(store.docIdsByCollection.get("orgs/acme/projects").stale, true);
+  assert.equal(store.docIdsByCollection.get("orgs").stale, true);
+  assert.equal(store.docIdsByCollection.get("orgs/acme/projects2").stale, false);
+
+  assert.equal(store.collectionGroupsByParent.get("").stale, true);
+  assert.equal(store.collectionGroupsByParent.get("orgs/acme").stale, true);
+  assert.equal(store.collectionGroupsByParent.get("orgs/other").stale, false);
+
+  assert.equal(store.fieldsByScope.get("orgs/acme/projects/p1|tasks|0").stale, true);
+  assert.equal(store.fieldsByScope.get("orgs/acme|tasks|1").stale, true);
+  assert.equal(store.fieldsByScope.get("|tasks|1").stale, true);
+  assert.equal(store.fieldsByScope.get("orgs/other|tasks|1").stale, false);
+  assert.equal(store.fieldsByScope.get("orgs/acme/projects/p1|tasks_v2|0").stale, false);
+}}
+
+// 4. toggleSsePaused unpausing marks suggestions stale, and onOpenQueryCollection preserves suggestion caches.
+{{
+  app.state.activeProjectId = "p";
+  app.state.activeDatabaseId = "db1";
+  app.state.activeDbMeta = {{
+    name: "projects/p/databases/db1",
+    uid: "u1",
+    type: "FIRESTORE_NATIVE",
+    databaseEdition: "STANDARD",
+    concurrencyMode: "PESSIMISTIC",
+  }};
+  app.state.querySuggestions.fieldsByScope.set("|orders|0", {{
+    items: [],
+    aggItems: [],
+    fieldHints: new Map(),
+    scope: {{ parentSubpath: "", collectionId: "orders", allDescendants: false }},
+    loading: false,
+    stale: false,
+    partial: false,
+    sampledDocs: 2,
+  }});
+  app.state.ssePaused = true;
+  fetchImpl = async (url) => {{
+    if (url === "/emulator/v1") return jsonResponse([rootPath]);
+    if (url === "/v1/projects/p/databases/db1") return jsonResponse(app.state.activeDbMeta);
+    if (url === "/v1/projects/p/databases/db1/documents:listCollectionIds") return jsonResponse({{ collectionIds: ["orders"] }});
+    throw new Error("unexpected url on unpause: " + url);
+  }};
+  await app.toggleSsePaused();
+  assert.equal(app.state.querySuggestions.fieldsByScope.get("|orders|0").stale, true);
+
+  // Explorer Query button (onOpenQueryCollection) replaces queryState while keeping querySuggestions!
+  app.state.view = "explorer";
+  app.state.rootCollections = ["orders"];
+  app.state.segments = ["orders"];
+  app.state.collectionColumns = new Map([[
+    `${{rootPath}}/orders`,
+    {{
+      collectionPath: `${{rootPath}}/orders`,
+      collectionId: "orders",
+      parentPath: rootPath,
+      documents: [],
+      nextPageToken: "",
+      filterText: "",
+      loading: false,
+    }},
+  ]]);
+  const queryBtn = findClickHandler(app.renderWorkspace(), "Query");
+  assert.ok(queryBtn);
+  queryBtn();
+  assert.equal(app.state.view, "query");
+  assert.equal(app.state.queryState.collectionId, "orders");
+  assert.equal(app.state.querySuggestions.fieldsByScope.has("|orders|0"), true, "onOpenQueryCollection must preserve suggestion cache");
+}}
+
+console.log("slice2_cache_and_sse_lifecycle passed");
 "#
     );
 

@@ -1,6 +1,7 @@
 // @ts-check
 
 import { html, nothing } from "../lit-html.js";
+import { isValidPathSegment } from "../router.js";
 import {
   VALUE_TYPES,
   findNonFiniteNumber,
@@ -17,11 +18,23 @@ import {
   validateTimestamp,
   encodeBytes,
 } from "../values.js";
+import { reconcileComboboxUi, renderCombobox } from "./combobox.js";
+import {
+  ensureCollectionGroups,
+  ensureFieldSuggestions,
+  ensureParentSubpathSuggestions,
+  ensureSubcollections,
+  formatSuggestionFooter,
+} from "./query-suggestions.js";
 
 /** @typedef {import('../values.js').ValueTypeKey} ValueTypeKey */
 /** @typedef {import('../values.js').FirestoreValue} FirestoreValue */
 /** @typedef {import('../values.js').FirestoreDocument} FirestoreDocument */
 /** @typedef {import('../lit-html.js').TemplateResult} TemplateResult */
+/** @typedef {import('./combobox.js').ComboboxItem} ComboboxItem */
+/** @typedef {import('./query-suggestions.js').FieldScopeEntry} FieldScopeEntry */
+/** @typedef {import('./query-suggestions.js').QuerySuggestionStore} QuerySuggestionStore */
+/** @typedef {import('./query-suggestions.js').SuggestionContext} SuggestionContext */
 
 /**
  * Supported StructuredQuery field and unary operators matching
@@ -51,6 +64,7 @@ const FILTER_OPERATORS = [
 const SCALAR_FILTER_TYPES = VALUE_TYPES.filter(
   (t) => t.key !== "arrayValue" && t.key !== "mapValue" && t.key !== "nullValue"
 );
+const SCALAR_FILTER_TYPE_SET = new Set(SCALAR_FILTER_TYPES.map((t) => t.key));
 
 /**
  * @typedef {{
@@ -61,6 +75,8 @@ const SCALAR_FILTER_TYPES = VALUE_TYPES.filter(
  *   valueText: string,
  *   latText: string,
  *   lngText: string,
+ *   valueTypeManuallySet: boolean,
+ *   valueUserEdited: boolean,
  * }} QueryFilterRow
  */
 
@@ -114,6 +130,213 @@ const STANDARD_MAX_AGGREGATIONS = 5;
 const ENTERPRISE_MAX_AGGREGATIONS = 64;
 
 let nextRowId = 1;
+
+/**
+ * Creates a new default visual Where filter row.
+ * @returns {QueryFilterRow}
+ */
+export function createFilterRow() {
+  return {
+    id: nextRowId++,
+    fieldPath: "",
+    op: "EQUAL",
+    valueType: "stringValue",
+    valueText: "",
+    latText: "0",
+    lngText: "0",
+    valueTypeManuallySet: false,
+    valueUserEdited: false,
+  };
+}
+
+/**
+ * @param {string} seg
+ * @returns {boolean}
+ */
+function isSafeResourceSegment(seg) {
+  return isValidPathSegment(seg) && !isReservedName(seg);
+}
+
+/**
+ * Normalizes a parent document subpath and validates that it is empty or an even-segment
+ * path without empty, dot, or reserved segments.
+ * @param {string} rawParentSubpath
+ * @returns {{ valid: boolean, normParent: string, segments: string[] }}
+ */
+function parseNormalizedParentSubpath(rawParentSubpath) {
+  const trimmed = rawParentSubpath.trim().replace(/^\/+|\/+$/g, "");
+  if (trimmed === "") {
+    return { valid: true, normParent: "", segments: [] };
+  }
+  const segments = trimmed.split("/");
+  if (
+    segments.length % 2 !== 0 ||
+    segments.some((s) => !isSafeResourceSegment(s))
+  ) {
+    return { valid: false, normParent: "", segments: [] };
+  }
+  return { valid: true, normParent: segments.join("/"), segments };
+}
+
+/**
+ * @param {QuerySuggestionStore} store
+ * @param {string[]} knownCollections
+ * @param {string} rootPath
+ * @param {string} rawInput
+ * @returns {{ items: ComboboxItem[], loading: boolean, footerText: string }}
+ */
+function resolveParentSubpathState(store, knownCollections, rootPath, rawInput) {
+  const lastSlash = rawInput.lastIndexOf("/");
+  if (lastSlash === -1) {
+    return {
+      items: knownCollections.map((col) => ({
+        value: `${col}/`,
+        label: `${col}/`,
+      })),
+      loading: false,
+      footerText: "",
+    };
+  }
+  if (!rootPath) {
+    return { items: [], loading: false, footerText: "" };
+  }
+  const prefix = rawInput.slice(0, lastSlash + 1);
+  const rawPrefix = rawInput.slice(0, lastSlash);
+  const segments = rawPrefix.split("/");
+  if (
+    segments.length === 0 ||
+    segments.some((s) => !isSafeResourceSegment(s))
+  ) {
+    return { items: [], loading: false, footerText: "" };
+  }
+  if (segments.length % 2 === 0) {
+    const normParent = segments.join("/");
+    const subEntry = store.subcollectionsByParent.get(normParent);
+    if (!subEntry) {
+      return { items: [], loading: false, footerText: "" };
+    }
+    return {
+      items: subEntry.items.map((item) => ({
+        ...item,
+        value: `${prefix}${item.value}/`,
+        label: `${item.label}/`,
+      })),
+      loading: subEntry.loading,
+      footerText: formatSuggestionFooter(subEntry),
+    };
+  }
+  const normColPath = segments.join("/");
+  const docEntry = store.docIdsByCollection.get(normColPath);
+  return {
+    items: docEntry?.items ?? [],
+    loading: docEntry?.loading ?? false,
+    footerText: formatSuggestionFooter(docEntry),
+  };
+}
+
+/**
+ * @param {QuerySuggestionStore} store
+ * @param {string[]} knownCollections
+ * @param {{ valid: boolean, normParent: string }} parsedParent
+ * @param {boolean} allDescendants
+ * @returns {{ items: ComboboxItem[], loading: boolean, footerText: string }}
+ */
+function resolveCollectionIdState(
+  store,
+  knownCollections,
+  parsedParent,
+  allDescendants
+) {
+  if (!parsedParent.valid) {
+    return { items: [], loading: false, footerText: "" };
+  }
+  if (allDescendants) {
+    const cgEntry = store.collectionGroupsByParent.get(parsedParent.normParent);
+    return {
+      items: cgEntry?.items ?? [],
+      loading: cgEntry?.loading ?? false,
+      footerText: formatSuggestionFooter(cgEntry),
+    };
+  }
+  if (parsedParent.normParent === "") {
+    return {
+      items: knownCollections.map((c) => ({ value: c, label: c })),
+      loading: false,
+      footerText: "",
+    };
+  }
+  const subEntry = store.subcollectionsByParent.get(parsedParent.normParent);
+  return {
+    items: subEntry?.items ?? [],
+    loading: subEntry?.loading ?? false,
+    footerText: formatSuggestionFooter(subEntry),
+  };
+}
+
+/**
+ * @param {QuerySuggestionStore | undefined} store
+ * @param {{ valid: boolean, normParent: string }} parsedParent
+ * @param {string} collectionId
+ * @param {boolean} allDescendants
+ * @returns {FieldScopeEntry | null}
+ */
+function resolveFieldScopeEntry(
+  store,
+  parsedParent,
+  collectionId,
+  allDescendants
+) {
+  if (!store || !parsedParent.valid) {
+    return null;
+  }
+  const colId = collectionId.trim();
+  if (!colId || !isSafeResourceSegment(colId)) {
+    return null;
+  }
+  const scopeKey = `${parsedParent.normParent}|${colId}|${allDescendants ? "1" : "0"}`;
+  return store.fieldsByScope.get(scopeKey) ?? null;
+}
+
+/**
+ * Applies non-clobbering field value type detection from sampled `fieldHints`
+ * when neither `valueTypeManuallySet` nor `valueUserEdited` is set.
+ * @param {QueryFilterRow} f
+ * @param {FieldScopeEntry | null} fieldEntry
+ */
+function applyFilterAutoType(f, fieldEntry) {
+  if (f.valueTypeManuallySet || f.valueUserEdited || !fieldEntry) {
+    return;
+  }
+  const opMeta = FILTER_OPERATORS.find((o) => o.op === f.op);
+  if (!opMeta || opMeta.kind === "unary") {
+    return;
+  }
+  const trimmedPath = f.fieldPath.trim();
+  const hint =
+    fieldEntry.fieldHints.get(f.fieldPath) ??
+    (trimmedPath ? fieldEntry.fieldHints.get(trimmedPath) : undefined);
+  if (!hint) {
+    return;
+  }
+  const detectedType =
+    f.op === "ARRAY_CONTAINS" || f.op === "ARRAY_CONTAINS_ANY"
+      ? hint.arrayElementType
+      : hint.scalarType;
+  if (!detectedType || !SCALAR_FILTER_TYPE_SET.has(detectedType)) {
+    return;
+  }
+  const prevType = f.valueType;
+  f.valueType = detectedType;
+  if (opMeta.kind === "field") {
+    if (detectedType === "booleanValue") {
+      if (f.valueText !== "true" && f.valueText !== "false") {
+        f.valueText = "true";
+      }
+    } else if (prevType === "booleanValue" && !f.valueUserEdited) {
+      f.valueText = "";
+    }
+  }
+}
 
 /**
  * Creates initial state for the Structured Query Runner.
@@ -524,6 +747,16 @@ function buildScalarFilterValue(f, projectId, databaseId) {
 }
 
 /**
+ * @typedef {{
+ *   store: QuerySuggestionStore,
+ *   ctx: SuggestionContext,
+ *   fieldScope: { parentSubpath: string, collectionId: string, allDescendants: boolean },
+ *   fieldEntry: FieldScopeEntry | null,
+ *   renderedIds: Set<string>,
+ * }} QueryComboboxContext
+ */
+
+/**
  * Renders the Structured Query Runner workspace.
  *
  * @param {{
@@ -531,6 +764,7 @@ function buildScalarFilterValue(f, projectId, databaseId) {
  *   databaseId: string,
  *   knownCollections: string[],
  *   enterprise?: boolean,
+ *   suggestions?: QuerySuggestionStore,
  *   state: QueryRunnerState,
  *   onRerender: () => void,
  *   onExecuteQuery: () => void,
@@ -544,6 +778,7 @@ export function renderQueryRunner(props) {
     databaseId,
     knownCollections,
     enterprise = false,
+    suggestions,
     state,
     onRerender,
     onExecuteQuery,
@@ -552,6 +787,45 @@ export function renderQueryRunner(props) {
   const maxAggregations = enterprise
     ? ENTERPRISE_MAX_AGGREGATIONS
     : STANDARD_MAX_AGGREGATIONS;
+  const useCombobox = Boolean(suggestions) && state.mode === "visual";
+  /** @type {Set<string>} */
+  const renderedIds = new Set();
+  const rootPath =
+    projectId && databaseId
+      ? `projects/${projectId}/databases/${databaseId}/documents`
+      : "";
+  /** @type {SuggestionContext} */
+  const suggestionCtx = {
+    rootPath,
+    rootCollections: knownCollections,
+    onRerender,
+  };
+  const parsedParent = parseNormalizedParentSubpath(state.parentSubpath);
+  const fieldScope = {
+    parentSubpath: state.parentSubpath,
+    collectionId: state.collectionId,
+    allDescendants: state.allDescendants,
+  };
+  const fieldEntry =
+    useCombobox && suggestions
+      ? resolveFieldScopeEntry(
+          suggestions,
+          parsedParent,
+          state.collectionId,
+          state.allDescendants
+        )
+      : null;
+  /** @type {QueryComboboxContext | null} */
+  const comboCtx =
+    useCombobox && suggestions
+      ? {
+          store: suggestions,
+          ctx: suggestionCtx,
+          fieldScope,
+          fieldEntry,
+          renderedIds,
+        }
+      : null;
 
   const switchQueryKind = (
     /** @type {'documents' | 'aggregations'} */ nextKind
@@ -608,15 +882,7 @@ export function renderQueryRunner(props) {
   };
 
   const addFilter = () => {
-    state.filters.push({
-      id: nextRowId++,
-      fieldPath: "",
-      op: "EQUAL",
-      valueType: "stringValue",
-      valueText: "",
-      latText: "0",
-      lngText: "0",
-    });
+    state.filters.push(createFilterRow());
     onRerender();
   };
 
@@ -632,7 +898,165 @@ export function renderQueryRunner(props) {
   const isAgg = state.queryKind === "aggregations";
   const rawBufferValue = isAgg ? state.rawAggregationText : state.rawQueryText;
 
-  return html`
+  const parentSubpathControl = (() => {
+    if (!comboCtx) {
+      return html`
+        <input
+          id="query-parent-subpath"
+          type="text"
+          class="input mono"
+          placeholder="e.g. rooms/room-1"
+          .value=${state.parentSubpath}
+          @input=${(/** @type {Event} */ e) => {
+            state.parentSubpath = /** @type {HTMLInputElement} */ (
+              e.target
+            ).value;
+            onRerender();
+          }}
+        />
+      `;
+    }
+    comboCtx.renderedIds.add("query-parent-subpath");
+    const parentState = resolveParentSubpathState(
+      comboCtx.store,
+      knownCollections,
+      rootPath,
+      state.parentSubpath
+    );
+    return renderCombobox({
+      id: "query-parent-subpath",
+      value: state.parentSubpath,
+      placeholder: "e.g. rooms/room-1",
+      ariaLabel: "Parent Document Path",
+      items: parentState.items,
+      uiState: comboCtx.store.comboboxUi,
+      footerText: parentState.footerText,
+      loading: parentState.loading,
+      keepOpenOnSelect: (item) => item.value.endsWith("/"),
+      onInput: (val) => {
+        state.parentSubpath = val;
+        if (val.includes("/")) {
+          void ensureParentSubpathSuggestions(
+            comboCtx.store,
+            comboCtx.ctx,
+            val
+          );
+        }
+      },
+      onSelect: (item) => {
+        state.parentSubpath = item.value;
+        if (item.value.endsWith("/")) {
+          void ensureParentSubpathSuggestions(
+            comboCtx.store,
+            comboCtx.ctx,
+            item.value
+          );
+        }
+      },
+      onOpen: () => {
+        void ensureParentSubpathSuggestions(
+          comboCtx.store,
+          comboCtx.ctx,
+          state.parentSubpath
+        );
+      },
+      onRefresh: () => {
+        void ensureParentSubpathSuggestions(
+          comboCtx.store,
+          comboCtx.ctx,
+          state.parentSubpath,
+          true
+        );
+      },
+      onRerender,
+    });
+  })();
+
+  const collectionIdControl = (() => {
+    if (!comboCtx) {
+      return html`
+        <input
+          id="query-collection-id"
+          type="text"
+          list="known-collections-list"
+          class="input mono"
+          style="flex: 1 1 180px;"
+          placeholder="Collection ID (e.g. users)"
+          .value=${state.collectionId}
+          @input=${(/** @type {Event} */ e) => {
+            state.collectionId = /** @type {HTMLInputElement} */ (
+              e.target
+            ).value;
+            onRerender();
+          }}
+        />
+        <datalist id="known-collections-list">
+          ${knownCollections.map(
+            (c) => html`<option value=${c}></option>`
+          )}
+        </datalist>
+      `;
+    }
+    comboCtx.renderedIds.add("query-collection-id");
+    const colState = resolveCollectionIdState(
+      comboCtx.store,
+      knownCollections,
+      parsedParent,
+      state.allDescendants
+    );
+    return renderCombobox({
+      id: "query-collection-id",
+      value: state.collectionId,
+      placeholder: "Collection ID (e.g. users)",
+      ariaLabel: "Collection ID",
+      inputStyle: "flex: 1 1 180px;",
+      items: colState.items,
+      uiState: comboCtx.store.comboboxUi,
+      footerText: colState.footerText,
+      loading: colState.loading,
+      onInput: (val) => {
+        state.collectionId = val;
+      },
+      onSelect: (item) => {
+        state.collectionId = item.value;
+      },
+      onOpen: () => {
+        if (state.allDescendants) {
+          void ensureCollectionGroups(
+            comboCtx.store,
+            comboCtx.ctx,
+            state.parentSubpath
+          );
+        } else if (parsedParent.valid && parsedParent.normParent !== "") {
+          void ensureSubcollections(
+            comboCtx.store,
+            comboCtx.ctx,
+            state.parentSubpath
+          );
+        }
+      },
+      onRefresh: () => {
+        if (state.allDescendants) {
+          void ensureCollectionGroups(
+            comboCtx.store,
+            comboCtx.ctx,
+            state.parentSubpath,
+            true
+          );
+        } else if (parsedParent.valid && parsedParent.normParent !== "") {
+          void ensureSubcollections(
+            comboCtx.store,
+            comboCtx.ctx,
+            state.parentSubpath,
+            true
+          );
+        }
+      },
+      onRerender,
+    });
+  })();
+
+  const viewTemplate = html`
     <div class="query-workspace">
       <aside class="query-builder-pane">
         <div class="query-mode-bar">
@@ -692,19 +1116,7 @@ export function renderQueryRunner(props) {
 
         <div class="form-field">
           <label for="query-parent-subpath">Parent Document Path (optional — leave empty for database root)</label>
-          <input
-            id="query-parent-subpath"
-            type="text"
-            class="input mono"
-            placeholder="e.g. rooms/room-1"
-            .value=${state.parentSubpath}
-            @input=${(/** @type {Event} */ e) => {
-              state.parentSubpath = /** @type {HTMLInputElement} */ (
-                e.target
-              ).value;
-              onRerender();
-            }}
-          />
+          ${parentSubpathControl}
         </div>
 
         ${state.error ? html`<div class="error-banner">${state.error}</div>` : nothing}
@@ -716,26 +1128,7 @@ export function renderQueryRunner(props) {
                   <label for="query-collection-id">Collection Source</label>
                 </div>
                 <div class="query-row">
-                  <input
-                    id="query-collection-id"
-                    type="text"
-                    list="known-collections-list"
-                    class="input mono"
-                    style="flex: 1 1 180px;"
-                    placeholder="Collection ID (e.g. users)"
-                    .value=${state.collectionId}
-                    @input=${(/** @type {Event} */ e) => {
-                      state.collectionId = /** @type {HTMLInputElement} */ (
-                        e.target
-                      ).value;
-                      onRerender();
-                    }}
-                  />
-                  <datalist id="known-collections-list">
-                    ${knownCollections.map(
-                      (c) => html`<option value=${c}></option>`
-                    )}
-                  </datalist>
+                  ${collectionIdControl}
                 </div>
                 <label for="query-all-descendants" style="display: flex; align-items: center; gap: 6px; font-size: 12.5px;">
                   <input
@@ -758,7 +1151,8 @@ export function renderQueryRunner(props) {
                     state,
                     maxAggregations,
                     addAggregation,
-                    onRerender
+                    onRerender,
+                    comboCtx
                   )
                 : nothing}
 
@@ -796,7 +1190,7 @@ export function renderQueryRunner(props) {
                       No filters — returns all documents in collection.
                     </div>`
                   : state.filters.map((f, idx) =>
-                      renderFilterRow(f, idx, state, onRerender)
+                      renderFilterRow(f, idx, state, onRerender, comboCtx)
                     )}
               </div>
 
@@ -811,23 +1205,67 @@ export function renderQueryRunner(props) {
                   ? html`<div style="font-size: 12px; color: var(--text-faint);">
                       Default ordering (<code>__name__ ASC</code>).
                     </div>`
-                  : state.orders.map(
-                      (o, idx) => html`
+                  : state.orders.map((o, idx) => {
+                      const orderFieldControl = (() => {
+                        if (!comboCtx) {
+                          return html`
+                            <input
+                              type="text"
+                              class="input mono"
+                              style="flex: 1 1 150px;"
+                              aria-label=${`Sort ${idx + 1} field path`}
+                              placeholder="field path (e.g. age)"
+                              .value=${o.fieldPath}
+                              @input=${(/** @type {Event} */ e) => {
+                                o.fieldPath = /** @type {HTMLInputElement} */ (
+                                  e.target
+                                ).value;
+                                onRerender();
+                              }}
+                            />
+                          `;
+                        }
+                        const orderId = `query-order-field-${o.id}`;
+                        comboCtx.renderedIds.add(orderId);
+                        return renderCombobox({
+                          id: orderId,
+                          value: o.fieldPath,
+                          placeholder: "field path (e.g. age)",
+                          ariaLabel: `Sort ${idx + 1} field path`,
+                          inputStyle: "flex: 1 1 150px;",
+                          items: comboCtx.fieldEntry?.items ?? [],
+                          uiState: comboCtx.store.comboboxUi,
+                          footerText: formatSuggestionFooter(
+                            comboCtx.fieldEntry
+                          ),
+                          loading: comboCtx.fieldEntry?.loading ?? false,
+                          onInput: (val) => {
+                            o.fieldPath = val;
+                          },
+                          onSelect: (item) => {
+                            o.fieldPath = item.value;
+                          },
+                          onOpen: () => {
+                            void ensureFieldSuggestions(
+                              comboCtx.store,
+                              comboCtx.ctx,
+                              comboCtx.fieldScope
+                            );
+                          },
+                          onRefresh: () => {
+                            void ensureFieldSuggestions(
+                              comboCtx.store,
+                              comboCtx.ctx,
+                              comboCtx.fieldScope,
+                              true
+                            );
+                          },
+                          onRerender,
+                        });
+                      })();
+                      return html`
                         <div class="query-row">
-                          <input
-                            type="text"
-                            class="input mono"
-                            style="flex: 1 1 150px;"
-                            aria-label=${`Sort ${idx + 1} field path`}
-                            placeholder="field path (e.g. age)"
-                            .value=${o.fieldPath}
-                            @input=${(/** @type {Event} */ e) => {
-                              o.fieldPath = /** @type {HTMLInputElement} */ (
-                                e.target
-                              ).value;
-                              onRerender();
-                            }}
-                          />
+                          ${orderFieldControl}
                           <select
                             class="select"
                             aria-label=${`Sort ${idx + 1} direction`}
@@ -857,8 +1295,8 @@ export function renderQueryRunner(props) {
                             ✕
                           </button>
                         </div>
-                      `
-                    )}
+                      `;
+                    })}
               </div>
 
               <div class="query-section">
@@ -924,6 +1362,11 @@ export function renderQueryRunner(props) {
       ${renderResultsPane(state, onOpenResultDocument)}
     </div>
   `;
+
+  if (suggestions) {
+    reconcileComboboxUi(suggestions.comboboxUi, renderedIds);
+  }
+  return viewTemplate;
 }
 
 /**
@@ -931,13 +1374,15 @@ export function renderQueryRunner(props) {
  * @param {number} maxAggregations
  * @param {() => void} addAggregation
  * @param {() => void} onRerender
+ * @param {QueryComboboxContext | null} comboCtx
  * @returns {TemplateResult}
  */
 function renderAggregationsSection(
   state,
   maxAggregations,
   addAggregation,
-  onRerender
+  onRerender,
+  comboCtx
 ) {
   const atCap = state.aggregations.length >= maxAggregations;
   let nextAutoAlias = 1;
@@ -964,6 +1409,62 @@ function renderAggregationsSection(
 
       ${state.aggregations.map((row, idx) => {
         const isCount = row.op === "COUNT";
+        const aggFieldControl = (() => {
+          if (isCount || !comboCtx) {
+            return html`
+              <input
+                type="text"
+                class="input mono"
+                style="flex: 1 1 120px;"
+                aria-label=${`Aggregation ${idx + 1} field path`}
+                placeholder=${isCount ? "—" : "field path (e.g. total)"}
+                ?disabled=${isCount}
+                .value=${row.fieldPath}
+                @input=${(/** @type {Event} */ e) => {
+                  row.fieldPath = /** @type {HTMLInputElement} */ (
+                    e.target
+                  ).value;
+                  onRerender();
+                }}
+              />
+            `;
+          }
+          const aggId = `query-agg-field-${row.id}`;
+          comboCtx.renderedIds.add(aggId);
+          return renderCombobox({
+            id: aggId,
+            value: row.fieldPath,
+            placeholder: "field path (e.g. total)",
+            ariaLabel: `Aggregation ${idx + 1} field path`,
+            inputStyle: "flex: 1 1 120px;",
+            items: comboCtx.fieldEntry?.aggItems ?? [],
+            uiState: comboCtx.store.comboboxUi,
+            footerText: formatSuggestionFooter(comboCtx.fieldEntry),
+            loading: comboCtx.fieldEntry?.loading ?? false,
+            onInput: (val) => {
+              row.fieldPath = val;
+            },
+            onSelect: (item) => {
+              row.fieldPath = item.value;
+            },
+            onOpen: () => {
+              void ensureFieldSuggestions(
+                comboCtx.store,
+                comboCtx.ctx,
+                comboCtx.fieldScope
+              );
+            },
+            onRefresh: () => {
+              void ensureFieldSuggestions(
+                comboCtx.store,
+                comboCtx.ctx,
+                comboCtx.fieldScope,
+                true
+              );
+            },
+            onRerender,
+          });
+        })();
         return html`
           <div class="query-agg-row">
             <select
@@ -986,21 +1487,7 @@ function renderAggregationsSection(
               <option value="AVG" ?selected=${row.op === "AVG"}>AVG</option>
             </select>
 
-            <input
-              type="text"
-              class="input mono"
-              style="flex: 1 1 120px;"
-              aria-label=${`Aggregation ${idx + 1} field path`}
-              placeholder=${isCount ? "—" : "field path (e.g. total)"}
-              ?disabled=${isCount}
-              .value=${row.fieldPath}
-              @input=${(/** @type {Event} */ e) => {
-                row.fieldPath = /** @type {HTMLInputElement} */ (
-                  e.target
-                ).value;
-                onRerender();
-              }}
-            />
+            ${aggFieldControl}
 
             <input
               type="text"
@@ -1199,17 +1686,16 @@ function renderResultsPane(state, onOpenResultDocument) {
  * @param {number} idx
  * @param {QueryRunnerState} state
  * @param {() => void} onRerender
+ * @param {QueryComboboxContext | null} comboCtx
  * @returns {TemplateResult}
  */
-function renderFilterRow(f, idx, state, onRerender) {
+function renderFilterRow(f, idx, state, onRerender, comboCtx) {
   const opMeta = FILTER_OPERATORS.find((o) => o.op === f.op);
   const kind = opMeta?.kind ?? "field";
 
-  return html`
-    <div
-      style="border: 1px solid var(--border); border-radius: 6px; padding: 8px; background: var(--bg-surface); display: flex; flex-direction: column; gap: 6px;"
-    >
-      <div class="query-row">
+  const fieldControl = (() => {
+    if (!comboCtx) {
+      return html`
         <input
           type="text"
           class="input mono"
@@ -1222,15 +1708,72 @@ function renderFilterRow(f, idx, state, onRerender) {
             onRerender();
           }}
         />
+      `;
+    }
+    const filterFieldId = `query-filter-field-${f.id}`;
+    comboCtx.renderedIds.add(filterFieldId);
+    return renderCombobox({
+      id: filterFieldId,
+      value: f.fieldPath,
+      placeholder: "field path (e.g. active)",
+      ariaLabel: `Filter ${idx + 1} field path`,
+      inputStyle: "flex: 1 1 130px;",
+      items: comboCtx.fieldEntry?.items ?? [],
+      uiState: comboCtx.store.comboboxUi,
+      footerText: formatSuggestionFooter(comboCtx.fieldEntry),
+      loading: comboCtx.fieldEntry?.loading ?? false,
+      onInput: (val) => {
+        f.fieldPath = val;
+      },
+      onSelect: (item) => {
+        f.fieldPath = item.value;
+        applyFilterAutoType(f, comboCtx.fieldEntry);
+      },
+      onOpen: () => {
+        void ensureFieldSuggestions(
+          comboCtx.store,
+          comboCtx.ctx,
+          comboCtx.fieldScope
+        );
+      },
+      onRefresh: () => {
+        void ensureFieldSuggestions(
+          comboCtx.store,
+          comboCtx.ctx,
+          comboCtx.fieldScope,
+          true
+        );
+      },
+      onRerender,
+    });
+  })();
+
+  return html`
+    <div
+      style="border: 1px solid var(--border); border-radius: 6px; padding: 8px; background: var(--bg-surface); display: flex; flex-direction: column; gap: 6px;"
+    >
+      <div class="query-row">
+        ${fieldControl}
         <select
           class="select"
           aria-label="Filter operator"
           .value=${f.op}
           @change=${(/** @type {Event} */ e) => {
+            const prevMeta = FILTER_OPERATORS.find((o) => o.op === f.op);
             f.op = /** @type {HTMLSelectElement} */ (e.target).value;
             const nextMeta = FILTER_OPERATORS.find((o) => o.op === f.op);
             if (nextMeta?.kind === "array" && !f.valueText.trim().startsWith("[")) {
               f.valueText = "[]";
+            }
+            applyFilterAutoType(f, comboCtx?.fieldEntry ?? null);
+            if (
+              prevMeta?.kind === "array" &&
+              nextMeta?.kind === "field" &&
+              f.valueType === "booleanValue" &&
+              f.valueText !== "true" &&
+              f.valueText !== "false"
+            ) {
+              f.valueText = "true";
             }
             onRerender();
           }}
@@ -1270,6 +1813,7 @@ function renderFilterRow(f, idx, state, onRerender) {
                   f.valueText = /** @type {HTMLInputElement} */ (
                     e.target
                   ).value;
+                  f.valueUserEdited = true;
                   onRerender();
                 }}
               />
@@ -1284,6 +1828,7 @@ function renderFilterRow(f, idx, state, onRerender) {
                     f.valueType = /** @type {ValueTypeKey} */ (
                       /** @type {HTMLSelectElement} */ (e.target).value
                     );
+                    f.valueTypeManuallySet = true;
                     if (f.valueType === "booleanValue") {
                       f.valueText = "true";
                     }
@@ -1311,6 +1856,7 @@ function renderFilterRow(f, idx, state, onRerender) {
                           f.valueText = /** @type {HTMLSelectElement} */ (
                             e.target
                           ).value;
+                          f.valueUserEdited = true;
                           onRerender();
                         }}
                       >
@@ -1331,6 +1877,7 @@ function renderFilterRow(f, idx, state, onRerender) {
                             f.latText = /** @type {HTMLInputElement} */ (
                               e.target
                             ).value;
+                            f.valueUserEdited = true;
                             onRerender();
                           }}
                         />
@@ -1345,6 +1892,7 @@ function renderFilterRow(f, idx, state, onRerender) {
                             f.lngText = /** @type {HTMLInputElement} */ (
                               e.target
                             ).value;
+                            f.valueUserEdited = true;
                             onRerender();
                           }}
                         />
@@ -1361,6 +1909,7 @@ function renderFilterRow(f, idx, state, onRerender) {
                             f.valueText = /** @type {HTMLInputElement} */ (
                               e.target
                             ).value;
+                            f.valueUserEdited = true;
                             onRerender();
                           }}
                         />

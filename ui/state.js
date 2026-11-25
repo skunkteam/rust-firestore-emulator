@@ -2,6 +2,10 @@
 
 import { createContentionState } from "./components/contention.js";
 import { createQueryRunnerState } from "./components/query.js";
+import {
+  createQuerySuggestionStore,
+  resetQuerySuggestionStore,
+} from "./components/query-suggestions.js";
 
 /** @typedef {import('./api.js').DatabaseMetadata} DatabaseMetadata */
 /** @typedef {import('./components/contention.js').ContentionState} ContentionState */
@@ -9,6 +13,7 @@ import { createQueryRunnerState } from "./components/query.js";
 /** @typedef {import('./components/explorer.js').DocumentLevelState} DocumentLevelState */
 /** @typedef {import('./components/editor.js').EditorSession} EditorSession */
 /** @typedef {import('./components/query.js').QueryRunnerState} QueryRunnerState */
+/** @typedef {import('./components/query-suggestions.js').QuerySuggestionStore} QuerySuggestionStore */
 
 /**
  * @typedef {
@@ -33,6 +38,7 @@ import { createQueryRunnerState } from "./components/query.js";
  *   collectionColumns: Map<string, CollectionColumnState>,
  *   documentLevels: Map<string, DocumentLevelState>,
  *   queryState: QueryRunnerState,
+ *   querySuggestions: QuerySuggestionStore,
  *   contention: ContentionState,
  *   sseStatus: 'live' | 'error',
  *   contentionSseStatus: 'idle' | 'connecting' | 'live' | 'error',
@@ -59,6 +65,7 @@ export const state = {
   documentLevels: new Map(),
 
   queryState: createQueryRunnerState(),
+  querySuggestions: createQuerySuggestionStore(),
   contention: createContentionState(),
 
   sseStatus: "live",
@@ -76,12 +83,22 @@ let navEpoch = 0;
 let dbListSeq = 0;
 let contentionSeq = 0;
 let queryRunSeq = 0;
+/** @type {AbortController} */
+let dbAbortController = new AbortController();
 /** @type {AbortController | null} */
 let activeQueryAbortController = null;
 /** @type {Map<string, number>} */
 const colRequestSeq = new Map();
 /** @type {Map<string, number>} */
 const docRequestSeq = new Map();
+
+/**
+ * Returns the AbortSignal tied to the active database session lifetime.
+ * @returns {AbortSignal}
+ */
+export function getDbSignal() {
+  return dbAbortController.signal;
+}
 
 /**
  * Returns the current database epoch counter.
@@ -263,8 +280,11 @@ export function resetDatabaseCaches(targetState = state) {
     docRequestSeq.clear();
     nextContentionSeq();
     abortActiveQueryRun();
+    dbAbortController.abort();
+    dbAbortController = new AbortController();
   }
   targetState.queryState = createQueryRunnerState();
+  resetQuerySuggestionStore(targetState.querySuggestions);
   targetState.contention.snapshot = null;
   targetState.contention.loading = false;
   targetState.contention.clearing = false;

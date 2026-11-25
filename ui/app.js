@@ -37,6 +37,7 @@ import {
   syncSessionWithDocument,
 } from "./components/editor.js";
 import { renderExplorer } from "./components/explorer.js";
+import { reconcileComboboxUi } from "./components/combobox.js";
 import {
   getModalFocusableElements,
   handleModalKeydown,
@@ -48,6 +49,7 @@ import {
   createQueryRunnerState,
   renderQueryRunner,
 } from "./components/query.js";
+import { markSuggestionsStale } from "./components/query-suggestions.js";
 import {
   getActiveRootPath,
   isValidPathSegment,
@@ -63,6 +65,7 @@ import {
   dismissToast,
   finishQueryRun,
   getDbEpoch,
+  getDbSignal,
   getNavEpoch,
   isCurrentColSeq,
   isCurrentContentionSeq,
@@ -284,13 +287,16 @@ function syncContentionLifecycle() {
 }
 
 /**
- * Enqueues an SSE event batch onto the serialized `sseQueue`.
+ * Enqueues an SSE event batch onto the serialized `sseQueue` after running
+ * synchronous preemption (`applySyncSseBatch`).
  * @param {EmulatorSseEvent[]} batch
  * @returns {Promise<void>}
  */
 function enqueueSseBatch(batch) {
+  const plan = applySyncSseBatch(batch);
+  if (!plan) return sseQueue;
   sseQueue = sseQueue
-    .then(() => handleSseBatch(batch))
+    .then(() => applyAsyncSseRefresh(plan))
     .catch(() => {});
   return sseQueue;
 }
@@ -509,6 +515,7 @@ export async function openDocumentFromName(docName) {
     targetDatabase === state.activeDatabaseId
   ) {
     const myDbEpoch = getDbEpoch();
+    const signal = getDbSignal();
     state.segments = nextSegments;
     const myNavEpoch = bumpNavEpoch();
     syncUrl();
@@ -516,9 +523,13 @@ export async function openDocumentFromName(docName) {
     const activeRoot = getActiveRootPath(targetProject, targetDatabase);
     if (activeRoot && !state.rootCollections.includes(nextSegments[0])) {
       try {
-        const cols = await listCollectionIds(activeRoot);
+        const cols = await listCollectionIds(activeRoot, {
+          signal,
+          shouldAbort: () => myDbEpoch !== getDbEpoch() || signal.aborted,
+        });
         if (
           myDbEpoch === getDbEpoch() &&
+          !signal.aborted &&
           state.activeProjectId === targetProject &&
           state.activeDatabaseId === targetDatabase
         ) {
@@ -529,7 +540,11 @@ export async function openDocumentFromName(docName) {
         // Proceed with path hydration even if root collection refresh fails
       }
     }
-    if (myDbEpoch === getDbEpoch() && myNavEpoch === getNavEpoch()) {
+    if (
+      myDbEpoch === getDbEpoch() &&
+      !signal.aborted &&
+      myNavEpoch === getNavEpoch()
+    ) {
       await hydrateVisiblePath(myDbEpoch, myNavEpoch, nextSegments);
     }
     return;
@@ -571,6 +586,7 @@ export async function toggleSsePaused() {
   syncContentionLifecycle();
   renderApp();
   if (wasPaused && !state.ssePaused) {
+    markSuggestionsStale(state.querySuggestions, "all");
     const epochBefore = getDbEpoch();
     await enqueueSseBatch([{ type: "resync" }]);
     if (
@@ -651,6 +667,7 @@ export async function selectDatabase(
       state.contention.loading = true;
     }
   }
+  const signal = getDbSignal();
 
   syncUrl(replaceHistory);
   syncContentionLifecycle();
@@ -660,24 +677,30 @@ export async function selectDatabase(
     state.rootLoading = true;
     renderApp();
     const [meta, cols] = await Promise.all([
-      getDatabase(projectId, databaseId),
+      getDatabase(projectId, databaseId, { signal }),
       listCollectionIds(
         `projects/${projectId}/databases/${databaseId}/documents`,
-        { shouldAbort: () => myDbEpoch !== getDbEpoch() }
+        {
+          signal,
+          shouldAbort: () => myDbEpoch !== getDbEpoch() || signal.aborted,
+        }
       ),
     ]);
-    if (myDbEpoch !== getDbEpoch()) return;
+    if (myDbEpoch !== getDbEpoch() || signal.aborted) return;
     state.activeDbMeta = meta;
     state.rootCollections = cols;
     await refreshDatabaseList();
+    if (myDbEpoch !== getDbEpoch() || signal.aborted) return;
   } catch (err) {
-    if (myDbEpoch !== getDbEpoch()) return;
+    if (myDbEpoch !== getDbEpoch() || signal.aborted || isAbortError(err)) {
+      return;
+    }
     notifyToast(
       `Failed to load database: ${err instanceof Error ? err.message : String(err)}`,
       "error"
     );
   } finally {
-    if (myDbEpoch === getDbEpoch()) {
+    if (myDbEpoch === getDbEpoch() && !signal.aborted) {
       state.rootLoading = false;
       renderApp();
     }
@@ -685,6 +708,7 @@ export async function selectDatabase(
 
   if (
     myDbEpoch === getDbEpoch() &&
+    !signal.aborted &&
     myNavEpoch === getNavEpoch() &&
     initialSegments.length > 0 &&
     state.view !== "contention"
@@ -692,7 +716,11 @@ export async function selectDatabase(
     await hydrateVisiblePath(myDbEpoch, myNavEpoch, initialSegments);
   }
 
-  if (myDbEpoch === getDbEpoch() && state.view === "contention") {
+  if (
+    myDbEpoch === getDbEpoch() &&
+    !signal.aborted &&
+    state.view === "contention"
+  ) {
     syncContentionLifecycle();
     await refreshContention();
   }
@@ -771,7 +799,8 @@ export async function loadCollectionColumn(
   appendPage,
   expectedDbEpoch = getDbEpoch()
 ) {
-  if (expectedDbEpoch !== getDbEpoch()) return;
+  const signal = getDbSignal();
+  if (expectedDbEpoch !== getDbEpoch() || signal.aborted) return;
   const seq = nextColSeq(colPath);
 
   let colState = state.collectionColumns.get(colPath);
@@ -798,8 +827,13 @@ export async function loadCollectionColumn(
         maskFieldPaths: ["__name__"],
         pageSize: 200,
         pageToken: colState.nextPageToken,
+        signal,
       });
-      if (expectedDbEpoch !== getDbEpoch() || !isCurrentColSeq(colPath, seq)) {
+      if (
+        expectedDbEpoch !== getDbEpoch() ||
+        signal.aborted ||
+        !isCurrentColSeq(colPath, seq)
+      ) {
         return;
       }
       const mapped = mapColumnDocuments(res.documents);
@@ -825,9 +859,11 @@ export async function loadCollectionColumn(
           maskFieldPaths: ["__name__"],
           pageSize,
           pageToken,
+          signal,
         });
         if (
           expectedDbEpoch !== getDbEpoch() ||
+          signal.aborted ||
           !isCurrentColSeq(colPath, seq)
         ) {
           return;
@@ -852,7 +888,11 @@ export async function loadCollectionColumn(
       colState.nextPageToken = nextToken;
     }
   } catch (err) {
-    if (expectedDbEpoch !== getDbEpoch() || !isCurrentColSeq(colPath, seq)) {
+    if (
+      expectedDbEpoch !== getDbEpoch() ||
+      signal.aborted ||
+      !isCurrentColSeq(colPath, seq)
+    ) {
       return;
     }
     notifyToast(
@@ -860,7 +900,11 @@ export async function loadCollectionColumn(
       "error"
     );
   } finally {
-    if (expectedDbEpoch === getDbEpoch() && isCurrentColSeq(colPath, seq)) {
+    if (
+      expectedDbEpoch === getDbEpoch() &&
+      !signal.aborted &&
+      isCurrentColSeq(colPath, seq)
+    ) {
       colState.loading = false;
       renderApp();
     }
@@ -880,7 +924,8 @@ export async function loadDocumentLevel(
   preserveDirty,
   expectedDbEpoch = getDbEpoch()
 ) {
-  if (expectedDbEpoch !== getDbEpoch()) return;
+  const signal = getDbSignal();
+  if (expectedDbEpoch !== getDbEpoch() || signal.aborted) return;
   if (!state.activeProjectId || !state.activeDatabaseId) return;
   const projectId = state.activeProjectId;
   const databaseId = state.activeDatabaseId;
@@ -905,7 +950,7 @@ export async function loadDocumentLevel(
 
   try {
     const [docOutcome, subcols] = await Promise.all([
-      getDocument(docPath).then(
+      getDocument(docPath, { signal }).then(
         (doc) => ({ exists: true, doc }),
         (err) => {
           if (err instanceof ApiError && err.code === 404) {
@@ -915,14 +960,17 @@ export async function loadDocumentLevel(
         }
       ),
       listCollectionIds(docPath, {
+        signal,
         shouldAbort: () =>
           expectedDbEpoch !== getDbEpoch() ||
+          signal.aborted ||
           !isCurrentDocSeq(docPath, seq) ||
           myNavEpoch !== getNavEpoch(),
       }),
     ]);
     if (
       expectedDbEpoch !== getDbEpoch() ||
+      signal.aborted ||
       !isCurrentDocSeq(docPath, seq) ||
       myNavEpoch !== getNavEpoch()
     ) {
@@ -966,6 +1014,7 @@ export async function loadDocumentLevel(
   } catch (err) {
     if (
       expectedDbEpoch !== getDbEpoch() ||
+      signal.aborted ||
       !isCurrentDocSeq(docPath, seq) ||
       myNavEpoch !== getNavEpoch()
     ) {
@@ -976,7 +1025,11 @@ export async function loadDocumentLevel(
       "error"
     );
   } finally {
-    if (expectedDbEpoch === getDbEpoch() && isCurrentDocSeq(docPath, seq)) {
+    if (
+      expectedDbEpoch === getDbEpoch() &&
+      !signal.aborted &&
+      isCurrentDocSeq(docPath, seq)
+    ) {
       level.loading = false;
       renderApp();
     }
@@ -984,11 +1037,27 @@ export async function loadDocumentLevel(
 }
 
 /**
- * Handles debounced SSE invalidation batches without clobbering dirty edits or resurrecting cleared databases.
- * @param {EmulatorSseEvent[]} events
+ * @typedef {{
+ *   dbEpoch: number,
+ *   signal: AbortSignal,
+ *   activeRoot: string | null,
+ *   shouldRefreshDbList: boolean,
+ *   shouldRefreshMeta: boolean,
+ *   fullResyncActiveDb: boolean,
+ *   clearedActiveDb: boolean,
+ *   changedPaths: Set<string>,
+ * }} SseRefreshPlan
  */
-export async function handleSseBatch(events) {
-  if (state.ssePaused) return;
+
+/**
+ * Synchronously processes an SSE batch: preempts cleared databases (rotating DB
+ * cancellation signals, clearing active caches and query suggestions), updates URL/toasts,
+ * and marks matching suggestion caches stale without firing HTTP requests.
+ * @param {EmulatorSseEvent[]} events
+ * @returns {SseRefreshPlan | null}
+ */
+export function applySyncSseBatch(events) {
+  if (state.ssePaused) return null;
 
   let shouldRefreshDbList = false;
   let shouldRefreshMeta = false;
@@ -997,7 +1066,6 @@ export async function handleSseBatch(events) {
   /** @type {Set<string>} */
   const changedPaths = new Set();
 
-  let myDbEpoch = getDbEpoch();
   const activeRoot = getActiveRootPath(
     state.activeProjectId,
     state.activeDatabaseId
@@ -1022,10 +1090,11 @@ export async function handleSseBatch(events) {
       }
       if (ev.database && ev.database === activeRoot) {
         // Clear cached state WITHOUT calling /v1/projects/... so we never re-create the cleared database!
-        myDbEpoch = bumpDbEpoch();
+        bumpDbEpoch();
         bumpNavEpoch();
         clearedActiveDb = true;
-        clearActiveDatabaseState();
+        resetDatabaseCaches(state);
+        clearActiveDatabaseState(state);
         syncUrl(true);
         notifyToast(`Database ${ev.database} was cleared`, "info");
       }
@@ -1046,19 +1115,69 @@ export async function handleSseBatch(events) {
     }
   }
 
+  if (!clearedActiveDb) {
+    if (fullResyncActiveDb) {
+      markSuggestionsStale(state.querySuggestions, "all");
+    } else if (changedPaths.size > 0) {
+      markSuggestionsStale(state.querySuggestions, changedPaths);
+    }
+  }
+
+  if (
+    !shouldRefreshDbList &&
+    !shouldRefreshMeta &&
+    !fullResyncActiveDb &&
+    !clearedActiveDb &&
+    changedPaths.size === 0
+  ) {
+    return null;
+  }
+
+  return {
+    dbEpoch: getDbEpoch(),
+    signal: getDbSignal(),
+    activeRoot,
+    shouldRefreshDbList,
+    shouldRefreshMeta,
+    fullResyncActiveDb,
+    clearedActiveDb,
+    changedPaths,
+  };
+}
+
+/**
+ * Executes asynchronous Explorer refreshes for a planned SSE batch, guarded by
+ * `dbEpoch` and `AbortSignal` after every `await`.
+ * @param {SseRefreshPlan | null} plan
+ * @returns {Promise<void>}
+ */
+export async function applyAsyncSseRefresh(plan) {
+  if (!plan) return;
+  const myDbEpoch = plan.dbEpoch ?? getDbEpoch();
+  const signal = plan.signal ?? getDbSignal();
+  const isStale = () => myDbEpoch !== getDbEpoch() || signal.aborted;
+  if (isStale()) return;
+
+  let {
+    shouldRefreshDbList,
+    fullResyncActiveDb,
+    clearedActiveDb,
+  } = plan;
+  const { shouldRefreshMeta, changedPaths, activeRoot } = plan;
+
   if (shouldRefreshDbList) {
     let applied = false;
     try {
       applied = await refreshDatabaseList();
     } catch (err) {
-      if (myDbEpoch !== getDbEpoch()) return;
+      if (isStale() || isAbortError(err)) return;
       fullResyncActiveDb = false;
       notifyToast(
         `Failed to refresh database list: ${err instanceof Error ? err.message : String(err)}`,
         "error"
       );
     }
-    if (myDbEpoch !== getDbEpoch()) return;
+    if (isStale()) return;
     if (
       applied &&
       fullResyncActiveDb &&
@@ -1069,10 +1188,11 @@ export async function handleSseBatch(events) {
       !state.databases.some((db) => db.rootPath === activeRoot)
     ) {
       // Clear cached state WITHOUT calling getDatabase(), which would lazily recreate the cleared DB!
-      myDbEpoch = bumpDbEpoch();
+      bumpDbEpoch();
       bumpNavEpoch();
       clearedActiveDb = true;
-      clearActiveDatabaseState();
+      resetDatabaseCaches(state);
+      clearActiveDatabaseState(state);
       syncUrl(true);
       notifyToast(`Database ${activeRoot} was cleared`, "info");
     }
@@ -1088,7 +1208,7 @@ export async function handleSseBatch(events) {
   if (
     clearedActiveDb ||
     state.rootLoading ||
-    myDbEpoch !== getDbEpoch() ||
+    isStale() ||
     !state.activeProjectId ||
     !state.activeDatabaseId ||
     !activeRoot ||
@@ -1102,17 +1222,19 @@ export async function handleSseBatch(events) {
     try {
       const meta = await getDatabase(
         state.activeProjectId,
-        state.activeDatabaseId
+        state.activeDatabaseId,
+        { signal }
       );
       if (
-        myDbEpoch !== getDbEpoch() ||
+        isStale() ||
         getActiveRootPath(state.activeProjectId, state.activeDatabaseId) !==
           activeRoot
       ) {
         return;
       }
       state.activeDbMeta = meta;
-    } catch {
+    } catch (err) {
+      if (isStale() || isAbortError(err)) return;
       // Ignore transient error
     }
   }
@@ -1120,27 +1242,30 @@ export async function handleSseBatch(events) {
   if (fullResyncActiveDb || changedPaths.size > 0) {
     try {
       const cols = await listCollectionIds(activeRoot, {
+        signal,
         shouldAbort: () =>
-          myDbEpoch !== getDbEpoch() ||
+          isStale() ||
           getActiveRootPath(state.activeProjectId, state.activeDatabaseId) !==
             activeRoot,
       });
       if (
-        myDbEpoch !== getDbEpoch() ||
+        isStale() ||
         getActiveRootPath(state.activeProjectId, state.activeDatabaseId) !==
           activeRoot
       ) {
         return;
       }
       state.rootCollections = cols;
-    } catch {
-      // Ignore
+    } catch (err) {
+      if (isStale() || isAbortError(err)) return;
+      // Ignore transient error
     }
 
+    if (isStale()) return;
     const myNavEpoch = getNavEpoch();
     const segmentsSnapshot = [...state.segments];
     for (let i = 0; i < segmentsSnapshot.length; i += 2) {
-      if (myDbEpoch !== getDbEpoch() || myNavEpoch !== getNavEpoch()) return;
+      if (isStale() || myNavEpoch !== getNavEpoch()) return;
       const colId = segmentsSnapshot[i];
       const parentSegments = segmentsSnapshot.slice(0, i);
       const colSegments = segmentsSnapshot.slice(0, i + 1);
@@ -1157,7 +1282,7 @@ export async function handleSseBatch(events) {
       if (affectsCollection) {
         await loadCollectionColumn(colPath, parentPath, colId, false, myDbEpoch);
       }
-      if (myDbEpoch !== getDbEpoch() || myNavEpoch !== getNavEpoch()) return;
+      if (isStale() || myNavEpoch !== getNavEpoch()) return;
 
       if (segmentsSnapshot.length > i + 1) {
         const docId = segmentsSnapshot[i + 1];
@@ -1171,9 +1296,20 @@ export async function handleSseBatch(events) {
         }
       }
     }
-    if (myDbEpoch === getDbEpoch()) {
+    if (!isStale()) {
       renderApp();
     }
+  }
+}
+
+/**
+ * Handles debounced SSE invalidation batches without clobbering dirty edits or resurrecting cleared databases.
+ * @param {EmulatorSseEvent[]} events
+ */
+export async function handleSseBatch(events) {
+  const plan = applySyncSseBatch(events);
+  if (plan) {
+    await applyAsyncSseRefresh(plan);
   }
 }
 
@@ -1785,6 +1921,7 @@ export function renderWorkspace() {
       databaseId: state.activeDatabaseId,
       knownCollections: state.rootCollections,
       enterprise: state.activeDbMeta?.databaseEdition === "ENTERPRISE",
+      suggestions: state.querySuggestions,
       state: state.queryState,
       onRerender: renderApp,
       onExecuteQuery: () => void executeCurrentQuery(),
@@ -1987,6 +2124,13 @@ function syncModalAccessibility(wasOpenBefore, prevActiveBeforeRender) {
 }
 
 function renderApp() {
+  if (
+    state.view !== "query" ||
+    state.modal !== null ||
+    state.queryState.mode !== "visual"
+  ) {
+    reconcileComboboxUi(state.querySuggestions.comboboxUi, new Set());
+  }
   const prevActive =
     !wasModalOpen &&
     state.modal !== null &&
@@ -2040,7 +2184,12 @@ export async function init() {
   activeEventStream?.close();
   activeEventStream = connectEventStream(
     (batch) => {
-      void enqueueSseBatch(batch);
+      const plan = applySyncSseBatch(batch);
+      if (plan) {
+        sseQueue = sseQueue
+          .then(() => applyAsyncSseRefresh(plan))
+          .catch(() => {});
+      }
     },
     (status) => {
       const prevStatus = state.sseStatus;
