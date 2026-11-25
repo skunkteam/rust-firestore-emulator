@@ -899,25 +899,18 @@ impl Firestore for FirestoreEmulator {
             request_options,
         } = request.into_inner();
         unimplemented_option!(request_options);
-        if page_size < 0 {
-            return Err(Status::invalid_argument("page_size must be non-negative"));
-        }
+        unimplemented_option!(consistency_selector);
         let parent: Ref = parent.parse()?;
-        let collection_ids = self
+        let (collection_ids, next_page_token) = self
             .project
             .database(parent.root())
             .await
-            .get_collection_ids(&(parent))
-            .await?
-            .into_iter()
-            .collect_vec();
-        unimplemented_bool!(page_size != 0 && (page_size as usize) < collection_ids.len());
-        unimplemented_collection!(page_token);
-        unimplemented_option!(consistency_selector);
+            .list_collection_ids(&parent, page_size, &page_token)
+            .await?;
 
         Ok(Response::new(ListCollectionIdsResponse {
             collection_ids,
-            next_page_token: "".to_string(),
+            next_page_token,
         }))
     }
 

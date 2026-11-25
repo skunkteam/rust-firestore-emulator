@@ -47,6 +47,17 @@ interface RawListDocumentsResponse {
     nextPageToken?: string;
 }
 
+interface RawListCollectionIdsRequest {
+    parent: string;
+    pageSize?: number;
+    pageToken?: string;
+}
+
+interface RawListCollectionIdsResponse {
+    collectionIds?: string[];
+    nextPageToken?: string;
+}
+
 interface InternalListDocumentsClient {
     initializeIfNeeded(requestTag: string): Promise<void>;
     createCallOptions(methodName: string): Record<string, unknown>;
@@ -59,6 +70,10 @@ interface InternalListDocumentsClient {
                     req: RawListDocumentsRequest,
                     options: Record<string, unknown>,
                 ): Promise<[RawListDocument[], RawListDocumentsRequest | null, RawListDocumentsResponse]>;
+                listCollectionIds(
+                    req: RawListCollectionIdsRequest,
+                    options: Record<string, unknown>,
+                ): Promise<[string[], RawListCollectionIdsRequest | null, RawListCollectionIdsResponse]>;
             }) => Promise<T>,
         ): Promise<T>;
     };
@@ -77,6 +92,23 @@ async function listDocumentsPage(
     );
     return {
         documents: rawResponse.documents ?? documents ?? [],
+        nextPageToken: rawResponse.nextPageToken ?? '',
+    };
+}
+
+async function listCollectionIdsPage(
+    firestore: (typeof editions)[number]['firestore'],
+    req: RawListCollectionIdsRequest,
+    tag = 'listCollectionIdsPage',
+): Promise<{ collectionIds: string[]; nextPageToken: string }> {
+    const client = firestore as unknown as InternalListDocumentsClient;
+    await client.initializeIfNeeded(tag);
+    const callOptions = client.createCallOptions('listCollectionIds');
+    const [collectionIds, , rawResponse] = await client._clientPool.run(tag, false, gapicClient =>
+        gapicClient.listCollectionIds(req, { ...callOptions, autoPaginate: false }),
+    );
+    return {
+        collectionIds: rawResponse.collectionIds ?? collectionIds ?? [],
         nextPageToken: rawResponse.nextPageToken ?? '',
     };
 }
@@ -1240,6 +1272,71 @@ describe.each(editions)('$description', fs => {
             await scope.collection('bar').doc().create(data);
             await scope.collection('baz').doc().create(data);
             expect((await scope.listCollections()).map(c => c.id)).toIncludeSameMembers(['foo', 'bar', 'baz']);
+        });
+
+        test('listCollectionIds pagination and validation', async () => {
+            const parentDoc = fs.collection.doc();
+            const dbRoot = (fs.firestore as unknown as { formattedName: string }).formattedName;
+            const docsRoot = `${dbRoot}/documents`;
+            const parent = `${docsRoot}/${parentDoc.path}`;
+
+            // Nonexistent doc parent returns empty list and empty nextPageToken.
+            expect(await listCollectionIdsPage(fs.firestore, { parent, pageSize: 2 })).toEqual({
+                collectionIds: [],
+                nextPageToken: '',
+            });
+
+            // Create 5 subcollections out of lexicographic order.
+            await Promise.all(['c3', 'c1', 'c5', 'c2', 'c4'].map(name => parentDoc.collection(name).doc('d').create(writeData({ name }))));
+
+            // (a) pageSize: 2 paginates lexicographically across 3 pages and ends with empty nextPageToken.
+            const p1 = await listCollectionIdsPage(fs.firestore, { parent, pageSize: 2 });
+            expect(p1.collectionIds).toEqual(['c1', 'c2']);
+            expect(p1.nextPageToken).not.toBe('');
+
+            const p2 = await listCollectionIdsPage(fs.firestore, { parent, pageSize: 2, pageToken: p1.nextPageToken });
+            expect(p2.collectionIds).toEqual(['c3', 'c4']);
+            expect(p2.nextPageToken).not.toBe('');
+
+            const p3 = await listCollectionIdsPage(fs.firestore, { parent, pageSize: 2, pageToken: p2.nextPageToken });
+            expect(p3).toEqual({ collectionIds: ['c5'], nextPageToken: '' });
+
+            // Changing pageSize to 0 (return all remaining) with a valid token succeeds.
+            const rest = await listCollectionIdsPage(fs.firestore, { parent, pageSize: 0, pageToken: p1.nextPageToken });
+            expect(rest).toEqual({ collectionIds: ['c3', 'c4', 'c5'], nextPageToken: '' });
+
+            // (b) Exact fit (pageSize == total), pageSize > total, and pageSize == 0 return empty nextPageToken.
+            for (const pageSize of [5, 6, 0]) {
+                expect(await listCollectionIdsPage(fs.firestore, { parent, pageSize })).toEqual({
+                    collectionIds: ['c1', 'c2', 'c3', 'c4', 'c5'],
+                    nextPageToken: '',
+                });
+            }
+
+            // (c) Negative pageSize -> 3 INVALID_ARGUMENT.
+            await expectRpcCode(
+                () => listCollectionIdsPage(fs.firestore, { parent, pageSize: -1 }),
+                3,
+                'list-collection-ids-negative-page-size',
+            );
+
+            // (d) Arbitrary / raw-string pageTokens -> 3 INVALID_ARGUMENT.
+            for (const badToken of ['not-a-valid-token', 'c2']) {
+                await expectRpcCode(
+                    () => listCollectionIdsPage(fs.firestore, { parent, pageSize: 2, pageToken: badToken }),
+                    3,
+                    `list-collection-ids-bad-token-${badToken}`,
+                );
+            }
+
+            // (e) Collection-path parent -> 3 INVALID_ARGUMENT.
+            for (const colParent of [`${docsRoot}/someCol`, `${docsRoot}/${fs.collection.path}`]) {
+                await expectRpcCode(
+                    () => listCollectionIdsPage(fs.firestore, { parent: colParent }),
+                    3,
+                    `list-collection-ids-collection-parent-${colParent}`,
+                );
+            }
         });
     });
 

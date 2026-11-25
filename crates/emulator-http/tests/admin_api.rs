@@ -2773,3 +2773,99 @@ async fn test_uniform_json_error_envelopes_405_head_413_logging_and_rest_debug_l
 
     Ok(())
 }
+
+#[gtest]
+#[tokio::test]
+async fn rest_list_collection_ids_uses_opaque_pagination_tokens() -> Result<()> {
+    let project: &'static FirestoreProject =
+        Box::leak(Box::new(FirestoreProject::new(FirestoreConfig::default())));
+    let router = RouterBuilder::new(project).build();
+    let docs_root = "/v1/projects/p/databases/(default)/documents";
+
+    for col in ["c3", "c1", "c5", "c2", "c4"] {
+        let (status, _) = send_oneshot(
+            &router,
+            Method::POST,
+            &format!("{docs_root}/parents/doc1/{col}?documentId=d"),
+            Some(json!({ "fields": {} })),
+        )
+        .await?;
+        expect_eq!(status, StatusCode::OK);
+    }
+
+    let parent_url = format!("{docs_root}/parents/doc1:listCollectionIds");
+    let (s1, p1) = send_oneshot(
+        &router,
+        Method::POST,
+        &parent_url,
+        Some(json!({ "pageSize": 2 })),
+    )
+    .await?;
+    expect_eq!(s1, StatusCode::OK);
+    expect_eq!(p1["collectionIds"], json!(["c1", "c2"]));
+    let tok1 = p1["nextPageToken"].as_str().unwrap_or("");
+    assert!(!tok1.is_empty());
+    assert_ne!(tok1, "c2");
+
+    let (s2, p2) = send_oneshot(
+        &router,
+        Method::POST,
+        &parent_url,
+        Some(json!({ "pageSize": 2, "pageToken": tok1 })),
+    )
+    .await?;
+    expect_eq!(s2, StatusCode::OK);
+    expect_eq!(p2["collectionIds"], json!(["c3", "c4"]));
+    let tok2 = p2["nextPageToken"].as_str().unwrap_or("");
+    assert!(!tok2.is_empty());
+
+    let (s3, p3) = send_oneshot(
+        &router,
+        Method::POST,
+        &parent_url,
+        Some(json!({ "pageSize": 2, "pageToken": tok2 })),
+    )
+    .await?;
+    expect_eq!(s3, StatusCode::OK);
+    expect_eq!(p3["collectionIds"], json!(["c5"]));
+    expect_eq!(
+        p3.get("nextPageToken")
+            .and_then(|v| v.as_str())
+            .unwrap_or(""),
+        ""
+    );
+
+    // Exact fit pageSize == total omits nextPageToken
+    let (s_exact, exact) = send_oneshot(
+        &router,
+        Method::POST,
+        &parent_url,
+        Some(json!({ "pageSize": 5 })),
+    )
+    .await?;
+    expect_eq!(s_exact, StatusCode::OK);
+    expect_eq!(
+        exact["collectionIds"],
+        json!(["c1", "c2", "c3", "c4", "c5"])
+    );
+    expect_eq!(
+        exact
+            .get("nextPageToken")
+            .and_then(|v| v.as_str())
+            .unwrap_or(""),
+        ""
+    );
+
+    // Raw-string / malformed pageToken and negative pageSize -> 400 INVALID_ARGUMENT
+    for body in [
+        json!({ "pageToken": "c2" }),
+        json!({ "pageToken": "not-a-valid-token" }),
+        json!({ "pageSize": -1 }),
+    ] {
+        let (st, err) = send_oneshot(&router, Method::POST, &parent_url, Some(body)).await?;
+        expect_eq!(st, StatusCode::BAD_REQUEST);
+        expect_eq!(err["error"]["status"], "INVALID_ARGUMENT");
+    }
+
+    Ok(())
+}

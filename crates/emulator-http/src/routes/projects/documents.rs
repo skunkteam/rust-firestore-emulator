@@ -200,20 +200,9 @@ async fn handle_list_collection_ids(
             "ListCollectionIds with readTime over REST is not implemented yet",
         ));
     }
-    if req.page_size < 0 {
-        return Err(RestError::bad_request("pageSize must be non-negative"));
-    }
-    let mut collection_ids: Vec<String> =
-        db.get_collection_ids(&parent).await?.into_iter().collect();
-    if !req.page_token.is_empty() {
-        collection_ids.retain(|id| id.as_str() > req.page_token.as_str());
-    }
-    let next_page_token = if req.page_size > 0 && collection_ids.len() > req.page_size as usize {
-        collection_ids.truncate(req.page_size as usize);
-        collection_ids.last().cloned().unwrap_or_default()
-    } else {
-        String::new()
-    };
+    let (collection_ids, next_page_token) = db
+        .list_collection_ids(&parent, req.page_size, &req.page_token)
+        .await?;
     Ok(Json(ListCollectionIdsResponse {
         collection_ids,
         next_page_token,
