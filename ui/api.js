@@ -214,12 +214,16 @@ export async function listDatabases() {
  * Fetches database edition & concurrency metadata (creates the database if absent).
  * @param {string} projectId
  * @param {string} databaseId
+ * @param {{ signal?: AbortSignal }} [opts]
  * @returns {Promise<DatabaseMetadata>}
  */
-export async function getDatabase(projectId, databaseId) {
+export async function getDatabase(projectId, databaseId, opts = {}) {
   const p = encodeURIComponent(projectId);
   const d = encodeURIComponent(databaseId);
-  return requestJson(`/v1/projects/${p}/databases/${d}`);
+  return requestJson(
+    `/v1/projects/${p}/databases/${d}`,
+    opts.signal ? { signal: opts.signal } : undefined
+  );
 }
 
 /**
@@ -315,7 +319,7 @@ export async function listCollectionIds(parentPath, opts = {}) {
  * Lists documents in a collection.
  * @param {string} parentPath
  * @param {string} collectionId
- * @param {{ showMissing?: boolean, maskFieldPaths?: string[], pageSize?: number, pageToken?: string }} [opts]
+ * @param {{ showMissing?: boolean, maskFieldPaths?: string[], pageSize?: number, pageToken?: string, signal?: AbortSignal }} [opts]
  * @returns {Promise<{ documents: FirestoreDocument[], nextPageToken: string }>}
  */
 export async function listDocuments(parentPath, collectionId, opts = {}) {
@@ -335,7 +339,10 @@ export async function listDocuments(parentPath, collectionId, opts = {}) {
   const qs = params.toString();
   const url = `/v1/${encodeResourcePath(parentPath)}/${encodeURIComponent(collectionId)}${qs ? `?${qs}` : ""}`;
   /** @type {{ documents?: FirestoreDocument[], nextPageToken?: string }} */
-  const res = await requestJson(url);
+  const res = await requestJson(
+    url,
+    opts.signal ? { signal: opts.signal } : undefined
+  );
   return {
     documents: res.documents ?? [],
     nextPageToken: res.nextPageToken ?? "",
@@ -345,10 +352,14 @@ export async function listDocuments(parentPath, collectionId, opts = {}) {
 /**
  * Fetches a single document by full resource path.
  * @param {string} docPath
+ * @param {{ signal?: AbortSignal }} [opts]
  * @returns {Promise<FirestoreDocument>}
  */
-export async function getDocument(docPath) {
-  return requestJson(`/v1/${encodeResourcePath(docPath)}`);
+export async function getDocument(docPath, opts = {}) {
+  return requestJson(
+    `/v1/${encodeResourcePath(docPath)}`,
+    opts.signal ? { signal: opts.signal } : undefined
+  );
 }
 
 /**
@@ -501,6 +512,8 @@ export async function clearContention(database) {
  *   primaryEvent: string,
  *   debounceMs: number,
  *   maxWaitMs?: number,
+ *   flushOnResync?: boolean,
+ *   isUrgent?: (ev: T) => boolean,
  *   onInvalidate?: (events: T[]) => void,
  *   onStatusChange?: (status: 'live' | 'error') => void,
  *   makeResyncFallback: () => T,
@@ -533,9 +546,13 @@ function createDebouncedEventStream(opts) {
     }
   };
 
-  const enqueue = (/** @type {T} */ ev) => {
+  const enqueue = (/** @type {T} */ ev, urgent = false) => {
     if (closed) return;
     pending.push(ev);
+    if (urgent || opts.isUrgent?.(ev)) {
+      flush();
+      return;
+    }
     if (timer !== null) {
       clearTimeout(timer);
     }
@@ -571,17 +588,18 @@ function createDebouncedEventStream(opts) {
   });
 
   es.addEventListener("resync", (msg) => {
+    const flushNow = Boolean(opts.flushOnResync);
     try {
       const ev = /** @type {unknown} */ (
         JSON.parse(/** @type {MessageEvent} */ (msg).data)
       );
       if (ev && typeof ev === "object") {
-        enqueue(/** @type {T} */ (ev));
+        enqueue(/** @type {T} */ (ev), flushNow);
       } else {
-        enqueue(opts.makeResyncFallback());
+        enqueue(opts.makeResyncFallback(), flushNow);
       }
     } catch {
-      enqueue(opts.makeResyncFallback());
+      enqueue(opts.makeResyncFallback(), flushNow);
     }
   });
 
@@ -603,16 +621,22 @@ function createDebouncedEventStream(opts) {
 }
 
 /**
- * Connects to `/emulator/v1/events` SSE stream and coalesces events with a 150ms trailing debounce.
+ * Connects to `/emulator/v1/events` SSE stream and coalesces events with a 150ms trailing debounce,
+ * a 1000ms maximum wait ceiling to prevent event starvation, and immediate FIFO flush on
+ * `database_cleared` and `resync` events.
  * @param {(events: EmulatorSseEvent[]) => void} onInvalidate
  * @param {(status: 'live' | 'error') => void} onStatusChange
  * @returns {{ close: () => void }}
  */
 export function connectEventStream(onInvalidate, onStatusChange) {
+  const MAX_WAIT_MS = 1000;
   return createDebouncedEventStream({
     url: "/emulator/v1/events",
     primaryEvent: "change",
     debounceMs: 150,
+    maxWaitMs: MAX_WAIT_MS,
+    flushOnResync: true,
+    isUrgent: (ev) => ev.type === "database_cleared" || ev.type === "resync",
     onInvalidate,
     onStatusChange,
     makeResyncFallback: () => /** @type {EmulatorSseEvent} */ ({ type: "resync" }),
