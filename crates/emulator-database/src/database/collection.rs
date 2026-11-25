@@ -61,4 +61,11 @@ impl Collection {
             .values()
             .any(|doc| doc.read_latest_uncontended(|c| c.exists())))
     }
+
+    #[cfg(test)]
+    pub(super) async fn documents_write(
+        &self,
+    ) -> tokio::sync::RwLockWriteGuard<'_, HashMap<DefaultAtom, Arc<DocumentMeta>>> {
+        self.documents.write().await
+    }
 }

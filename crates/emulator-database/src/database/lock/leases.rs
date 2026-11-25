@@ -115,8 +115,9 @@ impl Drop for WriteLease {
 /// Sealed commit capability owning all exclusive target [`WriteLease`]s for a commit apply phase.
 ///
 /// Constructing `CommitSeal` transitions the owning [`LockSession`] to non-woundable `Committing`
-/// and releases all un-upgraded retained read holds; dropping `CommitSeal` disarms individual
-/// [`WriteLease`]s and releases all remaining session locks atomically in one critical section.
+/// while retaining all un-upgraded read holds alongside the target write leases for Strict 2PL
+/// MVCC commit-time ordering; dropping `CommitSeal` disarms individual [`WriteLease`]s and releases
+/// all remaining read and write locks atomically in one critical section.
 #[derive(Debug)]
 pub(crate) struct CommitSeal {
     session: Arc<LockSession>,

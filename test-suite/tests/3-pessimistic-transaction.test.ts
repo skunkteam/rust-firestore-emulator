@@ -1,4 +1,4 @@
-import { DocumentReference, DocumentSnapshot, FieldPath, FieldValue, Transaction } from '@google-cloud/firestore';
+import { DocumentReference, DocumentSnapshot, FieldPath, FieldValue, Timestamp, Transaction } from '@google-cloud/firestore';
 import assert from 'assert';
 import { setTimeout as time } from 'timers/promises';
 import {
@@ -42,6 +42,13 @@ function commitTimeNs(res: RawCommitResponse): bigint {
     const secs = res.commitTime?.seconds ?? 0;
     const secsBig = typeof secs === 'string' || typeof secs === 'number' ? BigInt(secs) : BigInt(secs.toString());
     return secsBig * 1_000_000_000n + BigInt(res.commitTime?.nanos ?? 0);
+}
+
+function commitTimeToTimestamp(res: RawCommitResponse): Timestamp {
+    assert(res.commitTime, 'expected commitTime on CommitResponse');
+    const secs = res.commitTime.seconds ?? 0;
+    const secsNum = typeof secs === 'string' || typeof secs === 'number' ? Number(secs) : Number(secs.toString());
+    return new Timestamp(secsNum, res.commitTime.nanos ?? 0);
 }
 
 type RpcOutcome<T> = { ok: true; value: T } | { ok: false; code: number | undefined; message: string };
@@ -2200,6 +2207,184 @@ describe.each(editions.filter(e => e.concurrencyMode === 'pessimistic'))('$descr
                             txnBCode: 10,
                         });
                         expect(await unrelatedRef.get()).toHaveProperty('exists', false);
+                    } finally {
+                        if (txnA && !txnACommitted) await rawRollback(txnA).catch(() => undefined);
+                        if (txnB && !txnBCommitted) await rawRollback(txnB).catch(() => undefined);
+                    }
+                },
+                30_000,
+            );
+        });
+
+        describe('strict 2PL commit-time MVCC ordering', () => {
+            test.concurrent(
+                'read(doc1) + write(doc2) holds read lock until commit completes, preserving commitTime(A) < commitTime(B) and MVCC snapshot isolation',
+                async () => {
+                    const [doc1, doc2] = refs();
+                    await Promise.all([doc1.set(writeData({ value: 'initial' })), doc2.set(writeData({ value: 'initial' }))]);
+
+                    let txnA: Uint8Array | undefined;
+                    let txnB: Uint8Array | undefined;
+                    let txnACommitted = false;
+                    let txnBCommitted = false;
+
+                    try {
+                        txnA = await rawBeginTxn();
+                        await time(50);
+                        txnB = await rawBeginTxn();
+
+                        const activeA = txnA;
+                        const activeB = txnB;
+                        const ct = new ConcurrentTest({ timeout: 20_000 });
+                        let txnBDone = false;
+                        let txnBBlockedInitially = false;
+                        let txnAOutcome: RpcOutcome<RawCommitResponse> | undefined;
+                        let txnBOutcome: RpcOutcome<RawCommitResponse> | undefined;
+
+                        await ct.run(
+                            async () => {
+                                await rawReadDoc(doc1, activeA);
+                                ct.event('txnA read doc1');
+                                await ct.when('txnB commit queued');
+                                txnAOutcome = await captureRpcOutcome(() =>
+                                    rawCommit([rawUpdateWrite(doc2, { value: { stringValue: 'from A' } }, ['value'])], activeA),
+                                );
+                                txnACommitted = txnAOutcome.ok;
+                                ct.event('txnA committed');
+                            },
+                            async () => {
+                                await ct.when('txnA read doc1');
+                                const txnBPromise = captureRpcOutcome(() =>
+                                    rawCommit([rawUpdateWrite(doc1, { value: { stringValue: 'from B' } }, ['value'])], activeB),
+                                ).then(res => {
+                                    txnBDone = true;
+                                    return res;
+                                });
+                                await time(250);
+                                txnBBlockedInitially = !txnBDone;
+                                ct.event('txnB commit queued');
+                                txnBOutcome = await txnBPromise;
+                                txnBCommitted = txnBOutcome.ok;
+                            },
+                        );
+
+                        assert(txnAOutcome && txnBOutcome);
+                        expect({
+                            txnBBlockedInitially,
+                            txnAOk: txnAOutcome.ok,
+                            txnACode: txnAOutcome.ok ? undefined : txnAOutcome.code,
+                            txnBOk: txnBOutcome.ok,
+                            txnBCode: txnBOutcome.ok ? undefined : txnBOutcome.code,
+                        }).toEqual({
+                            txnBBlockedInitially: true,
+                            txnAOk: true,
+                            txnACode: undefined,
+                            txnBOk: true,
+                            txnBCode: undefined,
+                        });
+                        assert(txnAOutcome.ok && txnBOutcome.ok);
+
+                        expect(commitTimeNs(txnAOutcome.value)).toBeLessThan(commitTimeNs(txnBOutcome.value));
+
+                        const [doc1AtA, doc2AtA] = await fs.firestore.runTransaction(txn => txn.getAll(doc1, doc2), {
+                            readOnly: true,
+                            readTime: commitTimeToTimestamp(txnAOutcome.value),
+                        });
+                        expect(readData(doc1AtA.data())).toEqual({ value: 'initial' });
+                        expect(readData(doc2AtA.data())).toEqual({ value: 'from A' });
+
+                        const [doc1AtB, doc2AtB] = await fs.firestore.runTransaction(txn => txn.getAll(doc1, doc2), {
+                            readOnly: true,
+                            readTime: commitTimeToTimestamp(txnBOutcome.value),
+                        });
+                        expect(readData(doc1AtB.data())).toEqual({ value: 'from B' });
+                        expect(readData(doc2AtB.data())).toEqual({ value: 'from A' });
+                    } finally {
+                        if (txnA && !txnACommitted) await rawRollback(txnA).catch(() => undefined);
+                        if (txnB && !txnBCommitted) await rawRollback(txnB).catch(() => undefined);
+                    }
+                },
+                30_000,
+            );
+
+            test.concurrent(
+                'empty-write RW commit orders commitTime(A) < commitTime(B) against blocked writer',
+                async () => {
+                    const [doc1] = refs();
+                    await doc1.set(writeData({ value: 'initial' }));
+
+                    let txnA: Uint8Array | undefined;
+                    let txnB: Uint8Array | undefined;
+                    let txnACommitted = false;
+                    let txnBCommitted = false;
+
+                    try {
+                        txnA = await rawBeginTxn();
+                        await time(50);
+                        txnB = await rawBeginTxn();
+
+                        const activeA = txnA;
+                        const activeB = txnB;
+                        const ct = new ConcurrentTest({ timeout: 20_000 });
+                        let txnBDone = false;
+                        let txnBBlockedInitially = false;
+                        let txnAOutcome: RpcOutcome<RawCommitResponse> | undefined;
+                        let txnBOutcome: RpcOutcome<RawCommitResponse> | undefined;
+
+                        await ct.run(
+                            async () => {
+                                await rawReadDoc(doc1, activeA);
+                                ct.event('txnA read doc1');
+                                await ct.when('txnB commit queued');
+                                txnAOutcome = await captureRpcOutcome(() => rawCommit([], activeA));
+                                txnACommitted = txnAOutcome.ok;
+                                ct.event('txnA committed');
+                            },
+                            async () => {
+                                await ct.when('txnA read doc1');
+                                const txnBPromise = captureRpcOutcome(() =>
+                                    rawCommit([rawUpdateWrite(doc1, { value: { stringValue: 'from B' } }, ['value'])], activeB),
+                                ).then(res => {
+                                    txnBDone = true;
+                                    return res;
+                                });
+                                await time(250);
+                                txnBBlockedInitially = !txnBDone;
+                                ct.event('txnB commit queued');
+                                txnBOutcome = await txnBPromise;
+                                txnBCommitted = txnBOutcome.ok;
+                            },
+                        );
+
+                        assert(txnAOutcome && txnBOutcome);
+                        expect({
+                            txnBBlockedInitially,
+                            txnAOk: txnAOutcome.ok,
+                            txnACode: txnAOutcome.ok ? undefined : txnAOutcome.code,
+                            txnBOk: txnBOutcome.ok,
+                            txnBCode: txnBOutcome.ok ? undefined : txnBOutcome.code,
+                        }).toEqual({
+                            txnBBlockedInitially: true,
+                            txnAOk: true,
+                            txnACode: undefined,
+                            txnBOk: true,
+                            txnBCode: undefined,
+                        });
+                        assert(txnAOutcome.ok && txnBOutcome.ok);
+
+                        expect(commitTimeNs(txnAOutcome.value)).toBeLessThan(commitTimeNs(txnBOutcome.value));
+
+                        const snapAtA = await fs.firestore.runTransaction(txn => txn.get(doc1), {
+                            readOnly: true,
+                            readTime: commitTimeToTimestamp(txnAOutcome.value),
+                        });
+                        expect(readData(snapAtA.data())).toEqual({ value: 'initial' });
+
+                        const snapAtB = await fs.firestore.runTransaction(txn => txn.get(doc1), {
+                            readOnly: true,
+                            readTime: commitTimeToTimestamp(txnBOutcome.value),
+                        });
+                        expect(readData(snapAtB.data())).toEqual({ value: 'from B' });
                     } finally {
                         if (txnA && !txnACommitted) await rawRollback(txnA).catch(() => undefined);
                         if (txnB && !txnBCommitted) await rawRollback(txnB).catch(() => undefined);

@@ -286,24 +286,40 @@ async fn read_and_write_wounding_cancels_multi_doc_waiters_and_respects_committi
     let w_d1 = seal_holder.acquire_write(&d1).await.unwrap();
     let mut map = BTreeMap::new();
     map.insert(d1.clone(), w_d1);
-    let seal = seal_holder.seal_for_commit(map).unwrap();
+    let seal = Arc::clone(&seal_holder).seal_for_commit(map).unwrap();
     expect_eq!(seal.len(), 1);
     expect_false!(seal.is_empty());
     expect_that!(seal.get(&d1), some(anything()));
     expect_that!(seal.check_committing_active(), ok(()));
     expect_eq!(seal.doc_refs().count(), 1);
 
-    // `seal_holder` was un-upgraded on `d2`, so sealing released `d2` cleanly!
-    let check_d2 = oldest.acquire_write(&d2).await.unwrap();
-    drop(check_d2);
+    // Under Strict 2PL, `seal_holder`'s un-upgraded retained read on `d2` stays held and
+    // non-woundable until `CommitSeal::drop`, while allowing concurrent shared reads.
+    let concurrent_reader = locks.new_session(
+        None,
+        SessionKind::PointRead,
+        LockPriority::NextSeq,
+        false,
+        false,
+    );
+    drop(concurrent_reader.acquire_read(&d2).await.unwrap());
 
-    // `oldest` (seq=1) cannot wound `Committing` `seal_holder` on `d1`, so it queues cleanly.
+    // `oldest` (seq=1) cannot wound `Committing` `seal_holder` on `d2` or `d1`, so it queues on
+    // both until `drop(seal)`.
+    let d2_clone = d2.clone();
+    let oldest_d2 = oldest.clone();
+    let mut blocked_d2_by_seal = Box::pin(async move { oldest_d2.acquire_write(&d2_clone).await });
+    assert!(poll!(&mut blocked_d2_by_seal).is_pending());
+    expect_false!(seal_holder.is_wounded());
+
     let d1_clone = d1.clone();
     let oldest_clone = oldest.clone();
     let mut blocked_by_seal = Box::pin(async move { oldest_clone.acquire_write(&d1_clone).await });
     assert!(poll!(&mut blocked_by_seal).is_pending());
 
     drop(seal);
+    let w_d2_after_seal = blocked_d2_by_seal.await.unwrap();
+    drop(w_d2_after_seal);
     let w_after_seal = blocked_by_seal.await.unwrap();
     drop(w_after_seal);
 }
@@ -1191,8 +1207,8 @@ async fn h2_m1_seal_for_commit_drains_dangling_waiters_and_promoted_grants() {
             if msg == "transaction closed"
     ));
 
-    // Un-upgraded retained read and promoted grant are both released so writers succeed
-    // immediately.
+    // Dangling parked waiter and unconsumed promoted grant are released on seal, while retained
+    // reads stay held under Strict 2PL until `CommitSeal::drop`.
     drop(bw_parked);
     let probe = locks.new_session(
         None,
@@ -1201,10 +1217,12 @@ async fn h2_m1_seal_for_commit_drains_dangling_waiters_and_promoted_grants() {
         false,
         false,
     );
-    drop(probe.acquire_write(&d_retained).await.unwrap());
+    let mut retained_w_fut = Box::pin(probe.acquire_write(&d_retained));
+    assert!(poll!(&mut retained_w_fut).is_pending());
     drop(probe.acquire_write(&d_parked).await.unwrap());
     drop(probe.acquire_write(&d_promoted).await.unwrap());
     drop(seal);
+    drop(retained_w_fut.await.unwrap());
 }
 
 #[gtest]
@@ -2782,4 +2800,324 @@ async fn contention_seal_for_commit_under_contention_emits_sse_and_transitions_w
     waiter.close();
     holder.close();
     expect_eq!(locks.table_counts(), (0, 0));
+}
+
+#[gtest]
+#[tokio::test(start_paused = true)]
+async fn contention_seal_for_commit_notifies_and_transitions_contended_reader_to_committing() {
+    use tokio::sync::broadcast::error::TryRecvError;
+
+    let (locks, _broadcaster, mut sub) = mgr_with_broadcaster(Timeouts::FAST);
+    let d_read = doc("seal_contended_read");
+    let d_write = doc("seal_uncontended_write");
+
+    let reader = locks.new_session(
+        Some(test_txn_id(15, 1)),
+        SessionKind::PessimisticTxn,
+        LockPriority::NextSeq,
+        true,
+        true,
+    );
+    let rl = reader.acquire_read(&d_read).await.unwrap();
+    reader.retain_read(rl, None).unwrap();
+    // Write on an uncontended doc so `seal_for_commit`'s SSE notification must come from `d_read`.
+    let wl = reader.acquire_write(&d_write).await.unwrap();
+
+    let writer = locks.new_session(
+        Some(test_txn_id(16, 1)),
+        SessionKind::PessimisticTxn,
+        LockPriority::NextSeq,
+        true,
+        true,
+    );
+    let mut wait_fut = Box::pin(writer.acquire_write(&d_read));
+    assert!(poll!(&mut wait_fut).is_pending());
+    assert_eq!(
+        sub.rx.try_recv().unwrap(),
+        ContentionSseEvent::ContentionChanged {
+            database: db_root(),
+        }
+    );
+    assert!(matches!(sub.rx.try_recv(), Err(TryRecvError::Empty)));
+
+    let before = locks.contention_snapshot();
+    expect_eq!(before.total_contended_documents, 1);
+    expect_eq!(before.contended_documents[0].readers.len(), 1);
+    let reader_before = &before.contended_documents[0].readers[0];
+    expect_eq!(reader_before.state, ContentionSessionState::Active);
+    expect_true!(reader_before.woundable);
+    expect_true!(reader_before.retained);
+
+    let seal = Arc::clone(&reader)
+        .seal_for_commit(BTreeMap::from([(d_write, wl)]))
+        .unwrap();
+    assert_eq!(
+        sub.rx.try_recv().unwrap(),
+        ContentionSseEvent::ContentionChanged {
+            database: db_root(),
+        }
+    );
+    assert!(matches!(sub.rx.try_recv(), Err(TryRecvError::Empty)));
+
+    let after = locks.contention_snapshot();
+    expect_eq!(after.total_contended_documents, 1);
+    expect_eq!(after.contended_documents[0].reader_count, 1);
+    let reader_after = &after.contended_documents[0].readers[0];
+    expect_eq!(reader_after.session_id, reader.session_id());
+    expect_eq!(reader_after.state, ContentionSessionState::Committing);
+    expect_eq!(
+        serde_json::to_value(reader_after.state).unwrap(),
+        serde_json::json!("COMMITTING")
+    );
+    expect_false!(reader_after.woundable);
+    expect_true!(reader_after.retained);
+
+    drop(seal);
+    assert_eq!(
+        sub.rx.try_recv().unwrap(),
+        ContentionSseEvent::ContentionChanged {
+            database: db_root(),
+        }
+    );
+    drop(wait_fut.await.unwrap());
+    writer.close();
+    reader.close();
+    expect_eq!(locks.table_counts(), (0, 0));
+}
+
+#[gtest]
+#[tokio::test(start_paused = true)]
+async fn commit_empty_orders_timestamps_handles_abort_states_and_cleans_resources() {
+    use tokio::sync::broadcast::error::TryRecvError;
+
+    let (locks, _broadcaster, mut sub) = mgr_with_broadcaster(Timeouts::FAST);
+    let d1 = doc("ce_d1");
+    let d2 = doc("ce_d2");
+    let d_park = doc("ce_park");
+    let d_prom = doc("ce_prom");
+
+    // 1. Uncontended `commit_empty` succeeds, closes session, and emits zero SSE events.
+    let s_uncontended = locks.new_session(
+        Some(test_txn_id(50, 1)),
+        SessionKind::PessimisticTxn,
+        LockPriority::NextSeq,
+        true,
+        true,
+    );
+    let r_un = s_uncontended.acquire_read(&d1).await.unwrap();
+    s_uncontended.retain_read(r_un, None).unwrap();
+    let _ts_un = s_uncontended.commit_empty().unwrap();
+    expect_eq!(s_uncontended.abort_state(), SessionAbortState::Closed);
+    assert!(matches!(sub.rx.try_recv(), Err(TryRecvError::Empty)));
+    expect_eq!(locks.table_counts(), (0, 0));
+
+    // 2. Contended `commit_empty` stamps `commit_time` strictly BEFORE releasing retained reads and
+    //    waking blocked writers (`commit_time(A) < acquire_time(B)`), and invalidates any
+    //    unretained in-flight `ReadLease`.
+    let s_a = locks.new_session(
+        Some(test_txn_id(51, 1)),
+        SessionKind::PessimisticTxn,
+        LockPriority::NextSeq,
+        true,
+        true,
+    );
+    let r_a = s_a.acquire_read(&d1).await.unwrap();
+    s_a.retain_read(r_a, None).unwrap();
+    let r_inflight = s_a.acquire_read(&d1).await.unwrap();
+
+    let s_b = locks.new_session(
+        None,
+        SessionKind::SingleWrite,
+        LockPriority::NextSeq,
+        false,
+        false,
+    );
+    let mut b_fut = Box::pin(s_b.acquire_write(&d1));
+    assert!(poll!(&mut b_fut).is_pending());
+    assert_eq!(
+        sub.rx.try_recv().unwrap(),
+        ContentionSseEvent::ContentionChanged {
+            database: db_root(),
+        }
+    );
+
+    let a_commit_ts = s_a.commit_empty().unwrap();
+    expect_eq!(s_a.abort_state(), SessionAbortState::Closed);
+    assert_eq!(
+        r_inflight.check_active(),
+        Err(CommitError::Other(GenericDatabaseError::invalid_argument(
+            "transaction closed"
+        )))
+    );
+    drop(r_inflight);
+    assert_eq!(
+        sub.rx.try_recv().unwrap(),
+        ContentionSseEvent::ContentionChanged {
+            database: db_root(),
+        }
+    );
+    assert!(matches!(sub.rx.try_recv(), Err(TryRecvError::Empty)));
+
+    let b_lease = b_fut.await.unwrap();
+    expect_true!(a_commit_ts < b_lease.acquire_time());
+    drop(b_lease);
+    s_b.close();
+    expect_eq!(locks.table_counts(), (0, 0));
+
+    // 3. `commit_empty` drains dangling parked waiters, unconsumed promoted grants, and retained
+    //    reads atomically with coalesced SSE.
+    let holder = locks.new_session(
+        None,
+        SessionKind::SingleWrite,
+        LockPriority::NextSeq,
+        false,
+        false,
+    );
+    let hw_park = holder.acquire_write(&d_park).await.unwrap();
+    let hw_prom = holder.acquire_write(&d_prom).await.unwrap();
+
+    let s_mix = locks.new_session(
+        Some(test_txn_id(52, 1)),
+        SessionKind::PessimisticTxn,
+        LockPriority::NextSeq,
+        true,
+        true,
+    );
+    let r_ret = s_mix.acquire_read(&d1).await.unwrap();
+    s_mix.retain_read(r_ret, None).unwrap();
+    let s_mix_wait = locks.new_session(
+        None,
+        SessionKind::SingleWrite,
+        LockPriority::NextSeq,
+        false,
+        false,
+    );
+    let mut mix_ret_wait = Box::pin(s_mix_wait.acquire_write(&d1));
+    assert!(poll!(&mut mix_ret_wait).is_pending());
+    let mut mix_park_fut = Box::pin(s_mix.acquire_read(&d_park));
+    assert!(poll!(&mut mix_park_fut).is_pending());
+    let mut mix_prom_fut = Box::pin(s_mix.acquire_read(&d_prom));
+    assert!(poll!(&mut mix_prom_fut).is_pending());
+
+    drop(hw_prom);
+    s_mix.mark_commit_started();
+    while sub.rx.try_recv().is_ok() {}
+
+    let mix_ts = s_mix.commit_empty().unwrap();
+    assert_eq!(
+        sub.rx.try_recv().unwrap(),
+        ContentionSseEvent::ContentionChanged {
+            database: db_root(),
+        }
+    );
+    assert!(matches!(sub.rx.try_recv(), Err(TryRecvError::Empty)));
+    assert!(matches!(
+        mix_park_fut.await,
+        Err(CommitError::Other(GenericDatabaseError::InvalidArgument(msg)))
+            if msg == "transaction closed"
+    ));
+    assert!(matches!(
+        mix_prom_fut.await,
+        Err(CommitError::Other(GenericDatabaseError::InvalidArgument(msg)))
+            if msg == "transaction closed"
+    ));
+    let mix_w = mix_ret_wait.await.unwrap();
+    expect_true!(mix_ts < mix_w.acquire_time());
+    drop(mix_w);
+    s_mix_wait.close();
+    drop(hw_park);
+    drop(holder.acquire_write(&d_prom).await.unwrap());
+    holder.close();
+    expect_eq!(locks.table_counts(), (0, 0));
+
+    // 4. Error states: `Closed`, `Expired`, `Wounded`, `Committing`, and `DatabaseCleared`.
+    let s_closed = locks.new_session(
+        None,
+        SessionKind::PessimisticTxn,
+        LockPriority::NextSeq,
+        true,
+        true,
+    );
+    s_closed.close();
+    assert_eq!(
+        s_closed.commit_empty(),
+        Err(CommitError::Other(GenericDatabaseError::invalid_argument(
+            "transaction closed"
+        )))
+    );
+
+    let s_exp = locks.new_session(
+        None,
+        SessionKind::PessimisticTxn,
+        LockPriority::NextSeq,
+        true,
+        true,
+    );
+    s_exp.close_expired();
+    assert_eq!(
+        s_exp.commit_empty(),
+        Err(CommitError::Aborted(AbortReason::TransactionExpired))
+    );
+
+    let older = locks.new_session(
+        None,
+        SessionKind::PessimisticTxn,
+        LockPriority::NextSeq,
+        true,
+        true,
+    );
+    let younger = locks.new_session(
+        None,
+        SessionKind::PessimisticTxn,
+        LockPriority::NextSeq,
+        true,
+        true,
+    );
+    let yr = younger.acquire_read(&d2).await.unwrap();
+    younger.retain_read(yr, None).unwrap();
+    let ow = older.acquire_write(&d2).await.unwrap();
+    assert!(matches!(
+        younger.commit_empty(),
+        Err(CommitError::Aborted(AbortReason::Wounded { .. }))
+    ));
+    drop(ow);
+    older.close();
+    younger.close();
+
+    // Direct `LockTable::commit_empty` on an already-sealed `Committing` session rejects.
+    let mut table = LockTable::default();
+    let mut g = LockTableGarbage::default();
+    let s_shared = Arc::new(SessionSharedState::new(1));
+    table.register_session(
+        1,
+        Arc::clone(&s_shared),
+        None,
+        SessionKind::PessimisticTxn,
+        1,
+        true,
+        true,
+    );
+    expect_that!(
+        table.seal_for_commit(1, &s_shared, &BTreeMap::new(), &mut g),
+        ok(anything())
+    );
+    assert_eq!(
+        table.commit_empty(1, &s_shared, &mut g),
+        Err(CommitError::Other(GenericDatabaseError::invalid_argument(
+            "transaction closed"
+        )))
+    );
+
+    let s_clear = locks.new_session(
+        None,
+        SessionKind::PessimisticTxn,
+        LockPriority::NextSeq,
+        true,
+        true,
+    );
+    locks.abort_all(AbortReason::DatabaseCleared);
+    assert_eq!(
+        s_clear.commit_empty(),
+        Err(CommitError::Aborted(AbortReason::DatabaseCleared))
+    );
 }
