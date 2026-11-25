@@ -46,7 +46,7 @@ use crate::{
     FirestoreProject, GenericDatabaseError,
     database::field_path::FieldReference,
     error::{AbortReason, Result},
-    unimplemented_bool, unimplemented_option,
+    unimplemented_bool,
     utils::RwLockHashMapExt,
 };
 
@@ -331,7 +331,12 @@ impl FirestoreDatabase {
         ))
     }
 
-    #[instrument(level = Level::DEBUG, skip_all, err(level = Level::DEBUG))]
+    #[instrument(
+        level = Level::DEBUG,
+        skip_all,
+        fields(agg_count, enterprise, matched_docs),
+        err(level = Level::DEBUG)
+    )]
     pub async fn run_aggregation_query(
         &self,
         parent: Ref,
@@ -339,17 +344,20 @@ impl FirestoreDatabase {
         aggregations: Vec<Aggregation>,
         consistency: ReadConsistency,
     ) -> Result<(Timestamp, HashMap<String, Value>)> {
+        Span::current().record("agg_count", aggregations.len());
         self.ensure_owns_root(parent.root())?;
-        unimplemented_option!(query.select);
         let enterprise = self.enterprise_edition();
+        Span::current().record("enterprise", enterprise);
         let is_unordered = query.order_by.is_empty() && query.find_nearest.is_none();
         let mut query = Query::from_structured(parent, query, consistency, enterprise)?;
+        let compiled = compile_aggregations(aggregations, enterprise)?;
         debug!(?query);
         let (read_time, mut docs) = query.once(self).await?;
-        let has_sum_or_avg = aggregations.iter().any(|agg| {
+        Span::current().record("matched_docs", docs.len());
+        let has_sum_or_avg = compiled.iter().any(|agg| {
             matches!(
-                agg.operator,
-                Some(aggregation::Operator::Sum(_) | aggregation::Operator::Avg(_))
+                agg.op,
+                CompiledAggregationOp::Sum(_) | CompiledAggregationOp::Avg(_)
             )
         });
         if enterprise && is_unordered && has_sum_or_avg {
@@ -357,20 +365,16 @@ impl FirestoreDatabase {
             // for deterministic primary-key scan order.
             docs.sort_by(|a, b| a.version.name.cmp(&b.version.name));
         }
-        let result = aggregations
+        let result = compiled
             .into_iter()
             .map(|agg| {
-                use aggregation::*;
-                let operator = agg.operator.ok_or_else(|| {
-                    GenericDatabaseError::invalid_argument("missing operator in aggregation query")
-                })?;
-                let result = match operator {
+                let result = match agg.op {
                     // Count of documents that match the query.
                     //
                     // The `COUNT(*)` aggregation function operates on the entire document
                     // so it does not require a field reference.
-                    Operator::Count(Count { up_to }) => {
-                        let max = up_to.map(|v| v.value).unwrap_or(i64::MAX);
+                    CompiledAggregationOp::Count { up_to } => {
+                        let max = up_to.unwrap_or(i64::MAX);
                         Value::integer((docs.len() as i64).min(max))
                     }
                     // Sum of the values of the requested field.
@@ -389,15 +393,7 @@ impl FirestoreDatabase {
                     //   sequentially in `i64` before any `DoubleValue`, failing with
                     //   `InvalidArgument` (`"Long overflow"`) on intermediate or final `i64`
                     //   overflow.
-                    Operator::Sum(Sum { field }) => {
-                        let field_ref: FieldReference = field
-                            .as_ref()
-                            .ok_or_else(|| {
-                                GenericDatabaseError::invalid_argument(
-                                    "missing field reference in SUM operator",
-                                )
-                            })?
-                            .try_into()?;
+                    CompiledAggregationOp::Sum(field_ref) => {
                         let mut values = docs
                             .iter()
                             .filter_map(|m| {
@@ -427,15 +423,7 @@ impl FirestoreDatabase {
                     //
                     // * Always returns the result as a double (Enterprise Edition applies the same
                     //   sequential `Long overflow` check to its numerator sum).
-                    Operator::Avg(Avg { field }) => {
-                        let field_ref: FieldReference = field
-                            .as_ref()
-                            .ok_or_else(|| {
-                                GenericDatabaseError::invalid_argument(
-                                    "missing field reference in AVG operator",
-                                )
-                            })?
-                            .try_into()?;
+                    CompiledAggregationOp::Avg(field_ref) => {
                         let values = docs
                             .iter()
                             .filter_map(|m| {
@@ -893,6 +881,147 @@ impl FirestoreDatabase {
                 });
         }
     }
+}
+
+const MAX_STANDARD_AGGREGATIONS_PER_QUERY: usize = 5;
+const MAX_ENTERPRISE_AGGREGATIONS_PER_QUERY: usize = 64;
+const MAX_AGGREGATION_ALIAS_BYTES: usize = 1_500;
+
+#[derive(Debug, PartialEq, Eq)]
+enum CompiledAggregationOp {
+    Count { up_to: Option<i64> },
+    Sum(FieldReference),
+    Avg(FieldReference),
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct CompiledAggregation {
+    alias: String,
+    op:    CompiledAggregationOp,
+}
+
+/// Parses and validates a `SUM`/`AVG` field reference according to edition rules.
+fn compile_aggregation_field(
+    field: Option<structured_query::FieldReference>,
+    op_name: &str,
+    name_err: &'static str,
+    enterprise: bool,
+) -> Result<FieldReference> {
+    let field = field.as_ref().ok_or_else(|| {
+        GenericDatabaseError::invalid_argument(format!(
+            "missing field reference in {op_name} operator"
+        ))
+    })?;
+    let field_ref = FieldReference::try_from(field)?;
+    if enterprise {
+        match &field_ref {
+            FieldReference::DocumentName => Ok(field_ref),
+            FieldReference::FieldPath(fp) => {
+                fp.validate_non_reserved_allowing_doc_name()?;
+                Ok(field_ref)
+            }
+        }
+    } else {
+        let fp = field_ref.into_non_reserved_field_path(name_err)?;
+        Ok(FieldReference::FieldPath(fp))
+    }
+}
+
+/// Validates aggregation count, operators, `Count.up_to`, `SUM`/`AVG` fields, and aliases.
+fn compile_aggregations(
+    aggregations: Vec<Aggregation>,
+    enterprise: bool,
+) -> Result<Vec<CompiledAggregation>> {
+    if aggregations.is_empty() {
+        return Err(GenericDatabaseError::invalid_argument(
+            "aggregations cannot be empty",
+        ));
+    }
+    let max_aggregations = if enterprise {
+        MAX_ENTERPRISE_AGGREGATIONS_PER_QUERY
+    } else {
+        MAX_STANDARD_AGGREGATIONS_PER_QUERY
+    };
+    if aggregations.len() > max_aggregations {
+        return Err(GenericDatabaseError::invalid_argument(format!(
+            "a maximum of {max_aggregations} aggregations are allowed per query"
+        )));
+    }
+
+    let mut next_auto_alias: usize = 1;
+    let mut seen_aliases = HashSet::with_capacity(aggregations.len());
+    let mut compiled = Vec::with_capacity(aggregations.len());
+
+    for agg in aggregations {
+        let operator = agg.operator.ok_or_else(|| {
+            GenericDatabaseError::invalid_argument("missing operator in aggregation query")
+        })?;
+        let op = match operator {
+            aggregation::Operator::Count(aggregation::Count { up_to }) => {
+                let up_to = up_to.map(|v| v.value);
+                if enterprise {
+                    if up_to.is_some() {
+                        return Err(GenericDatabaseError::invalid_argument(
+                            "The `count_up_to(...)` accumulator is not supported in Enterprise \
+                             edition.",
+                        ));
+                    }
+                } else if let Some(limit) = up_to
+                    && limit < 0
+                {
+                    return Err(GenericDatabaseError::invalid_argument(
+                        "Count.up_to cannot be negative",
+                    ));
+                }
+                CompiledAggregationOp::Count { up_to }
+            }
+            aggregation::Operator::Sum(aggregation::Sum { field }) => {
+                CompiledAggregationOp::Sum(compile_aggregation_field(
+                    field,
+                    "SUM",
+                    "SUM field cannot be __name__",
+                    enterprise,
+                )?)
+            }
+            aggregation::Operator::Avg(aggregation::Avg { field }) => {
+                CompiledAggregationOp::Avg(compile_aggregation_field(
+                    field,
+                    "AVG",
+                    "AVG field cannot be __name__",
+                    enterprise,
+                )?)
+            }
+        };
+
+        let alias = if agg.alias.is_empty() {
+            let generated = format!("field_{next_auto_alias}");
+            next_auto_alias += 1;
+            generated
+        } else {
+            if agg.alias.len() > MAX_AGGREGATION_ALIAS_BYTES {
+                return Err(GenericDatabaseError::invalid_argument(format!(
+                    "aggregation alias cannot exceed {MAX_AGGREGATION_ALIAS_BYTES} bytes"
+                )));
+            }
+            if !enterprise && reference::is_reserved_name(&agg.alias) {
+                return Err(GenericDatabaseError::invalid_argument(format!(
+                    "the name {} is reserved",
+                    agg.alias
+                )));
+            }
+            agg.alias
+        };
+
+        if !seen_aliases.insert(alias.clone()) {
+            return Err(GenericDatabaseError::invalid_argument(format!(
+                "duplicate aggregation alias: {alias}"
+            )));
+        }
+
+        compiled.push(CompiledAggregation { alias, op });
+    }
+
+    Ok(compiled)
 }
 
 pub(crate) fn sum_enterprise_checked(values: impl IntoIterator<Item = Value>) -> Result<Value> {
@@ -2613,5 +2742,616 @@ mod tests {
                 .unwrap(),
             (vec!["parents".to_string()], String::new())
         );
+    }
+
+    fn agg_count(alias: &str, up_to: Option<i64>) -> Aggregation {
+        Aggregation {
+            alias:    alias.to_string(),
+            operator: Some(aggregation::Operator::Count(aggregation::Count {
+                up_to: up_to.map(|value| googleapis::google::protobuf::Int64Value { value }),
+            })),
+        }
+    }
+
+    fn agg_sum(alias: &str, field_path: Option<&str>) -> Aggregation {
+        Aggregation {
+            alias:    alias.to_string(),
+            operator: Some(aggregation::Operator::Sum(aggregation::Sum {
+                field: field_path.map(|fp| structured_query::FieldReference {
+                    field_path: fp.to_string(),
+                }),
+            })),
+        }
+    }
+
+    fn agg_avg(alias: &str, field_path: Option<&str>) -> Aggregation {
+        Aggregation {
+            alias:    alias.to_string(),
+            operator: Some(aggregation::Operator::Avg(aggregation::Avg {
+                field: field_path.map(|fp| structured_query::FieldReference {
+                    field_path: fp.to_string(),
+                }),
+            })),
+        }
+    }
+
+    #[test]
+    fn compile_aggregations_assigns_sequential_auto_aliases_and_rejects_collisions() {
+        for enterprise in [false, true] {
+            let compiled = compile_aggregations(
+                vec![
+                    agg_count("", None),
+                    agg_sum("", Some("a")),
+                    agg_avg("", Some("b")),
+                ],
+                enterprise,
+            )
+            .unwrap();
+            assert_eq!(
+                compiled,
+                vec![
+                    CompiledAggregation {
+                        alias: "field_1".to_string(),
+                        op:    CompiledAggregationOp::Count { up_to: None },
+                    },
+                    CompiledAggregation {
+                        alias: "field_2".to_string(),
+                        op:    CompiledAggregationOp::Sum(FieldReference::FieldPath(
+                            "a".parse().unwrap()
+                        )),
+                    },
+                    CompiledAggregation {
+                        alias: "field_3".to_string(),
+                        op:    CompiledAggregationOp::Avg(FieldReference::FieldPath(
+                            "b".parse().unwrap()
+                        )),
+                    },
+                ]
+            );
+
+            let mixed = compile_aggregations(
+                vec![
+                    agg_count("count_up_to_1", None),
+                    agg_count("", None),
+                    agg_count("count_up_to_3", None),
+                    agg_count("", None),
+                ],
+                enterprise,
+            )
+            .unwrap();
+            let aliases: Vec<&str> = mixed.iter().map(|c| c.alias.as_str()).collect();
+            assert_eq!(
+                aliases,
+                vec!["count_up_to_1", "field_1", "count_up_to_3", "field_2"]
+            );
+
+            for colliding in [
+                vec![agg_count("field_1", None), agg_count("", None)],
+                vec![agg_count("", None), agg_count("field_1", None)],
+                vec![
+                    agg_count("", None),
+                    agg_count("field_2", None),
+                    agg_count("", None),
+                ],
+                vec![agg_count("dup", None), agg_sum("dup", Some("v"))],
+            ] {
+                assert!(matches!(
+                    compile_aggregations(colliding, enterprise),
+                    Err(GenericDatabaseError::InvalidArgument(_))
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn compile_aggregations_validates_bounds_operators_aliases_and_fields() {
+        // Common checks across both editions: empty, missing operator, alias > 1,500 UTF-8 bytes,
+        // and non-__name__ reserved / empty / malformed SUM/AVG fields.
+        for enterprise in [false, true] {
+            assert!(matches!(
+                compile_aggregations(vec![], enterprise),
+                Err(GenericDatabaseError::InvalidArgument(_))
+            ));
+            assert!(matches!(
+                compile_aggregations(
+                    vec![Aggregation {
+                        alias:    "x".to_string(),
+                        operator: None,
+                    }],
+                    enterprise,
+                ),
+                Err(GenericDatabaseError::InvalidArgument(_))
+            ));
+
+            let max_ascii = "a".repeat(1_500);
+            let max_utf8 = "é".repeat(750);
+            assert_eq!(
+                compile_aggregations(vec![agg_count(&max_ascii, None)], enterprise).unwrap()[0]
+                    .alias,
+                max_ascii
+            );
+            assert_eq!(
+                compile_aggregations(vec![agg_count(&max_utf8, None)], enterprise).unwrap()[0]
+                    .alias,
+                max_utf8
+            );
+
+            let over_ascii = "a".repeat(1_501);
+            let over_utf8 = "é".repeat(751);
+            for over in [over_ascii.as_str(), over_utf8.as_str()] {
+                assert!(matches!(
+                    compile_aggregations(vec![agg_count(over, None)], enterprise),
+                    Err(GenericDatabaseError::InvalidArgument(_))
+                ));
+            }
+
+            for ok_alias in ["____", "___", "__prefix", "suffix__"] {
+                assert_eq!(
+                    compile_aggregations(vec![agg_count(ok_alias, None)], enterprise).unwrap()[0]
+                        .alias,
+                    ok_alias
+                );
+            }
+
+            for make_agg in [
+                agg_sum as fn(&str, Option<&str>) -> Aggregation,
+                agg_avg as fn(&str, Option<&str>) -> Aggregation,
+            ] {
+                assert!(matches!(
+                    compile_aggregations(vec![make_agg("f", None)], enterprise),
+                    Err(GenericDatabaseError::InvalidArgument(_))
+                ));
+                for bad_path in [
+                    "",
+                    "unclosed.`field",
+                    "a..b",
+                    "__custom__",
+                    "a.__custom__.b",
+                ] {
+                    assert!(matches!(
+                        compile_aggregations(vec![make_agg("f", Some(bad_path))], enterprise),
+                        Err(GenericDatabaseError::InvalidArgument(_))
+                    ));
+                }
+                assert!(
+                    compile_aggregations(vec![make_agg("f", Some("____"))], enterprise).is_ok()
+                );
+                assert!(
+                    compile_aggregations(vec![make_agg("f", Some("nested.`a.b`"))], enterprise)
+                        .is_ok()
+                );
+            }
+        }
+
+        // Standard Edition (`enterprise = false`): max 5, Count.up_to >= 0, reserved aliases &
+        // `__name__` fields rejected.
+        assert_eq!(
+            compile_aggregations(
+                (0..5).map(|i| agg_count(&format!("a{i}"), None)).collect(),
+                false,
+            )
+            .unwrap()
+            .len(),
+            5
+        );
+        assert!(matches!(
+            compile_aggregations(
+                (0..6).map(|i| agg_count(&format!("a{i}"), None)).collect(),
+                false,
+            ),
+            Err(GenericDatabaseError::InvalidArgument(_))
+        ));
+        for bad_up_to in [-1, i64::MIN] {
+            assert!(matches!(
+                compile_aggregations(vec![agg_count("c", Some(bad_up_to))], false),
+                Err(GenericDatabaseError::InvalidArgument(_))
+            ));
+        }
+        assert_eq!(
+            compile_aggregations(vec![agg_count("c", Some(0))], false).unwrap(),
+            vec![CompiledAggregation {
+                alias: "c".to_string(),
+                op:    CompiledAggregationOp::Count { up_to: Some(0) },
+            }]
+        );
+        for bad_alias in ["__a__", "__name__", "__id1__", "__reserved__"] {
+            assert!(matches!(
+                compile_aggregations(vec![agg_count(bad_alias, None)], false),
+                Err(GenericDatabaseError::InvalidArgument(_))
+            ));
+        }
+        for (make_agg, name_err) in [
+            (
+                agg_sum as fn(&str, Option<&str>) -> Aggregation,
+                "SUM field cannot be __name__",
+            ),
+            (
+                agg_avg as fn(&str, Option<&str>) -> Aggregation,
+                "AVG field cannot be __name__",
+            ),
+        ] {
+            for doc_name_path in ["__name__", "`__name__`"] {
+                assert_eq!(
+                    compile_aggregations(vec![make_agg("f", Some(doc_name_path))], false),
+                    Err(GenericDatabaseError::invalid_argument(name_err))
+                );
+            }
+            assert!(matches!(
+                compile_aggregations(vec![make_agg("f", Some("a.__name__"))], false),
+                Err(GenericDatabaseError::InvalidArgument(_))
+            ));
+        }
+
+        // Enterprise Edition (`enterprise = true`): max 64, Count.up_to rejected when Some(_),
+        // reserved aliases & `__name__` / `a.__name__` fields accepted (duplicate aliases still
+        // rejected).
+        for count in [6, 10, 64] {
+            assert_eq!(
+                compile_aggregations(
+                    (0..count)
+                        .map(|i| agg_count(&format!("a{i}"), None))
+                        .collect(),
+                    true,
+                )
+                .unwrap()
+                .len(),
+                count
+            );
+        }
+        assert!(matches!(
+            compile_aggregations(
+                (0..65).map(|i| agg_count(&format!("a{i}"), None)).collect(),
+                true,
+            ),
+            Err(GenericDatabaseError::InvalidArgument(_))
+        ));
+        for up_to in [-1, 0, 1, 2] {
+            assert_eq!(
+                compile_aggregations(vec![agg_count("c", Some(up_to))], true),
+                Err(GenericDatabaseError::invalid_argument(
+                    "The `count_up_to(...)` accumulator is not supported in Enterprise edition."
+                ))
+            );
+        }
+        for reserved_alias in ["__a__", "__name__", "__custom__", "__reserved__"] {
+            assert_eq!(
+                compile_aggregations(vec![agg_count(reserved_alias, None)], true).unwrap()[0].alias,
+                reserved_alias
+            );
+        }
+        assert!(matches!(
+            compile_aggregations(
+                vec![agg_count("__name__", None), agg_count("__name__", None)],
+                true,
+            ),
+            Err(GenericDatabaseError::InvalidArgument(_))
+        ));
+        for make_agg in [
+            agg_sum as fn(&str, Option<&str>) -> Aggregation,
+            agg_avg as fn(&str, Option<&str>) -> Aggregation,
+        ] {
+            for doc_name_path in ["__name__", "`__name__`", "a.__name__"] {
+                assert!(
+                    compile_aggregations(vec![make_agg("f", Some(doc_name_path))], true).is_ok()
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn run_aggregation_query_enforces_pre_execution_validation_order_and_edition_rules() {
+        use std::sync::Mutex;
+
+        use futures_util::poll;
+
+        use crate::database::lock::{LockPriority, SessionKind};
+
+        #[derive(Clone, Default)]
+        struct AggSpanSink {
+            declared_fields: Arc<Mutex<Vec<&'static str>>>,
+        }
+
+        impl tracing::Subscriber for AggSpanSink {
+            fn enabled(&self, _metadata: &tracing::Metadata<'_>) -> bool {
+                true
+            }
+
+            fn new_span(&self, attrs: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+                if attrs.metadata().name() == "run_aggregation_query" {
+                    let mut fields = self.declared_fields.lock().unwrap();
+                    fields.extend(attrs.metadata().fields().iter().map(|f| f.name()));
+                }
+                tracing::span::Id::from_u64(1)
+            }
+
+            fn record(&self, _span: &tracing::span::Id, _values: &tracing::span::Record<'_>) {}
+
+            fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {
+            }
+
+            fn event(&self, _event: &tracing::Event<'_>) {}
+
+            fn enter(&self, _span: &tracing::span::Id) {}
+
+            fn exit(&self, _span: &tracing::span::Id) {}
+        }
+
+        let project: &'static FirestoreProject =
+            Box::leak(Box::new(FirestoreProject::new(FirestoreConfig::default())));
+        let root: RootRef = "projects/p/databases/(default)".parse().unwrap();
+        let db = project.database(&root).await;
+
+        let d1: DocumentRef = "projects/p/databases/(default)/documents/items/d1"
+            .parse()
+            .unwrap();
+        let d2: DocumentRef = "projects/p/databases/(default)/documents/items/d2"
+            .parse()
+            .unwrap();
+        db.update_doc(
+            &d1,
+            HashMap::from([("v".to_string(), Value::integer(10))]),
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        db.update_doc(
+            &d2,
+            HashMap::from([("v".to_string(), Value::integer(20))]),
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let valid_sq = || StructuredQuery {
+            from: vec![CollectionSelector {
+                collection_id:   "items".to_string(),
+                all_descendants: false,
+            }],
+            ..Default::default()
+        };
+
+        // (1) ensure_owns_root precedes (2) Query::from_structured.
+        let foreign_parent: Ref = "projects/other/databases/(default)".parse().unwrap();
+        let invalid_foreign_sq = StructuredQuery {
+            from: vec![],
+            offset: -1,
+            ..Default::default()
+        };
+        let err1 = db
+            .run_aggregation_query(
+                foreign_parent,
+                invalid_foreign_sq,
+                vec![],
+                ReadConsistency::Default,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err1, GenericDatabaseError::InvalidArgument(ref m) if m.contains("does not match database")),
+            "expected ensure_owns_root error first, got {err1:?}"
+        );
+
+        // (2) Query::from_structured (including `select` Projection path checks) precedes
+        // (3) compile_aggregations.
+        let invalid_sq = StructuredQuery {
+            from: vec![],
+            offset: -1,
+            ..Default::default()
+        };
+        let err2 = db
+            .run_aggregation_query(
+                Ref::Root(root.clone()),
+                invalid_sq,
+                vec![],
+                ReadConsistency::Default,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err2, GenericDatabaseError::InvalidArgument(ref m) if m == "offset cannot be negative"),
+            "expected Query::from_structured error before compile_aggregations, got {err2:?}"
+        );
+        for (bad_select_path, expected_msg) in [
+            ("__custom__", "the name __custom__ is reserved"),
+            ("a..b", "field path cannot contain empty segments"),
+        ] {
+            let mut sq_bad_select = valid_sq();
+            sq_bad_select.select = Some(structured_query::Projection {
+                fields: vec![structured_query::FieldReference {
+                    field_path: bad_select_path.to_string(),
+                }],
+            });
+            let err_sel = db
+                .run_aggregation_query(
+                    Ref::Root(root.clone()),
+                    sq_bad_select,
+                    vec![],
+                    ReadConsistency::Default,
+                )
+                .await
+                .unwrap_err();
+            assert_eq!(
+                err_sel,
+                GenericDatabaseError::invalid_argument(expected_msg),
+                "expected invalid select path error before empty-aggregations error for \
+                 {bad_select_path}"
+            );
+        }
+
+        // (3) compile_aggregations precedes (4) query.once(self).
+        // Rolled-back transaction would fail with Aborted inside `query.once`; invalid aggregations
+        // must fail earlier with InvalidArgument even when a valid `select` is set.
+        let stale_txn = db.new_txn(TransactionOptions::READ_WRITE).await.unwrap();
+        db.rollback(stale_txn).await.unwrap();
+        let mut sq_valid_select = valid_sq();
+        sq_valid_select.select = Some(structured_query::Projection {
+            fields: vec![structured_query::FieldReference {
+                field_path: "other".to_string(),
+            }],
+        });
+        for bad_aggs in [
+            vec![agg_count("c", Some(-1))],
+            vec![agg_sum("s", Some("__name__"))],
+        ] {
+            let err3 = db
+                .run_aggregation_query(
+                    Ref::Root(root.clone()),
+                    sq_valid_select.clone(),
+                    bad_aggs,
+                    ReadConsistency::Transaction(stale_txn),
+                )
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(err3, GenericDatabaseError::InvalidArgument(_)),
+                "expected compile_aggregations InvalidArgument before query.once, got {err3:?}"
+            );
+        }
+
+        // Held write lock on `items/d1` must not block an invalid aggregation in a live
+        // transaction.
+        let blocker = db.locks.new_session(
+            None,
+            SessionKind::SingleWrite,
+            LockPriority::NextSeq,
+            false,
+            false,
+        );
+        let held_write = blocker.acquire_write(&d1).await.unwrap();
+        let active_txn = db.new_txn(TransactionOptions::READ_WRITE).await.unwrap();
+        let mut agg_fut = Box::pin(db.run_aggregation_query(
+            Ref::Root(root.clone()),
+            valid_sq(),
+            vec![agg_count("c", Some(-1))],
+            ReadConsistency::Transaction(active_txn),
+        ));
+        let poll_res = poll!(&mut agg_fut);
+        assert!(
+            matches!(
+                poll_res,
+                std::task::Poll::Ready(Err(GenericDatabaseError::InvalidArgument(_)))
+            ),
+            "expected immediate InvalidArgument without lock wait, got {poll_res:?}"
+        );
+        drop(held_write);
+        blocker.close();
+        db.rollback(active_txn).await.unwrap();
+
+        // Standard execution: valid `select` (empty and non-empty excluding `v`) is ignored,
+        // Count(up_to: 0) -> 0, mixed omitted aliases -> field_1 / field_2, and structured span
+        // metadata declares agg_count, enterprise, and matched_docs.
+        let sink = AggSpanSink::default();
+        let declared_fields = Arc::clone(&sink.declared_fields);
+        let _guard = tracing::subscriber::set_default(sink);
+        tracing::callsite::rebuild_interest_cache();
+        for select_fields in [
+            vec![],
+            vec![structured_query::FieldReference {
+                field_path: "other".to_string(),
+            }],
+            vec![structured_query::FieldReference {
+                field_path: "__name__".to_string(),
+            }],
+        ] {
+            let mut sq_with_select = valid_sq();
+            sq_with_select.select = Some(structured_query::Projection {
+                fields: select_fields,
+            });
+            let (_rt, fields) = db
+                .run_aggregation_query(
+                    Ref::Root(root.clone()),
+                    sq_with_select,
+                    vec![
+                        agg_count("zero_cap", Some(0)),
+                        agg_count("", Some(1)),
+                        agg_sum("", Some("v")),
+                    ],
+                    ReadConsistency::Default,
+                )
+                .await
+                .unwrap();
+            assert_eq!(fields.get("zero_cap"), Some(&Value::integer(0)));
+            assert_eq!(fields.get("field_1"), Some(&Value::integer(1)));
+            assert_eq!(fields.get("field_2"), Some(&Value::integer(30)));
+        }
+        {
+            let span_fields = declared_fields.lock().unwrap();
+            assert!(span_fields.contains(&"agg_count"));
+            assert!(span_fields.contains(&"enterprise"));
+            assert!(span_fields.contains(&"matched_docs"));
+        }
+
+        // Enterprise execution: 6 aggregations (with reserved aliases, valid select, and
+        // SUM/AVG on `__name__` / `a.__name__` returning nullValue), while Count.up_to is rejected
+        // pre-execution (even on stale txn).
+        let ent_root: RootRef = "projects/p/databases/ent".parse().unwrap();
+        let ent_db = project.database(&ent_root).await;
+        ent_db.set_enterprise_edition(true);
+        let ent_d1: DocumentRef = "projects/p/databases/ent/documents/items/d1"
+            .parse()
+            .unwrap();
+        ent_db
+            .update_doc(
+                &ent_d1,
+                HashMap::from([("v".to_string(), Value::integer(7))]),
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+        let ent_stale = ent_db
+            .new_txn(TransactionOptions::READ_WRITE)
+            .await
+            .unwrap();
+        ent_db.rollback(ent_stale).await.unwrap();
+        assert_eq!(
+            ent_db
+                .run_aggregation_query(
+                    Ref::Root(ent_root.clone()),
+                    valid_sq(),
+                    vec![agg_count("c", Some(0))],
+                    ReadConsistency::Transaction(ent_stale),
+                )
+                .await
+                .unwrap_err(),
+            GenericDatabaseError::invalid_argument(
+                "The `count_up_to(...)` accumulator is not supported in Enterprise edition."
+            )
+        );
+
+        let mut ent_sq = valid_sq();
+        ent_sq.select = Some(structured_query::Projection {
+            fields: vec![structured_query::FieldReference {
+                field_path: "other".to_string(),
+            }],
+        });
+        let (_rt, ent_fields) = ent_db
+            .run_aggregation_query(
+                Ref::Root(ent_root),
+                ent_sq,
+                vec![
+                    agg_count("__name__", None),
+                    agg_sum("__custom__", Some("v")),
+                    agg_sum("sum_doc_name", Some("__name__")),
+                    agg_avg("avg_doc_name", Some("`__name__`")),
+                    agg_sum("sum_nested_doc_name", Some("a.__name__")),
+                    agg_avg("", Some("v")),
+                ],
+                ReadConsistency::Default,
+            )
+            .await
+            .unwrap();
+        assert_eq!(ent_fields.get("__name__"), Some(&Value::integer(1)));
+        assert_eq!(ent_fields.get("__custom__"), Some(&Value::integer(7)));
+        assert_eq!(ent_fields.get("sum_doc_name"), Some(&Value::null()));
+        assert_eq!(ent_fields.get("avg_doc_name"), Some(&Value::null()));
+        assert_eq!(ent_fields.get("sum_nested_doc_name"), Some(&Value::null()));
+        assert_eq!(ent_fields.get("field_1"), Some(&Value::double(7.0)));
     }
 }
