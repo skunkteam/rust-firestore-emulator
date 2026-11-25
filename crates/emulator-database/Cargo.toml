@@ -2,6 +2,9 @@
 name = "emulator-database"
 version = { workspace = true }
 edition = "2024"
+rust-version = { workspace = true }
+license = { workspace = true }
+repository = { workspace = true }
 
 [dependencies]
 base64 = { workspace = true }

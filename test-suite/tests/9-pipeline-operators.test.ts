@@ -2130,8 +2130,8 @@ suite('$description', fs => {
                     .collection(cityRef)
                     .aggregate(
                         p.countAll().as('countAll'),
+                        p.count(p.field('zero')).as('count'),
                         ...(notImplementedInRust || [
-                            p.count(p.field('zero')).as('count'),
                             p.countIf(p.field('population').greaterThan(200000)).as('countIf'),
                             p.countDistinct(p.field('region')).as('countDistinct'),
                             p.first(p.field('city')).as('first'),
@@ -2151,7 +2151,7 @@ suite('$description', fs => {
 
                 expect(results).toEqual([
                     {
-                        count: notImplementedInRust ? undefined : 1,
+                        count: 1,
                         countAll: 5,
                         countIf: notImplementedInRust ? undefined : 3,
                         countDistinct: notImplementedInRust ? undefined : 3,

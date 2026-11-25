@@ -55,7 +55,7 @@ struct Args {
     /// In Cloud Firestore, transactions can take up to 15 seconds before aborting because of
     /// contention. By default, in the emulator, this is reduced to 2 seconds for faster
     /// unit-tests. Enable this feature to simulate the Cloud Firestore more accurately.
-    #[arg(long, env)]
+    #[arg(long, env = "FIRESTORE_EMULATOR_LONG_CONTENTION_TIMEOUT")]
     long_contention_timeout: bool,
 
     /// Default to Enterprise Edition for all new databases.
@@ -259,21 +259,34 @@ mod tests {
 
         // Verify exact env variable bindings on clap command definition.
         let cmd = Args::command();
-        let idle_arg = cmd
-            .get_arguments()
-            .find(|a| a.get_id() == "transaction_idle_timeout_ms")
-            .unwrap();
-        assert_eq!(
-            idle_arg.get_env().and_then(|s| s.to_str()),
-            Some("FIRESTORE_EMULATOR_TRANSACTION_IDLE_TIMEOUT_MS")
-        );
-        let max_arg = cmd
-            .get_arguments()
-            .find(|a| a.get_id() == "transaction_max_lifetime_ms")
-            .unwrap();
-        assert_eq!(
-            max_arg.get_env().and_then(|s| s.to_str()),
-            Some("FIRESTORE_EMULATOR_TRANSACTION_MAX_LIFETIME_MS")
-        );
+        for (arg_id, expected_env) in [
+            ("host_port", "FIRESTORE_EMULATOR_HOST"),
+            (
+                "long_contention_timeout",
+                "FIRESTORE_EMULATOR_LONG_CONTENTION_TIMEOUT",
+            ),
+            (
+                "default_enterprise",
+                "FIRESTORE_EMULATOR_DEFAULT_ENTERPRISE",
+            ),
+            (
+                "transaction_idle_timeout_ms",
+                "FIRESTORE_EMULATOR_TRANSACTION_IDLE_TIMEOUT_MS",
+            ),
+            (
+                "transaction_max_lifetime_ms",
+                "FIRESTORE_EMULATOR_TRANSACTION_MAX_LIFETIME_MS",
+            ),
+        ] {
+            let arg = cmd
+                .get_arguments()
+                .find(|a| a.get_id() == arg_id)
+                .unwrap_or_else(|| panic!("missing clap argument {arg_id}"));
+            assert_eq!(
+                arg.get_env().and_then(|s| s.to_str()),
+                Some(expected_env),
+                "unexpected env binding for {arg_id}"
+            );
+        }
     }
 }

@@ -32,6 +32,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Install Protoc
         uses: arduino/setup-protoc@v3
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
       - name: Install cargo-nextest and just
         uses: taiki-e/install-action@v2
         with:
@@ -68,6 +70,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Install Protoc
         uses: arduino/setup-protoc@v3
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
       - name: Install just
         uses: taiki-e/install-action@v2
         with:
@@ -88,6 +92,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Install Protoc
         uses: arduino/setup-protoc@v3
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
       - name: Install just
         uses: taiki-e/install-action@v2
         with:
@@ -129,9 +135,22 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Install Protoc
         uses: arduino/setup-protoc@v3
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Verify tag matches Cargo.toml version
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo_version="$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["workspace"]["package"]["version"])')"
+          tag_version="${GITHUB_REF_NAME#v}"
+          if [ "$tag_version" != "$cargo_version" ]; then
+            echo "::error::Tag ${GITHUB_REF_NAME} (version ${tag_version}) does not match Cargo.toml workspace.package.version (${cargo_version})"
+            exit 1
+          fi
+          echo "Verified tag ${GITHUB_REF_NAME} matches Cargo.toml version ${cargo_version}"
       - name: Build
         # Intentionally headless (--no-default-features) for CI runners; local installs use `cargo install` (default = ["ui"]).
-        run: cargo build --release --no-default-features
+        run: cargo build --release --no-default-features --locked
       - name: Package
         shell: bash
         run: |
@@ -146,6 +165,7 @@ jobs:
           # - https://github.com/skunkteam/rust-firestore-emulator/releases/latest/download/firestore-emulator.tar.gz
           # - https://github.com/skunkteam/rust-firestore-emulator/releases/download/<tag>/firestore-emulator.tar.gz
           files: firestore-emulator.tar.gz
+          prerelease: ${{ contains(github.ref_name, '-') }}
 
   # deploy-arm64:
   #   name: Deploy ARM64
