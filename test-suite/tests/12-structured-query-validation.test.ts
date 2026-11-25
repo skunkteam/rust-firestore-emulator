@@ -8,6 +8,7 @@ import {
     editions,
     expectRpcCode,
     notImplementedInJava,
+    rawRunAggregationQuery,
     rawRunQuery,
     readData,
     writeData,
@@ -1572,4 +1573,550 @@ describe.each(editions)('$description', fs => {
                 }
             });
         });
+
+    describe('RunAggregationQuery wire validation', () => {
+        const aggFieldsOf = async (
+            parent: string,
+            structuredAggregationQuery: Record<string, unknown>,
+            label: string,
+        ): Promise<Record<string, RawProtoValue>> => {
+            const chunks = await rawRunAggregationQuery(fs.firestore, { parent, structuredAggregationQuery }, label);
+            const fields = chunks.find(c => c.result?.aggregateFields)?.result?.aggregateFields;
+            expect(fields).toBeDefined();
+            return fields!;
+        };
+
+        test.concurrent(
+            'validates edition-aware Count.upTo bounds and support',
+            async () => {
+                const col = makeCol('agg-val-upto');
+                await Promise.all([
+                    col.doc('d1').set(writeData({ a: 1 })),
+                    col.doc('d2').set(writeData({ a: 2 })),
+                    col.doc('d3').set(writeData({ a: 3 })),
+                ]);
+                const parent = `${docsRoot}/${col.parent!.path}`;
+                const structuredQuery = { from: [{ collectionId: col.id }] };
+                const runUpto = (upTo: unknown, label: string, newTransaction?: Record<string, unknown>) =>
+                    rawRunAggregationQuery(
+                        fs.firestore,
+                        {
+                            parent,
+                            structuredAggregationQuery: {
+                                structuredQuery,
+                                aggregations: [{ alias: 'c', count: { upTo } }],
+                            },
+                            ...(newTransaction ? { newTransaction } : {}),
+                        },
+                        label,
+                    );
+
+                const checks: Array<Promise<unknown>> = [
+                    expectRpcCode(() => runUpto({ value: -1 }, 'upto-neg-one', { readWrite: {} }), 3, 'upto-neg-one'),
+                    expectRpcCode(() => runUpto({ value: '-5' }, 'upto-neg-five-str'), 3, 'upto-neg-five-str'),
+                    aggFieldsOf(
+                        parent,
+                        {
+                            structuredQuery,
+                            aggregations: [{ alias: 'c_null', count: { upTo: null } }],
+                        },
+                        'upto-null',
+                    ).then(nullUptoFields => {
+                        expect(nullUptoFields.c_null?.integerValue).toBe('3');
+                    }),
+                ];
+
+                if (fs.enterprise) {
+                    for (const [label, upTo] of [
+                        ['ent-upto-zero', { value: 0 }],
+                        ['ent-upto-one', { value: 1 }],
+                        ['ent-upto-two', { value: 2 }],
+                        ['ent-upto-empty-obj', {}],
+                    ] as const) {
+                        checks.push(expectRpcCode(() => runUpto(upTo, label), 3, label));
+                    }
+                } else {
+                    checks.push(
+                        aggFieldsOf(
+                            parent,
+                            {
+                                structuredQuery,
+                                aggregations: [
+                                    { alias: 'c_zero', count: { upTo: { value: 0 } } },
+                                    { alias: 'c_empty_obj', count: { upTo: {} } },
+                                ],
+                            },
+                            'std-upto-zero',
+                        ).then(zeroFields => {
+                            expect(zeroFields.c_zero?.integerValue).toBe('0');
+                            expect(zeroFields.c_empty_obj?.integerValue).toBe('0');
+                        }),
+                        aggFieldsOf(
+                            parent,
+                            {
+                                structuredQuery,
+                                aggregations: [
+                                    { alias: 'c_two', count: { upTo: { value: 2 } } },
+                                    { alias: 'c_ten', count: { upTo: { value: 10 } } },
+                                    { alias: 'c_all', count: {} },
+                                ],
+                            },
+                            'std-upto-positive',
+                        ).then(posFields => {
+                            expect(posFields.c_two?.integerValue).toBe('2');
+                            expect(posFields.c_ten?.integerValue).toBe('3');
+                            expect(posFields.c_all?.integerValue).toBe('3');
+                        }),
+                    );
+                }
+                await Promise.all(checks);
+            },
+            20_000,
+        );
+
+        test.concurrent(
+            'validates alias resolution (field_1/field_2), duplicates, collisions, reserved names, and 1500-byte limits',
+            async () => {
+                const col = makeCol('agg-val-aliases');
+                await Promise.all([col.doc('d1').set(writeData({ a: 10 })), col.doc('d2').set(writeData({ a: 20 }))]);
+                const parent = `${docsRoot}/${col.parent!.path}`;
+                const structuredQuery = { from: [{ collectionId: col.id }] };
+                const runAgg = (aggregations: Array<Record<string, unknown>>, label: string) =>
+                    rawRunAggregationQuery(fs.firestore, { parent, structuredAggregationQuery: { structuredQuery, aggregations } }, label);
+
+                const maxAsciiAlias = 'a'.repeat(1500);
+                const maxUtf8Alias = 'é'.repeat(750);
+
+                const checks: Array<Promise<unknown>> = [
+                    // All omitted / empty aliases receive field_1, field_2, field_3
+                    aggFieldsOf(
+                        parent,
+                        {
+                            structuredQuery,
+                            aggregations: [
+                                { count: {} },
+                                { alias: '', sum: { field: { fieldPath: 'a' } } },
+                                { avg: { field: { fieldPath: 'a' } } },
+                            ],
+                        },
+                        'aliases-all-omitted',
+                    ).then(allOmitted => {
+                        expect(Object.keys(allOmitted).sort()).toEqual(['field_1', 'field_2', 'field_3']);
+                        expect(allOmitted.field_1?.integerValue).toBe('2');
+                        expect(allOmitted.field_2?.integerValue).toBe('30');
+                        expect(allOmitted.field_3?.doubleValue).toBe(15);
+                    }),
+
+                    // Counter increments only for omitted/empty aliases in mixed lists
+                    aggFieldsOf(
+                        parent,
+                        {
+                            structuredQuery,
+                            aggregations: [
+                                { alias: 'total', count: {} },
+                                { alias: '', sum: { field: { fieldPath: 'a' } } },
+                                { alias: 'mean', avg: { field: { fieldPath: 'a' } } },
+                                { count: {} },
+                            ],
+                        },
+                        'aliases-mixed',
+                    ).then(mixedAliases => {
+                        expect(Object.keys(mixedAliases).sort()).toEqual(['field_1', 'field_2', 'mean', 'total']);
+                        expect(mixedAliases.total?.integerValue).toBe('2');
+                        expect(mixedAliases.field_1?.integerValue).toBe('30');
+                        expect(mixedAliases.mean?.doubleValue).toBe(15);
+                        expect(mixedAliases.field_2?.integerValue).toBe('2');
+                    }),
+
+                    // Duplicate explicit aliases and explicit-vs-omitted collisions
+                    ...(
+                        [
+                            [
+                                'dup-explicit-alias',
+                                [
+                                    { alias: 'dup', count: {} },
+                                    { alias: 'dup', sum: { field: { fieldPath: 'a' } } },
+                                ],
+                            ],
+                            [
+                                'explicit-field_1-then-omitted',
+                                [
+                                    { alias: 'field_1', count: {} },
+                                    { alias: '', sum: { field: { fieldPath: 'a' } } },
+                                ],
+                            ],
+                            ['omitted-then-explicit-field_1', [{ count: {} }, { alias: 'field_1', sum: { field: { fieldPath: 'a' } } }]],
+                            [
+                                'explicit-field_2-collides-second-omitted',
+                                [{ alias: 'field_2', count: {} }, { count: {} }, { sum: { field: { fieldPath: 'a' } } }],
+                            ],
+                        ] as Array<[string, Array<Record<string, unknown>>]>
+                    ).map(([label, aggregations]) => expectRpcCode(() => runAgg(aggregations, label), 3, label)),
+
+                    // 4-underscore alias accepted across editions
+                    aggFieldsOf(parent, { structuredQuery, aggregations: [{ alias: '____', count: {} }] }, 'alias-____-len4-ok').then(
+                        fourUnderscoreRes => {
+                            expect(fourUnderscoreRes.____?.integerValue).toBe('2');
+                        },
+                    ),
+
+                    // >= 5-char __...__ aliases rejected on Standard, allowed on Enterprise
+                    ...(
+                        [
+                            ['alias-reserved-len5', '__a__'],
+                            ['alias-reserved-custom', '__custom__'],
+                            ['alias-reserved-name', '__name__'],
+                        ] as const
+                    ).map(([label, reservedAlias]) =>
+                        fs.enterprise
+                            ? aggFieldsOf(
+                                  parent,
+                                  { structuredQuery, aggregations: [{ alias: reservedAlias, count: {} }] },
+                                  `ent-${label}-ok`,
+                              ).then(res => {
+                                  expect(res[reservedAlias]?.integerValue).toBe('2');
+                              })
+                            : expectRpcCode(() => runAgg([{ alias: reservedAlias, count: {} }], `std-${label}`), 3, `std-${label}`),
+                    ),
+
+                    // > 1,500 UTF-8 byte aliases rejected across both editions
+                    ...(
+                        [
+                            ['alias-1501-ascii-bytes', 'a'.repeat(1501)],
+                            ['alias-1502-utf8-bytes', 'é'.repeat(751)],
+                        ] as const
+                    ).map(([label, badAlias]) => expectRpcCode(() => runAgg([{ alias: badAlias, count: {} }], label), 3, label)),
+
+                    // Exact 1,500 UTF-8 byte boundary accepted (both ASCII and multi-byte)
+                    aggFieldsOf(
+                        parent,
+                        { structuredQuery, aggregations: [{ alias: maxAsciiAlias, count: {} }] },
+                        'alias-1500-ascii-ok',
+                    ).then(maxAsciiRes => {
+                        expect(maxAsciiRes[maxAsciiAlias]?.integerValue).toBe('2');
+                    }),
+                    aggFieldsOf(parent, { structuredQuery, aggregations: [{ alias: maxUtf8Alias, count: {} }] }, 'alias-1500-utf8-ok').then(
+                        maxUtf8Res => {
+                            expect(maxUtf8Res[maxUtf8Alias]?.integerValue).toBe('2');
+                        },
+                    ),
+                ];
+
+                await Promise.all(checks);
+            },
+            20_000,
+        );
+
+        test.concurrent(
+            'validates edition-aware aggregation limits, missing operators, SUM/AVG field paths, and inner select',
+            async () => {
+                const col = makeCol('agg-val-ops-fields');
+                await col.doc('d1').set(writeData({ 'a': 10, 'nested': { b: 5 }, 'dot.key': 2 }));
+                const parent = `${docsRoot}/${col.parent!.path}`;
+                const structuredQuery = { from: [{ collectionId: col.id }] };
+                const runAgg = (
+                    aggregations: Array<Record<string, unknown>>,
+                    label: string,
+                    sq: Record<string, unknown> = structuredQuery,
+                ) =>
+                    rawRunAggregationQuery(
+                        fs.firestore,
+                        { parent, structuredAggregationQuery: { structuredQuery: sq, aggregations } },
+                        label,
+                    );
+
+                const fiveAggs = Array.from({ length: 5 }, (_, i) => ({ alias: `c${i}`, count: {} }));
+                const sixAggs = Array.from({ length: 6 }, (_, i) => ({ alias: `c${i}`, count: {} }));
+
+                const checks: Array<Promise<unknown>> = [
+                    // Empty aggregations list and missing operator rejected across both editions
+                    expectRpcCode(() => runAgg([], 'empty-aggregations'), 3, 'empty-aggregations'),
+                    expectRpcCode(() => runAgg([{}], 'missing-operator-empty'), 3, 'missing-operator-empty'),
+                    expectRpcCode(() => runAgg([{ alias: 'no_op' }], 'missing-operator-with-alias'), 3, 'missing-operator-with-alias'),
+
+                    // Edition-aware aggregation count limits: Standard max 5, Enterprise max 64
+                    aggFieldsOf(parent, { structuredQuery, aggregations: fiveAggs }, 'five-aggregations-ok').then(fiveRes => {
+                        expect(Object.keys(fiveRes).sort()).toEqual(['c0', 'c1', 'c2', 'c3', 'c4']);
+                    }),
+                ];
+
+                if (fs.enterprise) {
+                    const sixtyFourAggs = Array.from({ length: 64 }, (_, i) => ({ alias: `c${i}`, count: {} }));
+                    const sixtyFiveAggs = Array.from({ length: 65 }, (_, i) => ({ alias: `c${i}`, count: {} }));
+                    checks.push(
+                        aggFieldsOf(parent, { structuredQuery, aggregations: sixAggs }, 'ent-six-aggregations-ok').then(sixRes => {
+                            expect(Object.keys(sixRes).sort()).toEqual(['c0', 'c1', 'c2', 'c3', 'c4', 'c5']);
+                        }),
+                        aggFieldsOf(parent, { structuredQuery, aggregations: sixtyFourAggs }, 'ent-sixty-four-aggregations-ok').then(
+                            sixtyFourRes => {
+                                expect(Object.keys(sixtyFourRes)).toHaveLength(64);
+                            },
+                        ),
+                        expectRpcCode(() => runAgg(sixtyFiveAggs, 'ent-sixty-five-aggregations-err'), 3, 'ent-sixty-five-aggregations-err'),
+                    );
+                } else {
+                    checks.push(expectRpcCode(() => runAgg(sixAggs, 'std-six-aggregations-err'), 3, 'std-six-aggregations-err'));
+                }
+
+                // SUM / AVG missing field, invalid FieldPath syntax, empty segments, and reserved non-__name__ segments
+                for (const op of ['sum', 'avg'] as const) {
+                    checks.push(
+                        expectRpcCode(() => runAgg([{ alias: 'x', [op]: {} }], `${op}-missing-field`), 3, `${op}-missing-field`),
+                        expectRpcCode(
+                            () => runAgg([{ alias: 'x', [op]: { field: {} } }], `${op}-missing-field-path`),
+                            3,
+                            `${op}-missing-field-path`,
+                        ),
+                    );
+                    for (const badPath of ['', 'a..b', '.a', 'a.', '``', '`unclosed', '`a`b', '__custom__', 'a.__custom__']) {
+                        checks.push(
+                            expectRpcCode(
+                                () => runAgg([{ alias: 'x', [op]: { field: { fieldPath: badPath } } }], `${op}-bad-path-${badPath}`),
+                                3,
+                                `${op}-bad-path-${badPath}`,
+                            ),
+                        );
+                    }
+
+                    // __name__, `__name__`, and a.__name__ reject on Standard and succeed (returning nullValue) on Enterprise
+                    for (const namePath of ['__name__', '`__name__`', 'a.__name__']) {
+                        checks.push(
+                            fs.enterprise
+                                ? aggFieldsOf(
+                                      parent,
+                                      { structuredQuery, aggregations: [{ alias: 'x', [op]: { field: { fieldPath: namePath } } }] },
+                                      `ent-${op}-${namePath}-ok`,
+                                  ).then(res => {
+                                      expect(res.x && 'nullValue' in res.x).toBe(true);
+                                  })
+                                : expectRpcCode(
+                                      () => runAgg([{ alias: 'x', [op]: { field: { fieldPath: namePath } } }], `std-${op}-${namePath}`),
+                                      3,
+                                      `std-${op}-${namePath}`,
+                                  ),
+                        );
+                    }
+                }
+
+                // Valid nested and backtick-escaped FieldPaths in SUM/AVG (separate queries avoid composite indexes on Standard)
+                checks.push(
+                    aggFieldsOf(
+                        parent,
+                        {
+                            structuredQuery,
+                            aggregations: [{ alias: 'sum_nested', sum: { field: { fieldPath: 'nested.b' } } }],
+                        },
+                        'valid-nested-sum',
+                    ).then(nestedSumRes => {
+                        expect(nestedSumRes.sum_nested?.integerValue).toBe('5');
+                    }),
+                    aggFieldsOf(
+                        parent,
+                        {
+                            structuredQuery,
+                            aggregations: [{ alias: 'avg_dot', avg: { field: { fieldPath: '`dot.key`' } } }],
+                        },
+                        'valid-escaped-avg',
+                    ).then(escapedAvgRes => {
+                        expect(escapedAvgRes.avg_dot?.doubleValue).toBe(2);
+                    }),
+
+                    // Inner StructuredQuery.select: valid select (populated and empty) is ignored and succeeds;
+                    // invalid field paths inside select return InvalidArgument (3); select + empty aggregations returns InvalidArgument (3).
+                    aggFieldsOf(
+                        parent,
+                        {
+                            structuredQuery: { ...structuredQuery, select: { fields: [{ fieldPath: 'a' }] } },
+                            aggregations: [{ alias: 'c', count: {} }],
+                        },
+                        'select-populated-ignored',
+                    ).then(selectPopulated => {
+                        expect(selectPopulated.c?.integerValue).toBe('1');
+                    }),
+                    aggFieldsOf(
+                        parent,
+                        {
+                            structuredQuery: { ...structuredQuery, select: { fields: [] } },
+                            aggregations: [{ alias: 'c', count: {} }],
+                        },
+                        'select-empty-ignored',
+                    ).then(selectEmpty => {
+                        expect(selectEmpty.c?.integerValue).toBe('1');
+                    }),
+                    ...['__custom__', 'a..b'].map(badSelectPath =>
+                        expectRpcCode(
+                            () =>
+                                runAgg([{ alias: 'c', count: {} }], `select-bad-path-${badSelectPath}`, {
+                                    ...structuredQuery,
+                                    select: { fields: [{ fieldPath: badSelectPath }] },
+                                }),
+                            3,
+                            `select-bad-path-${badSelectPath}`,
+                        ),
+                    ),
+                    expectRpcCode(
+                        () =>
+                            runAgg([], 'select-with-empty-aggs', {
+                                ...structuredQuery,
+                                select: { fields: [{ fieldPath: 'a' }] },
+                            }),
+                        3,
+                        'select-with-empty-aggs',
+                    ),
+                );
+
+                await Promise.all(checks);
+            },
+            20_000,
+        );
+
+        test.concurrent(
+            'validates limit (including 0 and < 0), orderBy, and edition-aware empty numeric set SUM/AVG',
+            async () => {
+                const col = makeCol('agg-val-limit-orderby');
+                const nonNumCol = makeCol('agg-val-non-numeric');
+                const emptyCol = makeCol('agg-val-empty');
+                await Promise.all([
+                    col.doc('d1').set(writeData({ a: 10, b: 3 })),
+                    col.doc('d2').set(writeData({ a: 20, b: 1 })),
+                    col.doc('d3').set(writeData({ a: 30, b: 2 })),
+                    nonNumCol.doc('n1').set(writeData({ a: 'text' })),
+                    nonNumCol.doc('n2').set(writeData({ a: null })),
+                    nonNumCol.doc('n3').set(writeData({ other: 42 })),
+                ]);
+                const parent = `${docsRoot}/${col.parent!.path}`;
+                const nonNumParent = `${docsRoot}/${nonNumCol.parent!.path}`;
+                const emptyParent = `${docsRoot}/${emptyCol.parent!.path}`;
+
+                const aggs = [
+                    { alias: 'c', count: {} },
+                    { alias: 's', sum: { field: { fieldPath: 'a' } } },
+                    { alias: 'avg', avg: { field: { fieldPath: 'a' } } },
+                ];
+
+                // Negative inner limit rejected
+                await expectRpcCode(
+                    () =>
+                        rawRunAggregationQuery(
+                            fs.firestore,
+                            {
+                                parent,
+                                structuredAggregationQuery: {
+                                    structuredQuery: { from: [{ collectionId: col.id }], limit: { value: -1 } },
+                                    aggregations: aggs,
+                                },
+                            },
+                            'neg-limit',
+                        ),
+                    3,
+                    'neg-limit',
+                );
+
+                // limit: 0 -> COUNT: 0, SUM: 0 (Standard) / null (Enterprise), AVG: null
+                const limitZero = await aggFieldsOf(
+                    parent,
+                    {
+                        structuredQuery: { from: [{ collectionId: col.id }], limit: { value: 0 } },
+                        aggregations: aggs,
+                    },
+                    'limit-zero',
+                );
+                expect(limitZero.c?.integerValue).toBe('0');
+                if (fs.enterprise) {
+                    expect(limitZero.s && 'nullValue' in limitZero.s).toBe(true);
+                } else {
+                    expect(limitZero.s?.integerValue).toBe('0');
+                }
+                expect(limitZero.avg && 'nullValue' in limitZero.avg).toBe(true);
+
+                // Empty collection & non-numeric collection: SUM -> 0 (Standard) / null (Enterprise), AVG -> null
+                // Keep count() separate on nonNumCol because combining count() + sum(a) excludes docs missing 'a' on Standard.
+                const sumAvgAggs = [
+                    { alias: 's', sum: { field: { fieldPath: 'a' } } },
+                    { alias: 'avg', avg: { field: { fieldPath: 'a' } } },
+                ];
+                for (const [label, targetParent, colId, expectedCount] of [
+                    ['empty-col', emptyParent, emptyCol.id, '0'],
+                    ['non-numeric-col', nonNumParent, nonNumCol.id, '3'],
+                ] as const) {
+                    const countRes = await aggFieldsOf(
+                        targetParent,
+                        {
+                            structuredQuery: { from: [{ collectionId: colId }] },
+                            aggregations: [{ alias: 'c', count: {} }],
+                        },
+                        `${label}-count`,
+                    );
+                    expect(countRes.c?.integerValue).toBe(expectedCount);
+
+                    const res = await aggFieldsOf(
+                        targetParent,
+                        {
+                            structuredQuery: { from: [{ collectionId: colId }] },
+                            aggregations: sumAvgAggs,
+                        },
+                        label,
+                    );
+                    if (fs.enterprise) {
+                        expect(res.s && 'nullValue' in res.s).toBe(true);
+                    } else {
+                        expect(res.s?.integerValue).toBe('0');
+                    }
+                    expect(res.avg && 'nullValue' in res.avg).toBe(true);
+                }
+
+                // orderBy aggregated field 'a' DESC + limit 2 works on both editions with zero new composite indexes
+                const orderedSameField = await aggFieldsOf(
+                    parent,
+                    {
+                        structuredQuery: {
+                            from: [{ collectionId: col.id }],
+                            orderBy: [{ field: { fieldPath: 'a' }, direction: 'DESCENDING' }],
+                            limit: { value: 2 },
+                        },
+                        aggregations: aggs,
+                    },
+                    'orderby-a-desc-limit-2',
+                );
+                expect(orderedSameField.c?.integerValue).toBe('2');
+                expect(orderedSameField.s?.integerValue).toBe('50');
+                expect(orderedSameField.avg?.doubleValue).toBe(25);
+
+                // Distinct-field orderBy ('b' DESC) + limit 2 with COUNT works on both editions
+                const distinctCount = await aggFieldsOf(
+                    parent,
+                    {
+                        structuredQuery: {
+                            from: [{ collectionId: col.id }],
+                            orderBy: [{ field: { fieldPath: 'b' }, direction: 'DESCENDING' }],
+                            limit: { value: 2 },
+                        },
+                        aggregations: [{ alias: 'c', count: {} }],
+                    },
+                    'orderby-b-desc-limit-2-count',
+                );
+                expect(distinctCount.c?.integerValue).toBe('2');
+
+                // On Enterprise Edition, distinct-field orderBy ('b' DESC) + limit 2 also supports SUM/AVG on 'a' without composite indexes
+                if (fs.enterprise) {
+                    const entDistinctAll = await aggFieldsOf(
+                        parent,
+                        {
+                            structuredQuery: {
+                                from: [{ collectionId: col.id }],
+                                orderBy: [{ field: { fieldPath: 'b' }, direction: 'DESCENDING' }],
+                                limit: { value: 2 },
+                            },
+                            aggregations: aggs,
+                        },
+                        'ent-orderby-b-desc-limit-2-all',
+                    );
+                    expect(entDistinctAll.c?.integerValue).toBe('2');
+                    expect(entDistinctAll.s?.integerValue).toBe('40');
+                    expect(entDistinctAll.avg?.doubleValue).toBe(20);
+                }
+            },
+            20_000,
+        );
+    });
 });
