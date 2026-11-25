@@ -75,6 +75,9 @@ let dbEpoch = 0;
 let navEpoch = 0;
 let dbListSeq = 0;
 let contentionSeq = 0;
+let queryRunSeq = 0;
+/** @type {AbortController | null} */
+let activeQueryAbortController = null;
 /** @type {Map<string, number>} */
 const colRequestSeq = new Map();
 /** @type {Map<string, number>} */
@@ -189,6 +192,51 @@ export function isCurrentContentionSeq(seq) {
 }
 
 /**
+ * Checks whether a query run sequence number is still the latest.
+ * @param {number} seq
+ * @returns {boolean}
+ */
+export function isCurrentQueryRunSeq(seq) {
+  return seq === queryRunSeq;
+}
+
+/**
+ * Aborts any prior active query run, increments `queryRunSeq`, and returns the new run `{ seq, controller }`.
+ * @returns {{ seq: number, controller: AbortController }}
+ */
+export function beginQueryRun() {
+  if (activeQueryAbortController) {
+    activeQueryAbortController.abort();
+    activeQueryAbortController = null;
+  }
+  const seq = ++queryRunSeq;
+  const controller = new AbortController();
+  activeQueryAbortController = controller;
+  return { seq, controller };
+}
+
+/**
+ * Clears the active query controller slot only if it still matches `controller`.
+ * @param {AbortController} controller
+ */
+export function finishQueryRun(controller) {
+  if (activeQueryAbortController === controller) {
+    activeQueryAbortController = null;
+  }
+}
+
+/**
+ * Aborts and clears any active query run controller and advances `queryRunSeq`.
+ */
+export function abortActiveQueryRun() {
+  ++queryRunSeq;
+  if (activeQueryAbortController) {
+    activeQueryAbortController.abort();
+    activeQueryAbortController = null;
+  }
+}
+
+/**
  * Removes cached document level state (and its request sequence when targeting the global state) for `docPath`.
  * @param {string} docPath
  * @param {AppState} [targetState]
@@ -214,6 +262,7 @@ export function resetDatabaseCaches(targetState = state) {
     colRequestSeq.clear();
     docRequestSeq.clear();
     nextContentionSeq();
+    abortActiveQueryRun();
   }
   targetState.queryState = createQueryRunnerState();
   targetState.contention.snapshot = null;

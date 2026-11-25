@@ -14,10 +14,16 @@ import {
   listDocuments,
   parseRootRef,
   patchDatabase,
+  runAggregationQuery,
   runQuery,
   updateDocument,
 } from "./api.js";
-import { generateAutoId, stringifyProtoJson } from "./values.js";
+import {
+  findNonFiniteNumber,
+  findUnsafeUnquotedInteger,
+  generateAutoId,
+  stringifyProtoJson,
+} from "./values.js";
 import {
   getDisplayedContentionDatabases,
   hasContentionWaiters,
@@ -37,6 +43,7 @@ import {
   renderModal as renderModalView,
 } from "./components/modals.js";
 import {
+  buildAggregationQueryFromVisual,
   buildStructuredQueryFromVisual,
   createQueryRunnerState,
   renderQueryRunner,
@@ -48,16 +55,20 @@ import {
   syncBrowserUrl,
 } from "./router.js";
 import {
+  abortActiveQueryRun,
+  beginQueryRun,
   bumpDbEpoch,
   bumpNavEpoch,
   clearActiveDatabaseState,
   dismissToast,
+  finishQueryRun,
   getDbEpoch,
   getNavEpoch,
   isCurrentColSeq,
   isCurrentContentionSeq,
   isCurrentDbListSeq,
   isCurrentDocSeq,
+  isCurrentQueryRunSeq,
   nextColSeq,
   nextContentionSeq,
   nextDbListSeq,
@@ -1221,59 +1232,227 @@ export async function saveDocumentFromInspector(docLevel) {
   renderApp();
 }
 
+const UNSUPPORTED_QUERY_ENVELOPE_KEYS = [
+  "readTime",
+  "transaction",
+  "newTransaction",
+  "explainOptions",
+  "requestOptions",
+];
+
+/**
+ * Validates and unwraps Raw JSON query text for `documents` or `aggregations`.
+ * @param {string} rawText
+ * @param {'documents' | 'aggregations'} queryKind
+ * @returns {{ valid: boolean, payload?: Record<string, unknown>, error?: string }}
+ */
+function parseRawQueryPayload(rawText, queryKind) {
+  const unsafeLiteral = findUnsafeUnquotedInteger(rawText);
+  if (unsafeLiteral) {
+    return {
+      valid: false,
+      error: `Unquoted 64-bit integer ${unsafeLiteral} loses precision in JSON.parse; wrap in quotes: "${unsafeLiteral}"`,
+    };
+  }
+
+  /** @type {unknown} */
+  let parsed;
+  try {
+    parsed = JSON.parse(rawText);
+  } catch (err) {
+    return {
+      valid: false,
+      error: `Invalid JSON: ${err instanceof Error ? err.message : String(err)}`,
+    };
+  }
+
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    return {
+      valid: false,
+      error: "Raw JSON must be a JSON object.",
+    };
+  }
+
+  const badPath = findNonFiniteNumber(parsed);
+  if (badPath !== null) {
+    return {
+      valid: false,
+      error: `Raw JSON contains a non-finite number at ${badPath} (number overflow).`,
+    };
+  }
+
+  const obj = /** @type {Record<string, unknown>} */ (parsed);
+  const wrapperKey =
+    queryKind === "aggregations"
+      ? "structuredAggregationQuery"
+      : "structuredQuery";
+
+  if (Object.hasOwn(obj, wrapperKey)) {
+    const extraKeys = Object.keys(obj).filter((k) => k !== wrapperKey);
+    if (extraKeys.length > 0) {
+      return {
+        valid: false,
+        error: `Unsupported top-level field(s) in Raw JSON alongside ${wrapperKey}: ${extraKeys.join(", ")}`,
+      };
+    }
+    const inner = obj[wrapperKey];
+    if (!inner || typeof inner !== "object" || Array.isArray(inner)) {
+      return {
+        valid: false,
+        error: `"${wrapperKey}" in Raw JSON must be a JSON object.`,
+      };
+    }
+    return {
+      valid: true,
+      payload: /** @type {Record<string, unknown>} */ (inner),
+    };
+  }
+
+  const unsupported = UNSUPPORTED_QUERY_ENVELOPE_KEYS.filter((k) =>
+    Object.hasOwn(obj, k)
+  );
+  if (unsupported.length > 0) {
+    return {
+      valid: false,
+      error: `Unsupported top-level field(s) in Raw JSON: ${unsupported.join(", ")}`,
+    };
+  }
+
+  return { valid: true, payload: obj };
+}
+
+/**
+ * Extracts limit/orderBy provenance from a StructuredAggregationQuery payload.
+ * @param {Record<string, unknown>} payload
+ * @returns {{ limit: number | null, hasOrderBy: boolean } | null}
+ */
+function extractAggProvenance(payload) {
+  const rawSq = payload.structuredQuery;
+  if (!rawSq || typeof rawSq !== "object" || Array.isArray(rawSq)) {
+    return null;
+  }
+  const sq = /** @type {Record<string, unknown>} */ (rawSq);
+  /** @type {number | null} */
+  let limit = null;
+  if (sq.limit !== undefined && sq.limit !== null) {
+    if (typeof sq.limit === "number" && Number.isFinite(sq.limit)) {
+      limit = sq.limit;
+    } else if (
+      typeof sq.limit === "string" &&
+      /^-?\d+$/.test(sq.limit.trim())
+    ) {
+      const parsed = Number(sq.limit.trim());
+      if (Number.isFinite(parsed)) {
+        limit = parsed;
+      }
+    }
+  }
+  const hasOrderBy = Array.isArray(sq.orderBy) && sq.orderBy.length > 0;
+  if (limit === null && !hasOrderBy) {
+    return null;
+  }
+  return { limit, hasOrderBy };
+}
+
+/**
+ * @param {unknown} err
+ * @returns {boolean}
+ */
+function isAbortError(err) {
+  return Boolean(
+    err && typeof err === "object" && "name" in err && err.name === "AbortError"
+  );
+}
+
 /**
  * Executes the current query in QueryRunnerState.
  */
 export async function executeCurrentQuery() {
   if (!state.activeProjectId || !state.activeDatabaseId) return;
   const qState = state.queryState;
+  const queryKind = qState.queryKind;
   qState.error = null;
 
   /** @type {Record<string, unknown>} */
-  let structuredQuery;
+  let payload;
   if (qState.mode === "visual") {
-    const built = buildStructuredQueryFromVisual(
-      qState,
-      state.activeProjectId,
-      state.activeDatabaseId
-    );
+    const enterprise = state.activeDbMeta?.databaseEdition === "ENTERPRISE";
+    const built =
+      queryKind === "aggregations"
+        ? buildAggregationQueryFromVisual(
+            qState,
+            state.activeProjectId,
+            state.activeDatabaseId,
+            { enterprise }
+          )
+        : buildStructuredQueryFromVisual(
+            qState,
+            state.activeProjectId,
+            state.activeDatabaseId
+          );
     if (!built.valid || !built.query) {
       qState.error = built.error ?? "Invalid query";
       renderApp();
       return;
     }
-    structuredQuery = built.query;
-    qState.rawQueryText = stringifyProtoJson(structuredQuery, 2);
+    payload = built.query;
+    if (queryKind === "aggregations") {
+      qState.rawAggregationText = stringifyProtoJson(payload, 2);
+    } else {
+      qState.rawQueryText = stringifyProtoJson(payload, 2);
+    }
   } else {
-    try {
-      const parsed = JSON.parse(qState.rawQueryText);
-      structuredQuery =
-        parsed && typeof parsed === "object" && parsed.structuredQuery
-          ? parsed.structuredQuery
-          : parsed;
-    } catch (err) {
-      qState.error = `Invalid JSON: ${err instanceof Error ? err.message : String(err)}`;
+    const rawText =
+      queryKind === "aggregations"
+        ? qState.rawAggregationText
+        : qState.rawQueryText;
+    const rawRes = parseRawQueryPayload(rawText, queryKind);
+    if (!rawRes.valid || !rawRes.payload) {
+      qState.error = rawRes.error ?? "Invalid Raw JSON";
       renderApp();
       return;
     }
+    payload = rawRes.payload;
   }
 
   const rootPath = `projects/${state.activeProjectId}/databases/${state.activeDatabaseId}/documents`;
   const cleanParentSub = qState.parentSubpath.trim().replace(/^\/+|\/+$/g, "");
   const parentPath = cleanParentSub ? `${rootPath}/${cleanParentSub}` : rootPath;
 
+  const myDbEpoch = getDbEpoch();
+  const { seq: mySeq, controller } = beginQueryRun();
+  const { signal } = controller;
+  const isCurrentRun = () =>
+    myDbEpoch === getDbEpoch() &&
+    isCurrentQueryRunSeq(mySeq) &&
+    !signal.aborted;
+
   qState.running = true;
   renderApp();
   const t0 = performance.now();
 
   try {
-    const rows = await runQuery(parentPath, structuredQuery);
-    qState.elapsedMs = performance.now() - t0;
-    qState.readTime = rows[0]?.readTime ?? null;
-    qState.results = rows
-      .map((r) => r.document)
-      .filter((d) => d !== undefined);
+    if (queryKind === "aggregations") {
+      const provenance = extractAggProvenance(payload);
+      const rows = await runAggregationQuery(parentPath, payload, { signal });
+      if (!isCurrentRun()) return;
+      qState.aggElapsedMs = performance.now() - t0;
+      qState.aggReadTime = rows[0]?.readTime ?? null;
+      qState.aggResults = rows[0]?.result?.aggregateFields ?? {};
+      qState.aggProvenance = provenance;
+    } else {
+      const rows = await runQuery(parentPath, payload, { signal });
+      if (!isCurrentRun()) return;
+      qState.elapsedMs = performance.now() - t0;
+      qState.readTime = rows[0]?.readTime ?? null;
+      qState.results = rows
+        .map((r) => r.document)
+        .filter((d) => d !== undefined);
+    }
   } catch (err) {
+    if (!isCurrentRun() || isAbortError(err)) {
+      return;
+    }
     qState.error =
       err instanceof ApiError
         ? `[${err.code} ${err.status}] ${err.message}`
@@ -1281,8 +1460,11 @@ export async function executeCurrentQuery() {
           ? err.message
           : String(err);
   } finally {
-    qState.running = false;
-    renderApp();
+    finishQueryRun(controller);
+    if (myDbEpoch === getDbEpoch() && isCurrentQueryRunSeq(mySeq)) {
+      qState.running = false;
+      renderApp();
+    }
   }
 }
 
@@ -1602,6 +1784,7 @@ export function renderWorkspace() {
       projectId: state.activeProjectId,
       databaseId: state.activeDatabaseId,
       knownCollections: state.rootCollections,
+      enterprise: state.activeDbMeta?.databaseEdition === "ENTERPRISE",
       state: state.queryState,
       onRerender: renderApp,
       onExecuteQuery: () => void executeCurrentQuery(),
@@ -1653,6 +1836,7 @@ export function renderWorkspace() {
       const parentSubpath = parentPath.startsWith(`${rootPrefix}/`)
         ? parentPath.slice(rootPrefix.length + 1)
         : "";
+      abortActiveQueryRun();
       state.queryState = createQueryRunnerState(collectionId, parentSubpath);
       void switchView("query");
     },

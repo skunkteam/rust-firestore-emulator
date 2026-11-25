@@ -433,14 +433,39 @@ export async function deleteCollection(colPath) {
  * Executes a StructuredQuery against parentPath.
  * @param {string} parentPath
  * @param {Record<string, unknown>} structuredQuery
+ * @param {{ signal?: AbortSignal }} [opts]
  * @returns {Promise<Array<{ document?: FirestoreDocument, readTime?: string }>>}
  */
-export async function runQuery(parentPath, structuredQuery) {
+export async function runQuery(parentPath, structuredQuery, opts = {}) {
   return requestJson(`/v1/${encodeResourcePath(parentPath)}:runQuery`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: stringifyProtoJson({ structuredQuery }),
+    ...(opts.signal ? { signal: opts.signal } : {}),
   });
+}
+
+/**
+ * Executes a StructuredAggregationQuery against parentPath.
+ * @param {string} parentPath
+ * @param {Record<string, unknown>} structuredAggregationQuery
+ * @param {{ signal?: AbortSignal }} [opts]
+ * @returns {Promise<Array<{ result?: { aggregateFields?: Record<string, FirestoreValue> }, readTime?: string }>>}
+ */
+export async function runAggregationQuery(
+  parentPath,
+  structuredAggregationQuery,
+  opts = {}
+) {
+  return requestJson(
+    `/v1/${encodeResourcePath(parentPath)}:runAggregationQuery`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: stringifyProtoJson({ structuredAggregationQuery }),
+      ...(opts.signal ? { signal: opts.signal } : {}),
+    }
+  );
 }
 
 /**
