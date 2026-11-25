@@ -13,11 +13,13 @@ use emulator_database::{
     reference::{CollectionRef, DocumentRef, Ref},
 };
 use googleapis::google::firestore::v1::{
-    Document, ListCollectionIdsRequest, ListCollectionIdsResponse, ListDocumentsResponse,
-    RunQueryRequest, RunQueryResponse, run_query_request,
+    AggregationResult, Document, ListCollectionIdsRequest, ListCollectionIdsResponse,
+    ListDocumentsResponse, RunAggregationQueryRequest, RunAggregationQueryResponse,
+    RunQueryRequest, RunQueryResponse, run_aggregation_query_request, run_query_request,
+    structured_aggregation_query,
 };
 use serde_json::json;
-use tracing::{Level, instrument};
+use tracing::{Level, Span, instrument};
 
 use super::query_params::{DocumentQueryParams, percent_decode_path_segment};
 use crate::error::{RestError, Result, parse_json_body};
@@ -28,7 +30,6 @@ const PHASE2_VERBS: &[&str] = &[
     "batchWrite",
     "beginTransaction",
     "rollback",
-    "runAggregationQuery",
     "executePipeline",
     "partitionQuery",
 ];
@@ -51,6 +52,9 @@ pub(super) async fn dispatch_documents(
         }
         (Method::POST, parent @ (Ref::Root(_) | Ref::Document(_)), Some("runQuery")) => {
             handle_run_query(&db, parent, headers, body).await
+        }
+        (Method::POST, parent @ (Ref::Root(_) | Ref::Document(_)), Some("runAggregationQuery")) => {
+            handle_run_aggregation_query(&db, parent, headers, body).await
         }
         (Method::POST, Ref::Document(_), Some(v)) if PHASE2_VERBS.contains(&v) => {
             Err(RestError::not_implemented(format!(
@@ -210,6 +214,44 @@ async fn handle_list_collection_ids(
     .into_response())
 }
 
+fn reject_unsupported_json_object_field(
+    container: &serde_json::Value,
+    field: &str,
+    unimplemented_msg: impl FnOnce() -> String,
+    invalid_msg: impl FnOnce() -> String,
+) -> Result<()> {
+    if let Some(val) = container.get(field)
+        && !val.is_null()
+    {
+        if val.is_object() {
+            return Err(RestError::not_implemented(unimplemented_msg()));
+        }
+        return Err(RestError::bad_request(invalid_msg()));
+    }
+    Ok(())
+}
+
+fn reject_unsupported_query_envelope_fields(raw: &serde_json::Value) -> Result<()> {
+    for field in ["newTransaction", "explainOptions", "requestOptions"] {
+        reject_unsupported_json_object_field(
+            raw,
+            field,
+            || format!("{field} over REST is not implemented"),
+            || format!("invalid {field} in request"),
+        )?;
+    }
+    Ok(())
+}
+
+fn reject_unsupported_structured_query_fields(sq: &serde_json::Value) -> Result<()> {
+    reject_unsupported_json_object_field(
+        sq,
+        "findNearest",
+        || "StructuredQuery.findNearest over REST is not implemented".to_string(),
+        || "invalid findNearest in StructuredQuery".to_string(),
+    )
+}
+
 #[instrument(level = Level::DEBUG, skip_all, fields(parent = %parent), err(level = Level::DEBUG))]
 async fn handle_run_query(
     db: &Arc<FirestoreDatabase>,
@@ -218,18 +260,9 @@ async fn handle_run_query(
     body: &[u8],
 ) -> Result<Response> {
     let raw: serde_json::Value = parse_json_body(headers, body)?;
-    if let Some(sq) = raw.get("structuredQuery")
-        && let Some(fn_val) = sq.get("findNearest")
-        && !fn_val.is_null()
-    {
-        if fn_val.is_object() {
-            return Err(RestError::not_implemented(
-                "StructuredQuery.findNearest over REST is not implemented",
-            ));
-        }
-        return Err(RestError::bad_request(
-            "invalid findNearest in StructuredQuery",
-        ));
+    reject_unsupported_query_envelope_fields(&raw)?;
+    if let Some(sq) = raw.get("structuredQuery") {
+        reject_unsupported_structured_query_fields(sq)?;
     }
     let req: RunQueryRequest =
         serde_json::from_value(raw).map_err(|e| RestError::bad_request(e.to_string()))?;
@@ -270,6 +303,76 @@ async fn handle_run_query(
             .collect()
     };
     Ok(Json(responses).into_response())
+}
+
+#[instrument(
+    level = Level::DEBUG,
+    skip_all,
+    fields(parent = %parent, agg_count = tracing::field::Empty),
+    err(level = Level::DEBUG)
+)]
+async fn handle_run_aggregation_query(
+    db: &Arc<FirestoreDatabase>,
+    parent: Ref,
+    headers: &HeaderMap,
+    body: &[u8],
+) -> Result<Response> {
+    let raw: serde_json::Value = parse_json_body(headers, body)?;
+    reject_unsupported_query_envelope_fields(&raw)?;
+    if let Some(sq) = raw
+        .get("structuredAggregationQuery")
+        .and_then(|saq| saq.get("structuredQuery"))
+    {
+        reject_unsupported_structured_query_fields(sq)?;
+    }
+    let req: RunAggregationQueryRequest =
+        serde_json::from_value(raw).map_err(|e| RestError::bad_request(e.to_string()))?;
+    if !req.parent.is_empty() && req.parent != parent.to_string() {
+        return Err(RestError::bad_request(
+            "request.parent does not match target URL path",
+        ));
+    }
+    let Some(run_aggregation_query_request::QueryType::StructuredAggregationQuery(agg_query)) =
+        req.query_type
+    else {
+        return Err(RestError::bad_request(
+            "missing structuredAggregationQuery in RunAggregationQueryRequest",
+        ));
+    };
+    let Some(structured_aggregation_query::QueryType::StructuredQuery(structured_query)) =
+        agg_query.query_type
+    else {
+        return Err(RestError::bad_request(
+            "missing structuredQuery in StructuredAggregationQuery",
+        ));
+    };
+    let read_consistency = match req.consistency_selector {
+        None => ReadConsistency::Default,
+        Some(run_aggregation_query_request::ConsistencySelector::ReadTime(ts)) => {
+            ReadConsistency::ReadTime(ts)
+        }
+        Some(_) => {
+            return Err(RestError::not_implemented(
+                "transactional runAggregationQuery over REST is not implemented yet",
+            ));
+        }
+    };
+    Span::current().record("agg_count", agg_query.aggregations.len());
+    let (read_time, aggregate_fields) = db
+        .run_aggregation_query(
+            parent,
+            structured_query,
+            agg_query.aggregations,
+            read_consistency,
+        )
+        .await?;
+    let response = vec![RunAggregationQueryResponse {
+        result: Some(AggregationResult { aggregate_fields }),
+        transaction: vec![],
+        read_time: Some(read_time),
+        explain_metrics: None,
+    }];
+    Ok(Json(response).into_response())
 }
 
 pub(super) async fn unmatched_projects_route(method: Method, uri: Uri) -> Response {

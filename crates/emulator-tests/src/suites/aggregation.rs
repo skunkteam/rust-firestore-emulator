@@ -2,15 +2,30 @@ use std::collections::HashMap;
 
 use googleapis::{
     fields,
-    google::firestore::v1::{Value, structured_query::field_filter::Operator},
+    google::{
+        firestore::v1::{
+            RunAggregationQueryRequest, StructuredAggregationQuery, StructuredQuery, Value,
+            run_aggregation_query_request,
+            structured_aggregation_query::{
+                self, Aggregation,
+                aggregation::{Avg, Count, Operator, Sum},
+            },
+            structured_query::{
+                CollectionSelector, FieldReference, Projection, field_filter::Operator as FilterOp,
+            },
+        },
+        protobuf::Int64Value,
+    },
 };
 use googletest::prelude::*;
-use tonic::Code;
+use tonic::{Code, Status};
 
 use crate::harness::{
     builders::{AggregationSpec, PipelineSpec, QuerySpec, field_filter, field_ref_val, fn_val},
-    env::TestEnv,
+    client::TestDb,
+    env::{DOCUMENTS_ROOT, TestEnv},
     matchers::assert_status_code,
+    stream::{AggregationOutput, collect_aggregation},
 };
 
 #[gtest]
@@ -93,7 +108,7 @@ async fn aggregation_count_sum_avg_across_empty_mixed_numeric_nan_and_mvcc_snaps
         .aggregate(
             QuerySpec::collection("ledger").where_filter(field_filter(
                 "kind",
-                Operator::Equal,
+                FilterOp::Equal,
                 "credit",
             )),
             AggregationSpec::new().sum("s", "amount").avg("a", "amount"),
@@ -486,5 +501,369 @@ async fn enterprise_aggregation_and_pipeline_reject_sequential_i64_long_overflow
                 Code::InvalidArgument,
             );
         }
+    }
+}
+
+async fn raw_aggregate(
+    db: &mut TestDb,
+    parent: &str,
+    structured_query: StructuredQuery,
+    aggregations: Vec<Aggregation>,
+    consistency_selector: Option<run_aggregation_query_request::ConsistencySelector>,
+) -> Result<AggregationOutput, Status> {
+    let resp = db
+        .raw_grpc()
+        .run_aggregation_query(RunAggregationQueryRequest {
+            parent: parent.to_string(),
+            query_type: Some(
+                run_aggregation_query_request::QueryType::StructuredAggregationQuery(
+                    StructuredAggregationQuery {
+                        aggregations,
+                        query_type: Some(structured_aggregation_query::QueryType::StructuredQuery(
+                            structured_query,
+                        )),
+                    },
+                ),
+            ),
+            consistency_selector,
+            explain_options: None,
+            request_options: None,
+        })
+        .await?;
+    collect_aggregation(resp.into_inner()).await
+}
+
+fn agg_count(alias: &str, up_to: Option<i64>) -> Aggregation {
+    Aggregation {
+        alias:    alias.to_string(),
+        operator: Some(Operator::Count(Count {
+            up_to: up_to.map(|value| Int64Value { value }),
+        })),
+    }
+}
+
+fn agg_sum(alias: &str, field_path: Option<&str>) -> Aggregation {
+    Aggregation {
+        alias:    alias.to_string(),
+        operator: Some(Operator::Sum(Sum {
+            field: field_path.map(|fp| FieldReference {
+                field_path: fp.to_string(),
+            }),
+        })),
+    }
+}
+
+fn agg_avg(alias: &str, field_path: Option<&str>) -> Aggregation {
+    Aggregation {
+        alias:    alias.to_string(),
+        operator: Some(Operator::Avg(Avg {
+            field: field_path.map(|fp| FieldReference {
+                field_path: fp.to_string(),
+            }),
+        })),
+    }
+}
+
+fn col_query(collection_id: &str) -> StructuredQuery {
+    StructuredQuery {
+        from: vec![CollectionSelector {
+            collection_id:   collection_id.to_string(),
+            all_descendants: false,
+        }],
+        ..Default::default()
+    }
+}
+
+#[gtest]
+#[tokio::test]
+async fn grpc_aggregation_edition_validation_aliases_select_and_pre_execution_order() {
+    for enterprise in [false, true] {
+        let mut db = if enterprise {
+            TestEnv::enterprise().build_db()
+        } else {
+            TestEnv::new().build_db()
+        };
+        for (doc, val) in [
+            ("items/d1", 10i64),
+            ("items/d2", 20i64),
+            ("items/d3", 30i64),
+        ] {
+            db.put(doc, fields!({ "v": val })).await.unwrap();
+        }
+
+        // 1. Sequential omitted aliases (`field_1`, `field_2`) + mixed explicit/omitted lists.
+        let auto_out = raw_aggregate(
+            &mut db,
+            DOCUMENTS_ROOT,
+            col_query("items"),
+            vec![
+                agg_count("total", None),
+                agg_count("", None),
+                agg_sum("sum_v", Some("v")),
+                agg_avg("", Some("v")),
+            ],
+            None,
+        )
+        .await
+        .unwrap();
+        expect_eq!(auto_out.fields.get("total"), Some(&Value::integer(3)));
+        expect_eq!(auto_out.fields.get("field_1"), Some(&Value::integer(3)));
+        expect_eq!(auto_out.fields.get("sum_v"), Some(&Value::integer(60)));
+        assert!(
+            auto_out
+                .fields
+                .get("field_2")
+                .unwrap()
+                .storage_eq(&Value::double(20.0))
+        );
+
+        // 2. Duplicate aliases, explicit `field_1` collision, > 1,500-byte aliases, empty
+        //    aggregations, missing operator, and malformed / non-__name__ reserved SUM/AVG fields.
+        let max_ascii = "a".repeat(1_500);
+        let max_utf8 = "é".repeat(750);
+        for ok_alias in [max_ascii.as_str(), max_utf8.as_str(), "____"] {
+            let out = raw_aggregate(
+                &mut db,
+                DOCUMENTS_ROOT,
+                col_query("items"),
+                vec![agg_count(ok_alias, None)],
+                None,
+            )
+            .await
+            .unwrap();
+            expect_eq!(out.fields.get(ok_alias), Some(&Value::integer(3)));
+        }
+
+        let over_ascii = "a".repeat(1_501);
+        let over_utf8 = "é".repeat(751);
+        for bad_aggs in [
+            vec![],
+            vec![Aggregation {
+                alias:    "missing_op".to_string(),
+                operator: None,
+            }],
+            vec![Aggregation::default()],
+            vec![agg_count("dup", None), agg_sum("dup", Some("v"))],
+            vec![agg_count("field_1", None), agg_count("", None)],
+            vec![agg_count("", None), agg_count("field_1", None)],
+            vec![agg_count(&over_ascii, None)],
+            vec![agg_count(&over_utf8, None)],
+            vec![agg_sum("s", None)],
+            vec![agg_avg("a", None)],
+            vec![agg_sum("s", Some(""))],
+            vec![agg_avg("a", Some("a..b"))],
+            vec![agg_sum("s", Some("__custom__"))],
+            vec![agg_avg("a", Some("nested.__custom__"))],
+        ] {
+            assert_status_code(
+                raw_aggregate(&mut db, DOCUMENTS_ROOT, col_query("items"), bad_aggs, None).await,
+                Code::InvalidArgument,
+            );
+        }
+
+        // 3. Edition-specific `Count.upTo`, aggregation count caps (5 vs 64), reserved aliases, and
+        //    `__name__` SUM/AVG fields.
+        if !enterprise {
+            let zero_cap = raw_aggregate(
+                &mut db,
+                DOCUMENTS_ROOT,
+                col_query("items"),
+                vec![agg_count("z", Some(0)), agg_count("c2", Some(2))],
+                None,
+            )
+            .await
+            .unwrap();
+            expect_eq!(zero_cap.fields.get("z"), Some(&Value::integer(0)));
+            expect_eq!(zero_cap.fields.get("c2"), Some(&Value::integer(2)));
+
+            let five_ok = (0..5)
+                .map(|i| agg_count(&format!("c{i}"), None))
+                .collect::<Vec<_>>();
+            expect_eq!(
+                raw_aggregate(&mut db, DOCUMENTS_ROOT, col_query("items"), five_ok, None)
+                    .await
+                    .unwrap()
+                    .fields
+                    .len(),
+                5
+            );
+
+            let six_err = (0..6)
+                .map(|i| agg_count(&format!("c{i}"), None))
+                .collect::<Vec<_>>();
+            for bad_std in [
+                six_err,
+                vec![agg_count("neg", Some(-1))],
+                vec![agg_count("__name__", None)],
+                vec![agg_count("__custom__", None)],
+                vec![agg_sum("s", Some("__name__"))],
+                vec![agg_avg("a", Some("`__name__`"))],
+                vec![agg_sum("s", Some("a.__name__"))],
+            ] {
+                assert_status_code(
+                    raw_aggregate(&mut db, DOCUMENTS_ROOT, col_query("items"), bad_std, None).await,
+                    Code::InvalidArgument,
+                );
+            }
+        } else {
+            let sixty_four_ok = (0..64)
+                .map(|i| agg_count(&format!("c{i}"), None))
+                .collect::<Vec<_>>();
+            expect_eq!(
+                raw_aggregate(
+                    &mut db,
+                    DOCUMENTS_ROOT,
+                    col_query("items"),
+                    sixty_four_ok,
+                    None,
+                )
+                .await
+                .unwrap()
+                .fields
+                .len(),
+                64
+            );
+            let sixty_five_err = (0..65)
+                .map(|i| agg_count(&format!("c{i}"), None))
+                .collect::<Vec<_>>();
+            assert_status_code(
+                raw_aggregate(
+                    &mut db,
+                    DOCUMENTS_ROOT,
+                    col_query("items"),
+                    sixty_five_err,
+                    None,
+                )
+                .await,
+                Code::InvalidArgument,
+            );
+            for up_to in [-1, 0, 1, 2] {
+                assert_status_code(
+                    raw_aggregate(
+                        &mut db,
+                        DOCUMENTS_ROOT,
+                        col_query("items"),
+                        vec![agg_count("c", Some(up_to))],
+                        None,
+                    )
+                    .await,
+                    Code::InvalidArgument,
+                );
+            }
+            let ent_reserved = raw_aggregate(
+                &mut db,
+                DOCUMENTS_ROOT,
+                col_query("items"),
+                vec![
+                    agg_count("__name__", None),
+                    agg_count("__custom__", None),
+                    agg_sum("sum_doc", Some("__name__")),
+                    agg_avg("avg_doc", Some("`__name__`")),
+                    agg_sum("sum_nested", Some("a.__name__")),
+                ],
+                None,
+            )
+            .await
+            .unwrap();
+            expect_eq!(
+                ent_reserved.fields.get("__name__"),
+                Some(&Value::integer(3))
+            );
+            expect_eq!(
+                ent_reserved.fields.get("__custom__"),
+                Some(&Value::integer(3))
+            );
+            expect_eq!(ent_reserved.fields.get("sum_doc"), Some(&Value::null()));
+            expect_eq!(ent_reserved.fields.get("avg_doc"), Some(&Value::null()));
+            expect_eq!(ent_reserved.fields.get("sum_nested"), Some(&Value::null()));
+        }
+
+        // 4. `StructuredQuery.select`: valid projections (empty and populated) are ignored during
+        //    aggregation, while invalid projection paths fail with `InvalidArgument`.
+        for select_paths in [vec![], vec!["other"], vec!["__name__"]] {
+            let mut sq = col_query("items");
+            sq.select = Some(Projection {
+                fields: select_paths
+                    .into_iter()
+                    .map(|p| FieldReference {
+                        field_path: p.to_string(),
+                    })
+                    .collect(),
+            });
+            let sel_ok = raw_aggregate(
+                &mut db,
+                DOCUMENTS_ROOT,
+                sq,
+                vec![agg_count("n", None), agg_sum("s", Some("v"))],
+                None,
+            )
+            .await
+            .unwrap();
+            expect_eq!(sel_ok.fields.get("n"), Some(&Value::integer(3)));
+            expect_eq!(sel_ok.fields.get("s"), Some(&Value::integer(60)));
+        }
+        for bad_sel in ["__custom__", "a..b"] {
+            let mut sq = col_query("items");
+            sq.select = Some(Projection {
+                fields: vec![FieldReference {
+                    field_path: bad_sel.to_string(),
+                }],
+            });
+            assert_status_code(
+                raw_aggregate(
+                    &mut db,
+                    DOCUMENTS_ROOT,
+                    sq,
+                    vec![agg_count("n", None)],
+                    None,
+                )
+                .await,
+                Code::InvalidArgument,
+            );
+        }
+
+        // 5. Pre-execution validation order: (a) `Query::from_structured` (`offset < 0` / bad
+        //    `select`) precedes `compile_aggregations` (empty aggregations)
+        let mut bad_offset_sq = col_query("items");
+        bad_offset_sq.offset = -1;
+        let offset_err = assert_status_code(
+            raw_aggregate(&mut db, DOCUMENTS_ROOT, bad_offset_sq, vec![], None).await,
+            Code::InvalidArgument,
+        );
+        expect_that!(offset_err.message(), contains_substring("offset"));
+
+        let mut bad_select_sq = col_query("items");
+        bad_select_sq.select = Some(Projection {
+            fields: vec![FieldReference {
+                field_path: "__custom__".to_string(),
+            }],
+        });
+        let select_err = assert_status_code(
+            raw_aggregate(&mut db, DOCUMENTS_ROOT, bad_select_sq, vec![], None).await,
+            Code::InvalidArgument,
+        );
+        expect_that!(select_err.message(), contains_substring("__custom__"));
+
+        //    (b) `compile_aggregations` precedes query execution: a rolled-back transaction
+        //        (`Transaction(stale_id)`) would fail query execution with `Aborted`, yet invalid
+        //        aggregations fail earlier with `InvalidArgument` from `compile_aggregations`.
+        let stale_txn = db.begin_rw_txn().await.unwrap();
+        let stale_id = stale_txn.id().to_vec();
+        stale_txn.rollback().await.unwrap();
+        let agg_before_exec_err = assert_status_code(
+            raw_aggregate(
+                &mut db,
+                DOCUMENTS_ROOT,
+                col_query("items"),
+                vec![agg_sum("bad", Some("__custom__"))],
+                Some(run_aggregation_query_request::ConsistencySelector::Transaction(stale_id)),
+            )
+            .await,
+            Code::InvalidArgument,
+        );
+        expect_that!(
+            agg_before_exec_err.message(),
+            contains_substring("__custom__")
+        );
     }
 }

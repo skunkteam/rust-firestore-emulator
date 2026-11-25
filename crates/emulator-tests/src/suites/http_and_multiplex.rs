@@ -1465,3 +1465,279 @@ async fn http_rest_run_query_array_filters_and_validation_across_editions() {
     expect_eq!(status, StatusCode::OK);
     expect_eq!(extract_ids(&bytes), vec!["d_missing", "d_null", "d_num"]);
 }
+
+#[gtest]
+#[tokio::test]
+async fn http_rest_run_aggregation_query_cross_protocol_and_editions() {
+    let mut db = TestEnv::new().build_db();
+    let agg_uri = format!("/v1/{DOCUMENTS_ROOT}:runAggregationQuery");
+
+    // 1. Seed via gRPC (large i64 beyond JS safe-integer range, standard int, and double) and via
+    //    HTTP REST (document-parent subcollection), then aggregate over REST.
+    db.put(
+        "metrics/m1",
+        fields!({ "n": 9_007_199_254_740_993_i64, "kind": "big" }),
+    )
+    .await
+    .unwrap();
+    db.put("metrics/m2", fields!({ "n": 7_i64, "kind": "big" }))
+        .await
+        .unwrap();
+    db.put("metrics/m3", fields!({ "n": 2.5_f64, "kind": "dbl" }))
+        .await
+        .unwrap();
+
+    let (sub_create_status, _) = db
+        .http_oneshot(
+            Method::POST,
+            &format!("/v1/{DOCUMENTS_ROOT}/orgs/acme/tasks?documentId=t1"),
+            Some(&json!({ "fields": { "pts": { "integerValue": "12" } } })),
+        )
+        .await;
+    expect_eq!(sub_create_status, StatusCode::OK);
+
+    let (status, bytes) = db
+        .http_oneshot(
+            Method::POST,
+            &agg_uri,
+            Some(&json!({
+                "structuredAggregationQuery": {
+                    "structuredQuery": {
+                        "from": [{ "collectionId": "metrics" }],
+                        "where": {
+                            "fieldFilter": {
+                                "field": { "fieldPath": "kind" },
+                                "op": "EQUAL",
+                                "value": { "stringValue": "big" }
+                            }
+                        }
+                    },
+                    "aggregations": [
+                        { "count": {}, "alias": "cnt" },
+                        { "count": { "upTo": "1" }, "alias": "capped" },
+                        { "sum": { "field": { "fieldPath": "n" } }, "alias": "sum_i64" },
+                        { "avg": { "field": { "fieldPath": "n" } }, "alias": "avg_i64" }
+                    ]
+                }
+            })),
+        )
+        .await;
+    expect_eq!(status, StatusCode::OK);
+    let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    expect_eq!(body.as_array().unwrap().len(), 1);
+    expect_eq!(
+        body[0]["result"]["aggregateFields"],
+        json!({
+            "avg_i64": { "doubleValue": 4_503_599_627_370_500.0 },
+            "capped": { "integerValue": "1" },
+            "cnt": { "integerValue": "2" },
+            "sum_i64": { "integerValue": "9007199254741000" }
+        })
+    );
+
+    // Subcollection document-parent REST aggregation
+    let (sub_status, sub_bytes) = db
+        .http_oneshot(
+            Method::POST,
+            &format!("/v1/{DOCUMENTS_ROOT}/orgs/acme:runAggregationQuery"),
+            Some(&json!({
+                "structuredAggregationQuery": {
+                    "structuredQuery": { "from": [{ "collectionId": "tasks" }] },
+                    "aggregations": [
+                        { "count": {} },
+                        { "sum": { "field": { "fieldPath": "pts" } } }
+                    ]
+                }
+            })),
+        )
+        .await;
+    expect_eq!(sub_status, StatusCode::OK);
+    let sub_body: serde_json::Value = serde_json::from_slice(&sub_bytes).unwrap();
+    expect_eq!(
+        sub_body[0]["result"]["aggregateFields"],
+        json!({
+            "field_1": { "integerValue": "1" },
+            "field_2": { "integerValue": "12" }
+        })
+    );
+
+    // 2. Standard vs Enterprise empty SUM and i64 overflow semantics over REST.
+    db.put("overflow_cancel/d0", fields!({ "v": i64::MAX }))
+        .await
+        .unwrap();
+    db.put("overflow_cancel/d1", fields!({ "v": 1_i64 }))
+        .await
+        .unwrap();
+    db.put("overflow_cancel/d2", fields!({ "v": -1_i64 }))
+        .await
+        .unwrap();
+    db.put("overflow_dbl/d0", fields!({ "v": i64::MAX }))
+        .await
+        .unwrap();
+    db.put("overflow_dbl/d1", fields!({ "v": i64::MAX }))
+        .await
+        .unwrap();
+
+    let empty_agg_req = json!({
+        "structuredAggregationQuery": {
+            "structuredQuery": { "from": [{ "collectionId": "no_such_col" }] },
+            "aggregations": [
+                { "sum": { "field": { "fieldPath": "v" } }, "alias": "s" },
+                { "avg": { "field": { "fieldPath": "v" } }, "alias": "a" }
+            ]
+        }
+    });
+    let (std_empty_st, std_empty_bytes) = db
+        .http_oneshot(Method::POST, &agg_uri, Some(&empty_agg_req))
+        .await;
+    expect_eq!(std_empty_st, StatusCode::OK);
+    let std_empty: serde_json::Value = serde_json::from_slice(&std_empty_bytes).unwrap();
+    expect_eq!(
+        std_empty[0]["result"]["aggregateFields"],
+        json!({ "s": { "integerValue": "0" }, "a": { "nullValue": null } })
+    );
+
+    // Standard overflow cancellation returns exact i64::MAX, and double-overflow promotes to
+    // doubleValue.
+    let (std_cancel_st, std_cancel_bytes) = db
+        .http_oneshot(
+            Method::POST,
+            &agg_uri,
+            Some(&json!({
+                "structuredAggregationQuery": {
+                    "structuredQuery": {
+                        "from": [{ "collectionId": "overflow_cancel" }],
+                        "orderBy": [{ "field": { "fieldPath": "__name__" }, "direction": "ASCENDING" }]
+                    },
+                    "aggregations": [{ "sum": { "field": { "fieldPath": "v" } }, "alias": "s" }]
+                }
+            })),
+        )
+        .await;
+    expect_eq!(std_cancel_st, StatusCode::OK);
+    let std_cancel: serde_json::Value = serde_json::from_slice(&std_cancel_bytes).unwrap();
+    expect_eq!(
+        std_cancel[0]["result"]["aggregateFields"]["s"]["integerValue"],
+        i64::MAX.to_string()
+    );
+
+    let (std_dbl_st, std_dbl_bytes) = db
+        .http_oneshot(
+            Method::POST,
+            &agg_uri,
+            Some(&json!({
+                "structuredAggregationQuery": {
+                    "structuredQuery": { "from": [{ "collectionId": "overflow_dbl" }] },
+                    "aggregations": [{ "sum": { "field": { "fieldPath": "v" } }, "alias": "s" }]
+                }
+            })),
+        )
+        .await;
+    expect_eq!(std_dbl_st, StatusCode::OK);
+    let std_dbl: serde_json::Value = serde_json::from_slice(&std_dbl_bytes).unwrap();
+    expect_eq!(
+        std_dbl[0]["result"]["aggregateFields"]["s"]["doubleValue"],
+        18_446_744_073_709_551_616.0
+    );
+
+    // Switch to Enterprise via HTTP Admin PATCH.
+    db.set_admin_mode(Some("ENTERPRISE"), None).await;
+
+    let (ent_empty_st, ent_empty_bytes) = db
+        .http_oneshot(Method::POST, &agg_uri, Some(&empty_agg_req))
+        .await;
+    expect_eq!(ent_empty_st, StatusCode::OK);
+    let ent_empty: serde_json::Value = serde_json::from_slice(&ent_empty_bytes).unwrap();
+    expect_eq!(
+        ent_empty[0]["result"]["aggregateFields"],
+        json!({ "s": { "nullValue": null }, "a": { "nullValue": null } })
+    );
+
+    // Enterprise sequential i64 overflow (`[i64::MAX, 1, -1]`) rejects with structured 400
+    // `google.rpc.Status` JSON error (`INVALID_ARGUMENT`).
+    let (ent_ovf_st, ent_ovf_bytes) = db
+        .http_oneshot(
+            Method::POST,
+            &agg_uri,
+            Some(&json!({
+                "structuredAggregationQuery": {
+                    "structuredQuery": {
+                        "from": [{ "collectionId": "overflow_cancel" }],
+                        "orderBy": [{ "field": { "fieldPath": "__name__" }, "direction": "ASCENDING" }]
+                    },
+                    "aggregations": [{ "sum": { "field": { "fieldPath": "v" } }, "alias": "s" }]
+                }
+            })),
+        )
+        .await;
+    expect_eq!(ent_ovf_st, StatusCode::BAD_REQUEST);
+    let ent_ovf_err: serde_json::Value = serde_json::from_slice(&ent_ovf_bytes).unwrap();
+    expect_eq!(ent_ovf_err["error"]["code"], 400);
+    expect_eq!(ent_ovf_err["error"]["status"], "INVALID_ARGUMENT");
+    expect_that!(
+        ent_ovf_err["error"]["message"].as_str().unwrap_or(""),
+        contains_substring("Long overflow")
+    );
+
+    // 3. Structured `google.rpc.Status` JSON error objects for 400 and 501 over REST.
+    for (bad_body, expected_http, expected_code, expected_status) in [
+        (
+            json!({
+                "structuredAggregationQuery": {
+                    "structuredQuery": { "from": [{ "collectionId": "metrics" }] },
+                    "aggregations": [{ "count": { "upTo": "1" } }]
+                }
+            }),
+            StatusCode::BAD_REQUEST,
+            400,
+            "INVALID_ARGUMENT",
+        ),
+        (
+            json!({
+                "structuredAggregationQuery": {
+                    "structuredQuery": {
+                        "from": [{ "collectionId": "metrics" }],
+                        "findNearest": { "limit": 1 }
+                    },
+                    "aggregations": [{ "count": {} }]
+                }
+            }),
+            StatusCode::NOT_IMPLEMENTED,
+            501,
+            "UNIMPLEMENTED",
+        ),
+        (
+            json!({
+                "newTransaction": { "readWrite": {} },
+                "structuredAggregationQuery": {
+                    "structuredQuery": { "from": [{ "collectionId": "metrics" }] },
+                    "aggregations": [{ "count": {} }]
+                }
+            }),
+            StatusCode::NOT_IMPLEMENTED,
+            501,
+            "UNIMPLEMENTED",
+        ),
+        (
+            json!({
+                "transaction": "AAEC",
+                "structuredAggregationQuery": {
+                    "structuredQuery": { "from": [{ "collectionId": "metrics" }] },
+                    "aggregations": [{ "count": {} }]
+                }
+            }),
+            StatusCode::NOT_IMPLEMENTED,
+            501,
+            "UNIMPLEMENTED",
+        ),
+    ] {
+        let (st, err_bytes) = db
+            .http_oneshot(Method::POST, &agg_uri, Some(&bad_body))
+            .await;
+        expect_eq!(st, expected_http);
+        let err: serde_json::Value = serde_json::from_slice(&err_bytes).unwrap();
+        expect_eq!(err["error"]["code"], expected_code);
+        expect_eq!(err["error"]["status"], expected_status);
+        expect_true!(!err["error"]["message"].as_str().unwrap_or("").is_empty());
+    }
+}
