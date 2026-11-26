@@ -590,3 +590,26 @@ fn regression_dark_theme_css_tokens_and_wcag_contrast() {
         );
     }
 }
+
+#[test]
+fn regression_snapshot_modal_banner_css() {
+    let repo_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let css = fs::read_to_string(repo_root.join("ui/styles.css")).expect("read ui/styles.css");
+
+    let error_banner = extract_css_rule_block(&css, ".error-banner.modal-banner");
+    assert!(
+        error_banner.contains("border: 1px solid var(--danger-border);")
+            && error_banner.contains("border-radius: var(--radius-sm);")
+            && error_banner.contains("overflow-wrap: anywhere;"),
+        "expected modal error banner framing and wrapping rules in .error-banner.modal-banner: \
+         {error_banner}"
+    );
+
+    let conflict_banner = extract_css_rule_block(&css, ".conflict-banner.modal-banner");
+    assert!(
+        conflict_banner.contains("border: 1px solid var(--warning-border);")
+            && conflict_banner.contains("border-radius: var(--radius-sm);"),
+        "expected modal conflict banner framing rules in .conflict-banner.modal-banner: \
+         {conflict_banner}"
+    );
+}

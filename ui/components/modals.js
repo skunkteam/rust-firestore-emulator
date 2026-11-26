@@ -38,7 +38,7 @@ import {
  * @typedef {{
  *   onRerender: () => void,
  *   onSelectDatabase: (projectId: string, databaseId: string, initialSegments?: string[], replaceHistory?: boolean) => Promise<void>,
- *   onHydrateVisiblePath: (expectedDbEpoch?: number, expectedNavEpoch?: number, segmentsSnapshot?: string[]) => Promise<void>,
+ *   onHydrateVisiblePath: (expectedDbEpoch?: number, expectedNavEpoch?: number, segmentsSnapshot?: string[]) => Promise<unknown>,
  *   onRefreshDatabaseList: () => Promise<boolean>,
  *   onToast: (text: string, tone?: 'info' | 'success' | 'error') => void,
  *   onImportSuccess: (summary: ImportSummary) => Promise<void>,
@@ -53,6 +53,8 @@ const FOCUSABLE_SELECTOR = [
   "textarea:not([disabled])",
   '[tabindex]:not([tabindex="-1"])',
 ].join(", ");
+
+const EXPORT_REVOKE_DELAY_MS = 60_000;
 
 /** @type {EventTarget | null} */
 let backdropMouseDownTarget = null;
@@ -201,7 +203,9 @@ function renderDialogShell(p) {
           </button>
         </div>
         <div class="modal-body">
-          ${p.error ? html`<div class="error-banner">${p.error}</div>` : nothing}
+          ${p.error
+            ? html`<div class="error-banner modal-banner" role="alert">${p.error}</div>`
+            : nothing}
           ${p.body}
         </div>
         <div class="modal-footer">${p.footer}</div>
@@ -829,7 +833,7 @@ function renderExportSnapshotModal(m, state, callbacks, close) {
         a?.remove?.();
         setTimeout(() => {
           URL.revokeObjectURL(objectUrl);
-        }, 60_000);
+        }, EXPORT_REVOKE_DELAY_MS);
       }
       state.modal = null;
       callbacks.onToast(`Exported snapshot ${filename}`, "info");
@@ -863,6 +867,7 @@ function renderExportSnapshotModal(m, state, callbacks, close) {
         <button
           type="button"
           class="btn btn-primary"
+          ?data-autofocus=${Boolean(activeRoot)}
           ?disabled=${m.busy || !activeRoot}
           @click=${() => triggerDownload("current")}
         >
@@ -873,6 +878,7 @@ function renderExportSnapshotModal(m, state, callbacks, close) {
         <button
           type="button"
           class="btn"
+          ?data-autofocus=${!activeRoot}
           ?disabled=${m.busy}
           @click=${() => triggerDownload("all")}
         >
@@ -901,6 +907,9 @@ function renderImportSnapshotModal(m, state, callbacks, close) {
   const hasDirtyEditors = Array.from(state.documentLevels.values()).some(
     (level) => Boolean(level.editorSession?.isDirty)
   );
+  const describedByIds = hasDirtyEditors
+    ? "import-snapshot-overwrite-warning import-snapshot-dirty-warning"
+    : "import-snapshot-overwrite-warning";
 
   const submitImport = async () => {
     if (m.busy) return;
@@ -944,20 +953,19 @@ function renderImportSnapshotModal(m, state, callbacks, close) {
     error: m.error,
     close,
     body: html`
-      <div class="conflict-banner modal-banner">
-        <span>
-          Importing replaces each database included in the snapshot and
-          overwrites its settings and documents. Databases not in the snapshot
-          remain untouched.
-        </span>
+      <div
+        class="conflict-banner modal-banner"
+        id="import-snapshot-overwrite-warning"
+      >
+        <span>Importing completely replaces (never merges) each database in the snapshot, deleting extra documents and overwriting settings. Databases not in the snapshot remain untouched.</span>
       </div>
       ${hasDirtyEditors
         ? html`
-            <div class="conflict-banner modal-banner">
-              <span>
-                You have unsaved edits in an open document editor. Replaced
-                documents preserve your local draft with a conflict banner.
-              </span>
+            <div
+              class="conflict-banner modal-banner"
+              id="import-snapshot-dirty-warning"
+            >
+              <span>You have unsaved edits in an open document editor. If this import updates or deletes that document, your local draft is kept with an option to keep, reload, or discard it.</span>
             </div>
           `
         : nothing}
@@ -968,6 +976,7 @@ function renderImportSnapshotModal(m, state, callbacks, close) {
           type="file"
           class="input"
           accept=".fsemu,application/octet-stream"
+          aria-describedby=${describedByIds}
           ?disabled=${m.busy}
           @change=${(/** @type {Event} */ e) => {
             const input = /** @type {HTMLInputElement} */ (e.target);

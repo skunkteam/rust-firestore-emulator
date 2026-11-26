@@ -18,6 +18,7 @@ export default [
       globals: {
         AbortController: "readonly",
         AbortSignal: "readonly",
+        Blob: "readonly",
         Buffer: "readonly",
         clearInterval: "readonly",
         clearTimeout: "readonly",
@@ -31,6 +32,7 @@ export default [
         requestAnimationFrame: "writable",
         setInterval: "readonly",
         setTimeout: "readonly",
+        TextDecoder: "readonly",
         TextEncoder: "readonly",
         URL: "readonly",
         window: "writable",
