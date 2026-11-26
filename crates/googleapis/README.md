@@ -7,7 +7,7 @@ Rust crate that compiles the upstream Google Firestore v1 Protocol Buffers (`inc
 - `[Cargo.toml:googleapis]`: Rust library crate exporting compiled Google Firestore v1 and protobuf well-known types, declarative construction macros, and domain extension traits/methods. Defines optional Cargo feature `client = ["tonic/channel", "tonic/gzip", "tonic-prost-build/transport"]` (`default = []`) to gate `FirestoreClient` generation for test/client consumers.
 - `[build.rs:main]`: Cargo build script invoking `tonic_prost_build` to compile `include/google/firestore/v1/firestore.proto` into `googleapis.rs`.
 - Subdirectories:
-  - [`./src/README.md`](./src/README.md): Crate root module (`lib.rs`), declarative macros (`macros.rs`), and extension implementations (`ser.rs`, `timestamp_ext.rs`, `transaction_options_ext.rs`, `value_ext.rs`, `vector_ext.rs`).
+  - [`./src/README.md`](./src/README.md): Crate root module (`lib.rs`), declarative macros (`macros.rs`), and extension implementations (`ser/mod.rs`, `ser/tests.rs`, `timestamp_ext.rs`, `transaction_options_ext.rs`, `value_ext.rs`, `vector_ext.rs`).
 
 ## Invariants
 - `[build.rs:main]`: Generates gRPC client stubs only when `feature = "client"` is active (`.build_client(cfg!(feature = "client"))`), compiles protobuf well-known types (`.compile_well_known_types(true)`), maps `bytes_value` protobuf fields to `prost::bytes::Bytes` (`.bytes("bytes_value")`), and derives `PartialOrd`/`Ord` on `google.protobuf.Timestamp` (`.type_attribute(".google.protobuf.Timestamp", "#[derive(PartialOrd, Ord)]")`).

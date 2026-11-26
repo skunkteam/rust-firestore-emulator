@@ -8,11 +8,7 @@ use std::{
 
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use googleapis::google::{
-    firestore::v1::{
-        structured_aggregation_query::{Aggregation, aggregation},
-        structured_query::CollectionSelector,
-        *,
-    },
+    firestore::v1::{structured_query::CollectionSelector, *},
     protobuf::Timestamp,
 };
 use itertools::Itertools;
@@ -24,6 +20,7 @@ use tokio::sync::{
 };
 use tracing::{Level, Span, debug, field::display, instrument};
 
+pub(crate) use self::aggregation::sum_enterprise_checked;
 pub use self::lock::{
     ContendedDocumentSnapshot, ContentionEvent, ContentionEventKind, ContentionLockMode,
     ContentionSessionState, ContentionSnapshot, ContentionSseEvent, ContentionSubscriberGuard,
@@ -46,10 +43,11 @@ use crate::{
     FirestoreProject, GenericDatabaseError,
     database::field_path::FieldReference,
     error::{AbortReason, Result},
-    unimplemented_bool, unimplemented_option,
+    unimplemented_bool,
     utils::RwLockHashMapExt,
 };
 
+mod aggregation;
 mod collection;
 mod commit;
 pub(crate) mod document;
@@ -331,137 +329,6 @@ impl FirestoreDatabase {
         ))
     }
 
-    #[instrument(level = Level::DEBUG, skip_all, err(level = Level::DEBUG))]
-    pub async fn run_aggregation_query(
-        &self,
-        parent: Ref,
-        query: StructuredQuery,
-        aggregations: Vec<Aggregation>,
-        consistency: ReadConsistency,
-    ) -> Result<(Timestamp, HashMap<String, Value>)> {
-        self.ensure_owns_root(parent.root())?;
-        unimplemented_option!(query.select);
-        let enterprise = self.enterprise_edition();
-        let is_unordered = query.order_by.is_empty() && query.find_nearest.is_none();
-        let mut query = Query::from_structured(parent, query, consistency, enterprise)?;
-        debug!(?query);
-        let (read_time, mut docs) = query.once(self).await?;
-        let has_sum_or_avg = aggregations.iter().any(|agg| {
-            matches!(
-                agg.operator,
-                Some(aggregation::Operator::Sum(_) | aggregation::Operator::Avg(_))
-            )
-        });
-        if enterprise && is_unordered && has_sum_or_avg {
-            // Enterprise checked integer sums depend on scan order; sort by canonical `__name__`
-            // for deterministic primary-key scan order.
-            docs.sort_by(|a, b| a.version.name.cmp(&b.version.name));
-        }
-        let result = aggregations
-            .into_iter()
-            .map(|agg| {
-                use aggregation::*;
-                let operator = agg.operator.ok_or_else(|| {
-                    GenericDatabaseError::invalid_argument("missing operator in aggregation query")
-                })?;
-                let result = match operator {
-                    // Count of documents that match the query.
-                    //
-                    // The `COUNT(*)` aggregation function operates on the entire document
-                    // so it does not require a field reference.
-                    Operator::Count(Count { up_to }) => {
-                        let max = up_to.map(|v| v.value).unwrap_or(i64::MAX);
-                        Value::integer((docs.len() as i64).min(max))
-                    }
-                    // Sum of the values of the requested field.
-                    //
-                    // * Only numeric values will be aggregated. All non-numeric values including
-                    //   `NULL` are skipped.
-                    //
-                    // * If the aggregated values contain `NaN`, returns `NaN`. Infinity math
-                    //   follows IEEE-754 standards.
-                    //
-                    // * Standard Edition returns `0` on empty numeric sets and accumulates integers
-                    //   in `i128` (promoting to `DoubleValue` only if the final sum overflows
-                    //   `i64`).
-                    //
-                    // * Enterprise Edition returns `NULL` on empty numeric sets and accumulates
-                    //   sequentially in `i64` before any `DoubleValue`, failing with
-                    //   `InvalidArgument` (`"Long overflow"`) on intermediate or final `i64`
-                    //   overflow.
-                    Operator::Sum(Sum { field }) => {
-                        let field_ref: FieldReference = field
-                            .as_ref()
-                            .ok_or_else(|| {
-                                GenericDatabaseError::invalid_argument(
-                                    "missing field reference in SUM operator",
-                                )
-                            })?
-                            .try_into()?;
-                        let mut values = docs
-                            .iter()
-                            .filter_map(|m| {
-                                Some(
-                                    query
-                                        .effective_numeric_field_value(m, &field_ref)?
-                                        .into_owned(),
-                                )
-                            })
-                            .filter(Value::is_number)
-                            .peekable();
-                        if enterprise && values.peek().is_none() {
-                            Value::null()
-                        } else {
-                            sum_aggregation_values(enterprise, values)?
-                        }
-                    }
-                    // Average of the values of the requested field.
-                    //
-                    // * Only numeric values will be aggregated. All non-numeric values including
-                    //   `NULL` are skipped.
-                    //
-                    // * If the aggregated values contain `NaN`, returns `NaN`. Infinity math
-                    //   follows IEEE-754 standards.
-                    //
-                    // * If the aggregated value set is empty, returns `NULL`.
-                    //
-                    // * Always returns the result as a double (Enterprise Edition applies the same
-                    //   sequential `Long overflow` check to its numerator sum).
-                    Operator::Avg(Avg { field }) => {
-                        let field_ref: FieldReference = field
-                            .as_ref()
-                            .ok_or_else(|| {
-                                GenericDatabaseError::invalid_argument(
-                                    "missing field reference in AVG operator",
-                                )
-                            })?
-                            .try_into()?;
-                        let values = docs
-                            .iter()
-                            .filter_map(|m| {
-                                Some(
-                                    query
-                                        .effective_numeric_field_value(m, &field_ref)?
-                                        .into_owned(),
-                                )
-                            })
-                            .filter(Value::is_number)
-                            .collect_vec();
-                        if values.is_empty() {
-                            Value::null()
-                        } else {
-                            let len = values.len();
-                            let sum = sum_aggregation_values(enterprise, values)?;
-                            Value::double(sum.as_double().unwrap_or(0.0) / len as f64)
-                        }
-                    }
-                };
-                Ok::<_, GenericDatabaseError>((agg.alias, result))
-            })
-            .try_collect()?;
-        Ok((read_time, result))
-    }
-
     pub async fn write(self: &Arc<Self>, write: Write) -> Result<WriteResult> {
         let (result, _) = self.write_with_version(write).await?;
         Ok(result)
@@ -718,7 +585,7 @@ impl FirestoreDatabase {
             .transpose()?;
 
         let mut query = builder.build()?;
-        let (_, found_docs) = query.once(self).await?;
+        let (read_time, found_docs) = query.once(self).await?;
         let mut documents: Vec<Document> = found_docs
             .iter()
             .filter(|v| {
@@ -730,7 +597,10 @@ impl FirestoreDatabase {
             .collect();
 
         let existing_names: HashSet<String> = documents.iter().map(|d| d.name.clone()).collect();
-        for missing_name in query.missing_docs_after(self, cursor_name).await? {
+        for missing_name in query
+            .missing_docs_at(self, Some(read_time), cursor_name)
+            .await?
+        {
             if !existing_names.contains(&missing_name) {
                 documents.push(Document {
                     name: missing_name,
@@ -892,22 +762,6 @@ impl FirestoreDatabase {
                     database: self.name.clone(),
                 });
         }
-    }
-}
-
-pub(crate) fn sum_enterprise_checked(values: impl IntoIterator<Item = Value>) -> Result<Value> {
-    Value::try_checked_sum(values)
-        .ok_or_else(|| GenericDatabaseError::invalid_argument("Long overflow"))
-}
-
-fn sum_aggregation_values(
-    enterprise: bool,
-    values: impl IntoIterator<Item = Value>,
-) -> Result<Value> {
-    if enterprise {
-        sum_enterprise_checked(values)
-    } else {
-        Ok(values.into_iter().sum())
     }
 }
 
@@ -2415,7 +2269,7 @@ mod tests {
         assert_eq!(miss_tok, "");
         assert!(
             db.peek_doc_meta(&d1_ref).await.unwrap().is_none(),
-            "missing_docs_after must not invoke get_doc on skipped ancestor <= cursor"
+            "missing_docs_at must not allocate DocumentMeta on skipped ancestor <= cursor"
         );
     }
 

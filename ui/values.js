@@ -461,6 +461,17 @@ export function escapeFieldPathSegment(segment) {
 }
 
 /**
+ * Returns true if `segment` matches Firestore's reserved `__...__` pattern (length >= 5).
+ * @param {string} segment
+ * @returns {boolean}
+ */
+export function isReservedName(segment) {
+  return (
+    segment.startsWith("__") && segment.endsWith("__") && segment.length >= 5
+  );
+}
+
+/**
  * Returns true if `val` is a Cloud Firestore vector sentinel map
  * (`{ mapValue: { fields: { __type__: { stringValue: "__vector__" }, value: { arrayValue: { values: [...] } } } } }`)
  * with 1..2048 non-NaN double coordinates.
@@ -681,6 +692,36 @@ export function findUnsafeUnquotedInteger(rawText) {
     } else if (ch !== " " && ch !== "\t" && ch !== "\n" && ch !== "\r") {
       activeKey = null;
       lastString = null;
+    }
+  }
+  return null;
+}
+
+/**
+ * Recursively walks plain objects and arrays to detect non-finite numbers
+ * (`Infinity`, `-Infinity`, `NaN`), returning the first offending JSONPath or `null`.
+ * @param {unknown} value
+ * @param {string} [path]
+ * @returns {string | null}
+ */
+export function findNonFiniteNumber(value, path = "$") {
+  if (typeof value === "number") {
+    return Number.isFinite(value) ? null : path;
+  }
+  if (Array.isArray(value)) {
+    for (let i = 0; i < value.length; i++) {
+      const hit = findNonFiniteNumber(value[i], `${path}[${i}]`);
+      if (hit !== null) return hit;
+    }
+    return null;
+  }
+  if (value && typeof value === "object") {
+    for (const [key, entry] of Object.entries(value)) {
+      const childPath = /^[A-Za-z_$][A-Za-z0-9_$]*$/.test(key)
+        ? `${path}.${key}`
+        : `${path}[${JSON.stringify(key)}]`;
+      const hit = findNonFiniteNumber(entry, childPath);
+      if (hit !== null) return hit;
     }
   }
   return null;

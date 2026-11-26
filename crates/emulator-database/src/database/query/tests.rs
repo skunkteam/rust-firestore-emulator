@@ -1737,3 +1737,465 @@ async fn enterprise_all_descendants_empty_order_by_is_deterministic_in_firestore
 
     Ok(())
 }
+
+#[gtest]
+#[tokio::test]
+async fn missing_docs_and_list_docs_default_do_not_block_on_held_write_locks() -> Result<()> {
+    use googleapis::google::protobuf::Timestamp;
+
+    use crate::{database::DocumentRef, reference::Ref};
+
+    let database = fresh_database()?;
+    let t_before = Timestamp::now();
+
+    let existing_ref: DocumentRef = format!("{}/users/existing", database.name).parse()?;
+    let phantom_a_ref: DocumentRef = format!("{}/users/phantom-a", database.name).parse()?;
+    let child_a_ref: DocumentRef =
+        format!("{}/users/phantom-a/sub/child", database.name).parse()?;
+    let phantom_b_ref: DocumentRef = format!("{}/users/phantom-b", database.name).parse()?;
+    let child_b_ref: DocumentRef =
+        format!("{}/users/phantom-b/sub/child", database.name).parse()?;
+    let phantom_c_ref: DocumentRef = format!("{}/users/phantom-c", database.name).parse()?;
+    let child_c_ref: DocumentRef =
+        format!("{}/users/phantom-c/sub/child", database.name).parse()?;
+
+    let write_doc = |doc_ref: &DocumentRef, val: i64| {
+        let name = doc_ref.to_string();
+        assert_ready_ok!(
+            spawn(database.write(Write {
+                operation: Some(write::Operation::Update(Document {
+                    name,
+                    fields: [("v".to_string(), Value::integer(val))].into(),
+                    ..Default::default()
+                })),
+                ..Default::default()
+            }))
+            .poll_until_idle()
+        );
+    };
+
+    write_doc(&existing_ref, 1);
+    write_doc(&child_a_ref, 2);
+    let t_mid = Timestamp::now();
+
+    write_doc(&child_b_ref, 3);
+    write_doc(&child_c_ref, 4);
+    let t_all = Timestamp::now();
+
+    assert_ready_ok!(spawn(database.delete_doc(&child_c_ref, None)).poll_until_idle());
+
+    // Directly acquire exclusive WriteLeases on the phantom ancestor, its child doc, and a
+    // materialized sibling to verify MVCC paths never enter `LockTable` wait queues.
+    let lock_session = database.locks.new_session(
+        None,
+        SessionKind::SingleWrite,
+        LockPriority::NextSeq,
+        false,
+        false,
+    );
+    let lease_phantom =
+        assert_ready_ok!(spawn(lock_session.acquire_write(&phantom_a_ref)).poll_until_idle());
+    let lease_child =
+        assert_ready_ok!(spawn(lock_session.acquire_write(&child_a_ref)).poll_until_idle());
+    let lease_existing =
+        assert_ready_ok!(spawn(lock_session.acquire_write(&existing_ref)).poll_until_idle());
+
+    // Confirm a lock-acquiring `get_doc(Default)` blocks on the held write lock.
+    {
+        let mut blocked_read = spawn(database.get_doc(&phantom_a_ref, ReadConsistency::Default));
+        assert!(blocked_read.poll_until_idle().is_pending());
+    }
+
+    // `Collection::has_doc_at` evaluates MVCC snapshots directly without touching `LockTable`.
+    let sub_a_col = assert_ready!(
+        spawn(database.get_collection(&child_a_ref.collection_ref)).poll_until_idle()
+    );
+    let sub_b_col = assert_ready!(
+        spawn(database.get_collection(&child_b_ref.collection_ref)).poll_until_idle()
+    );
+    let sub_c_col = assert_ready!(
+        spawn(database.get_collection(&child_c_ref.collection_ref)).poll_until_idle()
+    );
+    assert!(!assert_ready!(
+        spawn(sub_a_col.has_doc_at(t_before)).poll_until_idle()
+    ));
+    assert!(assert_ready!(
+        spawn(sub_a_col.has_doc_at(t_mid)).poll_until_idle()
+    ));
+    assert!(!assert_ready!(
+        spawn(sub_b_col.has_doc_at(t_mid)).poll_until_idle()
+    ));
+    assert!(assert_ready!(
+        spawn(sub_c_col.has_doc_at(t_all)).poll_until_idle()
+    ));
+    assert!(!assert_ready!(
+        spawn(sub_c_col.has_doc_at(Timestamp::now())).poll_until_idle()
+    ));
+
+    // `Query::missing_docs` and `missing_docs_at` under `ReadConsistency::Default` complete
+    // immediately without blocking on the held write locks.
+    let users_col = CollectionRef::new(database.name.clone(), "users");
+    let default_query = QueryBuilder::from_collection(users_col.clone()).build()?;
+    let missing_default =
+        assert_ready_ok!(spawn(default_query.missing_docs(&database)).poll_until_idle());
+    assert_eq!(
+        missing_default,
+        vec![phantom_a_ref.to_string(), phantom_b_ref.to_string()]
+    );
+
+    let missing_after_a = assert_ready_ok!(
+        spawn(default_query.missing_docs_at(&database, None, Some(&phantom_a_ref.to_string())))
+            .poll_until_idle()
+    );
+    assert_eq!(missing_after_a, vec![phantom_b_ref.to_string()]);
+
+    // `FirestoreDatabase::list_docs(..., show_missing: true)` under `ReadConsistency::Default`
+    // completes immediately without blocking.
+    let (listed_default, next_tok) = assert_ready_ok!(
+        spawn(database.list_docs(
+            Ref::Root(database.name.clone()),
+            "users".to_string(),
+            0,
+            String::new(),
+            String::new(),
+            None,
+            true,
+            ReadConsistency::Default,
+        ))
+        .poll_until_idle()
+    );
+    assert_eq!(next_tok, "");
+    assert_eq!(
+        listed_default.iter().map(|d| d.name.as_str()).collect_vec(),
+        vec![
+            existing_ref.to_string(),
+            phantom_a_ref.to_string(),
+            phantom_b_ref.to_string(),
+        ]
+    );
+    assert!(listed_default[0].create_time.is_some());
+    assert!(listed_default[1].create_time.is_none());
+    assert!(listed_default[2].create_time.is_none());
+
+    // Historical `ReadTime` also completes lock-free and filters phantom ancestors by child MVCC
+    // existence at the requested timestamp.
+    let mid_query = QueryBuilder::from_collection(users_col)
+        .consistency(ReadConsistency::ReadTime(t_mid))
+        .build()?;
+    assert_eq!(
+        assert_ready_ok!(spawn(mid_query.missing_docs(&database)).poll_until_idle()),
+        vec![phantom_a_ref.to_string()]
+    );
+
+    let (listed_all, _) = assert_ready_ok!(
+        spawn(database.list_docs(
+            Ref::Root(database.name.clone()),
+            "users".to_string(),
+            0,
+            String::new(),
+            String::new(),
+            None,
+            true,
+            ReadConsistency::ReadTime(t_all),
+        ))
+        .poll_until_idle()
+    );
+    assert_eq!(
+        listed_all.iter().map(|d| d.name.as_str()).collect_vec(),
+        vec![
+            existing_ref.to_string(),
+            phantom_a_ref.to_string(),
+            phantom_b_ref.to_string(),
+            phantom_c_ref.to_string(),
+        ]
+    );
+
+    drop((lease_phantom, lease_child, lease_existing));
+    lock_session.close();
+
+    let unblocked = assert_ready_ok!(
+        spawn(database.get_doc(&phantom_a_ref, ReadConsistency::Default)).poll_until_idle()
+    );
+    assert!(unblocked.is_none());
+
+    Ok(())
+}
+
+#[gtest]
+#[tokio::test(start_paused = true)]
+async fn missing_docs_at_respects_readonly_and_optimistic_mvcc_snapshots_and_rejects_inactive_txns()
+-> Result<()> {
+    use std::collections::HashMap;
+
+    use googleapis::google::protobuf::Timestamp;
+
+    use crate::database::DocumentRef;
+
+    // 1. ReadOnly (implicit snapshot + explicit historical read_time) and multi-subcollection
+    //    phantom ancestor deduplication.
+    let db = fresh_database()?;
+    let users_col = CollectionRef::new(db.name.clone(), "users");
+    let alice_ref: DocumentRef = format!("{}/users/alice", db.name).parse()?;
+    let p_multi_ref: DocumentRef = format!("{}/users/p_multi", db.name).parse()?;
+    let p_multi_s1: DocumentRef = format!("{}/users/p_multi/sub1/c1", db.name).parse()?;
+    let p_multi_s2: DocumentRef = format!("{}/users/p_multi/sub2/c2", db.name).parse()?;
+    let p_del_ref: DocumentRef = format!("{}/users/p_del", db.name).parse()?;
+    let p_del_sub: DocumentRef = format!("{}/users/p_del/sub/c1", db.name).parse()?;
+    let p_after_ref: DocumentRef = format!("{}/users/p_after", db.name).parse()?;
+    let p_after_sub: DocumentRef = format!("{}/users/p_after/sub/c1", db.name).parse()?;
+
+    for doc_ref in [&alice_ref, &p_multi_s1, &p_multi_s2, &p_del_sub] {
+        db.update_doc(
+            doc_ref,
+            HashMap::from([("v".to_string(), Value::integer(1))]),
+            None,
+            None,
+            None,
+        )
+        .await?;
+    }
+    let t_past = Timestamp::now();
+
+    let ro_implicit = db
+        .new_txn(TransactionOptions {
+            mode: Some(transaction_options::Mode::ReadOnly(
+                transaction_options::ReadOnly::default(),
+            )),
+        })
+        .await?;
+    let ro_historical = db
+        .new_txn(TransactionOptions {
+            mode: Some(transaction_options::Mode::ReadOnly(
+                transaction_options::ReadOnly {
+                    consistency_selector: Some(
+                        transaction_options::read_only::ConsistencySelector::ReadTime(t_past),
+                    ),
+                },
+            )),
+        })
+        .await?;
+
+    // Mutations after `t_past` and `ro_implicit` snapshot:
+    // - Create subchild under `p_after` (must NOT be phantom at `t_past` / `ro_implicit`)
+    // - Delete sole subchild under `p_del` (MUST STILL be phantom at `t_past` / `ro_implicit`)
+    // - Materialize `p_multi` (MUST STILL be phantom at `t_past` / `ro_implicit`)
+    db.update_doc(
+        &p_after_sub,
+        HashMap::from([("v".to_string(), Value::integer(2))]),
+        None,
+        None,
+        None,
+    )
+    .await?;
+    db.delete_doc(&p_del_sub, None).await?;
+    db.update_doc(
+        &p_multi_ref,
+        HashMap::from([("materialized".to_string(), Value::boolean(true))]),
+        None,
+        None,
+        None,
+    )
+    .await?;
+
+    let expected_past = vec![p_del_ref.to_string(), p_multi_ref.to_string()];
+    for ro_txn in [ro_implicit, ro_historical] {
+        let q = QueryBuilder::from_collection(users_col.clone())
+            .consistency(ReadConsistency::Transaction(ro_txn))
+            .build()?;
+        assert_eq!(q.missing_docs(&db).await?, expected_past);
+        assert_eq!(
+            q.missing_docs_at(&db, None, Some(&p_del_ref.to_string()))
+                .await?,
+            vec![p_multi_ref.to_string()]
+        );
+        db.rollback(ro_txn).await?;
+    }
+
+    // Default listing sees latest state (`p_after` only).
+    let q_default = QueryBuilder::from_collection(users_col).build()?;
+    assert_eq!(
+        q_default.missing_docs(&db).await?,
+        vec![p_after_ref.to_string()]
+    );
+
+    // 2. Enterprise Optimistic transaction: MVCC snapshot isolation + write-skew preservation on
+    //    observed phantom ancestor.
+    let ent_db = fresh_database()?;
+    ent_db.set_config(true, true);
+    let ent_users = CollectionRef::new(ent_db.name.clone(), "users");
+    let ent_seed: DocumentRef = format!("{}/users/seed", ent_db.name).parse()?;
+    let ent_p_keep: DocumentRef = format!("{}/users/p_keep", ent_db.name).parse()?;
+    let ent_p_keep_s1: DocumentRef = format!("{}/users/p_keep/s1/d1", ent_db.name).parse()?;
+    let ent_p_keep_s2: DocumentRef = format!("{}/users/p_keep/s2/d2", ent_db.name).parse()?;
+    let ent_p_del: DocumentRef = format!("{}/users/p_del", ent_db.name).parse()?;
+    let ent_p_del_sub: DocumentRef = format!("{}/users/p_del/sub/d1", ent_db.name).parse()?;
+    let ent_p_after_sub: DocumentRef = format!("{}/users/p_after/sub/d1", ent_db.name).parse()?;
+
+    for doc_ref in [&ent_seed, &ent_p_keep_s1, &ent_p_keep_s2, &ent_p_del_sub] {
+        ent_db
+            .update_doc(
+                doc_ref,
+                HashMap::from([("v".to_string(), Value::integer(1))]),
+                None,
+                None,
+                None,
+            )
+            .await?;
+    }
+
+    let opt_txn = start_rw_txn(&ent_db);
+    // Pin optimistic `read_time` before concurrent writes.
+    let _unused = ent_db
+        .get_doc(&ent_seed, ReadConsistency::Transaction(opt_txn))
+        .await?;
+
+    // Concurrent writes after `opt_txn` pinned its snapshot:
+    ent_db
+        .update_doc(
+            &ent_p_after_sub,
+            HashMap::from([("v".to_string(), Value::integer(2))]),
+            None,
+            None,
+            None,
+        )
+        .await?;
+    ent_db.delete_doc(&ent_p_del_sub, None).await?;
+
+    let opt_q = QueryBuilder::from_collection(ent_users.clone())
+        .enterprise_edition(true)
+        .consistency(ReadConsistency::Transaction(opt_txn))
+        .build()?;
+    let opt_missing = opt_q.missing_docs(&ent_db).await?;
+    assert_eq!(
+        opt_missing,
+        vec![ent_p_del.to_string(), ent_p_keep.to_string()]
+    );
+
+    // Concurrent materialization of observed phantom ancestor `p_keep` triggers optimistic
+    // write-skew abort on commit.
+    ent_db
+        .update_doc(
+            &ent_p_keep,
+            HashMap::from([("materialized".to_string(), Value::boolean(true))]),
+            None,
+            None,
+            None,
+        )
+        .await?;
+    let summary_ref: DocumentRef = format!("{}/other/summary", ent_db.name).parse()?;
+    let commit_err = ent_db
+        .commit(
+            vec![Write {
+                operation: Some(write::Operation::Update(Document {
+                    name: summary_ref.to_string(),
+                    fields: HashMap::from([("ok".to_string(), Value::boolean(true))]),
+                    ..Default::default()
+                })),
+                ..Default::default()
+            }],
+            Some(opt_txn),
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(commit_err, GenericDatabaseError::Aborted(_)),
+        "expected OptimisticWriteSkew Aborted after phantom ancestor materialization, got \
+         {commit_err:?}"
+    );
+
+    // 3. Zero-subcollection database: expired and rolled-back `Transaction(id)` are rejected
+    //    upfront instead of returning `Ok(vec![])`.
+    let empty_db = fresh_database()?;
+    let empty_users = CollectionRef::new(empty_db.name.clone(), "users");
+
+    let rb_txn = start_rw_txn(&empty_db);
+    empty_db.rollback(rb_txn).await?;
+    let q_rb = QueryBuilder::from_collection(empty_users.clone())
+        .consistency(ReadConsistency::Transaction(rb_txn))
+        .build()?;
+    assert!(matches!(
+        q_rb.missing_docs(&empty_db).await,
+        Err(GenericDatabaseError::InvalidArgument(_))
+    ));
+
+    let exp_ro = empty_db.new_txn(TransactionOptions::default()).await?;
+    let exp_rw = start_rw_txn(&empty_db);
+    let exp_rw_rb = start_rw_txn(&empty_db);
+    tokio::time::advance(std::time::Duration::from_secs(61)).await;
+    empty_db.rollback(exp_rw_rb).await?;
+
+    for expired_txn in [exp_ro, exp_rw, exp_rw_rb] {
+        let q_exp = QueryBuilder::from_collection(empty_users.clone())
+            .consistency(ReadConsistency::Transaction(expired_txn))
+            .build()?;
+        assert!(
+            matches!(
+                q_exp.missing_docs(&empty_db).await,
+                Err(GenericDatabaseError::Aborted(_))
+            ),
+            "expected Aborted for expired transaction with zero subcollections"
+        );
+    }
+
+    Ok(())
+}
+
+#[gtest]
+fn require_existing_fields_filters_missing_fields_and_preserves_explicit_nulls_in_prefilters()
+-> Result<()> {
+    use std::collections::HashMap;
+
+    use crate::document::StoredDocumentVersion;
+
+    let root: RootRef = "projects/p/databases/(default)".parse()?;
+    let col = CollectionRef::new(root, "items");
+    let make_doc = |id: &str, fields: HashMap<String, Value>| StoredDocumentVersion {
+        name: crate::reference::DocumentRef::new(col.clone(), id),
+        create_time: Default::default(),
+        update_time: Default::default(),
+        fields,
+    };
+
+    let mut q = QueryBuilder::from_collection(col.clone()).build()?;
+    q.require_existing_fields(vec![
+        "b".parse()?,
+        "a".parse()?,
+        "a".parse()?,
+        "nested.x".parse()?,
+    ]);
+
+    let has_both_null = make_doc(
+        "d1",
+        HashMap::from([
+            ("a".to_string(), Value::null()),
+            ("b".to_string(), Value::integer(1)),
+            (
+                "nested".to_string(),
+                Value::map(HashMap::from([("x".to_string(), Value::null())])),
+            ),
+        ]),
+    );
+    let missing_b = make_doc(
+        "d2",
+        HashMap::from([
+            ("a".to_string(), Value::integer(1)),
+            (
+                "nested".to_string(),
+                Value::map(HashMap::from([("x".to_string(), Value::integer(2))])),
+            ),
+        ]),
+    );
+    let non_map_nested = make_doc(
+        "d3",
+        HashMap::from([
+            ("a".to_string(), Value::integer(1)),
+            ("b".to_string(), Value::integer(2)),
+            ("nested".to_string(), Value::integer(42)),
+        ]),
+    );
+
+    assert!(q.matches_prefilters(&has_both_null));
+    assert!(!q.matches_prefilters(&missing_b));
+    assert!(!q.matches_prefilters(&non_map_nested));
+    Ok(())
+}

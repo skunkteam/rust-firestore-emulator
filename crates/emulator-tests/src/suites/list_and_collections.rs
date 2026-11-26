@@ -15,6 +15,7 @@ use tonic::Code;
 
 use crate::harness::{
     builders::{doc_mask, doc_path},
+    contention::ContentionProbe,
     env::{DOCUMENTS_ROOT, TestEnv},
     matchers::{assert_doc_wire_eq, assert_status_code, doc_names, short_ids},
 };
@@ -1100,4 +1101,397 @@ async fn list_documents_enterprise_edition_behavior() {
     assert!(miss2.documents[0].create_time.is_some());
     assert!(miss2.documents[1].create_time.is_none());
     expect_eq!(miss2.next_page_token, "");
+}
+
+#[gtest]
+#[tokio::test(start_paused = true)]
+async fn list_documents_show_missing_default_does_not_block_on_pessimistic_write_lock() {
+    let mut db = TestEnv::new().build_db();
+
+    db.put("users/a_phantom/sub/c1", fields!({ "v": 1i64 }))
+        .await
+        .unwrap();
+    db.put("users/doc_z", fields!({ "v": 2i64 })).await.unwrap();
+
+    // Tx1 acquires a retained read lock on `users/doc_z` (older lock priority).
+    let mut tx1 = db.begin_rw_txn().await.unwrap();
+    let _unused = tx1.get("users/doc_z").await.unwrap();
+
+    // Tx2 commits `[users/a_phantom, users/doc_z]`. Because `commit_read_write` acquires locks
+    // in sorted `BTreeSet<DocumentRef>` order (`"users/a_phantom" < "users/doc_z"`), Tx2 holds
+    // the exclusive write lock on `users/a_phantom` while parking on `users/doc_z`.
+    let mut tx2 = db.begin_rw_txn().await.unwrap();
+    tx2.put("users/a_phantom", fields!({ "materialized": true }))
+        .put("users/doc_z", fields!({ "v": 3i64 }));
+    let mut tx2_commit = ContentionProbe::spawn_op(tx2.commit());
+    tx2_commit.assert_pending().await;
+
+    // A normal `ReadConsistency::Default` read on `users/a_phantom` blocks on Tx2's write lock.
+    let mut blocked_get_client = db.clone();
+    let mut blocked_get =
+        ContentionProbe::spawn_op(async move { blocked_get_client.get("users/a_phantom").await });
+    blocked_get.assert_pending().await;
+
+    // `list_docs(..., show_missing: true)` under `ReadConsistency::Default` evaluates MVCC
+    // snapshots lock-free and completes immediately over both gRPC and HTTP REST.
+    let mut list_client = db.clone();
+    let list_op = ContentionProbe::spawn_op(async move {
+        list_client
+            .list_docs("users", 0, "", "", None, true, None)
+            .await
+    });
+    let listed = list_op
+        .expect_ready()
+        .await
+        .expect("gRPC list_docs(show_missing=true) must not block on held write lock");
+    expect_eq!(short_ids(&listed.documents), vec!["a_phantom", "doc_z"]);
+    expect_that!(listed.documents[0].create_time, none());
+    expect_that!(listed.documents[0].update_time, none());
+    expect_eq!(listed.documents[1].fields["v"].as_integer(), Some(2));
+
+    let http_op = ContentionProbe::spawn_op(db.http_oneshot(
+        Method::GET,
+        "/v1/projects/test-project/databases/(default)/documents/users?showMissing=true",
+        None,
+    ));
+    let (http_status, http_body) = http_op.expect_ready().await;
+    expect_eq!(http_status, StatusCode::OK);
+    let http_resp: ListDocumentsResponse = serde_json::from_slice(&http_body).unwrap();
+    expect_eq!(short_ids(&http_resp.documents), vec!["a_phantom", "doc_z"]);
+    expect_that!(http_resp.documents[0].create_time, none());
+
+    tx2_commit.assert_pending().await;
+
+    // Releasing Tx1 unblocks Tx2's commit and the parked point read.
+    tx1.rollback().await.unwrap();
+    tx2_commit
+        .expect_ready()
+        .await
+        .expect("Tx2 commit completes once Tx1 releases doc_z");
+    let materialized = blocked_get
+        .expect_ready()
+        .await
+        .expect("blocked point read completes after Tx2 commits");
+    expect_eq!(materialized.fields["materialized"].as_boolean(), Some(true));
+
+    let after = db
+        .list_docs("users", 0, "", "", None, true, None)
+        .await
+        .unwrap();
+    expect_eq!(short_ids(&after.documents), vec!["a_phantom", "doc_z"]);
+    expect_that!(after.documents[0].create_time, some(anything()));
+    expect_eq!(after.documents[1].fields["v"].as_integer(), Some(3));
+}
+
+#[gtest]
+#[tokio::test]
+async fn list_documents_show_missing_historical_read_time_excludes_future_phantoms() {
+    let mut db = TestEnv::new().build_db();
+
+    db.put("users/alice", fields!({ "v": 1i64 })).await.unwrap();
+    db.put("users/phantom_before/sub/c1", fields!({ "v": 1i64 }))
+        .await
+        .unwrap();
+    let deleted_child = db
+        .put("users/phantom_deleted/sub/c2", fields!({ "v": 2i64 }))
+        .await
+        .unwrap();
+    let snap_t = deleted_child.update_time.unwrap();
+
+    // Mutations after `snap_t`:
+    // - `phantom_after` has its sole child created after `snap_t` (must be excluded at `snap_t`).
+    // - `zoe` is a normal document created after `snap_t` (must be excluded at `snap_t`).
+    // - `phantom_before` is materialized after `snap_t` (must still appear phantom at `snap_t`).
+    // - `phantom_deleted`'s sole child is deleted after `snap_t` (must still appear phantom at
+    //   `snap_t`).
+    db.put("users/phantom_after/sub/c3", fields!({ "v": 3i64 }))
+        .await
+        .unwrap();
+    db.put("users/zoe", fields!({ "v": 4i64 })).await.unwrap();
+    db.put("users/phantom_before", fields!({ "materialized": true }))
+        .await
+        .unwrap();
+    db.delete("users/phantom_deleted/sub/c2", None)
+        .await
+        .unwrap();
+
+    let historical = db
+        .list_docs(
+            "users",
+            0,
+            "",
+            "",
+            None,
+            true,
+            Some(ConsistencySelector::ReadTime(snap_t)),
+        )
+        .await
+        .expect("historical list_docs(show_missing=true) at ReadTime");
+    expect_eq!(
+        short_ids(&historical.documents),
+        vec!["alice", "phantom_before", "phantom_deleted"]
+    );
+    expect_that!(historical.documents[0].create_time, some(anything()));
+    expect_that!(historical.documents[1].create_time, none());
+    expect_that!(historical.documents[1].update_time, none());
+    expect_that!(historical.documents[2].create_time, none());
+    expect_that!(historical.documents[2].update_time, none());
+
+    // Pagination at historical `ReadTime(snap_t)` with `show_missing = true` preserves snapshot
+    // filtering across pages.
+    let hist_p1 = db
+        .list_docs(
+            "users",
+            2,
+            "",
+            "",
+            None,
+            true,
+            Some(ConsistencySelector::ReadTime(snap_t)),
+        )
+        .await
+        .unwrap();
+    expect_eq!(
+        short_ids(&hist_p1.documents),
+        vec!["alice", "phantom_before"]
+    );
+    assert!(!hist_p1.next_page_token.is_empty());
+
+    let hist_p2 = db
+        .list_docs(
+            "users",
+            2,
+            &hist_p1.next_page_token,
+            "",
+            None,
+            true,
+            Some(ConsistencySelector::ReadTime(snap_t)),
+        )
+        .await
+        .unwrap();
+    expect_eq!(short_ids(&hist_p2.documents), vec!["phantom_deleted"]);
+    expect_eq!(hist_p2.next_page_token, "");
+
+    // Latest `Default` listing reflects the post-`snap_t` mutations.
+    let latest = db
+        .list_docs("users", 0, "", "", None, true, None)
+        .await
+        .unwrap();
+    expect_eq!(
+        short_ids(&latest.documents),
+        vec!["alice", "phantom_after", "phantom_before", "zoe"]
+    );
+    expect_that!(latest.documents[1].create_time, none());
+    expect_that!(latest.documents[2].create_time, some(anything()));
+}
+
+#[gtest]
+#[tokio::test]
+async fn list_documents_show_missing_readonly_and_enterprise_optimistic_mvcc_snapshots() {
+    // 1. ReadOnly transaction (implicit snapshot + explicit historical read_time).
+    let mut std_db = TestEnv::new().build_db();
+    std_db
+        .put("users/alice", fields!({ "v": 1i64 }))
+        .await
+        .unwrap();
+    std_db
+        .put("users/phantom_multi/sub1/c1", fields!({ "v": 1i64 }))
+        .await
+        .unwrap();
+    std_db
+        .put("users/phantom_multi/sub2/c2", fields!({ "v": 2i64 }))
+        .await
+        .unwrap();
+    let del_child = std_db
+        .put("users/phantom_del/sub/c3", fields!({ "v": 3i64 }))
+        .await
+        .unwrap();
+    let t_past = del_child.update_time.unwrap();
+
+    let ro_implicit = std_db.begin_ro_txn(None).await.unwrap();
+    let ro_historical = std_db.begin_ro_txn(Some(t_past)).await.unwrap();
+
+    // Concurrent mutations after `t_past` and `ro_implicit` snapshot:
+    std_db
+        .put("users/phantom_after/sub/c4", fields!({ "v": 4i64 }))
+        .await
+        .unwrap();
+    std_db
+        .delete("users/phantom_del/sub/c3", None)
+        .await
+        .unwrap();
+    std_db
+        .put("users/phantom_multi", fields!({ "materialized": true }))
+        .await
+        .unwrap();
+
+    for ro_txn in [&ro_implicit, &ro_historical] {
+        let listed = std_db
+            .list_docs(
+                "users",
+                0,
+                "",
+                "",
+                None,
+                true,
+                Some(ConsistencySelector::Transaction(ro_txn.id().to_vec())),
+            )
+            .await
+            .unwrap();
+        expect_eq!(
+            short_ids(&listed.documents),
+            vec!["alice", "phantom_del", "phantom_multi"]
+        );
+        expect_that!(listed.documents[0].create_time, some(anything()));
+        expect_that!(listed.documents[1].create_time, none());
+        expect_that!(listed.documents[2].create_time, none());
+    }
+    ro_implicit.rollback().await.unwrap();
+    ro_historical.rollback().await.unwrap();
+
+    // 2. Enterprise Optimistic transaction: snapshot isolation + phantom write-skew preservation.
+    let mut ent_db = TestEnv::enterprise().build_db();
+    ent_db
+        .put("users/alice", fields!({ "v": 1i64 }))
+        .await
+        .unwrap();
+    ent_db
+        .put("users/phantom_keep/sub1/c1", fields!({ "v": 1i64 }))
+        .await
+        .unwrap();
+    ent_db
+        .put("users/phantom_keep/sub2/c2", fields!({ "v": 2i64 }))
+        .await
+        .unwrap();
+    ent_db
+        .put("users/phantom_del/sub/c3", fields!({ "v": 3i64 }))
+        .await
+        .unwrap();
+
+    let mut opt_txn = ent_db.begin_rw_txn().await.unwrap();
+    // Pin optimistic snapshot before concurrent writes.
+    let _unused = opt_txn.get("users/alice").await.unwrap();
+
+    ent_db
+        .put("users/phantom_after/sub/c4", fields!({ "v": 4i64 }))
+        .await
+        .unwrap();
+    ent_db
+        .delete("users/phantom_del/sub/c3", None)
+        .await
+        .unwrap();
+
+    let opt_list = ent_db
+        .list_docs(
+            "users",
+            0,
+            "",
+            "",
+            None,
+            true,
+            Some(ConsistencySelector::Transaction(opt_txn.id().to_vec())),
+        )
+        .await
+        .unwrap();
+    expect_eq!(
+        short_ids(&opt_list.documents),
+        vec!["alice", "phantom_del", "phantom_keep"]
+    );
+    expect_that!(opt_list.documents[1].create_time, none());
+    expect_that!(opt_list.documents[2].create_time, none());
+
+    // Materializing observed phantom ancestor `users/phantom_keep` causes write-skew Aborted on
+    // commit.
+    ent_db
+        .put("users/phantom_keep", fields!({ "materialized": true }))
+        .await
+        .unwrap();
+    opt_txn.put("other/out", fields!({ "ok": true }));
+    assert_status_code(opt_txn.commit().await, Code::Aborted);
+
+    // Without concurrent conflict on observed docs/range, commit succeeds.
+    let mut clean_txn = ent_db.begin_rw_txn().await.unwrap();
+    let clean_list = ent_db
+        .list_docs(
+            "users",
+            0,
+            "",
+            "",
+            None,
+            true,
+            Some(ConsistencySelector::Transaction(clean_txn.id().to_vec())),
+        )
+        .await
+        .unwrap();
+    expect_eq!(
+        short_ids(&clean_list.documents),
+        vec!["alice", "phantom_after", "phantom_keep"]
+    );
+    ent_db
+        .put("other/unrelated", fields!({ "ok": true }))
+        .await
+        .unwrap();
+    clean_txn.put("other/out2", fields!({ "ok": true }));
+    clean_txn.commit().await.unwrap();
+}
+
+#[gtest]
+#[tokio::test(start_paused = true)]
+async fn list_documents_show_missing_rejects_expired_and_rolled_back_txns_with_zero_subcollections()
+{
+    let mut db = TestEnv::new().build_db();
+    let ro_exp = db.begin_ro_txn(None).await.unwrap();
+    let ro_exp_id = ro_exp.id().to_vec();
+    let rw_exp = db.begin_rw_txn().await.unwrap();
+    let rw_exp_id = rw_exp.id().to_vec();
+    let rw_rb = db.begin_rw_txn().await.unwrap();
+    let rw_rb_id = rw_rb.id().to_vec();
+    rw_rb.rollback().await.unwrap();
+
+    assert_status_code(
+        db.list_docs(
+            "users",
+            0,
+            "",
+            "",
+            None,
+            true,
+            Some(ConsistencySelector::Transaction(rw_rb_id)),
+        )
+        .await,
+        Code::InvalidArgument,
+    );
+
+    tokio::time::advance(std::time::Duration::from_secs(61)).await;
+    tokio::task::yield_now().await;
+
+    for exp_id in [&ro_exp_id, &rw_exp_id] {
+        assert_status_code(
+            db.list_docs(
+                "users",
+                0,
+                "",
+                "",
+                None,
+                true,
+                Some(ConsistencySelector::Transaction(exp_id.clone())),
+            )
+            .await,
+            Code::Aborted,
+        );
+    }
+    db.rollback_raw(&rw_exp_id).await.unwrap();
+    assert_status_code(
+        db.list_docs(
+            "users",
+            0,
+            "",
+            "",
+            None,
+            true,
+            Some(ConsistencySelector::Transaction(rw_exp_id)),
+        )
+        .await,
+        Code::Aborted,
+    );
 }

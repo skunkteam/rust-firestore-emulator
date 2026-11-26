@@ -52,6 +52,11 @@ pub(crate) fn router() -> Router<&'static FirestoreProject> {
                 .fallback(method_not_allowed_fallback("/v1/projects", "POST")),
         )
         .route(
+            "/{project_id}/databases/{database_id}/documents:runAggregationQuery",
+            post(dispatch_root_run_aggregation_query)
+                .fallback(method_not_allowed_fallback("/v1/projects", "POST")),
+        )
+        .route(
             "/{project_id}/databases/{database_id}/documents/{*tail}",
             any(dispatch_documents_tail),
         )
@@ -106,6 +111,23 @@ async fn dispatch_root_run_query(
     RestBytes(body): RestBytes,
 ) -> Result<Response> {
     dispatch_root_request(project, Some("runQuery"), Method::POST, uri, headers, &body).await
+}
+
+async fn dispatch_root_run_aggregation_query(
+    State(project): State<&'static FirestoreProject>,
+    uri: Uri,
+    headers: HeaderMap,
+    RestBytes(body): RestBytes,
+) -> Result<Response> {
+    dispatch_root_request(
+        project,
+        Some("runAggregationQuery"),
+        Method::POST,
+        uri,
+        headers,
+        &body,
+    )
+    .await
 }
 
 async fn dispatch_documents_tail(

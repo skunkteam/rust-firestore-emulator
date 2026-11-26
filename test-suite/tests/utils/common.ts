@@ -33,6 +33,20 @@ export interface RawRunQueryResponseChunk {
     transaction?: Uint8Array;
 }
 
+export interface RawRunAggregationQueryRequest {
+    parent: string;
+    structuredAggregationQuery?: Record<string, unknown>;
+    transaction?: Uint8Array;
+    newTransaction?: Record<string, unknown>;
+    readTime?: unknown;
+}
+
+export interface RawRunAggregationQueryResponseChunk {
+    result?: { aggregateFields?: Record<string, RawProtoValue> };
+    transaction?: Uint8Array;
+    readTime?: unknown;
+}
+
 interface InternalQueryProtoCarrier {
     toProto(transaction?: Uint8Array): RawRunQueryRequest;
 }
@@ -181,10 +195,13 @@ export async function callRawStreamRpc<TReq extends object, TChunk = unknown>(
     });
 }
 
-export async function rawRunQuery(firestore: Firestore, req: RawRunQueryRequest, tag = 'runQuery'): Promise<RawRunQueryResponseChunk[]> {
+async function runStreamRpcWithRollback<
+    TReq extends { parent: string; newTransaction?: Record<string, unknown> },
+    TChunk extends { transaction?: Uint8Array },
+>(firestore: Firestore, rpc: 'runQuery' | 'runAggregationQuery', req: TReq, tag: string): Promise<TChunk[]> {
     let capturedTx: Uint8Array | undefined;
     try {
-        return await callRawStreamRpc<RawRunQueryRequest, RawRunQueryResponseChunk>(firestore, 'runQuery', req, tag, chunk => {
+        return await callRawStreamRpc<TReq, TChunk>(firestore, rpc, req, tag, chunk => {
             if (chunk.transaction && chunk.transaction.length > 0) {
                 capturedTx = chunk.transaction;
             }
@@ -195,6 +212,18 @@ export async function rawRunQuery(firestore: Firestore, req: RawRunQueryRequest,
             await callRawUnaryRpc(firestore, 'rollback', { database, transaction: capturedTx }).catch(() => undefined);
         }
     }
+}
+
+export async function rawRunQuery(firestore: Firestore, req: RawRunQueryRequest, tag = 'runQuery'): Promise<RawRunQueryResponseChunk[]> {
+    return runStreamRpcWithRollback(firestore, 'runQuery', req, tag);
+}
+
+export async function rawRunAggregationQuery(
+    firestore: Firestore,
+    req: RawRunAggregationQueryRequest,
+    tag = 'runAggregationQuery',
+): Promise<RawRunAggregationQueryResponseChunk[]> {
+    return runStreamRpcWithRollback(firestore, 'runAggregationQuery', req, tag);
 }
 
 export async function expectRpcCode(fn: () => Promise<unknown>, expectedCode: number, label = 'rpc'): Promise<void> {

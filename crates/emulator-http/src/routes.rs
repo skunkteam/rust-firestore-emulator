@@ -144,6 +144,24 @@ async fn root_fallback(method: Method, uri: Uri) -> Response {
 
 #[cfg(feature = "ui")]
 fn serve_ui_asset(rel_path: &str) -> Response {
+    #[cfg(debug_assertions)]
+    {
+        let ui_dir = std::env::var_os("FIRESTORE_EMULATOR_UI_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| Path::new(env!("CARGO_MANIFEST_DIR")).join("../../ui"));
+        serve_ui_asset_in(rel_path, Some(&ui_dir))
+    }
+    #[cfg(not(debug_assertions))]
+    {
+        serve_ui_asset_in(rel_path, None)
+    }
+}
+
+#[cfg(feature = "ui")]
+fn serve_ui_asset_in(
+    rel_path: &str,
+    #[allow(unused_variables)] disk_ui_dir: Option<&Path>,
+) -> Response {
     let trimmed = rel_path.trim_start_matches('/');
     if trimmed.is_empty()
         || trimmed.contains('\\')
@@ -151,6 +169,7 @@ fn serve_ui_asset(rel_path: &str) -> Response {
             seg.is_empty()
                 || seg == "."
                 || seg == ".."
+                || seg.eq_ignore_ascii_case("tests")
                 || matches!(seg.as_bytes(), [drive, b':', ..] if drive.is_ascii_alphabetic())
         })
         || !Path::new(trimmed)
@@ -163,10 +182,7 @@ fn serve_ui_asset(rel_path: &str) -> Response {
     }
 
     #[cfg(debug_assertions)]
-    {
-        let ui_dir = std::env::var_os("FIRESTORE_EMULATOR_UI_DIR")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| Path::new(env!("CARGO_MANIFEST_DIR")).join("../../ui"));
+    if let Some(ui_dir) = disk_ui_dir {
         let disk_path = ui_dir.join(trimmed);
         if let Some(content_type) = mime_for_rel_path(trimmed)
             && let Ok(bytes) = std::fs::read(&disk_path)
@@ -242,6 +258,59 @@ mod tests {
         ] {
             let resp = serve_ui_asset(path);
             assert_eq!(resp.status(), StatusCode::NOT_FOUND, "path: {path}");
+        }
+    }
+
+    #[test]
+    fn serve_ui_asset_rejects_tests_directory_even_when_files_exist_on_disk() {
+        use std::path::PathBuf;
+
+        struct RemoveDirOnDrop(PathBuf);
+        impl Drop for RemoveDirOnDrop {
+            fn drop(&mut self) {
+                drop(std::fs::remove_dir_all(&self.0));
+            }
+        }
+
+        let dir = Path::new(env!("OUT_DIR"))
+            .join(format!("serve_ui_asset_tests_dir_{}", std::process::id()));
+        let _cleanup = RemoveDirOnDrop(dir.clone());
+        std::fs::create_dir_all(dir.join("tests")).unwrap();
+        std::fs::create_dir_all(dir.join("nested/tests")).unwrap();
+        std::fs::write(dir.join("ok.js"), b"export const ok = 1;").unwrap();
+        std::fs::write(dir.join("tests/foo.js"), b"export const secret = 1;").unwrap();
+        std::fs::write(
+            dir.join("tests/a11y-and-modals.test.mjs"),
+            b"export const test = 1;",
+        )
+        .unwrap();
+        std::fs::write(dir.join("nested/tests/bar.js"), b"export const nested = 1;").unwrap();
+
+        #[cfg(debug_assertions)]
+        assert_eq!(
+            serve_ui_asset_in("ok.js", Some(&dir)).status(),
+            StatusCode::OK
+        );
+
+        for blocked in [
+            "tests/foo.js",
+            "/tests/foo.js",
+            "Tests/foo.js",
+            "TESTS/foo.js",
+            "tests/a11y-and-modals.test.mjs",
+            "nested/tests/bar.js",
+            "nested/Tests/bar.js",
+        ] {
+            assert_eq!(
+                serve_ui_asset_in(blocked, Some(&dir)).status(),
+                StatusCode::NOT_FOUND,
+                "serve_ui_asset_in path: {blocked}"
+            );
+            assert_eq!(
+                serve_ui_asset(blocked).status(),
+                StatusCode::NOT_FOUND,
+                "serve_ui_asset path: {blocked}"
+            );
         }
     }
 }

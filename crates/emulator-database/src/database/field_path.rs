@@ -110,20 +110,28 @@ impl FieldPath {
         self.0.starts_with(&prefix.0)
     }
 
-    pub(crate) fn validate_non_reserved(&self) -> Result<()> {
+    fn validate_segments(&self, allow_doc_name: bool) -> Result<()> {
         for seg in &self.0 {
             if seg.is_empty() {
                 return Err(GenericDatabaseError::invalid_argument(
                     "field path cannot contain empty segments",
                 ));
             }
-            if super::reference::is_reserved_name(seg) {
+            if super::reference::is_reserved_name(seg) && !(allow_doc_name && seg == DOC_NAME) {
                 return Err(GenericDatabaseError::invalid_argument(format!(
                     "the name {seg} is reserved"
                 )));
             }
         }
         Ok(())
+    }
+
+    pub(crate) fn validate_non_reserved(&self) -> Result<()> {
+        self.validate_segments(false)
+    }
+
+    pub(crate) fn validate_non_reserved_allowing_doc_name(&self) -> Result<()> {
+        self.validate_segments(true)
     }
 
     /// Walk the path as represented by this [`FieldPath`] into the given object fields and return
@@ -461,6 +469,26 @@ mod tests {
                 bad.parse::<FieldReference>()
                     .unwrap()
                     .validate_query_reference(),
+                err(matches_pattern!(GenericDatabaseError::InvalidArgument(_)))
+            );
+        }
+    }
+
+    #[gtest]
+    fn validate_non_reserved_allowing_doc_name_permits_doc_name_only() {
+        for ok in ["a.__name__", "a.__name__.b", "__name__.a", "____"] {
+            assert!(
+                ok.parse::<FieldPath>()
+                    .unwrap()
+                    .validate_non_reserved_allowing_doc_name()
+                    .is_ok()
+            );
+        }
+        for bad in ["__custom__", "a.__custom__", "a.__custom__.b", "a..b"] {
+            assert_that!(
+                bad.parse::<FieldPath>()
+                    .unwrap()
+                    .validate_non_reserved_allowing_doc_name(),
                 err(matches_pattern!(GenericDatabaseError::InvalidArgument(_)))
             );
         }
