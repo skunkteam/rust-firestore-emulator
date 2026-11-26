@@ -6,6 +6,7 @@ mod list_and_collections;
 mod listeners;
 mod pipelines;
 mod properties;
+mod snapshot;
 mod structured_query;
 mod transactions_mvcc;
 mod transforms_preconditions;
