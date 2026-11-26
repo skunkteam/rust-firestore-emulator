@@ -566,6 +566,19 @@ async fn test_rest_error_envelopes_and_404_isolation() -> Result<()> {
             .await?;
         expect_eq!(md_asset.status(), StatusCode::NOT_FOUND);
 
+        for blocked_test_asset in [
+            "/ui/tests/a11y-and-modals.test.mjs",
+            "/ui/tests/foo.js",
+            "/ui/Tests/foo.js",
+            "/ui/TESTS/foo.js",
+        ] {
+            let test_asset = client
+                .get(format!("{base_url}{blocked_test_asset}"))
+                .send()
+                .await?;
+            expect_eq!(test_asset.status(), StatusCode::NOT_FOUND);
+        }
+
         let root_html = client.get(format!("{base_url}/")).send().await?;
         expect_eq!(root_html.status(), StatusCode::OK);
         expect_eq!(

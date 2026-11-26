@@ -912,6 +912,11 @@ impl<'de> Deserialize<'de> for ProtoInt32 {
     }
 }
 
+/// Lossy, presence-only sentinel that accepts any JSON object and discards its contents.
+///
+/// Strictly intended for downstream `501 UNIMPLEMENTED` detection (e.g., `findNearest` on REST
+/// `:runQuery`). Must be replaced with a typed Proto3 JSON codec before enabling REST execution
+/// for any field that uses it.
 struct UnsupportedMessageObject;
 
 impl<'de> Deserialize<'de> for UnsupportedMessageObject {

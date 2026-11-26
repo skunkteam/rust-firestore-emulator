@@ -1,4 +1,7 @@
-use std::collections::{HashMap, HashSet};
+use std::{
+    borrow::Cow,
+    collections::{HashMap, HashSet},
+};
 
 use googleapis::google::{
     firestore::v1::{
@@ -199,16 +202,19 @@ impl FirestoreDatabase {
                 let mut query = Query::from_structured(parent, query, consistency, enterprise)?;
                 let compiled = compile_aggregations(aggregations, enterprise)?;
                 if !enterprise {
+                    let distance_result_field = query.distance_result_field();
                     let required_fields: Vec<FieldPath> = compiled
                         .iter()
                         .filter_map(|agg| match &agg.op {
                             CompiledAggregationOp::Sum(FieldReference::FieldPath(fp))
-                            | CompiledAggregationOp::Avg(FieldReference::FieldPath(fp)) => {
+                            | CompiledAggregationOp::Avg(FieldReference::FieldPath(fp))
+                                if !distance_result_field.is_some_and(|dp| dp.starts_with(fp)) =>
+                            {
                                 Some(fp.clone())
                             }
                             CompiledAggregationOp::Count { .. }
-                            | CompiledAggregationOp::Sum(FieldReference::DocumentName)
-                            | CompiledAggregationOp::Avg(FieldReference::DocumentName) => None,
+                            | CompiledAggregationOp::Sum(_)
+                            | CompiledAggregationOp::Avg(_) => None,
                         })
                         .collect();
                     query.require_existing_fields(required_fields);
@@ -259,13 +265,11 @@ impl FirestoreDatabase {
                                 let mut values = docs
                                     .iter()
                                     .filter_map(|m| {
-                                        Some(
-                                            query
-                                                .effective_numeric_field_value(m, &field_ref)?
-                                                .into_owned(),
-                                        )
+                                        query
+                                            .effective_numeric_field_value(m, &field_ref)
+                                            .filter(|v| v.is_number())
+                                            .map(Cow::into_owned)
                                     })
-                                    .filter(Value::is_number)
                                     .peekable();
                                 if enterprise && values.peek().is_none() {
                                     Value::null()
@@ -289,13 +293,11 @@ impl FirestoreDatabase {
                                 let values = docs
                                     .iter()
                                     .filter_map(|m| {
-                                        Some(
-                                            query
-                                                .effective_numeric_field_value(m, &field_ref)?
-                                                .into_owned(),
-                                        )
+                                        query
+                                            .effective_numeric_field_value(m, &field_ref)
+                                            .filter(|v| v.is_number())
+                                            .map(Cow::into_owned)
                                     })
-                                    .filter(Value::is_number)
                                     .collect_vec();
                                 if values.is_empty() {
                                     Value::null()
@@ -820,9 +822,9 @@ mod tests {
         }
 
         // (3) compile_aggregations precedes (4) query.once(self).
-        // Rolled-back transaction would fail with Aborted/InvalidArgument inside `query.once`;
-        // invalid aggregations must fail earlier with InvalidArgument even when a valid `select`
-        // is set.
+        // Rolled-back transactions fail inside `query.once` with
+        // `InvalidArgument("invalid transaction ID: ...")`; invalid aggregations must fail earlier
+        // with their `compile_aggregations` error message even when a valid `select` is set.
         let stale_txn = db.new_txn(TransactionOptions::READ_WRITE).await.unwrap();
         db.rollback(stale_txn).await.unwrap();
         let mut sq_valid_select = valid_sq();
@@ -831,9 +833,15 @@ mod tests {
                 field_path: "other".to_string(),
             }],
         });
-        for bad_aggs in [
-            vec![agg_count("c", Some(-1))],
-            vec![agg_sum("s", Some("__name__"))],
+        for (bad_aggs, expected_substring) in [
+            (
+                vec![agg_count("c", Some(-1))],
+                "Count.up_to cannot be negative",
+            ),
+            (
+                vec![agg_sum("s", Some("__name__"))],
+                "SUM field cannot be __name__",
+            ),
         ] {
             let err3 = db
                 .run_aggregation_query(
@@ -845,8 +853,12 @@ mod tests {
                 .await
                 .unwrap_err();
             assert!(
-                matches!(err3, GenericDatabaseError::InvalidArgument(_)),
-                "expected compile_aggregations InvalidArgument before query.once, got {err3:?}"
+                matches!(
+                    err3,
+                    GenericDatabaseError::InvalidArgument(ref m) if m.contains(expected_substring)
+                ),
+                "expected compile_aggregations InvalidArgument containing {expected_substring:?} \
+                 before query.once, got {err3:?}"
             );
         }
 
@@ -1239,5 +1251,191 @@ mod tests {
                 assert_eq!(multi_res.get("avg"), Some(&Value::double(20.0)));
             }
         }
+    }
+
+    #[tokio::test]
+    async fn standard_find_nearest_distance_result_field_not_filtered_as_stored_field() {
+        let project: &'static FirestoreProject =
+            Box::leak(Box::new(FirestoreProject::new(FirestoreConfig::default())));
+        let root: RootRef = "projects/p/databases/(default)".parse().unwrap();
+        let db = project.database(&root).await;
+
+        // Seed vector docs WITHOUT stored `"dist"` or `"meta"` fields.
+        // Euclidean distances from `[0.0, 0.0]`: v1 = 5.0, v2 = 1.0, v3 = 6.0 (sum = 12.0, avg =
+        // 4.0).
+        for (id, fields) in [
+            (
+                "v1",
+                HashMap::from([
+                    ("embedding".to_string(), Value::vector([3.0, 4.0])),
+                    ("other".to_string(), Value::integer(10)),
+                ]),
+            ),
+            (
+                "v2",
+                HashMap::from([("embedding".to_string(), Value::vector([0.0, 1.0]))]),
+            ),
+            (
+                "v3",
+                HashMap::from([
+                    ("embedding".to_string(), Value::vector([0.0, 6.0])),
+                    ("other".to_string(), Value::integer(30)),
+                ]),
+            ),
+            (
+                "v4",
+                HashMap::from([("other".to_string(), Value::integer(99))]),
+            ),
+        ] {
+            let doc_ref: DocumentRef = format!("{root}/vec_items/{id}").parse().unwrap();
+            db.update_doc(&doc_ref, fields, None, None, None)
+                .await
+                .unwrap();
+        }
+
+        let find_nearest_sq = |distance_result_field: &str, limit: i32| StructuredQuery {
+            from: vec![CollectionSelector {
+                collection_id:   "vec_items".to_string(),
+                all_descendants: false,
+            }],
+            find_nearest: Some(structured_query::FindNearest {
+                vector_field: Some(structured_query::FieldReference {
+                    field_path: "embedding".to_string(),
+                }),
+                query_vector: Some(Value::vector([0.0, 0.0])),
+                distance_measure: structured_query::find_nearest::DistanceMeasure::Euclidean as i32,
+                limit: Some(googleapis::google::protobuf::Int32Value { value: limit }),
+                distance_result_field: distance_result_field.to_string(),
+                distance_threshold: None,
+            }),
+            ..Default::default()
+        };
+
+        // 1. Direct `distance_result_field: "dist"` is virtual and must not require stored
+        //    `"dist"`.
+        let (_, direct) = db
+            .run_aggregation_query(
+                Ref::Root(root.clone()),
+                find_nearest_sq("dist", 10),
+                vec![
+                    agg_count("c", None),
+                    agg_sum("s", Some("dist")),
+                    agg_avg("a", Some("dist")),
+                ],
+                ReadConsistency::Default,
+            )
+            .await
+            .unwrap();
+        assert_eq!(direct.get("c"), Some(&Value::integer(3)));
+        assert!(direct.get("s").unwrap().storage_eq(&Value::double(12.0)));
+        assert!(direct.get("a").unwrap().storage_eq(&Value::double(4.0)));
+
+        // 2. Nested `distance_result_field: "meta.dist"` works for `[count(), sum("meta.dist"),
+        //    avg("meta.dist")]` without stored `"meta"` or `"meta.dist"`.
+        let (_, nested_leaf) = db
+            .run_aggregation_query(
+                Ref::Root(root.clone()),
+                find_nearest_sq("meta.dist", 10),
+                vec![
+                    agg_count("c", None),
+                    agg_sum("s", Some("meta.dist")),
+                    agg_avg("a", Some("meta.dist")),
+                ],
+                ReadConsistency::Default,
+            )
+            .await
+            .unwrap();
+        assert_eq!(nested_leaf.get("c"), Some(&Value::integer(3)));
+        assert!(
+            nested_leaf
+                .get("s")
+                .unwrap()
+                .storage_eq(&Value::double(12.0))
+        );
+        assert!(
+            nested_leaf
+                .get("a")
+                .unwrap()
+                .storage_eq(&Value::double(4.0))
+        );
+
+        // 3. Ancestor map path `"meta"` synthesized by `distance_result_field: "meta.dist"`:
+        //    `count()` retains all matched docs while `sum("meta")` ignores the non-numeric map.
+        let (_, nested_parent) = db
+            .run_aggregation_query(
+                Ref::Root(root.clone()),
+                find_nearest_sq("meta.dist", 10),
+                vec![
+                    agg_count("c", None),
+                    agg_sum("s", Some("meta")),
+                    agg_avg("a", Some("meta")),
+                ],
+                ReadConsistency::Default,
+            )
+            .await
+            .unwrap();
+        assert_eq!(nested_parent.get("c"), Some(&Value::integer(3)));
+        assert!(
+            nested_parent
+                .get("s")
+                .unwrap()
+                .storage_eq(&Value::integer(0))
+        );
+        assert_eq!(nested_parent.get("a"), Some(&Value::null()));
+
+        // 4. Non-distance `SUM("other")` still enforces Standard field-existence filtering
+        //    alongside `findNearest`, excluding `v2` (missing `"other"`) before `limit: 2`.
+        let (_, mixed_other) = db
+            .run_aggregation_query(
+                Ref::Root(root.clone()),
+                find_nearest_sq("dist", 2),
+                vec![
+                    agg_count("c", None),
+                    agg_sum("sum_dist", Some("dist")),
+                    agg_avg("avg_dist", Some("dist")),
+                    agg_sum("sum_other", Some("other")),
+                ],
+                ReadConsistency::Default,
+            )
+            .await
+            .unwrap();
+        assert_eq!(mixed_other.get("c"), Some(&Value::integer(2)));
+        assert!(
+            mixed_other
+                .get("sum_dist")
+                .unwrap()
+                .storage_eq(&Value::double(11.0))
+        );
+        assert!(
+            mixed_other
+                .get("avg_dist")
+                .unwrap()
+                .storage_eq(&Value::double(5.5))
+        );
+        assert!(
+            mixed_other
+                .get("sum_other")
+                .unwrap()
+                .storage_eq(&Value::integer(40))
+        );
+
+        // 5. Sibling non-distance path `"meta.other"` is NOT synthesized by `"meta.dist"`, so
+        //    Standard field-existence filtering still excludes docs lacking stored `"meta.other"`.
+        let (_, sibling_missing) = db
+            .run_aggregation_query(
+                Ref::Root(root),
+                find_nearest_sq("meta.dist", 10),
+                vec![agg_count("c", None), agg_sum("s", Some("meta.other"))],
+                ReadConsistency::Default,
+            )
+            .await
+            .unwrap();
+        assert_eq!(sibling_missing.get("c"), Some(&Value::integer(0)));
+        assert!(
+            sibling_missing
+                .get("s")
+                .unwrap()
+                .storage_eq(&Value::integer(0))
+        );
     }
 }

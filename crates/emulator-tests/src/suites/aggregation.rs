@@ -11,17 +11,20 @@ use googleapis::{
                 aggregation::{Avg, Count, Operator, Sum},
             },
             structured_query::{
-                CollectionSelector, FieldReference, Projection, field_filter::Operator as FilterOp,
+                CollectionSelector, FieldReference, FindNearest, Projection,
+                field_filter::Operator as FilterOp, find_nearest::DistanceMeasure,
             },
         },
-        protobuf::Int64Value,
+        protobuf::{Int32Value, Int64Value},
     },
 };
 use googletest::prelude::*;
 use tonic::{Code, Status};
 
 use crate::harness::{
-    builders::{AggregationSpec, PipelineSpec, QuerySpec, field_filter, field_ref_val, fn_val},
+    builders::{
+        AggregationSpec, PipelineSpec, QuerySpec, field_filter, field_ref_val, fn_val, vec_val,
+    },
     client::TestDb,
     env::{DOCUMENTS_ROOT, TestEnv},
     matchers::assert_status_code,
@@ -845,8 +848,9 @@ async fn grpc_aggregation_edition_validation_aliases_select_and_pre_execution_or
         expect_that!(select_err.message(), contains_substring("__custom__"));
 
         //    (b) `compile_aggregations` precedes query execution: a rolled-back transaction
-        //        (`Transaction(stale_id)`) would fail query execution with `Aborted`, yet invalid
-        //        aggregations fail earlier with `InvalidArgument` from `compile_aggregations`.
+        //        (`Transaction(stale_id)`) would fail query execution with
+        //        `InvalidArgument("invalid transaction ID: ...")`, yet invalid aggregations fail
+        //        earlier with the `compile_aggregations` error message (`"__custom__"`).
         let stale_txn = db.begin_rw_txn().await.unwrap();
         let stale_id = stale_txn.id().to_vec();
         stale_txn.rollback().await.unwrap();
@@ -994,4 +998,177 @@ async fn standard_sum_avg_implicit_field_existence_filter_across_mixed_nested_li
             expect_eq!(multi_res.fields.get("avg"), Some(&Value::double(20.0)));
         }
     }
+}
+
+#[gtest]
+#[tokio::test]
+async fn standard_find_nearest_virtual_distance_field_aggregations_and_field_existence() {
+    let mut db = TestEnv::new().build_db();
+
+    // Docs have NO stored `"dist"` or `"meta"` fields.
+    // Euclidean distances from `[0.0, 0.0]`: v1 = 5.0, v2 = 1.0, v3 = 6.0 (sum = 12.0, avg = 4.0).
+    db.put(
+        "vec_items/v1",
+        fields!({ "embedding": vec_val([3.0, 4.0]), "other": 10i64 }),
+    )
+    .await
+    .unwrap();
+    db.put(
+        "vec_items/v2",
+        fields!({ "embedding": vec_val([0.0, 1.0]) }),
+    )
+    .await
+    .unwrap();
+    db.put(
+        "vec_items/v3",
+        fields!({ "embedding": vec_val([0.0, 6.0]), "other": 30i64 }),
+    )
+    .await
+    .unwrap();
+    db.put("vec_items/v4", fields!({ "other": 99i64 }))
+        .await
+        .unwrap();
+
+    let fn_spec = |distance_result_field: &str, limit: i32| {
+        QuerySpec::collection("vec_items").find_nearest(FindNearest {
+            vector_field: Some(FieldReference {
+                field_path: "embedding".to_string(),
+            }),
+            query_vector: Some(vec_val([0.0, 0.0])),
+            distance_measure: DistanceMeasure::Euclidean as i32,
+            limit: Some(Int32Value { value: limit }),
+            distance_result_field: distance_result_field.to_string(),
+            distance_threshold: None,
+        })
+    };
+
+    // 1. Top-level virtual `distance_result_field: "dist"`.
+    let direct = db
+        .aggregate(
+            fn_spec("dist", 10),
+            AggregationSpec::new()
+                .count("c")
+                .sum("s", "dist")
+                .avg("a", "dist"),
+        )
+        .await
+        .unwrap();
+    expect_eq!(direct.fields.get("c"), Some(&Value::integer(3)));
+    expect_true!(
+        direct
+            .fields
+            .get("s")
+            .unwrap()
+            .storage_eq(&Value::double(12.0))
+    );
+    expect_true!(
+        direct
+            .fields
+            .get("a")
+            .unwrap()
+            .storage_eq(&Value::double(4.0))
+    );
+
+    // 2. Nested virtual `distance_result_field: "meta.dist"`.
+    let nested_leaf = db
+        .aggregate(
+            fn_spec("meta.dist", 10),
+            AggregationSpec::new()
+                .count("c")
+                .sum("s", "meta.dist")
+                .avg("a", "meta.dist"),
+        )
+        .await
+        .unwrap();
+    expect_eq!(nested_leaf.fields.get("c"), Some(&Value::integer(3)));
+    expect_true!(
+        nested_leaf
+            .fields
+            .get("s")
+            .unwrap()
+            .storage_eq(&Value::double(12.0))
+    );
+    expect_true!(
+        nested_leaf
+            .fields
+            .get("a")
+            .unwrap()
+            .storage_eq(&Value::double(4.0))
+    );
+
+    // 3. Virtual ancestor map `"meta"` synthesized by `distance_result_field: "meta.dist"`:
+    //    `count()` retains matched docs while `sum("meta")` skips the non-numeric map.
+    let nested_parent = db
+        .aggregate(
+            fn_spec("meta.dist", 10),
+            AggregationSpec::new()
+                .count("c")
+                .sum("s", "meta")
+                .avg("a", "meta"),
+        )
+        .await
+        .unwrap();
+    expect_eq!(nested_parent.fields.get("c"), Some(&Value::integer(3)));
+    expect_true!(
+        nested_parent
+            .fields
+            .get("s")
+            .unwrap()
+            .storage_eq(&Value::integer(0))
+    );
+    expect_eq!(nested_parent.fields.get("a"), Some(&Value::null()));
+
+    // 4. Non-distance `SUM("other")` still applies Standard field-existence filtering alongside
+    //    `findNearest`, filtering out `v2` (missing `"other"`) before `limit: 2`.
+    let mixed_other = db
+        .aggregate(
+            fn_spec("dist", 2),
+            AggregationSpec::new()
+                .count("c")
+                .sum("sum_dist", "dist")
+                .avg("avg_dist", "dist")
+                .sum("sum_other", "other"),
+        )
+        .await
+        .unwrap();
+    expect_eq!(mixed_other.fields.get("c"), Some(&Value::integer(2)));
+    expect_true!(
+        mixed_other
+            .fields
+            .get("sum_dist")
+            .unwrap()
+            .storage_eq(&Value::double(11.0))
+    );
+    expect_true!(
+        mixed_other
+            .fields
+            .get("avg_dist")
+            .unwrap()
+            .storage_eq(&Value::double(5.5))
+    );
+    expect_true!(
+        mixed_other
+            .fields
+            .get("sum_other")
+            .unwrap()
+            .storage_eq(&Value::integer(40))
+    );
+
+    // 5. Sibling non-distance path `"meta.other"` is not synthesized by `"meta.dist"`, so Standard
+    //    field-existence filtering excludes docs lacking stored `"meta.other"`.
+    let sibling_missing = db
+        .aggregate(
+            fn_spec("meta.dist", 10),
+            AggregationSpec::new().count("c").sum("s", "meta.other"),
+        )
+        .await
+        .unwrap();
+    expect_eq!(sibling_missing.fields.get("c"), Some(&Value::integer(0)));
+    expect_true!(
+        sibling_missing
+            .fields
+            .get("s")
+            .unwrap()
+            .storage_eq(&Value::integer(0))
+    );
 }
