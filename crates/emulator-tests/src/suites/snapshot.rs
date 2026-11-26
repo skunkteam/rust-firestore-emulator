@@ -22,7 +22,7 @@ use tonic::Code;
 use crate::harness::{
     builders::{QuerySpec, WriteBatchSpec, doc_path, field_filter},
     client::TestDb,
-    env::{DATABASE_ROOT, TestEnv},
+    env::{DATABASE_ROOT, DOCUMENTS_ROOT, TestEnv},
     matchers::{assert_doc_wire_eq, assert_status_code, short_ids},
 };
 
@@ -674,5 +674,155 @@ async fn query_listener_terminates_with_failed_precondition_and_error_log_on_edi
         )
     );
 
+    doc_handle.close().await;
+}
+
+async fn wait_for_sse_substring(
+    stream: &mut axum::body::BodyDataStream,
+    buf: &mut String,
+    needle: &str,
+    timeout: Duration,
+) {
+    let deadline = tokio::time::Instant::now() + timeout;
+    while !buf.contains(needle) {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        assert!(
+            !remaining.is_zero(),
+            "timed out waiting for SSE event containing {needle:?}; saw {buf:?}"
+        );
+        let chunk = tokio::time::timeout(remaining, stream.next())
+            .await
+            .unwrap_or_else(|_| {
+                panic!("timed out waiting for SSE chunk containing {needle:?}; saw {buf:?}")
+            })
+            .expect("SSE stream ended before expected event arrived")
+            .expect("infallible SSE body chunk");
+        buf.push_str(&String::from_utf8_lossy(&chunk));
+    }
+}
+
+#[gtest]
+#[tokio::test]
+async fn import_aborts_blocked_lock_waiters_invalidates_stale_txns_and_rejected_import_preserves_state()
+ {
+    let mut db = TestEnv::new().cloud_timeouts().build_db();
+    db.put("lock/d1", fields!({ "v": 1i64 })).await.unwrap();
+    db.put("watch/d1", fields!({ "v": 1i64 })).await.unwrap();
+    let (_hdrs, snap_v1) = export_http_snapshot(&db, "/emulator/v1/export").await;
+    db.put("lock/d1", fields!({ "v": 2i64 })).await.unwrap();
+
+    // (a) Subscribe to `/emulator/v1/contention/events`, hold a pessimistic read lock in Txn A,
+    //     and block Txn B on Wound-Wait write-lock acquisition before triggering replacement
+    // import.
+    let (sse_status, mut contention_sse) = db.http_stream("/emulator/v1/contention/events").await;
+    expect_eq!(sse_status, StatusCode::OK);
+
+    let mut txn_a = db.begin_rw_txn().await.unwrap();
+    let read_a = txn_a.get("lock/d1").await.unwrap();
+    expect_eq!(read_a.fields["v"].as_integer(), Some(2));
+
+    // (b) Also open a pre-import idle transaction to verify post-cutover rejection.
+    let mut txn_idle = db.begin_rw_txn().await.unwrap();
+
+    let mut actor_b = db.clone();
+    let mut txn_b_task = tokio::spawn(async move {
+        let mut txn_b = actor_b.begin_rw_txn().await.unwrap();
+        txn_b.put("lock/d1", fields!({ "v": 99i64 }));
+        txn_b.commit().await
+    });
+
+    let mut sse_buf = String::new();
+    wait_for_sse_substring(
+        &mut contention_sse,
+        &mut sse_buf,
+        "\"contention_changed\"",
+        Duration::from_secs(2),
+    )
+    .await;
+    assert!(
+        !txn_b_task.is_finished(),
+        "txn B should remain blocked on txn A's lock before snapshot import"
+    );
+
+    let (imp_status, imp_json) = import_http_snapshot_chunked(&db, &snap_v1, 1024).await;
+    expect_eq!(imp_status, StatusCode::OK);
+    expect_eq!(imp_json["databases"][0]["replaced"], true);
+
+    // Txn B was in-flight on the cleared DB and unblocks promptly (well under 15s CLOUD timeout)
+    // with `Code::Aborted`.
+    let txn_b_res = tokio::time::timeout(Duration::from_secs(2), &mut txn_b_task)
+        .await
+        .expect("blocked txn B must unblock promptly on import replacement")
+        .expect("txn B task did not panic");
+    assert_status_code(txn_b_res, Code::Aborted);
+
+    // `/emulator/v1/contention/events` emits `ContentionSseEvent::DatabaseCleared`.
+    wait_for_sse_substring(
+        &mut contention_sse,
+        &mut sse_buf,
+        "\"database_cleared\"",
+        Duration::from_secs(2),
+    )
+    .await;
+    let cleared_payload: JsonValue = sse_buf
+        .lines()
+        .filter_map(|line| line.strip_prefix("data:"))
+        .filter_map(|data| serde_json::from_str::<JsonValue>(data.trim()).ok())
+        .find(|json| json["type"] == "database_cleared")
+        .expect("parsed database_cleared SSE payload");
+    expect_eq!(cleared_payload["database"], DOCUMENTS_ROOT);
+    drop(contention_sse);
+
+    // Post-cutover gRPC calls using pre-import Txn A or idle Txn IDs resolve against the
+    // replacement DB and fail with `Code::InvalidArgument` without mutating imported state.
+    txn_a.put("lock/d1", fields!({ "v": 77i64 }));
+    assert_status_code(txn_a.commit().await, Code::InvalidArgument);
+    assert_status_code(txn_idle.get("lock/d1").await, Code::InvalidArgument);
+    assert_status_code(txn_idle.commit().await, Code::InvalidArgument);
+    assert_doc_wire_eq(
+        &db.get("lock/d1").await.unwrap(),
+        "lock/d1",
+        &fields!({ "v": 1i64 }),
+    );
+
+    // (c) A rejected corrupt/truncated import (`400 Bad Request`) leaves an active
+    //     `DocumentsTarget` listener and an active read-write transaction undisturbed.
+    let (mut doc_handle, doc_init) = db.listen_doc("watch/d1", None).await.unwrap();
+    assert_doc_wire_eq(
+        &doc_init.changed_docs[0],
+        "watch/d1",
+        &fields!({ "v": 1i64 }),
+    );
+
+    let mut active_txn = db.begin_rw_txn().await.unwrap();
+    assert_doc_wire_eq(
+        &active_txn.get("watch/d1").await.unwrap(),
+        "watch/d1",
+        &fields!({ "v": 1i64 }),
+    );
+    active_txn.put("watch/d1", fields!({ "v": 3i64 }));
+
+    let truncated = &snap_v1[..snap_v1.len() / 2];
+    let (trunc_status, trunc_err) = import_http_snapshot_chunked(&db, truncated, 64).await;
+    expect_eq!(trunc_status, StatusCode::BAD_REQUEST);
+    expect_eq!(trunc_err["error"]["status"], "INVALID_ARGUMENT");
+
+    let mut corrupt = snap_v1.clone();
+    let crc_offset = corrupt.len() - 12;
+    corrupt[crc_offset] ^= 0x01;
+    let (corrupt_status, corrupt_err) = import_http_snapshot_chunked(&db, &corrupt, 1024).await;
+    expect_eq!(corrupt_status, StatusCode::BAD_REQUEST);
+    expect_eq!(corrupt_err["error"]["status"], "INVALID_ARGUMENT");
+
+    active_txn
+        .commit()
+        .await
+        .expect("active RW transaction survives rejected imports");
+    let batch = tokio::time::timeout(Duration::from_secs(2), doc_handle.next_batch())
+        .await
+        .expect("listener receives post-rejection commit promptly")
+        .unwrap();
+    assert!(!batch.was_reset);
+    assert_doc_wire_eq(&batch.changed_docs[0], "watch/d1", &fields!({ "v": 3i64 }));
     doc_handle.close().await;
 }

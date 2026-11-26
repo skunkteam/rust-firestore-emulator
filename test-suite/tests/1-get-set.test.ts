@@ -17,6 +17,10 @@ interface RawCommitRequest {
     database: string;
     writes: Array<{
         update: RawDocument;
+        updateTransforms?: Array<{
+            fieldPath: string;
+            appendMissingElements?: { values: RawProtoValue[] };
+        }>;
     }>;
 }
 
@@ -345,24 +349,31 @@ describe.each(editions)('$description', fs => {
         });
 
         describe('timestampValue bounds', () => {
-            async function commitTimestamp(
-                ref: DocumentReference,
-                timestampValue: NonNullable<RawProtoValue['timestampValue']>,
-                label: string,
-            ): Promise<void> {
+            type RawTimestampValue = NonNullable<RawProtoValue['timestampValue']>;
+
+            async function commitRawWrite(write: RawCommitRequest['writes'][number], label: string): Promise<void> {
                 const database = (fs.firestore as unknown as { formattedName: string }).formattedName;
-                const document: RawDocument = {
-                    name: `${database}/documents/${ref.path}`,
-                    fields: {
-                        ts: { timestampValue },
-                        ttl: rawTtlValue(),
-                    },
-                };
                 const req: RawCommitRequest = {
                     database,
-                    writes: [{ update: document }],
+                    writes: [write],
                 };
                 await callRawUnaryRpc<RawCommitRequest>(fs.firestore, 'commit', req, label);
+            }
+
+            async function commitTimestamp(ref: DocumentReference, timestampValue: RawTimestampValue, label: string): Promise<void> {
+                const database = (fs.firestore as unknown as { formattedName: string }).formattedName;
+                await commitRawWrite(
+                    {
+                        update: {
+                            name: `${database}/documents/${ref.path}`,
+                            fields: {
+                                ts: { timestampValue },
+                                ttl: rawTtlValue(),
+                            },
+                        },
+                    },
+                    label,
+                );
             }
 
             test.each([
@@ -390,13 +401,67 @@ describe.each(editions)('$description', fs => {
                     expect(await getDoc(docRef)).toEqual({ ts: new Timestamp(253_402_300_799, 999_999_000) });
                 });
 
-            test.each([
+            const invalidTimestamps = [
                 { label: 'seconds below minimum (-62135596801)', seconds: -62_135_596_801, nanos: 0 },
                 { label: 'seconds above maximum (253402300800)', seconds: 253_402_300_800, nanos: 0 },
                 { label: 'negative nanos (-1)', seconds: 0, nanos: -1 },
                 { label: 'nanos equal to 1_000_000_000', seconds: 0, nanos: 1_000_000_000 },
-            ])('rejects $label with 3 INVALID_ARGUMENT', async ({ label, seconds, nanos }) => {
+            ] as const;
+
+            test.each(invalidTimestamps)('rejects $label with 3 INVALID_ARGUMENT', async ({ label, seconds, nanos }) => {
                 await expectRpcCode(() => commitTimestamp(docRef, { seconds, nanos }, `ts-invalid-${label}`), 3, label);
+            });
+
+            describe.each([
+                {
+                    container: 'nested mapValue',
+                    buildWrite: (name: string, timestampValue: RawTimestampValue): RawCommitRequest['writes'][number] => ({
+                        update: {
+                            name,
+                            fields: {
+                                nested: { mapValue: { fields: { ts: { timestampValue } } } },
+                                ttl: rawTtlValue(),
+                            },
+                        },
+                    }),
+                },
+                {
+                    container: 'arrayValue',
+                    buildWrite: (name: string, timestampValue: RawTimestampValue): RawCommitRequest['writes'][number] => ({
+                        update: {
+                            name,
+                            fields: {
+                                list: { arrayValue: { values: [{ timestampValue }] } },
+                                ttl: rawTtlValue(),
+                            },
+                        },
+                    }),
+                },
+                {
+                    container: 'appendMissingElements transform',
+                    buildWrite: (name: string, timestampValue: RawTimestampValue): RawCommitRequest['writes'][number] => ({
+                        update: {
+                            name,
+                            fields: { ttl: rawTtlValue() },
+                        },
+                        updateTransforms: [
+                            {
+                                fieldPath: 'arr',
+                                appendMissingElements: { values: [{ timestampValue }] },
+                            },
+                        ],
+                    }),
+                },
+            ])('inside $container', ({ container, buildWrite }) => {
+                test.each(invalidTimestamps)('rejects $label with 3 INVALID_ARGUMENT', async ({ label, seconds, nanos }) => {
+                    const database = (fs.firestore as unknown as { formattedName: string }).formattedName;
+                    const name = `${database}/documents/${docRef.path}`;
+                    await expectRpcCode(
+                        () => commitRawWrite(buildWrite(name, { seconds, nanos }), `ts-invalid-${container}-${label}`),
+                        3,
+                        `${container}: ${label}`,
+                    );
+                });
             });
         });
     });

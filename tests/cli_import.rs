@@ -7,8 +7,12 @@ use std::{
     net::{SocketAddr, TcpListener},
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
-    sync::atomic::{AtomicU64, Ordering},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        mpsc,
+    },
     thread::{self, JoinHandle},
+    time::{Duration, Instant},
 };
 
 use bytes::Bytes;
@@ -116,54 +120,68 @@ fn spawn_and_wait_listening(mut cmd: Command, expected_loaded_line: &str) -> Sta
         .expect("spawn firestore-emulator binary");
 
     let stderr = child.stderr.take().expect("take child stderr pipe");
-    let mut reader = BufReader::new(stderr);
+    let (tx, rx) = mpsc::channel();
+    let stderr_reader = thread::spawn(move || {
+        for line in BufReader::new(stderr).lines() {
+            match line {
+                Ok(line) => {
+                    // Keep draining stderr to EOF even after `rx` is dropped so the child never
+                    // blocks on a full pipe.
+                    drop(tx.send(line));
+                }
+                Err(_) => break,
+            }
+        }
+    });
+    let guard = ChildGuard::new(child, stderr_reader);
+
     let mut lines = Vec::new();
     let mut loaded_idx = None;
     let mut listening_idx = None;
     let mut bound_addr = None;
+    let mut saw_eof = false;
 
-    let mut line = String::new();
-    loop {
-        line.clear();
-        let read = reader
-            .read_line(&mut line)
-            .expect("read stderr line from child");
-        if read == 0 {
-            break;
+    let startup_deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < startup_deadline {
+        let remaining = startup_deadline.saturating_duration_since(Instant::now());
+        match rx.recv_timeout(remaining) {
+            Ok(trimmed) => {
+                if trimmed == expected_loaded_line && loaded_idx.is_none() {
+                    loaded_idx = Some(lines.len());
+                }
+                if let Some(addr_str) = trimmed.strip_prefix("Firestore emulator listening on ") {
+                    bound_addr = Some(
+                        addr_str
+                            .trim()
+                            .parse::<SocketAddr>()
+                            .expect("parse bound SocketAddr"),
+                    );
+                    listening_idx = Some(lines.len());
+                    lines.push(trimmed);
+                    break;
+                }
+                lines.push(trimmed);
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                saw_eof = true;
+                break;
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => break,
         }
-        let trimmed = line.trim_end_matches(['\r', '\n']).to_string();
-        if trimmed == expected_loaded_line && loaded_idx.is_none() {
-            loaded_idx = Some(lines.len());
-        }
-        if let Some(addr_str) = trimmed.strip_prefix("Firestore emulator listening on ") {
-            bound_addr = Some(
-                addr_str
-                    .trim()
-                    .parse::<SocketAddr>()
-                    .expect("parse bound SocketAddr"),
-            );
-            listening_idx = Some(lines.len());
-            lines.push(trimmed);
-            break;
-        }
-        lines.push(trimmed);
     }
 
     let Some(addr) = bound_addr else {
-        let status = child.wait().expect("wait for exited child");
+        if saw_eof {
+            panic!(
+                "emulator exited before listening (premature stderr EOF), stderr lines:\n{}",
+                lines.join("\n")
+            );
+        }
         panic!(
-            "emulator exited before listening (status={status}), stderr lines:\n{}",
+            "emulator did not print listening banner within 10s, stderr lines:\n{}",
             lines.join("\n")
         );
     };
-
-    let stderr_drainer = thread::spawn(move || {
-        let mut sink = String::new();
-        while reader.read_line(&mut sink).unwrap_or(0) > 0 {
-            sink.clear();
-        }
-    });
-    let guard = ChildGuard::new(child, stderr_drainer);
 
     let loaded_idx = loaded_idx.unwrap_or_else(|| {
         panic!(
