@@ -49,7 +49,10 @@ import {
   parseRawQueryPayload,
 } from "./components/query-model.js";
 import { renderQueryRunner } from "./components/query.js";
-import { markSuggestionsStale } from "./components/query-suggestions.js";
+import {
+  markSuggestionsStale,
+  resetQuerySuggestionStore,
+} from "./components/query-suggestions.js";
 import {
   getActiveRootPath,
   isValidPathSegment,
@@ -62,6 +65,8 @@ import {
   bumpDbEpoch,
   bumpNavEpoch,
   clearActiveDatabaseState,
+  deleteCollectionColumnCache,
+  deleteDocumentLevelCache,
   dismissToast,
   finishQueryRun,
   getDbEpoch,
@@ -287,13 +292,14 @@ function syncContentionLifecycle() {
 }
 
 /**
- * Enqueues an SSE event batch onto the serialized `sseQueue` after running
- * synchronous preemption (`applySyncSseBatch`).
+ * Enqueues an SSE or local snapshot-refresh batch onto the serialized `sseQueue`
+ * after running synchronous preemption (`applySyncSseBatch`).
  * @param {EmulatorSseEvent[]} batch
+ * @param {{ ignorePaused?: boolean }} [options]
  * @returns {Promise<void>}
  */
-function enqueueSseBatch(batch) {
-  const plan = applySyncSseBatch(batch);
+function enqueueSseBatch(batch, options) {
+  const plan = applySyncSseBatch(batch, options);
   if (!plan) return sseQueue;
   sseQueue = sseQueue
     .then(() => applyAsyncSseRefresh(plan))
@@ -1051,24 +1057,102 @@ export async function loadDocumentLevel(
  *   shouldRefreshMeta: boolean,
  *   fullResyncActiveDb: boolean,
  *   clearedActiveDb: boolean,
+ *   replacedActiveDb: boolean,
+ *   ignorePaused: boolean,
  *   changedPaths: Set<string>,
  * }} SseRefreshPlan
  */
 
 /**
- * Synchronously processes an SSE batch: preempts cleared databases (rotating DB
- * cancellation signals, clearing active caches and query suggestions), updates URL/toasts,
- * and marks matching suggestion caches stale without firing HTTP requests.
+ * Truncates clean stale explorer segments to the deepest surviving prefix after replacement.
+ * Leaves `state.segments` untouched if any open document along the path has unsaved edits.
+ * @param {string} activeRoot
+ */
+function truncateStaleSegmentsAfterReplace(activeRoot) {
+  if (state.segments.length === 0) return;
+  for (let i = 1; i < state.segments.length; i += 2) {
+    const docPath = `${activeRoot}/${state.segments.slice(0, i + 1).join("/")}`;
+    if (state.documentLevels.get(docPath)?.editorSession?.isDirty) {
+      return;
+    }
+  }
+
+  let survivingLen = 0;
+  if (state.rootCollections.includes(state.segments[0])) {
+    survivingLen = 1;
+    for (let i = 1; i < state.segments.length; i += 2) {
+      const docPath = `${activeRoot}/${state.segments.slice(0, i + 1).join("/")}`;
+      const level = state.documentLevels.get(docPath);
+      if (!level || (!level.exists && level.subcollections.length === 0)) {
+        break;
+      }
+      survivingLen = i + 1;
+      if (i + 1 < state.segments.length) {
+        const subcolId = state.segments[i + 1];
+        if (!level.subcollections.includes(subcolId)) {
+          break;
+        }
+        survivingLen = i + 2;
+      }
+    }
+  }
+
+  if (survivingLen < state.segments.length) {
+    state.segments = state.segments.slice(0, survivingLen);
+    bumpNavEpoch();
+    syncUrl(true);
+  }
+}
+
+/**
+ * Prunes non-visible collection columns and non-dirty non-visible document levels after replacement.
+ * @param {string} activeRoot
+ */
+function pruneInvisibleCachesAfterReplace(activeRoot) {
+  /** @type {Set<string>} */
+  const visibleColPaths = new Set();
+  /** @type {Set<string>} */
+  const visibleDocPaths = new Set();
+  for (let i = 0; i < state.segments.length; i += 2) {
+    visibleColPaths.add(
+      `${activeRoot}/${state.segments.slice(0, i + 1).join("/")}`
+    );
+    if (i + 1 < state.segments.length) {
+      visibleDocPaths.add(
+        `${activeRoot}/${state.segments.slice(0, i + 2).join("/")}`
+      );
+    }
+  }
+
+  for (const key of Array.from(state.collectionColumns.keys())) {
+    if (!visibleColPaths.has(key)) {
+      deleteCollectionColumnCache(key);
+    }
+  }
+  for (const [key, level] of Array.from(state.documentLevels.entries())) {
+    if (!visibleDocPaths.has(key) && !level.editorSession?.isDirty) {
+      deleteDocumentLevelCache(key);
+    }
+  }
+}
+
+/**
+ * Synchronously processes an SSE batch: preempts cleared or replaced databases
+ * (rotating cancellation signals, clearing active caches/query state and suggestions),
+ * updates URL/toasts, and marks matching suggestion caches stale without firing HTTP requests.
  * @param {EmulatorSseEvent[]} events
+ * @param {{ ignorePaused?: boolean }} [options]
  * @returns {SseRefreshPlan | null}
  */
-export function applySyncSseBatch(events) {
-  if (state.ssePaused) return null;
+export function applySyncSseBatch(events, options = {}) {
+  const ignorePaused = Boolean(options?.ignorePaused);
+  if (state.ssePaused && !ignorePaused) return null;
 
   let shouldRefreshDbList = false;
   let shouldRefreshMeta = false;
   let fullResyncActiveDb = false;
   let clearedActiveDb = false;
+  let replacedActiveDb = false;
   /** @type {Set<string>} */
   const changedPaths = new Set();
 
@@ -1080,7 +1164,9 @@ export function applySyncSseBatch(events) {
   for (const ev of events) {
     if (ev.type === "resync") {
       shouldRefreshDbList = true;
-      fullResyncActiveDb = true;
+      if (!clearedActiveDb) {
+        fullResyncActiveDb = true;
+      }
       continue;
     }
     if (ev.type === "database_created") {
@@ -1097,25 +1183,37 @@ export function applySyncSseBatch(events) {
           (db) => db.rootPath !== ev.database
         );
       }
-      if (ev.database && ev.database === activeRoot) {
+      if (ev.database && activeRoot !== null && ev.database === activeRoot) {
         // Clear cached state WITHOUT calling /v1/projects/... so we never re-create the cleared database!
         bumpDbEpoch();
         bumpNavEpoch();
         clearedActiveDb = true;
+        replacedActiveDb = false;
+        fullResyncActiveDb = false;
+        shouldRefreshMeta = false;
+        changedPaths.clear();
         clearActiveDatabaseState(state);
         syncUrl(true);
         notifyToast(`Database ${ev.database} was cleared`, "info");
       }
       continue;
     }
+    if (ev.type === "database_replaced") {
+      shouldRefreshDbList = true;
+      if (!clearedActiveDb && activeRoot !== null && ev.database === activeRoot) {
+        fullResyncActiveDb = true;
+        replacedActiveDb = true;
+      }
+      continue;
+    }
     if (ev.type === "database_config_changed") {
-      if (ev.database && ev.database === activeRoot) {
+      if (!clearedActiveDb && activeRoot !== null && ev.database === activeRoot) {
         shouldRefreshMeta = true;
       }
       continue;
     }
     if (ev.type === "documents_changed") {
-      if (ev.database && ev.database === activeRoot) {
+      if (!clearedActiveDb && activeRoot !== null && ev.database === activeRoot) {
         for (const p of ev.paths ?? []) {
           changedPaths.add(p);
         }
@@ -1123,7 +1221,11 @@ export function applySyncSseBatch(events) {
     }
   }
 
-  if (!clearedActiveDb) {
+  if (replacedActiveDb && !clearedActiveDb) {
+    abortActiveQueryRun();
+    state.queryState = createQueryRunnerState();
+    resetQuerySuggestionStore(state.querySuggestions);
+  } else if (!clearedActiveDb) {
     if (fullResyncActiveDb) {
       markSuggestionsStale(state.querySuggestions, "all");
     } else if (changedPaths.size > 0) {
@@ -1136,6 +1238,7 @@ export function applySyncSseBatch(events) {
     !shouldRefreshMeta &&
     !fullResyncActiveDb &&
     !clearedActiveDb &&
+    !replacedActiveDb &&
     changedPaths.size === 0
   ) {
     return null;
@@ -1149,6 +1252,8 @@ export function applySyncSseBatch(events) {
     shouldRefreshMeta,
     fullResyncActiveDb,
     clearedActiveDb,
+    replacedActiveDb,
+    ignorePaused,
     changedPaths,
   };
 }
@@ -1160,7 +1265,9 @@ export function applySyncSseBatch(events) {
  * @returns {Promise<void>}
  */
 export async function applyAsyncSseRefresh(plan) {
-  if (!plan || state.ssePaused) return;
+  if (!plan) return;
+  const isPausedBlocked = () => state.ssePaused && !plan.ignorePaused;
+  if (isPausedBlocked()) return;
   const myDbEpoch = plan.dbEpoch ?? getDbEpoch();
   const signal = plan.signal ?? getDbSignal();
   const isStale = () => myDbEpoch !== getDbEpoch() || signal.aborted;
@@ -1169,22 +1276,24 @@ export async function applyAsyncSseRefresh(plan) {
     shouldRefreshDbList,
     fullResyncActiveDb,
     clearedActiveDb,
+    replacedActiveDb,
+    shouldRefreshMeta,
   } = plan;
-  const { shouldRefreshMeta, changedPaths, activeRoot } = plan;
+  const { changedPaths, activeRoot } = plan;
 
   if (shouldRefreshDbList) {
     let applied = false;
     try {
       applied = await refreshDatabaseList();
     } catch (err) {
-      if (state.ssePaused || isStale() || isAbortError(err)) return;
+      if (isPausedBlocked() || isStale() || isAbortError(err)) return;
       fullResyncActiveDb = false;
       notifyToast(
         `Failed to refresh database list: ${err instanceof Error ? err.message : String(err)}`,
         "error"
       );
     }
-    if (state.ssePaused) return;
+    if (isPausedBlocked()) return;
     if (
       applied &&
       !isStale() &&
@@ -1199,6 +1308,10 @@ export async function applyAsyncSseRefresh(plan) {
       bumpDbEpoch();
       bumpNavEpoch();
       clearedActiveDb = true;
+      replacedActiveDb = false;
+      fullResyncActiveDb = false;
+      shouldRefreshMeta = false;
+      changedPaths.clear();
       clearActiveDatabaseState(state);
       syncUrl(true);
       notifyToast(`Database ${activeRoot} was cleared`, "info");
@@ -1208,7 +1321,7 @@ export async function applyAsyncSseRefresh(plan) {
       applied &&
       !state.activeProjectId &&
       state.databases.length > 0 &&
-      !state.ssePaused
+      !isPausedBlocked()
     ) {
       const first = state.databases[0];
       await selectDatabase(first.projectId, first.databaseId, [], true);
@@ -1218,7 +1331,7 @@ export async function applyAsyncSseRefresh(plan) {
   }
 
   if (
-    state.ssePaused ||
+    isPausedBlocked() ||
     isStale() ||
     clearedActiveDb ||
     state.rootLoading ||
@@ -1239,7 +1352,7 @@ export async function applyAsyncSseRefresh(plan) {
         { signal }
       );
       if (
-        state.ssePaused ||
+        isPausedBlocked() ||
         isStale() ||
         getActiveRootPath(state.activeProjectId, state.activeDatabaseId) !==
           activeRoot
@@ -1248,25 +1361,28 @@ export async function applyAsyncSseRefresh(plan) {
       }
       state.activeDbMeta = meta;
     } catch (err) {
-      if (state.ssePaused || isStale() || isAbortError(err)) return;
+      if (isPausedBlocked() || isStale() || isAbortError(err)) return;
       // Ignore transient error
     }
   }
 
-  if (state.ssePaused || isStale()) return;
+  if (isPausedBlocked() || isStale()) return;
 
   if (fullResyncActiveDb || changedPaths.size > 0) {
+    const myNavEpoch = getNavEpoch();
+    const segmentsSnapshot = [...state.segments];
+    let rootColsLoaded = false;
     try {
       const cols = await listCollectionIds(activeRoot, {
         signal,
         shouldAbort: () =>
-          state.ssePaused ||
+          isPausedBlocked() ||
           isStale() ||
           getActiveRootPath(state.activeProjectId, state.activeDatabaseId) !==
             activeRoot,
       });
       if (
-        state.ssePaused ||
+        isPausedBlocked() ||
         isStale() ||
         getActiveRootPath(state.activeProjectId, state.activeDatabaseId) !==
           activeRoot
@@ -1274,16 +1390,31 @@ export async function applyAsyncSseRefresh(plan) {
         return;
       }
       state.rootCollections = cols;
+      rootColsLoaded = true;
     } catch (err) {
-      if (state.ssePaused || isStale() || isAbortError(err)) return;
+      if (isPausedBlocked() || isStale() || isAbortError(err)) return;
       // Ignore transient error
     }
+    if (
+      isPausedBlocked() ||
+      isStale() ||
+      myNavEpoch !== getNavEpoch() ||
+      getActiveRootPath(state.activeProjectId, state.activeDatabaseId) !==
+        activeRoot
+    ) {
+      return;
+    }
 
-    if (state.ssePaused || isStale()) return;
-    const myNavEpoch = getNavEpoch();
-    const segmentsSnapshot = [...state.segments];
     for (let i = 0; i < segmentsSnapshot.length; i += 2) {
-      if (state.ssePaused || isStale() || myNavEpoch !== getNavEpoch()) return;
+      if (
+        isPausedBlocked() ||
+        isStale() ||
+        myNavEpoch !== getNavEpoch() ||
+        getActiveRootPath(state.activeProjectId, state.activeDatabaseId) !==
+          activeRoot
+      ) {
+        return;
+      }
       const colId = segmentsSnapshot[i];
       const parentSegments = segmentsSnapshot.slice(0, i);
       const colSegments = segmentsSnapshot.slice(0, i + 1);
@@ -1300,7 +1431,15 @@ export async function applyAsyncSseRefresh(plan) {
       if (affectsCollection) {
         await loadCollectionColumn(colPath, parentPath, colId, false, myDbEpoch);
       }
-      if (state.ssePaused || isStale() || myNavEpoch !== getNavEpoch()) return;
+      if (
+        isPausedBlocked() ||
+        isStale() ||
+        myNavEpoch !== getNavEpoch() ||
+        getActiveRootPath(state.activeProjectId, state.activeDatabaseId) !==
+          activeRoot
+      ) {
+        return;
+      }
 
       if (segmentsSnapshot.length > i + 1) {
         const docId = segmentsSnapshot[i + 1];
@@ -1314,18 +1453,35 @@ export async function applyAsyncSseRefresh(plan) {
         }
       }
     }
-    if (!state.ssePaused && !isStale()) {
-      renderApp();
+
+    if (
+      isPausedBlocked() ||
+      isStale() ||
+      myNavEpoch !== getNavEpoch() ||
+      getActiveRootPath(state.activeProjectId, state.activeDatabaseId) !==
+        activeRoot
+    ) {
+      return;
     }
+
+    if (replacedActiveDb) {
+      if (rootColsLoaded) {
+        truncateStaleSegmentsAfterReplace(activeRoot);
+      }
+      pruneInvisibleCachesAfterReplace(activeRoot);
+    }
+
+    renderApp();
   }
 }
 
 /**
  * Handles debounced SSE invalidation batches without clobbering dirty edits or resurrecting cleared databases.
  * @param {EmulatorSseEvent[]} events
+ * @param {{ ignorePaused?: boolean }} [options]
  */
-export async function handleSseBatch(events) {
-  const plan = applySyncSseBatch(events);
+export async function handleSseBatch(events, options = {}) {
+  const plan = applySyncSseBatch(events, options);
   if (plan) {
     await applyAsyncSseRefresh(plan);
   }
@@ -1560,6 +1716,25 @@ function openDatabaseModal() {
   renderApp();
 }
 
+function openExportModal() {
+  state.modal = {
+    kind: "export_snapshot",
+    busy: false,
+    error: null,
+  };
+  renderApp();
+}
+
+function openImportModal() {
+  state.modal = {
+    kind: "import_snapshot",
+    file: null,
+    busy: false,
+    error: null,
+  };
+  renderApp();
+}
+
 /**
  * @param {string} parentPath
  * @param {string} [collectionId]
@@ -1751,6 +1926,22 @@ export function renderTopbar() {
             `
           : nothing}
 
+        <button type="button" class="btn btn-sm" @click=${openImportModal}>
+          Import
+        </button>
+
+        ${state.databases.length > 0
+          ? html`
+              <button
+                type="button"
+                class="btn btn-sm"
+                @click=${openExportModal}
+              >
+                Export
+              </button>
+            `
+          : nothing}
+
         <button
           type="button"
           class="sse-badge"
@@ -1778,13 +1969,18 @@ export function renderWorkspace() {
           Connect your test suite to automatically populate databases, or create
           a database right now to start adding collections and documents.
         </p>
-        <button
-          type="button"
-          class="btn btn-primary"
-          @click=${openDatabaseModal}
-        >
-          + Open / Create Database
-        </button>
+        <div class="empty-hero-actions">
+          <button
+            type="button"
+            class="btn btn-primary"
+            @click=${openDatabaseModal}
+          >
+            + Open / Create Database
+          </button>
+          <button type="button" class="btn" @click=${openImportModal}>
+            Import Snapshot
+          </button>
+        </div>
       </div>
     `;
   }
@@ -1912,6 +2108,13 @@ export function renderModal() {
     onHydrateVisiblePath: hydrateVisiblePath,
     onRefreshDatabaseList: refreshDatabaseList,
     onToast: notifyToast,
+    onImportSuccess: async (summary) => {
+      const events = summary.databases.map((d) => ({
+        type: /** @type {const} */ ("database_replaced"),
+        database: d.name,
+      }));
+      await enqueueSseBatch(events, { ignorePaused: true });
+    },
   });
 }
 

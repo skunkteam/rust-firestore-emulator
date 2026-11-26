@@ -490,6 +490,14 @@ input[type="checkbox"]:focus-visible {
   color: var(--text-muted);
 }
 
+.empty-hero-actions {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
 /* Breadcrumb Bar */
 .breadcrumb-bar {
   flex: 0 0 auto;
@@ -788,6 +796,11 @@ input[type="checkbox"]:focus-visible {
   border-bottom: 1px solid var(--warning-border);
   color: var(--warning-text);
   font-size: 12.5px;
+}
+
+.conflict-banner.modal-banner {
+  border: 1px solid var(--warning-border);
+  border-radius: var(--radius-sm);
 }
 
 .error-banner {
@@ -1319,6 +1332,13 @@ input[type="checkbox"]:focus-visible {
   display: flex;
   gap: 8px;
   align-items: flex-end;
+}
+
+.snapshot-action-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
 }
 
 /* Toasts */
