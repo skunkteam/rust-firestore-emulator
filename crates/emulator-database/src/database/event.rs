@@ -23,6 +23,9 @@ pub enum ProjectEvent {
     DatabaseCleared {
         database: RootRef,
     },
+    DatabaseReplaced {
+        database: RootRef,
+    },
     DatabaseConfigChanged {
         database: RootRef,
     },

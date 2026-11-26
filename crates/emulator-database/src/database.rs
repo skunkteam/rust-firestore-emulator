@@ -2,7 +2,7 @@ use std::{
     collections::{BTreeSet, HashMap, HashSet},
     sync::{
         Arc, Weak,
-        atomic::{self, AtomicBool},
+        atomic::{self, AtomicBool, AtomicU8},
     },
 };
 
@@ -41,6 +41,7 @@ use self::{
 };
 use crate::{
     FirestoreProject, GenericDatabaseError,
+    config::{DatabaseConcurrencyMode, DatabaseEdition, DatabaseSettings},
     database::field_path::FieldReference,
     error::{AbortReason, Result},
     unimplemented_bool,
@@ -48,7 +49,7 @@ use crate::{
 };
 
 mod aggregation;
-mod collection;
+pub(crate) mod collection;
 mod commit;
 pub(crate) mod document;
 pub mod event;
@@ -61,7 +62,7 @@ pub mod read_consistency;
 pub mod reference;
 pub(crate) mod timeouts;
 pub(crate) mod transaction;
-mod validation;
+pub(crate) mod validation;
 pub(crate) mod vector;
 
 pub(crate) fn ensure_owns_root(expected: &RootRef, actual: &RootRef) -> Result<()> {
@@ -73,14 +74,38 @@ pub(crate) fn ensure_owns_root(expected: &RootRef, actual: &RootRef) -> Result<(
     Ok(())
 }
 
-const MAX_EVENT_BACKLOG: usize = 1024;
+pub(crate) const MAX_EVENT_BACKLOG: usize = 1024;
+const BIT_ENTERPRISE: u8 = 0b01;
+const BIT_OPTIMISTIC: u8 = 0b10;
+
+const fn pack_settings(settings: DatabaseSettings) -> u8 {
+    let mut bits = 0;
+    if matches!(settings.edition, DatabaseEdition::Enterprise) {
+        bits |= BIT_ENTERPRISE;
+    }
+    if matches!(
+        settings.concurrency_mode,
+        DatabaseConcurrencyMode::Optimistic
+    ) {
+        bits |= BIT_OPTIMISTIC;
+    }
+    bits
+}
+
+const fn unpack_settings(bits: u8) -> DatabaseSettings {
+    let edition = DatabaseEdition::from_enterprise(bits & BIT_ENTERPRISE != 0);
+    let concurrency_mode = DatabaseConcurrencyMode::from_optimistic(bits & BIT_OPTIMISTIC != 0);
+    DatabaseSettings {
+        edition,
+        concurrency_mode,
+    }
+}
 
 #[derive(Debug)]
 pub struct FirestoreDatabase {
     project: &'static FirestoreProject,
     pub name: RootRef,
-    enterprise_edition: AtomicBool,
-    optimistic_concurrency: AtomicBool,
+    settings: AtomicU8,
     cleared: AtomicBool,
     collections: RwLock<HashMap<DefaultAtom, Arc<Collection>>>,
     pub(crate) locks: Arc<LockManager>,
@@ -95,6 +120,26 @@ impl FirestoreDatabase {
         name: RootRef,
         enterprise_edition: bool,
     ) -> Arc<Self> {
+        let edition = DatabaseEdition::from_enterprise(enterprise_edition);
+        Self::new_with_config_and_collections(
+            project,
+            name,
+            DatabaseSettings::for_edition(edition),
+            HashMap::new(),
+        )
+    }
+
+    pub(crate) fn new_with_config_and_collections(
+        project: &'static FirestoreProject,
+        name: RootRef,
+        settings: DatabaseSettings,
+        collections: HashMap<DefaultAtom, Arc<Collection>>,
+    ) -> Arc<Self> {
+        debug_assert!(
+            collections
+                .iter()
+                .all(|(id, col)| *id == col.name.collection_id && col.name.root_ref == name)
+        );
         let locks = Arc::new(LockManager::with_broadcaster(
             name.clone(),
             project.timeouts,
@@ -103,10 +148,9 @@ impl FirestoreDatabase {
         let db = Arc::new_cyclic(|database| FirestoreDatabase {
             project,
             name,
-            enterprise_edition: AtomicBool::new(enterprise_edition),
-            optimistic_concurrency: AtomicBool::new(enterprise_edition),
+            settings: AtomicU8::new(pack_settings(settings)),
             cleared: AtomicBool::new(false),
-            collections: Default::default(),
+            collections: RwLock::new(collections),
             locks: Arc::clone(&locks),
             transactions: RunningTransactions::new(Weak::clone(database), locks, project.timeouts),
             optimistic_commit_lock: Default::default(),
@@ -309,7 +353,7 @@ impl FirestoreDatabase {
     }
     /// Get all collections asap collected into a [`Vec`] in order to keep the read lock time
     /// minimal.
-    async fn get_all_collections(&self) -> Vec<Arc<Collection>> {
+    pub(crate) async fn get_all_collections(&self) -> Vec<Arc<Collection>> {
         self.collections
             .read()
             .await
@@ -724,43 +768,54 @@ impl FirestoreDatabase {
             .map_or_else(|| broadcast::channel(1).1, broadcast::Sender::subscribe)
     }
 
+    pub fn settings(&self) -> DatabaseSettings {
+        unpack_settings(self.settings.load(atomic::Ordering::Acquire))
+    }
+
     pub fn enterprise_edition(&self) -> bool {
-        self.enterprise_edition.load(atomic::Ordering::Relaxed)
+        self.settings().edition == DatabaseEdition::Enterprise
     }
 
     pub fn set_enterprise_edition(&self, enterprise_edition: bool) {
-        self.update_config(Some(enterprise_edition), None);
+        self.update_settings(|s| {
+            s.edition = DatabaseEdition::from_enterprise(enterprise_edition);
+        });
     }
 
     pub fn optimistic_concurrency(&self) -> bool {
-        self.optimistic_concurrency.load(atomic::Ordering::Relaxed)
+        self.settings().concurrency_mode == DatabaseConcurrencyMode::Optimistic
     }
 
     pub fn set_optimistic_concurrency(&self, optimistic_concurrency: bool) {
-        self.update_config(None, Some(optimistic_concurrency));
+        self.update_settings(|s| {
+            s.concurrency_mode = DatabaseConcurrencyMode::from_optimistic(optimistic_concurrency);
+        });
     }
 
     pub fn set_config(&self, enterprise_edition: bool, optimistic_concurrency: bool) {
-        self.update_config(Some(enterprise_edition), Some(optimistic_concurrency));
+        self.update_settings(|s| {
+            s.edition = DatabaseEdition::from_enterprise(enterprise_edition);
+            s.concurrency_mode = DatabaseConcurrencyMode::from_optimistic(optimistic_concurrency);
+        });
     }
 
-    fn update_config(&self, enterprise: Option<bool>, optimistic: Option<bool>) {
+    fn update_settings(&self, update: impl FnOnce(&mut DatabaseSettings)) {
         let events = self
             .events
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let enterprise_changed = enterprise
-            .is_some_and(|val| self.enterprise_edition.swap(val, atomic::Ordering::Relaxed) != val);
-        let optimistic_changed = optimistic.is_some_and(|val| {
-            self.optimistic_concurrency
-                .swap(val, atomic::Ordering::Relaxed)
-                != val
-        });
-        if (enterprise_changed || optimistic_changed) && events.is_some() {
-            self.project
-                .send_project_event(ProjectEvent::DatabaseConfigChanged {
-                    database: self.name.clone(),
-                });
+        let prev = self.settings.load(atomic::Ordering::Acquire);
+        let mut next_settings = unpack_settings(prev);
+        update(&mut next_settings);
+        let next = pack_settings(next_settings);
+        if next != prev {
+            self.settings.store(next, atomic::Ordering::Release);
+            if events.is_some() {
+                self.project
+                    .send_project_event(ProjectEvent::DatabaseConfigChanged {
+                        database: self.name.clone(),
+                    });
+            }
         }
     }
 }
@@ -2466,6 +2521,85 @@ mod tests {
                 .await
                 .unwrap(),
             (vec!["parents".to_string()], String::new())
+        );
+    }
+
+    #[tokio::test]
+    async fn packed_settings_and_new_with_config_and_collections_roundtrip() {
+        let project: &'static FirestoreProject =
+            Box::leak(Box::new(FirestoreProject::new(FirestoreConfig::default())));
+        let mut proj_rx = project.subscribe_project_events();
+        let root: RootRef = "projects/p/databases/(default)".parse().unwrap();
+
+        let sub_col_ref: CollectionRef = "projects/p/databases/(default)/documents/rooms/r1/\
+                                          messages"
+            .parse()
+            .unwrap();
+        let sub_col = Arc::new(Collection::new(sub_col_ref.clone()));
+        let custom_settings = DatabaseSettings {
+            edition: DatabaseEdition::Standard,
+            concurrency_mode: DatabaseConcurrencyMode::Optimistic,
+        };
+
+        let db = FirestoreDatabase::new_with_config_and_collections(
+            project,
+            root.clone(),
+            custom_settings,
+            HashMap::from([(sub_col_ref.collection_id.clone(), Arc::clone(&sub_col))]),
+        );
+
+        assert_eq!(db.settings(), custom_settings);
+        assert!(!db.enterprise_edition());
+        assert!(db.optimistic_concurrency());
+        assert_eq!(db.get_all_collections().await.len(), 1);
+        assert!(
+            proj_rx.try_recv().is_err(),
+            "new_with_config_and_collections must not emit DatabaseConfigChanged"
+        );
+
+        // No-op config update must not emit DatabaseConfigChanged.
+        db.set_config(false, true);
+        assert!(proj_rx.try_recv().is_err());
+
+        db.set_enterprise_edition(true);
+        assert_eq!(
+            db.settings(),
+            DatabaseSettings {
+                edition: DatabaseEdition::Enterprise,
+                concurrency_mode: DatabaseConcurrencyMode::Optimistic,
+            }
+        );
+        assert!(db.enterprise_edition());
+        assert!(db.optimistic_concurrency());
+        assert!(matches!(
+            proj_rx.try_recv().unwrap(),
+            ProjectEvent::DatabaseConfigChanged { .. }
+        ));
+
+        db.set_optimistic_concurrency(false);
+        assert_eq!(
+            db.settings(),
+            DatabaseSettings {
+                edition: DatabaseEdition::Enterprise,
+                concurrency_mode: DatabaseConcurrencyMode::Pessimistic,
+            }
+        );
+        assert!(db.enterprise_edition());
+        assert!(!db.optimistic_concurrency());
+        assert!(matches!(
+            proj_rx.try_recv().unwrap(),
+            ProjectEvent::DatabaseConfigChanged { .. }
+        ));
+
+        let std_db = FirestoreDatabase::new(project, root.clone(), false);
+        assert_eq!(
+            std_db.settings(),
+            DatabaseSettings::for_edition(DatabaseEdition::Standard)
+        );
+        let ent_db = FirestoreDatabase::new(project, root, true);
+        assert_eq!(
+            ent_db.settings(),
+            DatabaseSettings::for_edition(DatabaseEdition::Enterprise)
         );
     }
 }

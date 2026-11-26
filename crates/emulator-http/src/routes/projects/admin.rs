@@ -1,23 +1,12 @@
 use axum::{Json, extract::State, http::Uri};
-use emulator_database::{FirestoreProject, reference::RootRef};
+use emulator_database::{
+    DatabaseConcurrencyMode, DatabaseEdition, DatabaseSettings, FirestoreProject,
+    reference::RootRef,
+};
 use serde::{Deserialize, Serialize};
 
-use super::{parse_raw_root_ref, query_params::percent_decode};
+use super::{parse_query_pairs, parse_raw_root_ref};
 use crate::error::{ApiJson, RestError, Result};
-
-#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
-#[serde(rename_all = "UPPERCASE")]
-enum DatabaseEdition {
-    Standard,
-    Enterprise,
-}
-
-#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
-#[serde(rename_all = "UPPERCASE")]
-enum ConcurrencyMode {
-    Pessimistic,
-    Optimistic,
-}
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -26,11 +15,11 @@ pub(super) struct DatabaseMetadata {
     uid: &'static str,
     r#type: &'static str,
     database_edition: DatabaseEdition,
-    concurrency_mode: ConcurrencyMode,
+    concurrency_mode: DatabaseConcurrencyMode,
 }
 
 impl DatabaseMetadata {
-    fn new(name: &RootRef, enterprise_edition: bool, optimistic_concurrency: bool) -> Self {
+    fn new(name: &RootRef, settings: DatabaseSettings) -> Self {
         Self {
             name: format!(
                 "projects/{}/databases/{}",
@@ -38,16 +27,8 @@ impl DatabaseMetadata {
             ),
             uid: "emulator-uid",
             r#type: "FIRESTORE_NATIVE",
-            database_edition: if enterprise_edition {
-                DatabaseEdition::Enterprise
-            } else {
-                DatabaseEdition::Standard
-            },
-            concurrency_mode: if optimistic_concurrency {
-                ConcurrencyMode::Optimistic
-            } else {
-                ConcurrencyMode::Pessimistic
-            },
+            database_edition: settings.edition,
+            concurrency_mode: settings.concurrency_mode,
         }
     }
 }
@@ -58,7 +39,7 @@ pub(super) struct PatchDatabase {
     #[serde(alias = "database_edition")]
     database_edition: Option<DatabaseEdition>,
     #[serde(alias = "concurrency_mode")]
-    concurrency_mode: Option<ConcurrencyMode>,
+    concurrency_mode: Option<DatabaseConcurrencyMode>,
     #[serde(alias = "firestore_data_access_mode")]
     firestore_data_access_mode: Option<serde_json::Value>,
     #[serde(alias = "mongodb_compatible_data_access_mode")]
@@ -74,11 +55,7 @@ pub(super) async fn get_database(
     let name = parse_raw_root_ref(uri.path())?;
 
     let db = project.database(&name).await;
-    Ok(Json(DatabaseMetadata::new(
-        &name,
-        db.enterprise_edition(),
-        db.optimistic_concurrency(),
-    )))
+    Ok(Json(DatabaseMetadata::new(&name, db.settings())))
 }
 
 pub(super) async fn patch_database(
@@ -125,26 +102,23 @@ pub(super) async fn patch_database(
         None
     };
 
-    let prev_enterprise = db.enterprise_edition();
+    let prev = db.settings();
+    let prev_enterprise = prev.edition == DatabaseEdition::Enterprise;
     let target_enterprise = effective_edition
         .map(|edition| matches!(edition, DatabaseEdition::Enterprise))
         .unwrap_or(prev_enterprise);
     let target_optimistic = if let Some(mode) = effective_concurrency {
-        matches!(mode, ConcurrencyMode::Optimistic)
+        matches!(mode, DatabaseConcurrencyMode::Optimistic)
     } else if target_enterprise != prev_enterprise {
         // Derive optimistic concurrency mode automatically when edition changes
         target_enterprise
     } else {
-        db.optimistic_concurrency()
+        prev.concurrency_mode == DatabaseConcurrencyMode::Optimistic
     };
 
     db.set_config(target_enterprise, target_optimistic);
 
-    Ok(Json(DatabaseMetadata::new(
-        &name,
-        db.enterprise_edition(),
-        db.optimistic_concurrency(),
-    )))
+    Ok(Json(DatabaseMetadata::new(&name, db.settings())))
 }
 
 #[derive(Debug, Default)]
@@ -159,13 +133,7 @@ fn parse_patch_database_mask(raw_query: Option<&str>) -> Result<Option<PatchData
     };
     let mut mask = PatchDatabaseMask::default();
     let mut saw_mask = false;
-    for pair in query.split('&') {
-        if pair.is_empty() {
-            continue;
-        }
-        let (raw_k, raw_v) = pair.split_once('=').unwrap_or((pair, ""));
-        let key = percent_decode(raw_k)?;
-        let val = percent_decode(raw_v)?;
+    for (key, val) in parse_query_pairs(query)? {
         if matches!(
             key.as_str(),
             "updateMask" | "update_mask" | "updateMask.paths" | "update_mask.paths"

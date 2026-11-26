@@ -7,7 +7,7 @@ use axum::{
     http::{HeaderMap, HeaderValue, Method, StatusCode, Uri, header},
     response::{IntoResponse, Response},
 };
-use emulator_database::GenericDatabaseError;
+use emulator_database::{GenericDatabaseError, snapshot::SnapshotError};
 use emulator_tracing::SetLogLevelsError;
 use serde::de::DeserializeOwned;
 use serde_json::json;
@@ -56,6 +56,18 @@ impl RestError {
 
     pub(crate) fn bad_request(message: impl Into<String>) -> Self {
         Self::new(StatusCode::BAD_REQUEST, "INVALID_ARGUMENT", message)
+    }
+
+    pub(crate) fn unsupported_media_type(message: impl Into<String>) -> Self {
+        Self::new(
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "INVALID_ARGUMENT",
+            message,
+        )
+    }
+
+    pub(crate) fn conflict(message: impl Into<String>) -> Self {
+        Self::new(StatusCode::CONFLICT, "ABORTED", message)
     }
 
     pub(crate) fn not_implemented(message: impl Into<String>) -> Self {
@@ -137,6 +149,24 @@ impl From<SetLogLevelsError> for RestError {
                 parse_error.to_string(),
             ),
             SetLogLevelsError::ReloadError(error) => Self::internal(error.to_string()),
+        }
+    }
+}
+
+impl From<SnapshotError> for RestError {
+    fn from(value: SnapshotError) -> Self {
+        match value {
+            SnapshotError::ImportInProgress => Self::conflict(value.to_string()),
+            SnapshotError::FrameTooLarge { .. } => Self::new(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "INVALID_ARGUMENT",
+                value.to_string(),
+            ),
+            SnapshotError::InvalidFormat(_)
+            | SnapshotError::UnsupportedVersion { .. }
+            | SnapshotError::Truncated(_)
+            | SnapshotError::Stream(_) => Self::bad_request(value.to_string()),
+            SnapshotError::Validation(err) => err.into(),
         }
     }
 }

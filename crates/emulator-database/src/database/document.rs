@@ -66,6 +66,26 @@ impl DocumentMeta {
         }
     }
 
+    pub(crate) fn from_imported_version(
+        name: DocumentRef,
+        fields: HashMap<String, Value>,
+        import_time: Timestamp,
+    ) -> Self {
+        let mut contents = DocumentContents::new();
+        contents
+            .versions
+            .push(DocumentVersion::Stored(Arc::new(StoredDocumentVersion {
+                name: name.clone(),
+                create_time: import_time,
+                update_time: import_time,
+                fields,
+            })));
+        Self {
+            contents: LockableDocument(RwLock::new(contents)),
+            name,
+        }
+    }
+
     pub(crate) fn read_with<R>(
         &self,
         lease: &ReadLease,
@@ -792,5 +812,58 @@ mod tests {
             err,
             CommitError::Other(GenericDatabaseError::Internal(_))
         ));
+    }
+
+    #[gtest]
+    fn from_imported_version_initializes_mvcc_state_without_locks() {
+        let name: DocumentRef = "projects/p/databases/(default)/documents/col/imported"
+            .parse()
+            .unwrap();
+        let import_time = Timestamp {
+            seconds: 500,
+            nanos:   25,
+        };
+        let fields = HashMap::from([
+            ("k".to_string(), Value::string("v")),
+            ("n".to_string(), Value::integer(42)),
+        ]);
+
+        let meta = DocumentMeta::from_imported_version(name.clone(), fields.clone(), import_time);
+        assert_eq!(meta.name, name);
+        assert!(meta.read_latest_uncontended(DocumentContents::exists));
+        assert_that!(
+            meta.read_mvcc_at(Timestamp {
+                seconds: 500,
+                nanos:   24,
+            }),
+            none()
+        );
+
+        let snap = meta.read_mvcc_at(import_time).unwrap();
+        assert_eq!(snap.name, name);
+        assert_eq!(snap.create_time, import_time);
+        assert_eq!(snap.update_time, import_time);
+        assert!(Value::fields_storage_eq(&snap.fields, &fields));
+
+        let later = Timestamp {
+            seconds: 501,
+            nanos:   0,
+        };
+        let snap_later = meta.read_mvcc_at(later).unwrap();
+        assert_eq!(snap_later.update_time, import_time);
+
+        // Subsequent updates preserve `create_time == import_time`.
+        let mut contents = meta.contents.write();
+        let (_, ver) = contents
+            .maybe_update(
+                &name,
+                HashMap::from([("k".to_string(), Value::string("updated"))]),
+                later,
+            )
+            .unwrap();
+        let ver = ver.unwrap();
+        let stored = ver.stored_document().unwrap();
+        assert_eq!(stored.create_time, import_time);
+        assert_eq!(stored.update_time, later);
     }
 }

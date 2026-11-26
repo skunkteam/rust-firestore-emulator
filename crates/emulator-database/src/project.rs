@@ -1,14 +1,32 @@
-use std::{collections::HashMap, ops::Deref, sync::Arc};
+use std::{
+    collections::{BTreeSet, HashMap},
+    ops::Deref,
+    sync::Arc,
+};
 
-use googleapis::google::firestore::v1::{ListenRequest, ListenResponse};
-use tokio::sync::{RwLock, broadcast};
-use tokio_stream::Stream;
+use bytes::Bytes;
+use googleapis::google::{
+    firestore::v1::{ListenRequest, ListenResponse},
+    protobuf::Timestamp,
+};
+use tokio::sync::{Mutex, RwLock, broadcast};
+use tokio_stream::{Stream, StreamExt};
 use tracing::{Level, debug, instrument};
 
 use crate::{
     ContentionSnapshot, ContentionSseEvent, ContentionSubscription, DatabaseContentionSnapshot,
-    FirestoreDatabase, config::FirestoreConfig, database::lock::ContentionBroadcaster,
-    error::Result, event::ProjectEvent, listener::Listener, reference::RootRef, timeouts::Timeouts,
+    FirestoreDatabase, GenericDatabaseError,
+    config::FirestoreConfig,
+    database::{collection::Collection, document::DocumentMeta, lock::ContentionBroadcaster},
+    error::Result,
+    event::ProjectEvent,
+    listener::Listener,
+    reference::{CollectionRef, RootRef},
+    snapshot::{
+        ExportSnapshotPlan, ExportTarget, ImportSummary, ImportedDatabase, SnapshotError,
+        codec::SnapshotDecoder,
+    },
+    timeouts::Timeouts,
     utils::RwLockHashMapExt,
 };
 
@@ -20,6 +38,7 @@ pub struct FirestoreProject {
     databases: RwLock<HashMap<RootRef, Arc<FirestoreDatabase>>>,
     events: broadcast::Sender<ProjectEvent>,
     contention: ContentionBroadcaster,
+    import_lock: Mutex<()>,
 }
 
 // A lot of structs refer back to FirestoreProject, so make sure not to print them out in Debug to
@@ -56,6 +75,7 @@ impl FirestoreProject {
             databases: Default::default(),
             events: broadcast::channel(MAX_PROJECT_EVENT_BACKLOG).0,
             contention: ContentionBroadcaster::new(),
+            import_lock: Mutex::new(()),
         }
     }
 
@@ -186,6 +206,134 @@ impl FirestoreProject {
         request_stream: impl Stream<Item = ListenRequest> + Send + Unpin + 'static,
     ) -> impl Stream<Item = Result<ListenResponse>> {
         Listener::start(self, request_stream)
+    }
+
+    pub async fn prepare_export(
+        &self,
+        targets: Option<&[RootRef]>,
+    ) -> std::result::Result<ExportSnapshotPlan, GenericDatabaseError> {
+        let databases = self.databases.read().await;
+        let export_targets = match targets {
+            Some(roots) => {
+                let unique: BTreeSet<&RootRef> = roots.iter().collect();
+                let mut resolved = Vec::with_capacity(unique.len());
+                for root in unique {
+                    let db = databases.get(root).ok_or_else(|| {
+                        GenericDatabaseError::not_found(format!("database not found: {root}"))
+                    })?;
+                    resolved.push(ExportTarget {
+                        database: Arc::clone(db),
+                        settings: db.settings(),
+                    });
+                }
+                resolved
+            }
+            None => {
+                let mut all: Vec<ExportTarget> = databases
+                    .values()
+                    .map(|db| ExportTarget {
+                        database: Arc::clone(db),
+                        settings: db.settings(),
+                    })
+                    .collect();
+                all.sort_by(|a, b| a.database.name.cmp(&b.database.name));
+                all
+            }
+        };
+        let snapshot_time = Timestamp::now();
+        drop(databases);
+        Ok(ExportSnapshotPlan::new(snapshot_time, export_targets))
+    }
+
+    pub async fn import_snapshot(
+        &'static self,
+        mut stream: impl Stream<Item = std::result::Result<Bytes, SnapshotError>> + Unpin,
+    ) -> std::result::Result<ImportSummary, SnapshotError> {
+        let _import_guard = self
+            .import_lock
+            .try_lock()
+            .map_err(|_| SnapshotError::ImportInProgress)?;
+
+        let mut decoder = SnapshotDecoder::new();
+        while let Some(chunk_res) = stream.next().await {
+            let chunk = chunk_res?;
+            decoder.feed(&chunk)?;
+        }
+        let prepared = decoder.finish()?;
+
+        let mut replaced_dbs = Vec::new();
+        let mut summary_dbs = Vec::with_capacity(prepared.len());
+
+        {
+            let mut databases = self.databases.write().await;
+
+            for db_spec in &prepared {
+                if let Some(old_db) = databases.get(&db_spec.name) {
+                    old_db.mark_cleared();
+                }
+            }
+
+            let import_time = Timestamp::now();
+
+            for db_spec in prepared {
+                let root = db_spec.name;
+                let settings = db_spec.settings;
+                let document_count = db_spec.document_count;
+
+                let mut collections = HashMap::with_capacity(db_spec.collections.len());
+                for (col_id, raw_docs) in db_spec.collections {
+                    let col_ref = CollectionRef::new(root.clone(), col_id.clone());
+                    let mut doc_metas = HashMap::with_capacity(raw_docs.len());
+                    for (doc_id, (doc_ref, fields)) in raw_docs {
+                        doc_metas.insert(
+                            doc_id,
+                            Arc::new(DocumentMeta::from_imported_version(
+                                doc_ref,
+                                fields,
+                                import_time,
+                            )),
+                        );
+                    }
+                    collections.insert(col_id, Arc::new(Collection::from_docs(col_ref, doc_metas)));
+                }
+
+                let new_db = FirestoreDatabase::new_with_config_and_collections(
+                    self,
+                    root.clone(),
+                    settings,
+                    collections,
+                );
+                let old_db = databases.insert(root.clone(), new_db);
+                let replaced = old_db.is_some();
+                if let Some(old_db) = old_db {
+                    replaced_dbs.push(old_db);
+                    self.send_project_event(ProjectEvent::DatabaseReplaced {
+                        database: root.clone(),
+                    });
+                    self.contention
+                        .send_if_subscribed(|| ContentionSseEvent::DatabaseCleared {
+                            database: root.clone(),
+                        });
+                } else {
+                    self.send_project_event(ProjectEvent::DatabaseCreated {
+                        database: root.clone(),
+                    });
+                }
+                summary_dbs.push(ImportedDatabase {
+                    name: root,
+                    settings,
+                    document_count,
+                    replaced,
+                });
+            }
+        }
+
+        drop(replaced_dbs);
+        drop(_import_guard);
+
+        Ok(ImportSummary {
+            databases: summary_dbs,
+        })
     }
 }
 
@@ -366,5 +514,591 @@ mod tests {
 
         drop(sub);
         assert_eq!(project.contention_subscriber_count(), 0);
+    }
+
+    async fn collect_export_bytes(
+        project: &FirestoreProject,
+        targets: Option<&[RootRef]>,
+    ) -> std::result::Result<Vec<u8>, GenericDatabaseError> {
+        let plan = project.prepare_export(targets).await?;
+        let mut stream = plan.into_stream();
+        let mut out = Vec::new();
+        while let Some(chunk) = stream.next().await {
+            out.extend_from_slice(&chunk.expect("export stream should not fail"));
+        }
+        Ok(out)
+    }
+
+    fn bytes_stream(
+        chunks: Vec<std::result::Result<Bytes, SnapshotError>>,
+    ) -> impl Stream<Item = std::result::Result<Bytes, SnapshotError>> + Unpin {
+        tokio_stream::iter(chunks)
+    }
+
+    #[tokio::test]
+    async fn concurrent_write_mvcc_point_in_time_export() {
+        let project: &'static FirestoreProject =
+            Box::leak(Box::new(FirestoreProject::new(FirestoreConfig::default())));
+        let root: RootRef = "projects/p/databases/(default)".parse().unwrap();
+        let unknown: RootRef = "projects/p/databases/missing".parse().unwrap();
+        let col: CollectionRef = format!("{root}/c").parse().unwrap();
+
+        let db = project.database(&root).await;
+        db.create_doc(
+            &col,
+            "d1",
+            HashMap::from([("v".to_string(), Value::integer(1))]),
+            None,
+        )
+        .await
+        .unwrap();
+        db.create_doc(
+            &col,
+            "d2",
+            HashMap::from([("v".to_string(), Value::integer(1))]),
+            None,
+        )
+        .await
+        .unwrap();
+
+        // Explicit missing target fails with NotFound without lazy creation.
+        let err = project
+            .prepare_export(Some(std::slice::from_ref(&unknown)))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, GenericDatabaseError::NotFound(_)));
+        assert_eq!(project.database_names().await, vec![root.clone()]);
+
+        // Duplicate explicit targets deduplicate to single_target() == Some(&root).
+        let plan = project
+            .prepare_export(Some(&[root.clone(), root.clone()]))
+            .await
+            .unwrap();
+        assert_eq!(plan.single_target(), Some(&root));
+
+        // Mutate & delete after prepare_export while streaming; exported snapshot stays at snap
+        // time.
+        let mut stream = plan.into_stream();
+        let d1: DocumentRef = format!("{root}/c/d1").parse().unwrap();
+        let d2: DocumentRef = format!("{root}/c/d2").parse().unwrap();
+        db.delete_doc(&d1, None).await.unwrap();
+        db.update_doc(
+            &d2,
+            HashMap::from([("v".to_string(), Value::integer(99))]),
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        db.create_doc(
+            &col,
+            "d3",
+            HashMap::from([("v".to_string(), Value::integer(3))]),
+            None,
+        )
+        .await
+        .unwrap();
+
+        let mut exported = Vec::new();
+        while let Some(chunk) = stream.next().await {
+            exported.extend_from_slice(&chunk.unwrap());
+        }
+
+        let project2: &'static FirestoreProject =
+            Box::leak(Box::new(FirestoreProject::new(FirestoreConfig::default())));
+        let summary = project2
+            .import_snapshot(bytes_stream(vec![Ok(Bytes::from(exported))]))
+            .await
+            .unwrap();
+        assert_eq!(summary.total_databases(), 1);
+        assert_eq!(summary.total_documents(), 2);
+
+        let db2 = project2.database(&root).await;
+        assert_eq!(
+            db2.get_doc(&d1, crate::read_consistency::ReadConsistency::Default)
+                .await
+                .unwrap()
+                .unwrap()
+                .fields["v"]
+                .as_integer(),
+            Some(1)
+        );
+        assert_eq!(
+            db2.get_doc(&d2, crate::read_consistency::ReadConsistency::Default)
+                .await
+                .unwrap()
+                .unwrap()
+                .fields["v"]
+                .as_integer(),
+            Some(1)
+        );
+        let d3: DocumentRef = format!("{root}/c/d3").parse().unwrap();
+        assert!(
+            db2.get_doc(&d3, crate::read_consistency::ReadConsistency::Default)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn reconnecting_documents_listener_with_resume_token_while_writes_race_import() {
+        use googleapis::google::firestore::v1::{
+            ListenRequest, Target, listen_request,
+            listen_response::ResponseType,
+            target::{self, DocumentsTarget, ResumeType},
+            target_change::TargetChangeType,
+        };
+        use tokio::sync::mpsc;
+        use tokio_stream::wrappers::ReceiverStream;
+
+        let project: &'static FirestoreProject =
+            Box::leak(Box::new(FirestoreProject::new(FirestoreConfig::default())));
+        let root: RootRef = "projects/p/databases/(default)".parse().unwrap();
+        let col: CollectionRef = format!("{root}/c").parse().unwrap();
+        let doc_ref: DocumentRef = format!("{root}/c/doc1").parse().unwrap();
+
+        let db1 = project.database(&root).await;
+        db1.create_doc(
+            &col,
+            "doc1",
+            HashMap::from([("v".to_string(), Value::integer(1))]),
+            None,
+        )
+        .await
+        .unwrap();
+        let snapshot = collect_export_bytes(project, None).await.unwrap();
+
+        // Capture pre-import resume_token from an initial DocumentsTarget listener.
+        let (req_tx, req_rx) = mpsc::channel(4);
+        let mut live_stream = project.listen(ReceiverStream::new(req_rx));
+        req_tx
+            .send(ListenRequest {
+                database: root.to_string(),
+                labels: Default::default(),
+                target_change: Some(listen_request::TargetChange::AddTarget(Target {
+                    target_id: 1,
+                    once: false,
+                    expected_count: None,
+                    target_type: Some(target::TargetType::Documents(DocumentsTarget {
+                        documents: vec![doc_ref.to_string()],
+                    })),
+                    resume_type: None,
+                })),
+                request_options: None,
+            })
+            .await
+            .unwrap();
+
+        let mut pre_import_token = Vec::new();
+        while let Some(frame) = live_stream.next().await {
+            if let Some(ResponseType::TargetChange(tc)) = frame.unwrap().response_type {
+                if tc.target_change_type == TargetChangeType::Current as i32 {
+                    pre_import_token = tc.resume_token;
+                } else if tc.target_change_type == TargetChangeType::NoChange as i32
+                    && tc.target_ids.is_empty()
+                {
+                    break;
+                }
+            }
+        }
+        assert!(!pre_import_token.is_empty());
+
+        // Start streaming import, then commit live writes on `db1` while decoder is mid-stream.
+        let (chunk_tx, chunk_rx) = mpsc::channel::<std::result::Result<Bytes, SnapshotError>>(4);
+        let split_at = snapshot.len() / 2;
+        chunk_tx
+            .send(Ok(Bytes::copy_from_slice(&snapshot[..split_at])))
+            .await
+            .unwrap();
+
+        let import_handle =
+            tokio::spawn(
+                async move { project.import_snapshot(ReceiverStream::new(chunk_rx)).await },
+            );
+        tokio::task::yield_now().await;
+
+        // Live write commits on `db1` during decode with timestamp > `pre_import_token`.
+        db1.update_doc(
+            &doc_ref,
+            HashMap::from([("v".to_string(), Value::integer(99))]),
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        chunk_tx
+            .send(Ok(Bytes::copy_from_slice(&snapshot[split_at..])))
+            .await
+            .unwrap();
+        drop(chunk_tx);
+        import_handle.await.unwrap().unwrap();
+
+        // Active listener must eventually converge on restored value `1`.
+        let mut saw_restored = false;
+        while let Some(frame) = live_stream.next().await {
+            match frame.unwrap().response_type {
+                Some(ResponseType::DocumentChange(dc)) => {
+                    if dc.document.as_ref().and_then(|d| d.fields.get("v"))
+                        == Some(&Value::integer(1))
+                    {
+                        saw_restored = true;
+                    }
+                }
+                Some(ResponseType::TargetChange(tc))
+                    if tc.target_change_type == TargetChangeType::NoChange as i32
+                        && tc.target_ids.is_empty()
+                        && saw_restored =>
+                {
+                    break;
+                }
+                _ => {}
+            }
+        }
+        assert!(saw_restored);
+        drop(req_tx);
+
+        // Reconnect a DocumentsTarget listener with the pre-import resume_token: because
+        // `import_time` is stamped after `old_db.mark_cleared()`, it strictly exceeds the
+        // pre-import token and delivers the restored `v = 1` document.
+        let (req2_tx, req2_rx) = mpsc::channel(4);
+        let mut reconnected = project.listen(ReceiverStream::new(req2_rx));
+        req2_tx
+            .send(ListenRequest {
+                database: root.to_string(),
+                labels: Default::default(),
+                target_change: Some(listen_request::TargetChange::AddTarget(Target {
+                    target_id: 1,
+                    once: false,
+                    expected_count: None,
+                    target_type: Some(target::TargetType::Documents(DocumentsTarget {
+                        documents: vec![doc_ref.to_string()],
+                    })),
+                    resume_type: Some(ResumeType::ResumeToken(pre_import_token)),
+                })),
+                request_options: None,
+            })
+            .await
+            .unwrap();
+
+        let mut got_v1 = false;
+        while let Some(frame) = reconnected.next().await {
+            match frame.unwrap().response_type {
+                Some(ResponseType::DocumentChange(dc)) => {
+                    assert_eq!(
+                        dc.document.as_ref().and_then(|d| d.fields.get("v")),
+                        Some(&Value::integer(1))
+                    );
+                    got_v1 = true;
+                }
+                Some(ResponseType::TargetChange(tc))
+                    if tc.target_change_type == TargetChangeType::NoChange as i32
+                        && tc.target_ids.is_empty() =>
+                {
+                    break;
+                }
+                _ => {}
+            }
+        }
+        assert!(got_v1);
+        drop(req2_tx);
+    }
+
+    #[tokio::test]
+    async fn selective_overwrite_empty_db_zero_db_and_project_events() {
+        let project: &'static FirestoreProject =
+            Box::leak(Box::new(FirestoreProject::new(FirestoreConfig::default())));
+        let app: RootRef = "projects/p/databases/app".parse().unwrap();
+        let audit: RootRef = "projects/p/databases/audit".parse().unwrap();
+        let scratch: RootRef = "projects/p/databases/scratch".parse().unwrap();
+
+        let db_app = project.database(&app).await;
+        db_app
+            .create_doc(
+                &format!("{app}/users").parse().unwrap(),
+                "u1",
+                HashMap::from([("role".to_string(), Value::string("admin"))]),
+                None,
+            )
+            .await
+            .unwrap();
+        db_app
+            .create_doc(
+                &format!("{app}/rooms/r1/messages").parse().unwrap(),
+                "m1",
+                HashMap::new(),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let db_audit = project.database(&audit).await;
+        db_audit.set_config(true, true);
+
+        let db_scratch = project.database(&scratch).await;
+        db_scratch
+            .create_doc(
+                &format!("{scratch}/notes").parse().unwrap(),
+                "n1",
+                HashMap::from([("v".to_string(), Value::integer(1))]),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let snapshot = collect_export_bytes(project, Some(&[app.clone(), audit.clone()]))
+            .await
+            .unwrap();
+
+        // Mutate all three databases after checkpoint.
+        db_app
+            .delete_doc(&format!("{app}/users/u1").parse().unwrap(), None)
+            .await
+            .unwrap();
+        db_app.set_config(true, true);
+        db_audit
+            .create_doc(
+                &format!("{audit}/leaked").parse().unwrap(),
+                "bad",
+                HashMap::from([("v".to_string(), Value::integer(1))]),
+                None,
+            )
+            .await
+            .unwrap();
+        db_scratch
+            .create_doc(
+                &format!("{scratch}/notes").parse().unwrap(),
+                "n2",
+                HashMap::from([("v".to_string(), Value::integer(2))]),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let mut proj_rx = project.subscribe_project_events();
+        let summary = project
+            .import_snapshot(bytes_stream(vec![Ok(Bytes::from(snapshot.clone()))]))
+            .await
+            .unwrap();
+
+        assert_eq!(summary.total_databases(), 2);
+        assert_eq!(summary.total_documents(), 2);
+        assert_eq!(
+            summary.databases,
+            vec![
+                ImportedDatabase {
+                    name: app.clone(),
+                    settings: crate::DatabaseSettings::for_edition(
+                        crate::DatabaseEdition::Standard
+                    ),
+                    document_count: 2,
+                    replaced: true,
+                },
+                ImportedDatabase {
+                    name: audit.clone(),
+                    settings: crate::DatabaseSettings::for_edition(
+                        crate::DatabaseEdition::Enterprise
+                    ),
+                    document_count: 0,
+                    replaced: true,
+                },
+            ]
+        );
+
+        let ev1 = proj_rx.try_recv().unwrap();
+        let ev2 = proj_rx.try_recv().unwrap();
+        assert!(matches!(ev1, ProjectEvent::DatabaseReplaced { ref database } if database == &app));
+        assert!(
+            matches!(ev2, ProjectEvent::DatabaseReplaced { ref database } if database == &audit)
+        );
+        assert!(proj_rx.try_recv().is_err());
+
+        // `app` and `audit` restored; `scratch` untouched.
+        let restored_app = project.database(&app).await;
+        assert_eq!(
+            restored_app.settings(),
+            crate::DatabaseSettings::for_edition(crate::DatabaseEdition::Standard)
+        );
+        assert!(
+            restored_app
+                .get_doc(
+                    &format!("{app}/users/u1").parse().unwrap(),
+                    crate::read_consistency::ReadConsistency::Default,
+                )
+                .await
+                .unwrap()
+                .is_some()
+        );
+
+        let restored_audit = project.database(&audit).await;
+        assert_eq!(
+            restored_audit.settings(),
+            crate::DatabaseSettings::for_edition(crate::DatabaseEdition::Enterprise)
+        );
+        assert!(
+            restored_audit
+                .list_collection_ids(&crate::reference::Ref::Root(audit.clone()), 0, "")
+                .await
+                .unwrap()
+                .0
+                .is_empty()
+        );
+
+        assert!(
+            db_scratch
+                .get_doc(
+                    &format!("{scratch}/notes/n2").parse().unwrap(),
+                    crate::read_consistency::ReadConsistency::Default,
+                )
+                .await
+                .unwrap()
+                .is_some()
+        );
+
+        // Fresh project receives `DatabaseCreated` and `replaced == false`.
+        let project2: &'static FirestoreProject =
+            Box::leak(Box::new(FirestoreProject::new(FirestoreConfig::default())));
+        let mut proj2_rx = project2.subscribe_project_events();
+        let created_summary = project2
+            .import_snapshot(bytes_stream(vec![Ok(Bytes::from(snapshot))]))
+            .await
+            .unwrap();
+        assert!(created_summary.databases.iter().all(|d| !d.replaced));
+        assert!(matches!(
+            proj2_rx.try_recv().unwrap(),
+            ProjectEvent::DatabaseCreated { ref database } if database == &app
+        ));
+        assert!(matches!(
+            proj2_rx.try_recv().unwrap(),
+            ProjectEvent::DatabaseCreated { ref database } if database == &audit
+        ));
+
+        // Zero-database snapshot imports as a no-op without modifying live databases.
+        let empty_project: &'static FirestoreProject =
+            Box::leak(Box::new(FirestoreProject::new(FirestoreConfig::default())));
+        let empty_snap = collect_export_bytes(empty_project, None).await.unwrap();
+        let noop_summary = project
+            .import_snapshot(bytes_stream(vec![Ok(Bytes::from(empty_snap))]))
+            .await
+            .unwrap();
+        assert_eq!(noop_summary.total_databases(), 0);
+        assert_eq!(noop_summary.total_documents(), 0);
+        assert!(proj_rx.try_recv().is_err());
+        assert_eq!(project.database_names().await.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn import_lock_rejects_overlaps_and_releases_on_errors_or_cancellation() {
+        use tokio::sync::mpsc;
+        use tokio_stream::wrappers::ReceiverStream;
+
+        let project: &'static FirestoreProject =
+            Box::leak(Box::new(FirestoreProject::new(FirestoreConfig::default())));
+        let root: RootRef = "projects/p/databases/(default)".parse().unwrap();
+        let col: CollectionRef = format!("{root}/c").parse().unwrap();
+        let doc_ref: DocumentRef = format!("{root}/c/d1").parse().unwrap();
+
+        let db = project.database(&root).await;
+        db.create_doc(
+            &col,
+            "d1",
+            HashMap::from([("v".to_string(), Value::integer(1))]),
+            None,
+        )
+        .await
+        .unwrap();
+        let valid_snapshot = collect_export_bytes(project, None).await.unwrap();
+
+        // Update live state so any failed/cancelled import must leave `v = 2` untouched.
+        db.update_doc(
+            &doc_ref,
+            HashMap::from([("v".to_string(), Value::integer(2))]),
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        // 1. Overlapping import fails immediately with ImportInProgress until first completes.
+        let (tx, rx) = mpsc::channel::<std::result::Result<Bytes, SnapshotError>>(4);
+        let split_at = valid_snapshot.len() / 2;
+        tx.send(Ok(Bytes::copy_from_slice(&valid_snapshot[..split_at])))
+            .await
+            .unwrap();
+
+        let mut import_fut = Box::pin(project.import_snapshot(ReceiverStream::new(rx)));
+        assert!(futures_util::poll!(&mut import_fut).is_pending());
+
+        let overlap_err = project
+            .import_snapshot(bytes_stream(vec![Ok(Bytes::from(valid_snapshot.clone()))]))
+            .await
+            .unwrap_err();
+        assert!(matches!(overlap_err, SnapshotError::ImportInProgress));
+
+        // 2. Cancelling (dropping) an in-progress import future releases `import_lock`.
+        drop(import_fut);
+        drop(tx);
+
+        // 3. Stream error releases `import_lock` and leaves `v = 2` intact.
+        let stream_err = project
+            .import_snapshot(bytes_stream(vec![
+                Ok(Bytes::copy_from_slice(&valid_snapshot[..split_at])),
+                Err(SnapshotError::Stream("transport reset".to_string())),
+            ]))
+            .await
+            .unwrap_err();
+        assert!(matches!(stream_err, SnapshotError::Stream(_)));
+        assert_eq!(
+            db.get_doc(&doc_ref, crate::read_consistency::ReadConsistency::Default)
+                .await
+                .unwrap()
+                .unwrap()
+                .fields["v"]
+                .as_integer(),
+            Some(2)
+        );
+
+        // 4. Live task holding import_lock rejects overlapping import until completion, then
+        //    releases cleanly so subsequent imports succeed.
+        let (tx2, rx2) = mpsc::channel::<std::result::Result<Bytes, SnapshotError>>(4);
+        tx2.send(Ok(Bytes::copy_from_slice(&valid_snapshot[..split_at])))
+            .await
+            .unwrap();
+        let import_task =
+            tokio::spawn(async move { project.import_snapshot(ReceiverStream::new(rx2)).await });
+        tokio::task::yield_now().await;
+        let overlap2 = project
+            .import_snapshot(bytes_stream(vec![Ok(Bytes::from(valid_snapshot.clone()))]))
+            .await
+            .unwrap_err();
+        assert!(matches!(overlap2, SnapshotError::ImportInProgress));
+        tx2.send(Ok(Bytes::copy_from_slice(&valid_snapshot[split_at..])))
+            .await
+            .unwrap();
+        drop(tx2);
+        let summary = import_task.await.unwrap().unwrap();
+        assert_eq!(summary.total_documents(), 1);
+        let db_after = project.database(&root).await;
+        assert_eq!(
+            db_after
+                .get_doc(&doc_ref, crate::read_consistency::ReadConsistency::Default)
+                .await
+                .unwrap()
+                .unwrap()
+                .fields["v"]
+                .as_integer(),
+            Some(1)
+        );
+
+        // 5. Subsequent import succeeds cleanly after previous import completed.
+        let summary2 = project
+            .import_snapshot(bytes_stream(vec![Ok(Bytes::from(valid_snapshot))]))
+            .await
+            .unwrap();
+        assert_eq!(summary2.total_documents(), 1);
     }
 }

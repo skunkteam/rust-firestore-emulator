@@ -10,6 +10,7 @@ mod database;
 mod error;
 mod listener;
 mod project;
+pub mod snapshot;
 
 #[macro_use]
 mod utils;
