@@ -5,6 +5,7 @@ Zero-build, multi-file ES-module web application for inspecting, creating, editi
 
 ## Subdirectories
 - `components`: [./components/README.md](./components/README.md) - Declarative UI view components and pure domain modules for Miller-column collection/document navigation (`explorer.js`), hybrid structured field-tree and Raw ProtoJSON document editing (`editor.js`), pure query/aggregation models and Raw JSON validation (`query-model.js`), the 2x2 Documents/Aggregations structured query runner (`query.js`), the pure `lit-html` WAI-ARIA 1.2 combobox (`combobox.js`), the DB-scoped standard-REST autosuggestion engine (`query-suggestions.js`), the live lock contention visualizer (`contention.js`), and modal dialogs (`modals.js`).
+- `tests`: Zero-dependency `node:test` unit and regression suite (`*.test.mjs`) with a shared DOM/`fetch`/`EventSource`/`lit-html` harness (`helpers/dom-harness.mjs`) and standalone ESLint config (`eslint.config.mjs`), excluded from embedded binary assets by `crates/emulator-http/build.rs`.
 
 ## Interface
 - `[index.html]`: Minimal HTML shell mounting `<header id="topbar">`, `<main id="workspace">`, `<div id="modal-root">`, `<div id="toast-root">`, `/ui/styles.css`, and `<script type="module" src="/ui/app.js">`.
@@ -39,4 +40,5 @@ Zero-build, multi-file ES-module web application for inspecting, creating, editi
 
 ## Verification
 - Run: `just ui-check`
+- Run: `just ui-test`
 - Run: `cargo nextest run -p emulator-http --all-features`

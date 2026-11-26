@@ -3,7 +3,7 @@
 # `just watch lint` runs linting on file change.
 #
 # Available commands:
-# just                          - Run all CI checks locally (fmt-check, lint, test, sdk-test)
+# just                          - Run all CI checks locally (fmt-check, lint, test, ui-test, sdk-test)
 # just watch                    - Watch and re-run all default checks on file change
 # just [watch] test [crate]     - Run tests on workspace (including --no-default-features and doctests) or the specified crate (run `just test` without a crate to include cross-crate black-box suites in `emulator-tests`)
 # just [watch] cov [crate]      - Generate line/region coverage summary via cargo-llvm-cov + nextest
@@ -11,7 +11,8 @@
 # just [watch] clippy [crate]   - Run Clippy on workspace or the specified crate
 # just [watch] lint [crate]     - Run Clippy on workspace or the specified crate (includes `sdk-lint` and `ui-check` when crate is omitted or 'all')
 # just [watch] sdk-lint         - Lint and type-check the TypeScript conformance test suite (ESLint, Prettier, tsc)
-# just [watch] ui-check         - Type-check the Web UI JavaScript modules via JSDoc/TypeScript
+# just [watch] ui-check         - Type-check the Web UI modules and lint/type-check Web UI tests
+# just [watch] ui-test          - Run the Web UI unit and regression tests via Node test runner
 # just [watch] doc [crate]      - Create crate docs for the workspace or the specified crate
 # just [watch] fmt [crate]      - Format the code of the entire workspace or the specified crate
 # just [watch] fmt-check [crate]- Check Rust formatting without modifying files
@@ -28,8 +29,8 @@ set quiet
 
 export FORCE_COLOR := "1"
 
-# Default action runs all CI checks locally: formatting, linting/type-checking, Rust tests, and SDK conformance tests.
-default: fmt-check lint test sdk-test
+# Default action runs all CI checks locally: formatting, linting/type-checking, Rust tests, Web UI tests, and SDK conformance tests.
+default: fmt-check lint test ui-test sdk-test
 
 # Clean the repo, removing all compiled and generated artifacts
 clean:
@@ -121,10 +122,16 @@ sdk-lint: sdk-deps
     npm run lint
     ./node_modules/.bin/tsc -p tsconfig.json --noEmit
 
-# Type-check the zero-build Web UI JavaScript modules using JSDoc and TypeScript
+# Type-check the zero-build Web UI JavaScript modules and lint/type-check Web UI tests
 ui-check: sdk-deps
-    echo Running TypeScript JSDoc check for Web UI
+    echo Running TypeScript JSDoc and ESLint checks for Web UI
     ./test-suite/node_modules/.bin/tsc --noEmit --allowJs --checkJs --strict --target es2022 --module es2022 --lib es2022,dom,dom.iterable ui/app.js
+    ./test-suite/node_modules/.bin/tsc --typeRoots test-suite/node_modules/@types --types node --module nodenext --moduleResolution nodenext --target es2022 --allowJs --checkJs --strict --noEmit ui/tests/*.test.mjs ui/tests/helpers/*.mjs
+    ./test-suite/node_modules/.bin/eslint --config ui/tests/eslint.config.mjs ui/tests
+
+# Run the Web UI unit and regression tests via Node's built-in test runner
+ui-test:
+    node --test ui/tests/*.test.mjs
 
 # Run the application, simple alias for cargo run
 run *cmd:

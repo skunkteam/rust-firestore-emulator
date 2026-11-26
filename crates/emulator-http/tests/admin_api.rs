@@ -598,6 +598,7 @@ async fn test_rest_error_envelopes_and_404_isolation() -> Result<()> {
             "/ui/components/editor.js",
             "/ui/components/explorer.js",
             "/ui/components/modals.js",
+            "/ui/components/query-model.js",
             "/ui/components/query-suggestions.js",
             "/ui/components/query.js",
             "/ui/lit-html.js",

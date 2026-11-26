@@ -57,6 +57,9 @@ fn collect_ui_assets(root: &Path, dir: &Path, entries: &mut Vec<(String, &'stati
     for entry in dir_entries {
         let path = entry.path();
         if path.is_dir() {
+            if entry.file_name() == "tests" {
+                continue;
+            }
             collect_ui_assets(root, &path, entries);
             continue;
         }

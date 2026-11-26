@@ -110,6 +110,8 @@ jobs:
         run: just sdk-lint
       - name: Check Web UI JSDoc types
         run: just ui-check
+      - name: Run Web UI tests
+        run: just ui-test
       - name: Run compatibility test suite
         run: just sdk-test
 
