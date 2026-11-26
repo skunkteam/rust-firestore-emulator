@@ -5,9 +5,7 @@ use bytes::Bytes;
 use googleapis::{
     fields,
     google::{
-        firestore::v1::{
-            Value, structured_query::field_filter::Operator, target, value::ValueType,
-        },
+        firestore::v1::{Value, structured_query::field_filter::Operator, target},
         protobuf::Timestamp,
         r#type::LatLng,
     },
@@ -99,12 +97,10 @@ fn all_eleven_value_types_fields() -> HashMap<String, Value> {
         ),
         (
             "geo_val".to_string(),
-            Value {
-                value_type: Some(ValueType::GeoPointValue(LatLng {
-                    latitude:  -37.8136,
-                    longitude: 144.9631,
-                })),
-            },
+            Value::from(LatLng {
+                latitude:  -37.8136,
+                longitude: 144.9631,
+            }),
         ),
         (
             "arr_val".to_string(),

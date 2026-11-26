@@ -19,13 +19,10 @@ use bytes::Bytes;
 use emulator_database::{
     FirestoreConfig, FirestoreProject,
     reference::{CollectionRef, RootRef},
+    snapshot::{EOF_MAGIC, FORMAT_MAJOR, SNAPSHOT_MAGIC},
 };
 use futures_util::StreamExt;
-use googleapis::google::{
-    firestore::v1::{Value, value::ValueType},
-    protobuf::Timestamp,
-    r#type::LatLng,
-};
+use googleapis::google::{firestore::v1::Value, protobuf::Timestamp, r#type::LatLng};
 use http::{Method, Request, StatusCode, header};
 use http_body_util::{BodyExt, Empty};
 use hyper_util::rt::TokioIo;
@@ -279,12 +276,10 @@ async fn cli_import_flag_preloads_databases_settings_and_documents_before_listen
         ),
         (
             "geo_val".to_string(),
-            Value {
-                value_type: Some(ValueType::GeoPointValue(LatLng {
-                    latitude:  52.3676,
-                    longitude: 4.9041,
-                })),
-            },
+            Value::from(LatLng {
+                latitude:  52.3676,
+                longitude: 4.9041,
+            }),
         ),
         (
             "arr_val".to_string(),
@@ -560,17 +555,7 @@ async fn cli_import_env_var_streams_multi_chunk_snapshot_and_preserves_settings_
     assert_eq!(legacy_doc["fields"]["name"]["stringValue"], "kept");
 }
 
-#[tokio::test]
-async fn cli_import_fails_fast_before_binding_on_invalid_inputs() {
-    let dir = TempDirGuard::new("fail-fast");
-
-    // Keep an occupied port open: if the binary ever reached `TcpListener::bind` before failing
-    // `--import`, bind would fail with "Could not start listener on provided address" instead of
-    // "Could not import snapshot from".
-    let occupied_listener = TcpListener::bind("127.0.0.1:0").expect("bind occupied test port");
-    let occupied_addr = occupied_listener.local_addr().unwrap();
-
-    // Seed a valid snapshot to derive truncated / corrupt / future-version fixtures.
+async fn build_single_doc_snapshot_bytes() -> Vec<u8> {
     let project: &'static FirestoreProject =
         Box::leak(Box::new(FirestoreProject::new(FirestoreConfig::default())));
     let root: RootRef = "projects/demo/databases/(default)".parse().unwrap();
@@ -586,7 +571,94 @@ async fn cli_import_fails_fast_before_binding_on_invalid_inputs() {
         )
         .await
         .unwrap();
-    let valid_bytes = export_project_bytes(project).await;
+    export_project_bytes(project).await
+}
+
+#[tokio::test]
+async fn cli_import_accepts_valid_zero_database_snapshot() {
+    let dir = TempDirGuard::new("zero-db");
+    let snapshot_path = dir.path().join("zero-databases.fsemu");
+
+    let empty_project: &'static FirestoreProject =
+        Box::leak(Box::new(FirestoreProject::new(FirestoreConfig::default())));
+    let snapshot_bytes = export_project_bytes(empty_project).await;
+    fs::write(&snapshot_path, &snapshot_bytes).expect("write 0-database snapshot fixture");
+
+    let mut cmd = base_command();
+    cmd.arg("--host-port")
+        .arg("127.0.0.1:0")
+        .arg("--import")
+        .arg(&snapshot_path);
+    let expected_line = format!(
+        "Loaded snapshot from {}: 0 database(s), 0 document(s)",
+        snapshot_path.display()
+    );
+    let emu = spawn_and_wait_listening(cmd, &expected_line);
+
+    let (status, databases) = http_get_json(emu.addr, "/emulator/v1").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(databases, JsonValue::Array(Vec::new()));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn cli_import_follows_symlinked_snapshot_file() {
+    let dir = TempDirGuard::new("symlink-file");
+    let target_path = dir.path().join("target.fsemu");
+    let symlink_path = dir.path().join("linked.fsemu");
+
+    let snapshot_bytes = build_single_doc_snapshot_bytes().await;
+    fs::write(&target_path, &snapshot_bytes).expect("write target snapshot fixture");
+    std::os::unix::fs::symlink(&target_path, &symlink_path).expect("create snapshot file symlink");
+
+    let mut cmd = base_command();
+    cmd.arg("--host-port")
+        .arg("127.0.0.1:0")
+        .arg("--import")
+        .arg(&symlink_path);
+    let expected_line = format!(
+        "Loaded snapshot from {}: 1 database(s), 1 document(s)",
+        symlink_path.display()
+    );
+    let emu = spawn_and_wait_listening(cmd, &expected_line);
+
+    let (status, doc) = http_get_json(
+        emu.addr,
+        "/v1/projects/demo/databases/(default)/documents/c/d",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(doc["fields"]["v"]["integerValue"], "1");
+}
+
+#[tokio::test]
+async fn cli_import_fails_fast_before_binding_on_invalid_inputs() {
+    let dir = TempDirGuard::new("fail-fast");
+
+    // Keep an occupied port open: if the binary ever reached `TcpListener::bind` before failing
+    // `--import`, bind would fail with "Could not start listener on provided address" instead of
+    // "Could not import snapshot from".
+    let occupied_listener = TcpListener::bind("127.0.0.1:0").expect("bind occupied test port");
+    let occupied_addr = occupied_listener.local_addr().unwrap();
+
+    // Seed a valid snapshot to derive truncated / corrupt / future-version fixtures.
+    let valid_bytes = build_single_doc_snapshot_bytes().await;
+    let header_magic_len = SNAPSHOT_MAGIC.len();
+    let header_len = header_magic_len + size_of::<u16>();
+    let trailer_len = size_of::<u32>() + EOF_MAGIC.len();
+    assert_eq!(&valid_bytes[..header_magic_len], &SNAPSHOT_MAGIC);
+    assert_eq!(
+        u16::from_le_bytes(
+            valid_bytes[header_magic_len..header_len]
+                .try_into()
+                .unwrap()
+        ),
+        FORMAT_MAJOR
+    );
+    assert_eq!(
+        &valid_bytes[valid_bytes.len() - EOF_MAGIC.len()..],
+        &EOF_MAGIC
+    );
 
     let run_failure = |import_arg: &Path, use_env: bool| {
         let mut cmd = base_command();
@@ -647,7 +719,20 @@ async fn cli_import_fails_fast_before_binding_on_invalid_inputs() {
         "{missing_env_stderr}"
     );
 
-    // 3. Truncated file.
+    // 3. 0-byte empty file.
+    let empty_path = dir.path().join("empty.fsemu");
+    fs::write(&empty_path, []).unwrap();
+    let empty_stderr = run_failure(&empty_path, false);
+    assert!(
+        empty_stderr.contains("Truncated snapshot"),
+        "{empty_stderr}"
+    );
+    assert!(
+        empty_stderr.contains("valid, uncorrupted .fsemu snapshot"),
+        "{empty_stderr}"
+    );
+
+    // 4. Truncated file.
     let truncated_path = dir.path().join("truncated.fsemu");
     fs::write(&truncated_path, &valid_bytes[..valid_bytes.len() / 2]).unwrap();
     let trunc_stderr = run_failure(&truncated_path, false);
@@ -660,10 +745,10 @@ async fn cli_import_fails_fast_before_binding_on_invalid_inputs() {
         "{trunc_stderr}"
     );
 
-    // 4. Bad CRC-32 checksum in trailer.
+    // 5. Bad CRC-32 checksum in trailer.
     let bad_crc_path = dir.path().join("bad-crc.fsemu");
     let mut bad_crc = valid_bytes.clone();
-    let crc_offset = bad_crc.len() - 12;
+    let crc_offset = bad_crc.len() - trailer_len;
     bad_crc[crc_offset] ^= 0x01;
     fs::write(&bad_crc_path, &bad_crc).unwrap();
     let crc_stderr = run_failure(&bad_crc_path, false);
@@ -673,17 +758,38 @@ async fn cli_import_fails_fast_before_binding_on_invalid_inputs() {
         "{crc_stderr}"
     );
 
-    // 5. Unsupported major version.
-    let future_ver_path = dir.path().join("future-v2.fsemu");
+    // 6. Unsupported major version.
+    let future_ver_path = dir.path().join("future-major.fsemu");
     let mut future_ver = valid_bytes;
-    future_ver[8..10].copy_from_slice(&2u16.to_le_bytes());
+    let future_major = FORMAT_MAJOR + 1;
+    future_ver[header_magic_len..header_len].copy_from_slice(&future_major.to_le_bytes());
     fs::write(&future_ver_path, &future_ver).unwrap();
     let ver_stderr = run_failure(&future_ver_path, false);
     assert!(
-        ver_stderr.contains("Unsupported snapshot version: found major 2, supported major 1"),
+        ver_stderr.contains(&format!(
+            "Unsupported snapshot version: found major {future_major}, supported major \
+             {FORMAT_MAJOR}"
+        )),
         "{ver_stderr}"
     );
     assert!(ver_stderr.contains("compatible version"), "{ver_stderr}");
+
+    // 7. Symlinked directory fails fast before bind with directory guidance.
+    #[cfg(unix)]
+    {
+        let symlink_dir_path = dir.path().join("symlinked-export-dir");
+        std::os::unix::fs::symlink(&subdir, &symlink_dir_path)
+            .expect("create snapshot directory symlink");
+        let symlink_dir_stderr = run_failure(&symlink_dir_path, false);
+        assert!(
+            symlink_dir_stderr.contains("directory"),
+            "{symlink_dir_stderr}"
+        );
+        assert!(
+            symlink_dir_stderr.contains(".fsemu"),
+            "{symlink_dir_stderr}"
+        );
+    }
 
     drop(occupied_listener);
 }
