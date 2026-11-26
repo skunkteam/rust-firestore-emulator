@@ -680,6 +680,7 @@ export function renderQueryRunner(props) {
                     ? html`
                         <span
                           class="query-limit-warning"
+                          role="img"
                           title="Aggregation runs over the limited query window"
                           aria-label="Aggregation runs over the limited query window"
                         >

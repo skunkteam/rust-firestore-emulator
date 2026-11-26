@@ -1588,4 +1588,108 @@ describe("Query runner, aggregations, and Raw JSON validation", () => {
     assert.equal(uiRow.valueText, "true");
     assert.equal(findAllElements(tpl, (e) => e.tagName === "select").length >= 1, true);
   });
+
+  test("f6_untouched_array_placeholder_resets_across_unary_hops_and_preserves_user_edits", () => {
+    /** @type {import('../components/query-suggestions.js').FieldScopeEntry} */
+    const fieldEntry = {
+      items: [],
+      aggItems: [],
+      fieldHints: new Map([
+        [
+          "title",
+          {
+            scalarType: "stringValue",
+            arrayElementType: null,
+            isNumeric: false,
+          },
+        ],
+        [
+          "age",
+          {
+            scalarType: "integerValue",
+            arrayElementType: null,
+            isNumeric: true,
+          },
+        ],
+        [
+          "score",
+          {
+            scalarType: "doubleValue",
+            arrayElementType: null,
+            isNumeric: true,
+          },
+        ],
+      ]),
+      scope: { parentSubpath: "", collectionId: "users", allDescendants: false },
+      loading: false,
+      stale: false,
+      partial: false,
+      sampledDocs: 1,
+    };
+
+    // 1. EQUAL -> IN -> IS_NULL -> GREATER_THAN resets untouched "[]" for string, integer, and double.
+    for (const [fieldPath, valueType, targetFieldOp] of /** @type {const} */ ([
+      ["title", "stringValue", "GREATER_THAN"],
+      ["age", "integerValue", "GREATER_THAN"],
+      ["score", "doubleValue", "EQUAL"],
+    ])) {
+      for (const entry of [fieldEntry, null]) {
+        const row = queryModel.createFilterRow();
+        row.fieldPath = fieldPath;
+        row.op = "EQUAL";
+        row.valueType = valueType;
+        row.valueText = "";
+        row.valueUserEdited = false;
+
+        queryModel.transitionFilterOperator(row, "IN", entry);
+        assert.equal(row.op, "IN");
+        assert.equal(row.valueText, "[]");
+        assert.equal(row.valueUserEdited, false);
+
+        queryModel.transitionFilterOperator(row, "IS_NULL", entry);
+        assert.equal(row.op, "IS_NULL");
+        assert.equal(row.valueText, "[]");
+
+        queryModel.transitionFilterOperator(row, targetFieldOp, entry);
+        assert.equal(row.op, targetFieldOp);
+        assert.equal(row.valueType, valueType);
+        assert.equal(
+          row.valueText,
+          "",
+          `untouched [] must reset across EQUAL -> IN -> IS_NULL -> ${targetFieldOp} for ${valueType}`
+        );
+      }
+    }
+
+    // 2. Preserves user-edited "[]" across unary hops when valueUserEdited === true.
+    for (const valueType of /** @type {const} */ ([
+      "stringValue",
+      "integerValue",
+      "doubleValue",
+    ])) {
+      const editedRow = queryModel.createFilterRow();
+      editedRow.fieldPath = "title";
+      editedRow.op = "EQUAL";
+      editedRow.valueType = valueType;
+      editedRow.valueTypeManuallySet = true;
+      editedRow.valueText = "";
+      editedRow.valueUserEdited = false;
+
+      queryModel.transitionFilterOperator(editedRow, "IN", fieldEntry);
+      assert.equal(editedRow.valueText, "[]");
+      editedRow.valueUserEdited = true;
+
+      queryModel.transitionFilterOperator(editedRow, "IS_NULL", fieldEntry);
+      assert.equal(editedRow.op, "IS_NULL");
+      assert.equal(editedRow.valueText, "[]");
+
+      queryModel.transitionFilterOperator(editedRow, "GREATER_THAN", fieldEntry);
+      assert.equal(editedRow.op, "GREATER_THAN");
+      assert.equal(
+        editedRow.valueText,
+        "[]",
+        `user-edited [] must be preserved across unary hops for ${valueType}`
+      );
+    }
+  });
 });

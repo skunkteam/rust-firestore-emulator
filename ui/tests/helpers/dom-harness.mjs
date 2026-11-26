@@ -651,6 +651,18 @@ export async function resetHarness(appModule, stateModule) {
   if (appModule) {
     if (appModule.state.modal) {
       appModule.state.modal.busy = false;
+    } else if (harness.docKeydownListeners.length > 0) {
+      // A test cleared `state.modal = null` without running `renderApp()`, leaving
+      // `app.js`'s internal `wasModalOpen` and `modalKeydownListener` out of sync.
+      // Install a temporary non-busy sentinel modal so dispatching `Escape` runs
+      // `closeActiveModal()` -> `renderApp()` -> `syncModalAccessibility(...)`.
+      appModule.state.modal = {
+        kind: "clear_db",
+        projectId: "",
+        databaseId: "",
+        busy: false,
+        error: null,
+      };
     }
     if (harness.docKeydownListeners.length > 0) {
       for (const fn of [...harness.docKeydownListeners]) {

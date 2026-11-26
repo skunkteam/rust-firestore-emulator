@@ -629,7 +629,14 @@ function syncUrl(replace = false) {
  */
 async function refreshDatabaseList() {
   const seq = nextDbListSeq();
-  const rawList = await listDatabases();
+  /** @type {string[]} */
+  let rawList;
+  try {
+    rawList = await listDatabases();
+  } catch (err) {
+    if (!isCurrentDbListSeq(seq)) return false;
+    throw err;
+  }
   if (!isCurrentDbListSeq(seq)) return false;
   const parsed = rawList
     .map(parseRootRef)
@@ -1082,6 +1089,9 @@ export function applySyncSseBatch(events) {
     }
     if (ev.type === "database_cleared") {
       shouldRefreshDbList = true;
+      // Invalidate any in-flight pre-clear GET /emulator/v1 so it cannot repopulate
+      // state.databases or auto-select (lazily resurrect) the cleared database.
+      nextDbListSeq();
       if (ev.database) {
         state.databases = state.databases.filter(
           (db) => db.rootPath !== ev.database

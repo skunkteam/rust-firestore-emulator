@@ -362,9 +362,18 @@ export function markSuggestionsStale(store, changedPathsOrAll) {
 }
 
 /**
+ * Tracks cache placeholders inserted for an initial (never-settled) fetch so that
+ * a transient failure — even after a `force: true` supersede — evicts the placeholder
+ * instead of retaining an unpopulated entry.
+ * @type {WeakSet<object>}
+ */
+const unpopulatedPlaceholders = new WeakSet();
+
+/**
  * Deduplicates concurrent requests via `store.inflight`, aborts prior controllers when `force` is true,
- * preserves invalidations that occurred while in flight via `store.invalidationSeq`, checks
- * `!signal.aborted && reqEpoch === store.epoch` before cache writes, and clears `loading` silently on errors.
+ * chains same-epoch aborted callers to any replacement in-flight promise, preserves mid-flight
+ * invalidations via `store.invalidationSeq`, checks `!signal.aborted && reqEpoch === store.epoch`
+ * before cache writes, and evicts unpopulated placeholders (or marks existing entries stale) on error.
  * @template {{ loading: boolean, stale: boolean }} T
  * @param {QuerySuggestionStore} store
  * @param {SuggestionContext} ctx
@@ -398,12 +407,19 @@ function runCachedFetch(
     return Promise.resolve(existing);
   }
 
+  const hadExisting =
+    existing !== undefined && !unpopulatedPlaceholders.has(existing);
   const entry = existing ?? createInitial();
+  if (!hadExisting) {
+    unpopulatedPlaceholders.add(entry);
+  }
   entry.loading = true;
   cacheMap.set(cacheKey, entry);
 
   const prev = store.controllers.get(ctrlKey);
   if (prev) {
+    store.controllers.delete(ctrlKey);
+    store.inflight.delete(ctrlKey);
     prev.abort();
   }
   const controller = new AbortController();
@@ -411,27 +427,47 @@ function runCachedFetch(
   const { signal } = controller;
   const reqEpoch = store.epoch;
   const invalidationBefore = store.invalidationSeq;
-  ctx.onRerender();
 
   let settled = false;
   /** @type {Promise<T> | null} */
   let promise = null;
+  /**
+   * Resolves an aborted or epoch-superseded fetch by chaining to any same-epoch
+   * replacement in-flight promise, or falling back to the current cache entry.
+   * @returns {Promise<T> | T}
+   */
+  const resolveAbortedOrStale = () => {
+    if (signal.aborted && reqEpoch === store.epoch) {
+      const replacement = store.inflight.get(ctrlKey);
+      if (replacement && replacement !== promise) {
+        return /** @type {Promise<T>} */ (replacement);
+      }
+      return cacheMap.get(cacheKey) ?? entry;
+    }
+    return entry;
+  };
+
   promise = (async () => {
     try {
       const nextEntry = await fetcher(signal);
       if (signal.aborted || reqEpoch !== store.epoch) {
-        return cacheMap.get(cacheKey) ?? entry;
+        return resolveAbortedOrStale();
       }
       if (store.invalidationSeq !== invalidationBefore) {
         nextEntry.stale = true;
       }
+      unpopulatedPlaceholders.delete(nextEntry);
       cacheMap.set(cacheKey, nextEntry);
       return nextEntry;
     } catch {
       if (signal.aborted || reqEpoch !== store.epoch) {
-        return cacheMap.get(cacheKey) ?? entry;
+        return resolveAbortedOrStale();
       }
       entry.loading = false;
+      entry.stale = true;
+      if (!hadExisting && cacheMap.get(cacheKey) === entry) {
+        cacheMap.delete(cacheKey);
+      }
       return entry;
     } finally {
       settled = true;
@@ -449,6 +485,9 @@ function runCachedFetch(
 
   if (!settled && store.controllers.get(ctrlKey) === controller) {
     store.inflight.set(ctrlKey, promise);
+  }
+  if (!settled && !signal.aborted && reqEpoch === store.epoch) {
+    ctx.onRerender();
   }
   return promise;
 }
@@ -794,7 +833,7 @@ export async function ensureCollectionGroups(store, ctx, parentSubpath, force = 
       return {
         items,
         loading: false,
-        stale: false,
+        stale: Boolean(subEntry?.stale),
         partial: docRows.length >= COLLECTION_GROUP_DISCOVERY_LIMIT,
       };
     }

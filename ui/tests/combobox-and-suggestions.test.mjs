@@ -1102,7 +1102,10 @@ describe("Combobox ARIA/geometry/focus and suggestion caching", () => {
       "orders"
     );
     assert.equal(app.state.querySuggestions.comboboxUi.openId, null);
-    app.state.modal = null;
+    assert.equal(harness.docKeydownListeners.length, 1);
+    harness.docKeydownListeners[0]({ key: "Escape", preventDefault() {} });
+    assert.equal(app.state.modal, null);
+    assert.equal(harness.docKeydownListeners.length, 0);
   });
 
   test("slice2_cache_reset_and_mark_suggestions_stale_boundaries", async () => {
@@ -1884,6 +1887,601 @@ describe("Combobox ARIA/geometry/focus and suggestion caching", () => {
     assert.deepEqual(
       qsugg.getCollectionIdSuggestions(store, ["orgs"], "bad_odd", false).items,
       []
+    );
+  });
+
+  test("f3_scrollbar_pointer_focus_recovery_selectItem_refocus_and_listener_cleanup", () => {
+    const mockRect = { top: 100, bottom: 130, left: 20, width: 240 };
+    const uiState = combobox.createComboboxUiState();
+    let focusCalls = 0;
+    let rerenders = 0;
+    let val = "";
+    /** @type {string[]} */
+    const selected = [];
+    const popupChild = { kind: "scrollbar-thumb" };
+    const outsideEl = { kind: "outside-control" };
+    const inputEl = {
+      isConnected: true,
+      getBoundingClientRect: () => mockRect,
+      focus() {
+        focusCalls++;
+        harness.activeElement = inputEl;
+        inputEl.onFocusTriggered?.();
+      },
+      /** @type {(() => void) | null} */
+      onFocusTriggered: null,
+    };
+    const popupEl = {
+      id: "cb-f3-popup",
+      contains: (/** @type {unknown} */ target) => target === popupChild,
+    };
+
+    harness.getElementById = (id) => {
+      if (id === "cb-f3") return inputEl;
+      if (id === "cb-f3-popup") return popupEl;
+      return null;
+    };
+
+    const renderBox = () =>
+      combobox.renderCombobox({
+        id: "cb-f3",
+        value: val,
+        placeholder: "Path",
+        ariaLabel: "Parent Document Path",
+        items: [
+          { value: "orgs/", label: "orgs/" },
+          { value: "orgs/acme", label: "acme" },
+        ],
+        uiState,
+        footerText: "Sampled 2 docs",
+        loading: false,
+        keepOpenOnSelect: (item) => item.value.endsWith("/"),
+        onInput: (next) => {
+          val = next;
+        },
+        onSelect: (item) => {
+          val = item.value;
+          selected.push(item.value);
+        },
+        onOpen: () => {},
+        onRefresh: () => {},
+        onRerender: () => {
+          rerenders++;
+        },
+      });
+
+    const pointerListenerCount = () =>
+      (harness.winListeners.get("mouseup") ?? []).length +
+      (harness.winListeners.get("pointerup") ?? []).length +
+      (harness.winListeners.get("mousemove") ?? []).length +
+      (harness.winListeners.get("blur") ?? []).length +
+      (harness.winListeners.get("mousedown") ?? []).length;
+
+    inputEl.onFocusTriggered = () => {
+      findElementById(renderBox(), "cb-f3")?.handlers.focus({
+        currentTarget: inputEl,
+      });
+    };
+
+    // Open combobox.
+    harness.activeElement = inputEl;
+    findElementById(renderBox(), "cb-f3")?.handlers.focus({
+      currentTarget: inputEl,
+    });
+    assert.equal(uiState.openId, "cb-f3");
+    assert.equal(pointerListenerCount(), 0);
+
+    // 1. Scrollbar/popup mousedown (no preventDefault) + Chrome blur (relatedTarget=popupEl)
+    //    AND Safari blur (relatedTarget=null) both keep popup open; mouseup restores focus to <input>.
+    const popupInfo = findElementById(renderBox(), "cb-f3-popup");
+    assert.ok(popupInfo?.handlers.mousedown);
+    let mdPrevented = false;
+    popupInfo.handlers.mousedown({
+      preventDefault() {
+        mdPrevented = true;
+      },
+    });
+    assert.equal(
+      mdPrevented,
+      false,
+      "popup container mousedown must not preventDefault so native scrollbar dragging works"
+    );
+    assert.equal((harness.winListeners.get("mouseup") ?? []).length, 1);
+
+    rerenders = 0;
+    harness.activeElement = popupEl;
+    findElementById(renderBox(), "cb-f3")?.handlers.blur({
+      relatedTarget: popupEl,
+    });
+    assert.equal(uiState.openId, "cb-f3");
+    assert.equal(rerenders, 0);
+
+    // Safari/WebKit native scrollbar blur/focusout with relatedTarget === null while pointer is down.
+    harness.activeElement = null;
+    findElementById(renderBox(), "cb-f3")?.handlers.blur({
+      relatedTarget: null,
+    });
+    findElementById(renderBox(), "cb-f3-popup")?.handlers.focusout({
+      currentTarget: popupEl,
+      relatedTarget: null,
+    });
+    assert.equal(
+      uiState.openId,
+      "cb-f3",
+      "Safari scrollbar blur/focusout with relatedTarget=null must not close popup while pointer is down"
+    );
+    assert.equal(rerenders, 0);
+
+    // Mouseup releases pointer state, cleans up all temporary listeners, and refocuses <input>.
+    focusCalls = 0;
+    harness.winListeners.get("mouseup")?.[0].fn();
+    assert.equal(uiState.openId, "cb-f3");
+    assert.equal(pointerListenerCount(), 0, "mouseup must clean up pointer listeners");
+    assert.equal(focusCalls, 1, "mouseup must restore focus to <input>");
+    assert.equal(harness.activeElement, inputEl);
+
+    // Keyboard ArrowDown works immediately on <input> after scrollbar release.
+    findElementById(renderBox(), "cb-f3")?.handlers.keydown({
+      key: "ArrowDown",
+      preventDefault() {},
+      currentTarget: inputEl,
+    });
+    assert.equal(uiState.activeIndex, 0);
+
+    // 2. Swallowed mouseup fallback: mousemove with buttons === 0 recovers focus & cleans listeners.
+    findElementById(renderBox(), "cb-f3-popup")?.handlers.mousedown({});
+    harness.activeElement = popupEl;
+    focusCalls = 0;
+    harness.winListeners.get("mousemove")?.[0].fn({ buttons: 1 });
+    assert.equal(focusCalls, 0, "dragging with buttons=1 must not release early");
+    harness.winListeners.get("mousemove")?.[0].fn({ buttons: 0 });
+    assert.equal(focusCalls, 1, "mousemove with buttons=0 must restore focus");
+    assert.equal(pointerListenerCount(), 0);
+
+    // 2b. Window blur closes popup & cleans listeners without stealing focus (no Safari body orphan).
+    findElementById(renderBox(), "cb-f3-popup")?.handlers.mousedown({});
+    harness.activeElement = popupEl;
+    focusCalls = 0;
+    rerenders = 0;
+    harness.winListeners.get("blur")?.[0].fn();
+    assert.equal(uiState.openId, null, "window blur must close popup instead of leaving it stranded");
+    assert.equal(rerenders, 1);
+    assert.equal(focusCalls, 0, "window blur must not steal focus");
+    assert.equal(pointerListenerCount(), 0);
+
+    // Reopen for 2c.
+    findElementById(renderBox(), "cb-f3")?.handlers.focus({
+      currentTarget: inputEl,
+    });
+    assert.equal(uiState.openId, "cb-f3");
+
+    // 2c. Outside mousedown after swallowed mouseup closes popup & cleans listeners.
+    findElementById(renderBox(), "cb-f3-popup")?.handlers.mousedown({});
+    rerenders = 0;
+    harness.winListeners.get("mousedown")?.[0].fn({ target: outsideEl });
+    assert.equal(uiState.openId, null);
+    assert.equal(rerenders, 1);
+    assert.equal(pointerListenerCount(), 0);
+
+    // Reopen for remaining checks.
+    findElementById(renderBox(), "cb-f3")?.handlers.focus({
+      currentTarget: inputEl,
+    });
+    assert.equal(uiState.openId, "cb-f3");
+
+    // 3. Mouseup when activeElement deliberately moved outside popup & input closes without stealing focus.
+    findElementById(renderBox(), "cb-f3-popup")?.handlers.mousedown({});
+    harness.activeElement = outsideEl;
+    focusCalls = 0;
+    rerenders = 0;
+    harness.winListeners.get("mouseup")?.[0].fn();
+    assert.equal(uiState.openId, null, "mouseup with outside focus must close popup");
+    assert.equal(rerenders, 1);
+    assert.equal(focusCalls, 0, "mouseup must not steal focus from outside control");
+    assert.equal(pointerListenerCount(), 0);
+
+    // Reopen for selection checks.
+    findElementById(renderBox(), "cb-f3")?.handlers.focus({
+      currentTarget: inputEl,
+    });
+    assert.equal(uiState.openId, "cb-f3");
+
+    // 4. selectItem refocuses <input> on keepOpenOnSelect=true ("orgs/") while staying open.
+    harness.activeElement = popupEl;
+    focusCalls = 0;
+    const orgsClick = findClickHandler(renderBox(), "orgs/");
+    assert.ok(orgsClick);
+    orgsClick();
+    assert.equal(val, "orgs/");
+    assert.equal(uiState.openId, "cb-f3");
+    assert.equal(uiState.activeIndex, -1);
+    assert.equal(focusCalls, 1, "keepOpenOnSelect must restore focus to <input>");
+    assert.equal(harness.activeElement, inputEl);
+
+    // 5. selectItem refocuses <input> on keepOpenOnSelect=false ("orgs/acme") WITHOUT reopening.
+    harness.activeElement = popupEl;
+    focusCalls = 0;
+    const acmeClick = findClickHandler(renderBox(), "acme");
+    assert.ok(acmeClick);
+    acmeClick();
+    assert.equal(val, "orgs/acme");
+    assert.deepEqual(selected, ["orgs/", "orgs/acme"]);
+    assert.equal(
+      uiState.openId,
+      null,
+      "closing selectItem must not reopen popup via synchronous @focus"
+    );
+    assert.equal(focusCalls, 1, "closing selectItem must restore focus to <input>");
+    assert.equal(harness.activeElement, inputEl);
+
+    // 6. Shift+Tab on popup closes popup and refocuses <input> without reopening.
+    val = "";
+    findElementById(renderBox(), "cb-f3")?.handlers.focus({
+      currentTarget: inputEl,
+    });
+    assert.equal(uiState.openId, "cb-f3");
+    harness.activeElement = popupEl;
+    focusCalls = 0;
+    findElementById(renderBox(), "cb-f3-popup")?.handlers.keydown({
+      key: "Tab",
+      shiftKey: true,
+      preventDefault() {},
+    });
+    assert.equal(uiState.openId, null);
+    assert.equal(focusCalls, 1);
+    assert.equal(harness.activeElement, inputEl);
+
+    // 7. Closing via closeActiveCombobox / Escape while pointer is down cleans up all listeners.
+    findElementById(renderBox(), "cb-f3")?.handlers.focus({
+      currentTarget: inputEl,
+    });
+    findElementById(renderBox(), "cb-f3-popup")?.handlers.mousedown({});
+    assert.ok(pointerListenerCount() > 0);
+    findElementById(renderBox(), "cb-f3-popup")?.handlers.keydown({
+      key: "Escape",
+      preventDefault() {},
+      stopPropagation() {},
+    });
+    assert.equal(uiState.openId, null);
+    assert.equal(pointerListenerCount(), 0);
+    assert.equal((harness.winListeners.get("scroll") ?? []).length, 0);
+    assert.equal((harness.winListeners.get("resize") ?? []).length, 0);
+
+    // 8. ArrowDown on popup recovers focus to <input>, and Enter on button is not intercepted.
+    findElementById(renderBox(), "cb-f3")?.handlers.focus({
+      currentTarget: inputEl,
+    });
+    harness.activeElement = popupEl;
+    focusCalls = 0;
+    findElementById(renderBox(), "cb-f3-popup")?.handlers.keydown({
+      key: "ArrowDown",
+      preventDefault() {},
+    });
+    assert.equal(uiState.activeIndex, 0);
+    assert.equal(focusCalls, 1);
+    let btnEnterPrevented = false;
+    findElementById(renderBox(), "cb-f3-popup")?.handlers.keydown({
+      key: "Enter",
+      target: { tagName: "BUTTON" },
+      preventDefault() {
+        btnEnterPrevented = true;
+      },
+    });
+    assert.equal(btnEnterPrevented, false);
+    assert.equal(uiState.openId, "cb-f3");
+
+    // 9. Swallowed scrollbar mouseup + immediate printable char / Backspace on popup forwards to <input>.
+    val = "or";
+    findElementById(renderBox(), "cb-f3-popup")?.handlers.mousedown({});
+    assert.ok(pointerListenerCount() > 0);
+    harness.activeElement = popupEl;
+    uiState.activeIndex = 0;
+    focusCalls = 0;
+    rerenders = 0;
+    let charPrevented = false;
+    findElementById(renderBox(), "cb-f3-popup")?.handlers.keydown({
+      key: "g",
+      ctrlKey: false,
+      metaKey: false,
+      altKey: false,
+      preventDefault() {
+        charPrevented = true;
+      },
+    });
+    assert.equal(charPrevented, true);
+    assert.equal(val, "org");
+    assert.equal(uiState.activeIndex, -1);
+    assert.equal(pointerListenerCount(), 0);
+    assert.equal(focusCalls, 1);
+    assert.equal(harness.activeElement, inputEl);
+    assert.equal(rerenders, 1);
+
+    harness.activeElement = popupEl;
+    focusCalls = 0;
+    rerenders = 0;
+    let bsPrevented = false;
+    findElementById(renderBox(), "cb-f3-popup")?.handlers.keydown({
+      key: "Backspace",
+      ctrlKey: false,
+      metaKey: false,
+      altKey: false,
+      preventDefault() {
+        bsPrevented = true;
+      },
+    });
+    assert.equal(bsPrevented, true);
+    assert.equal(val, "or");
+    assert.equal(focusCalls, 1);
+    assert.equal(harness.activeElement, inputEl);
+    assert.equal(rerenders, 1);
+
+    // Modifier combos and Space on a <button> inside popup are NOT intercepted.
+    for (const ev of [
+      { key: "a", ctrlKey: true, metaKey: false, altKey: false },
+      { key: "c", ctrlKey: false, metaKey: true, altKey: false },
+      { key: "x", ctrlKey: false, metaKey: false, altKey: true },
+      { key: " ", ctrlKey: false, metaKey: false, altKey: false, target: { tagName: "BUTTON" } },
+    ]) {
+      let prevented = false;
+      findElementById(renderBox(), "cb-f3-popup")?.handlers.keydown({
+        ...ev,
+        preventDefault() {
+          prevented = true;
+        },
+      });
+      assert.equal(prevented, false);
+    }
+    assert.equal(val, "or");
+    combobox.closeActiveCombobox(uiState);
+  });
+
+  test("f7_vertical_resize_while_flipUp_updates_popupBottom_and_rerenders", () => {
+    const mockRect = { top: 600, bottom: 630, left: 24, width: 220, right: 244 };
+    window.innerWidth = 1200;
+    window.innerHeight = 750;
+    harness.getElementById = (id) =>
+      id === "cb-f7"
+        ? { isConnected: true, getBoundingClientRect: () => mockRect }
+        : null;
+
+    const uiState = combobox.createComboboxUiState();
+    let rerenders = 0;
+    const renderBox = () =>
+      combobox.renderCombobox({
+        id: "cb-f7",
+        value: "",
+        placeholder: "Field",
+        ariaLabel: "Field",
+        items: [{ value: "age", label: "age" }],
+        uiState,
+        footerText: "",
+        loading: false,
+        onInput: () => {},
+        onSelect: () => {},
+        onOpen: () => {},
+        onRefresh: () => {},
+        onRerender: () => {
+          rerenders++;
+        },
+      });
+
+    findElementById(renderBox(), "cb-f7")?.handlers.focus({
+      currentTarget: { getBoundingClientRect: () => mockRect },
+    });
+    assert.equal(uiState.rect?.flipUp, true);
+    assert.equal(uiState.rect?.maxListboxHeight, 260);
+    assert.equal(uiState.rect?.popupBottom, 152); // 750 - 600 + 2
+    assert.ok(
+      String(findElementById(renderBox(), "cb-f7-popup")?.attrs.style).includes(
+        "bottom: 152px; top: auto;"
+      )
+    );
+
+    // Resize vertically while flipUp remains true and maxListboxHeight stays capped at 260.
+    rerenders = 0;
+    window.innerHeight = 880;
+    const resizeFn = harness.winListeners.get("resize")?.[0].fn;
+    assert.ok(resizeFn);
+    resizeFn();
+    assert.equal(
+      rerenders,
+      1,
+      "vertical resize changing popupBottom while flipUp=true must trigger onRerender"
+    );
+    assert.equal(uiState.rect?.flipUp, true);
+    assert.equal(uiState.rect?.maxListboxHeight, 260);
+    assert.equal(uiState.rect?.popupBottom, 282); // 880 - 600 + 2
+    assert.ok(
+      String(findElementById(renderBox(), "cb-f7-popup")?.attrs.style).includes(
+        "bottom: 282px; top: auto;"
+      )
+    );
+
+    // Repeat resize with identical viewport height skips rerender.
+    rerenders = 0;
+    resizeFn();
+    assert.equal(rerenders, 0);
+    combobox.closeActiveCombobox(uiState);
+  });
+
+  test("f9_resetHarness_syncs_modal_listener_state_after_raw_modal_null_in_explorer", async () => {
+    app.state.activeProjectId = "p";
+    app.state.activeDatabaseId = "(default)";
+    app.state.view = "explorer";
+    app.openCreateDocumentModal(
+      "projects/p/databases/(default)/documents",
+      "users"
+    );
+    assert.equal(harness.docKeydownListeners.length, 1);
+
+    // Simulate a test that clears app.state.modal directly without renderApp() while in explorer view.
+    app.state.modal = null;
+    await resetHarness(app, stateMod);
+    assert.equal(harness.docKeydownListeners.length, 0);
+
+    // Subsequent test opening a modal must cleanly register its document keydown listener again.
+    app.state.activeProjectId = "p";
+    app.state.activeDatabaseId = "(default)";
+    app.state.view = "explorer";
+    app.openCreateDocumentModal(
+      "projects/p/databases/(default)/documents",
+      "users"
+    );
+    assert.equal(
+      harness.docKeydownListeners.length,
+      1,
+      "resetHarness must resync app.js wasModalOpen/modalKeydownListener after raw modal=null"
+    );
+    harness.docKeydownListeners[0]({ key: "Escape", preventDefault() {} });
+    assert.equal(app.state.modal, null);
+    assert.equal(harness.docKeydownListeners.length, 0);
+  });
+
+  test("f10_empty_filtered_listbox_is_hidden_and_shown_when_options_present", () => {
+    const mockRect = { top: 100, bottom: 130, left: 20, width: 240 };
+    const uiState = combobox.createComboboxUiState();
+    let val = "";
+    /** @type {import('../components/combobox.js').ComboboxItem[]} */
+    let items = [];
+    let loading = true;
+
+    const renderBox = () =>
+      combobox.renderCombobox({
+        id: "cb-f10",
+        value: val,
+        placeholder: "Field",
+        ariaLabel: "Field",
+        items,
+        uiState,
+        footerText: "",
+        loading,
+        onInput: (next) => {
+          val = next;
+        },
+        onSelect: () => {},
+        onOpen: () => {},
+        onRefresh: () => {},
+        onRerender: () => {},
+      });
+
+    findElementById(renderBox(), "cb-f10")?.handlers.focus({
+      currentTarget: { getBoundingClientRect: () => mockRect },
+    });
+
+    // Empty while loading -> <ul> is explicitly hidden.
+    assert.equal(
+      findElementById(renderBox(), "cb-f10-listbox")?.attrs.hidden,
+      true
+    );
+
+    // Non-matching filter query -> <ul> is explicitly hidden.
+    loading = false;
+    items = [{ value: "price", label: "price" }];
+    val = "zzz-nomatch";
+    assert.equal(
+      findElementById(renderBox(), "cb-f10-listbox")?.attrs.hidden,
+      true
+    );
+
+    // Matching items -> <ul> is visible (hidden attribute absent).
+    val = "pri";
+    assert.equal(
+      findElementById(renderBox(), "cb-f10-listbox")?.attrs.hidden,
+      undefined
+    );
+    combobox.closeActiveCombobox(uiState);
+  });
+
+  test("f13a_combobox_keydown_ignores_ime_isComposing_events", () => {
+    const mockRect = { top: 100, bottom: 130, left: 20, width: 240 };
+    const uiState = combobox.createComboboxUiState();
+    /** @type {string[]} */
+    const selected = [];
+    const renderBox = () =>
+      combobox.renderCombobox({
+        id: "cb-f13a",
+        value: "",
+        placeholder: "Field",
+        ariaLabel: "Field",
+        items: [{ value: "name", label: "name" }],
+        uiState,
+        footerText: "",
+        loading: false,
+        onInput: () => {},
+        onSelect: (item) => {
+          selected.push(item.value);
+        },
+        onOpen: () => {},
+        onRefresh: () => {},
+        onRerender: () => {},
+      });
+
+    findElementById(renderBox(), "cb-f13a")?.handlers.focus({
+      currentTarget: { getBoundingClientRect: () => mockRect },
+    });
+    assert.equal(uiState.openId, "cb-f13a");
+
+    // Input @keydown ignores ArrowDown, Enter, Escape when isComposing === true.
+    for (const keyName of ["ArrowDown", "ArrowUp", "Enter", "Escape"]) {
+      let prevented = false;
+      let stopped = false;
+      findElementById(renderBox(), "cb-f13a")?.handlers.keydown({
+        key: keyName,
+        isComposing: true,
+        preventDefault() {
+          prevented = true;
+        },
+        stopPropagation() {
+          stopped = true;
+        },
+        currentTarget: { getBoundingClientRect: () => mockRect },
+      });
+      assert.equal(prevented, false, `composing ${keyName} must not preventDefault`);
+      assert.equal(stopped, false, `composing ${keyName} must not stopPropagation`);
+      assert.equal(uiState.openId, "cb-f13a");
+      assert.equal(uiState.activeIndex, -1);
+      assert.equal(selected.length, 0);
+    }
+
+    // Popup @keydown also ignores Escape/Tab/ArrowDown/Enter when isComposing === true.
+    uiState.activeIndex = 0;
+    for (const keyName of ["Escape", "Tab", "ArrowDown", "Enter"]) {
+      let prevented = false;
+      findElementById(renderBox(), "cb-f13a-popup")?.handlers.keydown({
+        key: keyName,
+        isComposing: true,
+        preventDefault() {
+          prevented = true;
+        },
+        stopPropagation() {},
+      });
+      assert.equal(prevented, false);
+      assert.equal(uiState.openId, "cb-f13a");
+      assert.equal(uiState.activeIndex, 0);
+      assert.equal(selected.length, 0);
+    }
+    combobox.closeActiveCombobox(uiState);
+  });
+
+  test("f13b_query_limit_warning_exposes_img_role_with_aria_label", () => {
+    const qState = query.createQueryRunnerState("orders");
+    qState.queryKind = "aggregations";
+    qState.limitText = "10";
+    const tpl = query.renderQueryRunner({
+      projectId: "p",
+      databaseId: "(default)",
+      knownCollections: ["orders"],
+      state: qState,
+      onRerender: () => {},
+      onExecuteQuery: () => {},
+      onOpenResultDocument: () => {},
+    });
+    const warningEl = findElementByClass(tpl, "query-limit-warning");
+    assert.ok(warningEl, "expected .query-limit-warning in aggregation mode with limit");
+    assert.equal(warningEl.attrs.role, "img");
+    assert.equal(
+      warningEl.attrs["aria-label"],
+      "Aggregation runs over the limited query window"
     );
   });
 });

@@ -296,14 +296,12 @@ export function applyFilterAutoType(f, fieldEntry) {
  * @param {FieldScopeEntry | null} [fieldEntry]
  */
 export function transitionFilterOperator(f, nextOp, fieldEntry = null) {
-  const prevMeta = FILTER_OPERATORS.find((o) => o.op === f.op);
   f.op = nextOp;
   const nextMeta = FILTER_OPERATORS.find((o) => o.op === f.op);
   if (nextMeta?.kind === "array" && !f.valueText.trim().startsWith("[")) {
     f.valueText = "[]";
   }
   if (
-    prevMeta?.kind === "array" &&
     nextMeta?.kind === "field" &&
     !f.valueUserEdited &&
     f.valueText === "[]"

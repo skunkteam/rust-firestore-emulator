@@ -918,4 +918,338 @@ describe("SSE lifecycle, preemption, and DB epoch isolation", () => {
     await pSelectB;
     assert.equal(app.state.rootLoading, false);
   });
+
+  test("f2_database_cleared_invalidates_inflight_refresh_database_list_for_active_db", async () => {
+    const db1Root = "projects/p/databases/db1/documents";
+    const db2Root = "projects/p/databases/db2/documents";
+
+    // Part A: Active DB (only DB) is cleared while a prior SSE refreshDatabaseList() is in flight.
+    // The stale pre-clear GET /emulator/v1 response must NOT repopulate state.databases or
+    // auto-call selectDatabase(db1) (which would lazily resurrect the cleared DB).
+    harness.fetchImpl = async (url) => {
+      if (url === "/emulator/v1") return jsonResponse([db1Root]);
+      if (url === "/v1/projects/p/databases/db1") {
+        return jsonResponse({
+          name: "projects/p/databases/db1",
+          uid: "u1",
+          type: "FIRESTORE_NATIVE",
+          databaseEdition: "STANDARD",
+          concurrencyMode: "PESSIMISTIC",
+        });
+      }
+      if (url === "/v1/projects/p/databases/db1/documents:listCollectionIds") {
+        return jsonResponse({ collectionIds: ["users"] });
+      }
+      throw new Error("unexpected init url: " + url);
+    };
+
+    window.location.pathname = "/projects/p/databases/db1/documents";
+    await app.init();
+    const es = harness.lastEventSource;
+    assert.ok(es);
+    assert.equal(app.state.activeDatabaseId, "db1");
+    assert.deepEqual(
+      app.state.databases.map((d) => d.databaseId),
+      ["db1"]
+    );
+
+    const preClearListDef = deferred();
+    const postClearListDef = deferred();
+    let listCalls = 0;
+    /** @type {string[]} */
+    const postClearV1Calls = [];
+
+    harness.fetchImpl = async (url) => {
+      if (url === "/emulator/v1") {
+        listCalls++;
+        if (listCalls === 1) return preClearListDef.promise;
+        if (listCalls === 2) return postClearListDef.promise;
+        return jsonResponse([]);
+      }
+      if (url.startsWith("/v1/")) {
+        postClearV1Calls.push(url);
+      }
+      throw new Error("must not issue /v1 fetch for cleared db1: " + url);
+    };
+
+    // Plan 1 starts via SSE resync and awaits GET /emulator/v1 (pre-clear).
+    es.emit("resync", { data: JSON.stringify({ type: "resync" }) });
+    await nextTick();
+    assert.equal(listCalls, 1);
+
+    // Plan 2 (database_cleared for active db1) arrives synchronously before Plan 1 settles.
+    es.emit("change", {
+      data: JSON.stringify({ type: "database_cleared", database: db1Root }),
+    });
+    assert.deepEqual(
+      app.state.databases.map((d) => d.databaseId),
+      []
+    );
+    assert.equal(app.state.activeProjectId, null);
+    assert.equal(app.state.activeDatabaseId, null);
+
+    // Stale pre-clear response resolves with [db1Root] while Plan 2's post-clear fetch is pending.
+    preClearListDef.resolve(jsonResponse([db1Root]));
+    for (let i = 0; i < 6 && listCalls < 2; i++) {
+      await nextTick();
+    }
+    assert.equal(listCalls, 2, "queued post-clear refresh must run after plan1");
+    assert.deepEqual(
+      app.state.databases.map((d) => d.databaseId),
+      [],
+      "stale pre-clear GET /emulator/v1 must not repopulate state.databases"
+    );
+    assert.equal(app.state.activeProjectId, null);
+    assert.equal(app.state.activeDatabaseId, null);
+    assert.deepEqual(
+      postClearV1Calls,
+      [],
+      "stale pre-clear refresh must not call selectDatabase and resurrect cleared db1"
+    );
+
+    // Post-clear refresh resolves cleanly with empty list.
+    postClearListDef.resolve(jsonResponse([]));
+    await app.flushSseQueue();
+    assert.deepEqual(
+      app.state.databases.map((d) => d.databaseId),
+      []
+    );
+    assert.equal(app.state.activeProjectId, null);
+    assert.equal(app.state.activeDatabaseId, null);
+    assert.deepEqual(postClearV1Calls, []);
+
+    // Part B: Active db1 is cleared while another db2 exists -> stale [db1, db2] must be ignored
+    // (never selecting db1) while queued post-clear refresh [db2] applies and auto-selects db2.
+    await resetHarness(app, stateMod);
+    harness.fetchImpl = async (url) => {
+      if (url === "/emulator/v1") return jsonResponse([db1Root, db2Root]);
+      if (url === "/v1/projects/p/databases/db1") {
+        return jsonResponse({
+          name: "projects/p/databases/db1",
+          uid: "u1",
+          type: "FIRESTORE_NATIVE",
+          databaseEdition: "STANDARD",
+          concurrencyMode: "PESSIMISTIC",
+        });
+      }
+      if (url === "/v1/projects/p/databases/db1/documents:listCollectionIds") {
+        return jsonResponse({ collectionIds: ["users"] });
+      }
+      throw new Error("unexpected init B url: " + url);
+    };
+
+    window.location.pathname = "/projects/p/databases/db1/documents";
+    await app.init();
+    const esB = harness.lastEventSource;
+    assert.ok(esB);
+
+    const preClearListB = deferred();
+    const postClearListB = deferred();
+    let listCallsB = 0;
+    /** @type {string[]} */
+    const v1CallsB = [];
+
+    harness.fetchImpl = async (url) => {
+      if (url === "/emulator/v1") {
+        listCallsB++;
+        if (listCallsB === 1) return preClearListB.promise;
+        if (listCallsB === 2) return postClearListB.promise;
+        return jsonResponse([db2Root]);
+      }
+      if (url.startsWith("/v1/")) {
+        v1CallsB.push(url);
+      }
+      if (url === "/v1/projects/p/databases/db2") {
+        return jsonResponse({
+          name: "projects/p/databases/db2",
+          uid: "u2",
+          type: "FIRESTORE_NATIVE",
+          databaseEdition: "STANDARD",
+          concurrencyMode: "PESSIMISTIC",
+        });
+      }
+      if (url === "/v1/projects/p/databases/db2/documents:listCollectionIds") {
+        return jsonResponse({ collectionIds: ["orders"] });
+      }
+      throw new Error("unexpected B url: " + url);
+    };
+
+    esB.emit("resync", { data: JSON.stringify({ type: "resync" }) });
+    await nextTick();
+    assert.equal(listCallsB, 1);
+
+    esB.emit("change", {
+      data: JSON.stringify({ type: "database_cleared", database: db1Root }),
+    });
+    assert.deepEqual(
+      app.state.databases.map((d) => d.databaseId),
+      ["db2"]
+    );
+    assert.equal(app.state.activeDatabaseId, null);
+
+    preClearListB.resolve(jsonResponse([db1Root, db2Root]));
+    for (let i = 0; i < 6 && listCallsB < 2; i++) {
+      await nextTick();
+    }
+    assert.equal(listCallsB, 2);
+    assert.deepEqual(
+      app.state.databases.map((d) => d.databaseId),
+      ["db2"],
+      "stale [db1, db2] must not overwrite post-clear state.databases"
+    );
+    assert.equal(
+      v1CallsB.some((u) => u.includes("/databases/db1")),
+      false,
+      "must never request cleared db1"
+    );
+
+    postClearListB.resolve(jsonResponse([db2Root]));
+    await app.flushSseQueue();
+    assert.equal(app.state.activeDatabaseId, "db2");
+    assert.deepEqual(app.state.rootCollections, ["orders"]);
+    assert.equal(
+      v1CallsB.some((u) => u.includes("/databases/db1")),
+      false
+    );
+  });
+
+  test("f2_database_cleared_for_non_active_db_and_rapid_batches_invalidate_stale_list", async () => {
+    const db1Root = "projects/p/databases/db1/documents";
+    const db2Root = "projects/p/databases/db2/documents";
+    const db3Root = "projects/p/databases/db3/documents";
+
+    harness.fetchImpl = async (url) => {
+      if (url === "/emulator/v1") return jsonResponse([db1Root, db2Root]);
+      if (url === "/v1/projects/p/databases/db1") {
+        return jsonResponse({
+          name: "projects/p/databases/db1",
+          uid: "u1",
+          type: "FIRESTORE_NATIVE",
+          databaseEdition: "STANDARD",
+          concurrencyMode: "PESSIMISTIC",
+        });
+      }
+      if (url === "/v1/projects/p/databases/db1/documents:listCollectionIds") {
+        return jsonResponse({ collectionIds: ["users"] });
+      }
+      throw new Error("unexpected init url: " + url);
+    };
+
+    window.location.pathname = "/projects/p/databases/db1/documents";
+    await app.init();
+    const es = harness.lastEventSource;
+    assert.ok(es);
+    assert.equal(app.state.activeDatabaseId, "db1");
+    assert.deepEqual(
+      app.state.databases.map((d) => d.databaseId),
+      ["db1", "db2"]
+    );
+
+    // 1. Non-active db2 is cleared while a prior GET /emulator/v1 is in flight.
+    const preClearDef = deferred();
+    const postClearDef = deferred();
+    let listCalls = 0;
+    harness.fetchImpl = async (url) => {
+      if (url === "/emulator/v1") {
+        listCalls++;
+        if (listCalls === 1) return preClearDef.promise;
+        if (listCalls === 2) return postClearDef.promise;
+        return jsonResponse([db1Root, db3Root]);
+      }
+      if (url === "/v1/projects/p/databases/db1") {
+        return jsonResponse(app.state.activeDbMeta);
+      }
+      if (url === "/v1/projects/p/databases/db1/documents:listCollectionIds") {
+        return jsonResponse({ collectionIds: ["users"] });
+      }
+      throw new Error("unexpected url: " + url);
+    };
+
+    es.emit("resync", { data: JSON.stringify({ type: "resync" }) });
+    await nextTick();
+    assert.equal(listCalls, 1);
+
+    // Non-active db2 cleared: synchronously filtered out and dbListSeq bumped.
+    es.emit("change", {
+      data: JSON.stringify({ type: "database_cleared", database: db2Root }),
+    });
+    assert.deepEqual(
+      app.state.databases.map((d) => d.databaseId),
+      ["db1"]
+    );
+    assert.equal(app.state.activeDatabaseId, "db1");
+
+    // Pre-clear response still includes db2 -> must be ignored without even transiently restoring db2.
+    preClearDef.resolve(jsonResponse([db1Root, db2Root]));
+    for (let i = 0; i < 8 && listCalls < 2; i++) {
+      await nextTick();
+    }
+    assert.equal(listCalls, 2);
+    assert.deepEqual(
+      app.state.databases.map((d) => d.databaseId),
+      ["db1"],
+      "stale pre-clear response must not restore cleared non-active db2"
+    );
+
+    // Post-clear refresh applies cleanly (including newly appearing db3).
+    postClearDef.resolve(jsonResponse([db1Root, db3Root]));
+    await app.flushSseQueue();
+    assert.deepEqual(
+      app.state.databases.map((d) => d.databaseId),
+      ["db1", "db3"]
+    );
+    assert.equal(app.state.activeDatabaseId, "db1");
+
+    // 2. database_created + database_cleared in the same batch AND rapid back-to-back clears
+    // never drop the final legitimate post-clear refresh.
+    const clear1ListDef = deferred();
+    const clear2ListDef = deferred();
+    let rapidListCalls = 0;
+    harness.fetchImpl = async (url) => {
+      if (url === "/emulator/v1") {
+        rapidListCalls++;
+        if (rapidListCalls === 1) return clear1ListDef.promise;
+        return clear2ListDef.promise;
+      }
+      throw new Error("unexpected rapid url: " + url);
+    };
+
+    const batchPlan1 = app.applySyncSseBatch([
+      { type: "database_created", database: db2Root },
+      { type: "database_cleared", database: db3Root },
+    ]);
+    assert.ok(batchPlan1);
+    assert.deepEqual(
+      app.state.databases.map((d) => d.databaseId),
+      ["db1"]
+    );
+
+    const pBatch1 = app.applyAsyncSseRefresh(batchPlan1);
+    await nextTick();
+    assert.equal(rapidListCalls, 1);
+
+    // Rapid second clear (db2) supersedes batchPlan1's in-flight refresh.
+    const batchPlan2 = app.applySyncSseBatch([
+      { type: "database_cleared", database: db2Root },
+    ]);
+    assert.ok(batchPlan2);
+
+    // First refresh returns stale [db1, db2] -> ignored!
+    clear1ListDef.resolve(jsonResponse([db1Root, db2Root]));
+    await pBatch1;
+    assert.deepEqual(
+      app.state.databases.map((d) => d.databaseId),
+      ["db1"]
+    );
+
+    // Second (final) refresh applies cleanly with [db1].
+    const pBatch2 = app.applyAsyncSseRefresh(batchPlan2);
+    clear2ListDef.resolve(jsonResponse([db1Root]));
+    await pBatch2;
+    assert.equal(rapidListCalls, 2);
+    assert.deepEqual(
+      app.state.databases.map((d) => d.databaseId),
+      ["db1"]
+    );
+  });
 });
