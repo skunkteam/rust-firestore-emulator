@@ -19,8 +19,6 @@ import {
   updateDocument,
 } from "./api.js";
 import {
-  findNonFiniteNumber,
-  findUnsafeUnquotedInteger,
   generateAutoId,
   stringifyProtoJson,
 } from "./values.js";
@@ -47,8 +45,10 @@ import {
   buildAggregationQueryFromVisual,
   buildStructuredQueryFromVisual,
   createQueryRunnerState,
-  renderQueryRunner,
-} from "./components/query.js";
+  extractAggProvenance,
+  parseRawQueryPayload,
+} from "./components/query-model.js";
+import { renderQueryRunner } from "./components/query.js";
 import { markSuggestionsStale } from "./components/query-suggestions.js";
 import {
   getActiveRootPath,
@@ -586,7 +586,6 @@ export async function toggleSsePaused() {
   syncContentionLifecycle();
   renderApp();
   if (wasPaused && !state.ssePaused) {
-    markSuggestionsStale(state.querySuggestions, "all");
     const epochBefore = getDbEpoch();
     await enqueueSseBatch([{ type: "resync" }]);
     if (
@@ -1093,7 +1092,6 @@ export function applySyncSseBatch(events) {
         bumpDbEpoch();
         bumpNavEpoch();
         clearedActiveDb = true;
-        resetDatabaseCaches(state);
         clearActiveDatabaseState(state);
         syncUrl(true);
         notifyToast(`Database ${ev.database} was cleared`, "info");
@@ -1152,11 +1150,10 @@ export function applySyncSseBatch(events) {
  * @returns {Promise<void>}
  */
 export async function applyAsyncSseRefresh(plan) {
-  if (!plan) return;
+  if (!plan || state.ssePaused) return;
   const myDbEpoch = plan.dbEpoch ?? getDbEpoch();
   const signal = plan.signal ?? getDbSignal();
   const isStale = () => myDbEpoch !== getDbEpoch() || signal.aborted;
-  if (isStale()) return;
 
   let {
     shouldRefreshDbList,
@@ -1170,16 +1167,17 @@ export async function applyAsyncSseRefresh(plan) {
     try {
       applied = await refreshDatabaseList();
     } catch (err) {
-      if (isStale() || isAbortError(err)) return;
+      if (state.ssePaused || isStale() || isAbortError(err)) return;
       fullResyncActiveDb = false;
       notifyToast(
         `Failed to refresh database list: ${err instanceof Error ? err.message : String(err)}`,
         "error"
       );
     }
-    if (isStale()) return;
+    if (state.ssePaused) return;
     if (
       applied &&
+      !isStale() &&
       fullResyncActiveDb &&
       activeRoot &&
       !clearedActiveDb &&
@@ -1191,13 +1189,17 @@ export async function applyAsyncSseRefresh(plan) {
       bumpDbEpoch();
       bumpNavEpoch();
       clearedActiveDb = true;
-      resetDatabaseCaches(state);
       clearActiveDatabaseState(state);
       syncUrl(true);
       notifyToast(`Database ${activeRoot} was cleared`, "info");
     }
     // If no active DB is selected and a DB now exists, auto-select the first one cleanly.
-    if (applied && !state.activeProjectId && state.databases.length > 0) {
+    if (
+      applied &&
+      !state.activeProjectId &&
+      state.databases.length > 0 &&
+      !state.ssePaused
+    ) {
       const first = state.databases[0];
       await selectDatabase(first.projectId, first.databaseId, [], true);
       return;
@@ -1206,9 +1208,10 @@ export async function applyAsyncSseRefresh(plan) {
   }
 
   if (
+    state.ssePaused ||
+    isStale() ||
     clearedActiveDb ||
     state.rootLoading ||
-    isStale() ||
     !state.activeProjectId ||
     !state.activeDatabaseId ||
     !activeRoot ||
@@ -1226,6 +1229,7 @@ export async function applyAsyncSseRefresh(plan) {
         { signal }
       );
       if (
+        state.ssePaused ||
         isStale() ||
         getActiveRootPath(state.activeProjectId, state.activeDatabaseId) !==
           activeRoot
@@ -1234,21 +1238,25 @@ export async function applyAsyncSseRefresh(plan) {
       }
       state.activeDbMeta = meta;
     } catch (err) {
-      if (isStale() || isAbortError(err)) return;
+      if (state.ssePaused || isStale() || isAbortError(err)) return;
       // Ignore transient error
     }
   }
+
+  if (state.ssePaused || isStale()) return;
 
   if (fullResyncActiveDb || changedPaths.size > 0) {
     try {
       const cols = await listCollectionIds(activeRoot, {
         signal,
         shouldAbort: () =>
+          state.ssePaused ||
           isStale() ||
           getActiveRootPath(state.activeProjectId, state.activeDatabaseId) !==
             activeRoot,
       });
       if (
+        state.ssePaused ||
         isStale() ||
         getActiveRootPath(state.activeProjectId, state.activeDatabaseId) !==
           activeRoot
@@ -1257,15 +1265,15 @@ export async function applyAsyncSseRefresh(plan) {
       }
       state.rootCollections = cols;
     } catch (err) {
-      if (isStale() || isAbortError(err)) return;
+      if (state.ssePaused || isStale() || isAbortError(err)) return;
       // Ignore transient error
     }
 
-    if (isStale()) return;
+    if (state.ssePaused || isStale()) return;
     const myNavEpoch = getNavEpoch();
     const segmentsSnapshot = [...state.segments];
     for (let i = 0; i < segmentsSnapshot.length; i += 2) {
-      if (isStale() || myNavEpoch !== getNavEpoch()) return;
+      if (state.ssePaused || isStale() || myNavEpoch !== getNavEpoch()) return;
       const colId = segmentsSnapshot[i];
       const parentSegments = segmentsSnapshot.slice(0, i);
       const colSegments = segmentsSnapshot.slice(0, i + 1);
@@ -1282,7 +1290,7 @@ export async function applyAsyncSseRefresh(plan) {
       if (affectsCollection) {
         await loadCollectionColumn(colPath, parentPath, colId, false, myDbEpoch);
       }
-      if (isStale() || myNavEpoch !== getNavEpoch()) return;
+      if (state.ssePaused || isStale() || myNavEpoch !== getNavEpoch()) return;
 
       if (segmentsSnapshot.length > i + 1) {
         const docId = segmentsSnapshot[i + 1];
@@ -1296,7 +1304,7 @@ export async function applyAsyncSseRefresh(plan) {
         }
       }
     }
-    if (!isStale()) {
+    if (!state.ssePaused && !isStale()) {
       renderApp();
     }
   }
@@ -1368,128 +1376,6 @@ export async function saveDocumentFromInspector(docLevel) {
   renderApp();
 }
 
-const UNSUPPORTED_QUERY_ENVELOPE_KEYS = [
-  "readTime",
-  "transaction",
-  "newTransaction",
-  "explainOptions",
-  "requestOptions",
-];
-
-/**
- * Validates and unwraps Raw JSON query text for `documents` or `aggregations`.
- * @param {string} rawText
- * @param {'documents' | 'aggregations'} queryKind
- * @returns {{ valid: boolean, payload?: Record<string, unknown>, error?: string }}
- */
-function parseRawQueryPayload(rawText, queryKind) {
-  const unsafeLiteral = findUnsafeUnquotedInteger(rawText);
-  if (unsafeLiteral) {
-    return {
-      valid: false,
-      error: `Unquoted 64-bit integer ${unsafeLiteral} loses precision in JSON.parse; wrap in quotes: "${unsafeLiteral}"`,
-    };
-  }
-
-  /** @type {unknown} */
-  let parsed;
-  try {
-    parsed = JSON.parse(rawText);
-  } catch (err) {
-    return {
-      valid: false,
-      error: `Invalid JSON: ${err instanceof Error ? err.message : String(err)}`,
-    };
-  }
-
-  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
-    return {
-      valid: false,
-      error: "Raw JSON must be a JSON object.",
-    };
-  }
-
-  const badPath = findNonFiniteNumber(parsed);
-  if (badPath !== null) {
-    return {
-      valid: false,
-      error: `Raw JSON contains a non-finite number at ${badPath} (number overflow).`,
-    };
-  }
-
-  const obj = /** @type {Record<string, unknown>} */ (parsed);
-  const wrapperKey =
-    queryKind === "aggregations"
-      ? "structuredAggregationQuery"
-      : "structuredQuery";
-
-  if (Object.hasOwn(obj, wrapperKey)) {
-    const extraKeys = Object.keys(obj).filter((k) => k !== wrapperKey);
-    if (extraKeys.length > 0) {
-      return {
-        valid: false,
-        error: `Unsupported top-level field(s) in Raw JSON alongside ${wrapperKey}: ${extraKeys.join(", ")}`,
-      };
-    }
-    const inner = obj[wrapperKey];
-    if (!inner || typeof inner !== "object" || Array.isArray(inner)) {
-      return {
-        valid: false,
-        error: `"${wrapperKey}" in Raw JSON must be a JSON object.`,
-      };
-    }
-    return {
-      valid: true,
-      payload: /** @type {Record<string, unknown>} */ (inner),
-    };
-  }
-
-  const unsupported = UNSUPPORTED_QUERY_ENVELOPE_KEYS.filter((k) =>
-    Object.hasOwn(obj, k)
-  );
-  if (unsupported.length > 0) {
-    return {
-      valid: false,
-      error: `Unsupported top-level field(s) in Raw JSON: ${unsupported.join(", ")}`,
-    };
-  }
-
-  return { valid: true, payload: obj };
-}
-
-/**
- * Extracts limit/orderBy provenance from a StructuredAggregationQuery payload.
- * @param {Record<string, unknown>} payload
- * @returns {{ limit: number | null, hasOrderBy: boolean } | null}
- */
-function extractAggProvenance(payload) {
-  const rawSq = payload.structuredQuery;
-  if (!rawSq || typeof rawSq !== "object" || Array.isArray(rawSq)) {
-    return null;
-  }
-  const sq = /** @type {Record<string, unknown>} */ (rawSq);
-  /** @type {number | null} */
-  let limit = null;
-  if (sq.limit !== undefined && sq.limit !== null) {
-    if (typeof sq.limit === "number" && Number.isFinite(sq.limit)) {
-      limit = sq.limit;
-    } else if (
-      typeof sq.limit === "string" &&
-      /^-?\d+$/.test(sq.limit.trim())
-    ) {
-      const parsed = Number(sq.limit.trim());
-      if (Number.isFinite(parsed)) {
-        limit = parsed;
-      }
-    }
-  }
-  const hasOrderBy = Array.isArray(sq.orderBy) && sq.orderBy.length > 0;
-  if (limit === null && !hasOrderBy) {
-    return null;
-  }
-  return { limit, hasOrderBy };
-}
-
 /**
  * @param {unknown} err
  * @returns {boolean}
@@ -1508,6 +1394,10 @@ export async function executeCurrentQuery() {
   const qState = state.queryState;
   const queryKind = qState.queryKind;
   qState.error = null;
+
+  const rootPath = `projects/${state.activeProjectId}/databases/${state.activeDatabaseId}/documents`;
+  const cleanParentSub = qState.parentSubpath.trim().replace(/^\/+|\/+$/g, "");
+  const parentPath = cleanParentSub ? `${rootPath}/${cleanParentSub}` : rootPath;
 
   /** @type {Record<string, unknown>} */
   let payload;
@@ -1542,7 +1432,7 @@ export async function executeCurrentQuery() {
       queryKind === "aggregations"
         ? qState.rawAggregationText
         : qState.rawQueryText;
-    const rawRes = parseRawQueryPayload(rawText, queryKind);
+    const rawRes = parseRawQueryPayload(rawText, queryKind, parentPath);
     if (!rawRes.valid || !rawRes.payload) {
       qState.error = rawRes.error ?? "Invalid Raw JSON";
       renderApp();
@@ -1551,17 +1441,14 @@ export async function executeCurrentQuery() {
     payload = rawRes.payload;
   }
 
-  const rootPath = `projects/${state.activeProjectId}/databases/${state.activeDatabaseId}/documents`;
-  const cleanParentSub = qState.parentSubpath.trim().replace(/^\/+|\/+$/g, "");
-  const parentPath = cleanParentSub ? `${rootPath}/${cleanParentSub}` : rootPath;
-
   const myDbEpoch = getDbEpoch();
   const { seq: mySeq, controller } = beginQueryRun();
   const { signal } = controller;
   const isCurrentRun = () =>
     myDbEpoch === getDbEpoch() &&
     isCurrentQueryRunSeq(mySeq) &&
-    !signal.aborted;
+    !signal.aborted &&
+    qState.queryKind === queryKind;
 
   qState.running = true;
   renderApp();
@@ -1925,6 +1812,10 @@ export function renderWorkspace() {
       state: state.queryState,
       onRerender: renderApp,
       onExecuteQuery: () => void executeCurrentQuery(),
+      onAbortQueryRun: () => {
+        abortActiveQueryRun();
+        state.queryState.running = false;
+      },
       onOpenResultDocument: (docName) => void openDocumentFromName(docName),
     });
   }
@@ -2184,12 +2075,7 @@ export async function init() {
   activeEventStream?.close();
   activeEventStream = connectEventStream(
     (batch) => {
-      const plan = applySyncSseBatch(batch);
-      if (plan) {
-        sseQueue = sseQueue
-          .then(() => applyAsyncSseRefresh(plan))
-          .catch(() => {});
-      }
+      void enqueueSseBatch(batch);
     },
     (status) => {
       const prevStatus = state.sseStatus;

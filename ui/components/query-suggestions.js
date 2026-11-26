@@ -58,7 +58,9 @@ import { closeActiveCombobox, createComboboxUiState } from "./combobox.js";
 /**
  * @typedef {{
  *   epoch: number,
+ *   invalidationSeq: number,
  *   controllers: Map<string, AbortController>,
+ *   inflight: Map<string, Promise<unknown>>,
  *   subcollectionsByParent: Map<string, SuggestionCacheEntry>,
  *   docIdsByCollection: Map<string, SuggestionCacheEntry>,
  *   collectionGroupsByParent: Map<string, SuggestionCacheEntry>,
@@ -105,7 +107,7 @@ function isSafeResourceSegment(seg) {
  * @param {string} rawParentSubpath
  * @returns {{ valid: boolean, normParent: string, segments: string[] }}
  */
-function parseNormalizedParentSubpath(rawParentSubpath) {
+export function parseNormalizedParentSubpath(rawParentSubpath) {
   const trimmed = rawParentSubpath.trim().replace(/^\/+|\/+$/g, "");
   if (trimmed === "") {
     return { valid: true, normParent: "", segments: [] };
@@ -115,6 +117,17 @@ function parseNormalizedParentSubpath(rawParentSubpath) {
     return { valid: false, normParent: "", segments: [] };
   }
   return { valid: true, normParent: segments.join("/"), segments };
+}
+
+/**
+ * Builds an unambiguous JSON-tuple cache key for `fieldsByScope`.
+ * @param {string} normParent
+ * @param {string} colId
+ * @param {boolean} allDescendants
+ * @returns {string}
+ */
+function makeFieldScopeKey(normParent, colId, allDescendants) {
+  return JSON.stringify([normParent, colId, Boolean(allDescendants)]);
 }
 
 /**
@@ -188,7 +201,9 @@ export function formatSuggestionFooter(entry) {
 export function createQuerySuggestionStore() {
   return {
     epoch: 0,
+    invalidationSeq: 0,
     controllers: new Map(),
+    inflight: new Map(),
     subcollectionsByParent: new Map(),
     docIdsByCollection: new Map(),
     collectionGroupsByParent: new Map(),
@@ -198,8 +213,8 @@ export function createQuerySuggestionStore() {
 }
 
 /**
- * Aborts all in-flight suggestion requests, increments `store.epoch`, clears all four
- * cache maps, and closes active combobox UI state without issuing any network calls.
+ * Aborts all in-flight suggestion requests, increments `store.epoch` and `store.invalidationSeq`,
+ * clears all four cache maps and in-flight promises, and closes active combobox UI state.
  * @param {QuerySuggestionStore} store
  */
 export function resetQuerySuggestionStore(store) {
@@ -207,7 +222,9 @@ export function resetQuerySuggestionStore(store) {
     controller.abort();
   }
   store.controllers.clear();
+  store.inflight.clear();
   store.epoch++;
+  store.invalidationSeq++;
   store.subcollectionsByParent.clear();
   store.docIdsByCollection.clear();
   store.collectionGroupsByParent.clear();
@@ -216,7 +233,7 @@ export function resetQuerySuggestionStore(store) {
 }
 
 /**
- * Parses a `fieldsByScope` cache key when `entry.scope` metadata is unavailable.
+ * Parses a `fieldsByScope` JSON 3-tuple cache key when `entry.scope` metadata is unavailable.
  * @param {string} scopeKey
  * @param {FieldScopeEntry} entry
  * @returns {{ parentSubpath: string, collectionId: string, allDescendants: boolean } | null}
@@ -225,15 +242,25 @@ function resolveFieldEntryScope(scopeKey, entry) {
   if (entry.scope) {
     return entry.scope;
   }
-  const parts = scopeKey.split("|");
-  if (parts.length !== 3) {
-    return null;
+  try {
+    const parsed = /** @type {unknown} */ (JSON.parse(scopeKey));
+    if (
+      Array.isArray(parsed) &&
+      parsed.length === 3 &&
+      typeof parsed[0] === "string" &&
+      typeof parsed[1] === "string" &&
+      typeof parsed[2] === "boolean"
+    ) {
+      return {
+        parentSubpath: parsed[0],
+        collectionId: parsed[1],
+        allDescendants: parsed[2],
+      };
+    }
+  } catch {
+    // Ignore malformed key
   }
-  return {
-    parentSubpath: parts[0],
-    collectionId: parts[1],
-    allDescendants: parts[2] === "1",
-  };
+  return null;
 }
 
 /**
@@ -243,6 +270,7 @@ function resolveFieldEntryScope(scopeKey, entry) {
  */
 export function markSuggestionsStale(store, changedPathsOrAll) {
   if (changedPathsOrAll === "all") {
+    store.invalidationSeq++;
     for (const entry of store.subcollectionsByParent.values()) {
       entry.stale = true;
     }
@@ -258,6 +286,7 @@ export function markSuggestionsStale(store, changedPathsOrAll) {
     return;
   }
 
+  let markedAny = false;
   for (const rawPath of changedPathsOrAll) {
     const relDocPath = rawPath
       .replace(/^projects\/[^/]+\/databases\/[^/]+\/documents\/?/, "")
@@ -278,28 +307,33 @@ export function markSuggestionsStale(store, changedPathsOrAll) {
       const subEntry = store.subcollectionsByParent.get(ancestorDoc);
       if (subEntry) {
         subEntry.stale = true;
+        markedAny = true;
       }
       const cgEntry = store.collectionGroupsByParent.get(ancestorDoc);
       if (cgEntry) {
         cgEntry.stale = true;
+        markedAny = true;
       }
     }
 
     const rootCgEntry = store.collectionGroupsByParent.get("");
     if (rootCgEntry) {
       rootCgEntry.stale = true;
+      markedAny = true;
     }
 
     const changedCol = segs.slice(0, segs.length - 1).join("/");
     const colEntry = store.docIdsByCollection.get(changedCol);
     if (colEntry) {
       colEntry.stale = true;
+      markedAny = true;
     }
     for (let k = 1; k <= segs.length - 3; k += 2) {
       const ancestorCol = segs.slice(0, k).join("/");
       const ancEntry = store.docIdsByCollection.get(ancestorCol);
       if (ancEntry) {
         ancEntry.stale = true;
+        markedAny = true;
       }
     }
 
@@ -309,6 +343,7 @@ export function markSuggestionsStale(store, changedPathsOrAll) {
       if (!scope.allDescendants) {
         if (scope.parentSubpath === parentDoc && scope.collectionId === colId) {
           entry.stale = true;
+          markedAny = true;
         }
       } else if (
         scope.collectionId === colId &&
@@ -317,15 +352,19 @@ export function markSuggestionsStale(store, changedPathsOrAll) {
           parentDoc.startsWith(`${scope.parentSubpath}/`))
       ) {
         entry.stale = true;
+        markedAny = true;
       }
     }
+  }
+  if (markedAny) {
+    store.invalidationSeq++;
   }
 }
 
 /**
- * Deduplicates concurrent requests, aborts prior controllers when `force` is true,
- * checks `!signal.aborted && reqEpoch === store.epoch` before cache writes, and
- * clears `loading` silently on errors.
+ * Deduplicates concurrent requests via `store.inflight`, aborts prior controllers when `force` is true,
+ * preserves invalidations that occurred while in flight via `store.invalidationSeq`, checks
+ * `!signal.aborted && reqEpoch === store.epoch` before cache writes, and clears `loading` silently on errors.
  * @template {{ loading: boolean, stale: boolean }} T
  * @param {QuerySuggestionStore} store
  * @param {SuggestionContext} ctx
@@ -337,7 +376,7 @@ export function markSuggestionsStale(store, changedPathsOrAll) {
  * @param {(signal: AbortSignal) => Promise<T>} fetcher
  * @returns {Promise<T>}
  */
-async function runCachedFetch(
+function runCachedFetch(
   store,
   ctx,
   cacheMap,
@@ -348,8 +387,15 @@ async function runCachedFetch(
   fetcher
 ) {
   const existing = cacheMap.get(cacheKey);
-  if (existing && ((existing.loading && !force) || (!existing.stale && !force))) {
-    return existing;
+  if (existing && existing.loading && !force) {
+    const inflightPromise = store.inflight.get(ctrlKey);
+    if (inflightPromise) {
+      return /** @type {Promise<T>} */ (inflightPromise);
+    }
+    return Promise.resolve(existing);
+  }
+  if (existing && !existing.stale && !force) {
+    return Promise.resolve(existing);
   }
 
   const entry = existing ?? createInitial();
@@ -364,29 +410,177 @@ async function runCachedFetch(
   store.controllers.set(ctrlKey, controller);
   const { signal } = controller;
   const reqEpoch = store.epoch;
+  const invalidationBefore = store.invalidationSeq;
   ctx.onRerender();
 
-  try {
-    const nextEntry = await fetcher(signal);
-    if (signal.aborted || reqEpoch !== store.epoch) {
-      return cacheMap.get(cacheKey) ?? entry;
+  let settled = false;
+  /** @type {Promise<T> | null} */
+  let promise = null;
+  promise = (async () => {
+    try {
+      const nextEntry = await fetcher(signal);
+      if (signal.aborted || reqEpoch !== store.epoch) {
+        return cacheMap.get(cacheKey) ?? entry;
+      }
+      if (store.invalidationSeq !== invalidationBefore) {
+        nextEntry.stale = true;
+      }
+      cacheMap.set(cacheKey, nextEntry);
+      return nextEntry;
+    } catch {
+      if (signal.aborted || reqEpoch !== store.epoch) {
+        return cacheMap.get(cacheKey) ?? entry;
+      }
+      entry.loading = false;
+      return entry;
+    } finally {
+      settled = true;
+      if (store.controllers.get(ctrlKey) === controller) {
+        store.controllers.delete(ctrlKey);
+      }
+      if (promise !== null && store.inflight.get(ctrlKey) === promise) {
+        store.inflight.delete(ctrlKey);
+      }
+      if (!signal.aborted && reqEpoch === store.epoch) {
+        ctx.onRerender();
+      }
     }
-    cacheMap.set(cacheKey, nextEntry);
-    return nextEntry;
-  } catch {
-    if (signal.aborted || reqEpoch !== store.epoch) {
-      return cacheMap.get(cacheKey) ?? entry;
-    }
-    entry.loading = false;
-    return entry;
-  } finally {
-    if (store.controllers.get(ctrlKey) === controller) {
-      store.controllers.delete(ctrlKey);
-    }
-    if (!signal.aborted && reqEpoch === store.epoch) {
-      ctx.onRerender();
-    }
+  })();
+
+  if (!settled && store.controllers.get(ctrlKey) === controller) {
+    store.inflight.set(ctrlKey, promise);
   }
+  return promise;
+}
+
+/**
+ * Reads cached `parentSubpath` combobox suggestions, loading state, and footer text.
+ * @param {QuerySuggestionStore} store
+ * @param {string[]} knownCollections
+ * @param {string} rootPath
+ * @param {string} rawInput
+ * @returns {{ items: ComboboxItem[], loading: boolean, footerText: string }}
+ */
+export function getParentSubpathSuggestions(
+  store,
+  knownCollections,
+  rootPath,
+  rawInput
+) {
+  const lastSlash = rawInput.lastIndexOf("/");
+  if (lastSlash === -1) {
+    return {
+      items: knownCollections.map((col) => ({
+        value: `${col}/`,
+        label: `${col}/`,
+      })),
+      loading: false,
+      footerText: "",
+    };
+  }
+  if (!rootPath) {
+    return { items: [], loading: false, footerText: "" };
+  }
+  const prefix = rawInput.slice(0, lastSlash + 1);
+  const rawPrefix = rawInput.slice(0, lastSlash);
+  const segments = rawPrefix.split("/");
+  if (segments.length === 0 || segments.some((s) => !isSafeResourceSegment(s))) {
+    return { items: [], loading: false, footerText: "" };
+  }
+  if (segments.length % 2 === 0) {
+    const normParent = segments.join("/");
+    const subEntry = store.subcollectionsByParent.get(normParent);
+    if (!subEntry) {
+      return { items: [], loading: false, footerText: "" };
+    }
+    return {
+      items: subEntry.items.map((item) => ({
+        ...item,
+        value: `${prefix}${item.value}/`,
+        label: `${item.label}/`,
+      })),
+      loading: subEntry.loading,
+      footerText: formatSuggestionFooter(subEntry),
+    };
+  }
+  const normColPath = segments.join("/");
+  const docEntry = store.docIdsByCollection.get(normColPath);
+  return {
+    items: docEntry?.items ?? [],
+    loading: docEntry?.loading ?? false,
+    footerText: formatSuggestionFooter(docEntry),
+  };
+}
+
+/**
+ * Reads cached `collectionId` combobox suggestions, loading state, and footer text.
+ * @param {QuerySuggestionStore} store
+ * @param {string[]} knownCollections
+ * @param {string} rawParentSubpath
+ * @param {boolean} allDescendants
+ * @returns {{ items: ComboboxItem[], loading: boolean, footerText: string }}
+ */
+export function getCollectionIdSuggestions(
+  store,
+  knownCollections,
+  rawParentSubpath,
+  allDescendants
+) {
+  const parsedParent = parseNormalizedParentSubpath(rawParentSubpath);
+  if (!parsedParent.valid) {
+    return { items: [], loading: false, footerText: "" };
+  }
+  if (allDescendants) {
+    const cgEntry = store.collectionGroupsByParent.get(parsedParent.normParent);
+    return {
+      items: cgEntry?.items ?? [],
+      loading: cgEntry?.loading ?? false,
+      footerText: formatSuggestionFooter(cgEntry),
+    };
+  }
+  if (parsedParent.normParent === "") {
+    return {
+      items: knownCollections.map((c) => ({ value: c, label: c })),
+      loading: false,
+      footerText: "",
+    };
+  }
+  const subEntry = store.subcollectionsByParent.get(parsedParent.normParent);
+  return {
+    items: subEntry?.items ?? [],
+    loading: subEntry?.loading ?? false,
+    footerText: formatSuggestionFooter(subEntry),
+  };
+}
+
+/**
+ * Looks up the cached `FieldScopeEntry` for `(rawParentSubpath, collectionId, allDescendants)`.
+ * @param {QuerySuggestionStore | null | undefined} store
+ * @param {string} rawParentSubpath
+ * @param {string} collectionId
+ * @param {boolean} allDescendants
+ * @returns {FieldScopeEntry | null}
+ */
+export function getFieldScopeEntry(
+  store,
+  rawParentSubpath,
+  collectionId,
+  allDescendants
+) {
+  const parsedParent = parseNormalizedParentSubpath(rawParentSubpath);
+  if (!store || !parsedParent.valid) {
+    return null;
+  }
+  const colId = collectionId.trim();
+  if (!colId || !isSafeResourceSegment(colId)) {
+    return null;
+  }
+  const scopeKey = makeFieldScopeKey(
+    parsedParent.normParent,
+    colId,
+    Boolean(allDescendants)
+  );
+  return store.fieldsByScope.get(scopeKey) ?? null;
 }
 
 /**
@@ -844,7 +1038,7 @@ export async function ensureFieldSuggestions(store, ctx, scope, force = false) {
     collectionId: colId,
     allDescendants,
   };
-  const scopeKey = `${normParent}|${colId}|${allDescendants ? "1" : "0"}`;
+  const scopeKey = makeFieldScopeKey(normParent, colId, allDescendants);
   return runCachedFetch(
     store,
     ctx,

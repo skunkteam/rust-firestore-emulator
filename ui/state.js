@@ -1,7 +1,7 @@
 // @ts-check
 
 import { createContentionState } from "./components/contention.js";
-import { createQueryRunnerState } from "./components/query.js";
+import { createQueryRunnerState } from "./components/query-model.js";
 import {
   createQuerySuggestionStore,
   resetQuerySuggestionStore,
@@ -12,7 +12,7 @@ import {
 /** @typedef {import('./components/explorer.js').CollectionColumnState} CollectionColumnState */
 /** @typedef {import('./components/explorer.js').DocumentLevelState} DocumentLevelState */
 /** @typedef {import('./components/editor.js').EditorSession} EditorSession */
-/** @typedef {import('./components/query.js').QueryRunnerState} QueryRunnerState */
+/** @typedef {import('./components/query-model.js').QueryRunnerState} QueryRunnerState */
 /** @typedef {import('./components/query-suggestions.js').QuerySuggestionStore} QuerySuggestionStore */
 
 /**
@@ -273,6 +273,7 @@ export function deleteDocumentLevelCache(docPath, targetState = state) {
 export function resetDatabaseCaches(targetState = state) {
   targetState.activeDbMeta = null;
   targetState.rootCollections = [];
+  targetState.rootLoading = false;
   targetState.collectionColumns.clear();
   targetState.documentLevels.clear();
   if (targetState === state) {

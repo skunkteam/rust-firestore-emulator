@@ -1,750 +1,63 @@
 // @ts-check
 
 import { html, nothing } from "../lit-html.js";
-import { isValidPathSegment } from "../router.js";
 import {
   VALUE_TYPES,
-  findNonFiniteNumber,
-  findUnsafeUnquotedInteger,
   formatValuePreview,
   getValueType,
-  isReservedName,
-  normalizeProtoValue,
-  normalizeReference,
   stringifyProtoJson,
-  validateDouble,
-  validateGeoPoint,
-  validateInteger64,
-  validateTimestamp,
-  encodeBytes,
 } from "../values.js";
 import { reconcileComboboxUi, renderCombobox } from "./combobox.js";
+import {
+  ENTERPRISE_MAX_AGGREGATIONS,
+  FILTER_OPERATORS,
+  SCALAR_FILTER_TYPES,
+  STANDARD_MAX_AGGREGATIONS,
+  applyFilterAutoType,
+  buildAggregationQueryFromVisual,
+  buildStructuredQueryFromVisual,
+  createAggregationRow,
+  createFilterRow,
+  createOrderRow,
+  createQueryRunnerState,
+  extractAggProvenance,
+  formatAggProvenanceNote,
+  isUntouchedDefaultQueryState,
+  parseRawQueryPayload,
+  transitionFilterOperator,
+} from "./query-model.js";
 import {
   ensureCollectionGroups,
   ensureFieldSuggestions,
   ensureParentSubpathSuggestions,
   ensureSubcollections,
   formatSuggestionFooter,
+  getCollectionIdSuggestions,
+  getFieldScopeEntry,
+  getParentSubpathSuggestions,
+  parseNormalizedParentSubpath,
 } from "./query-suggestions.js";
 
 /** @typedef {import('../values.js').ValueTypeKey} ValueTypeKey */
-/** @typedef {import('../values.js').FirestoreValue} FirestoreValue */
-/** @typedef {import('../values.js').FirestoreDocument} FirestoreDocument */
 /** @typedef {import('../lit-html.js').TemplateResult} TemplateResult */
 /** @typedef {import('./combobox.js').ComboboxItem} ComboboxItem */
+/** @typedef {import('./query-model.js').QueryFilterRow} QueryFilterRow */
+/** @typedef {import('./query-model.js').QueryOrderRow} QueryOrderRow */
+/** @typedef {import('./query-model.js').QueryAggregationRow} QueryAggregationRow */
+/** @typedef {import('./query-model.js').QueryRunnerState} QueryRunnerState */
 /** @typedef {import('./query-suggestions.js').FieldScopeEntry} FieldScopeEntry */
 /** @typedef {import('./query-suggestions.js').QuerySuggestionStore} QuerySuggestionStore */
 /** @typedef {import('./query-suggestions.js').SuggestionContext} SuggestionContext */
 
-/**
- * Supported StructuredQuery field and unary operators matching
- * crates/emulator-database/src/database/query/filter.rs.
- */
-const FILTER_OPERATORS = [
-  { op: "EQUAL", label: "== (EQUAL)", kind: "field" },
-  { op: "NOT_EQUAL", label: "!= (NOT_EQUAL)", kind: "field" },
-  { op: "LESS_THAN", label: "< (LESS_THAN)", kind: "field" },
-  { op: "LESS_THAN_OR_EQUAL", label: "<= (LESS_THAN_OR_EQUAL)", kind: "field" },
-  { op: "GREATER_THAN", label: "> (GREATER_THAN)", kind: "field" },
-  {
-    op: "GREATER_THAN_OR_EQUAL",
-    label: ">= (GREATER_THAN_OR_EQUAL)",
-    kind: "field",
-  },
-  { op: "ARRAY_CONTAINS", label: "array-contains", kind: "field" },
-  { op: "IN", label: "in (JSON array)", kind: "array" },
-  { op: "ARRAY_CONTAINS_ANY", label: "array-contains-any (JSON array)", kind: "array" },
-  { op: "NOT_IN", label: "not-in (JSON array)", kind: "array" },
-  { op: "IS_NULL", label: "is null", kind: "unary" },
-  { op: "IS_NOT_NULL", label: "is not null", kind: "unary" },
-  { op: "IS_NAN", label: "is NaN", kind: "unary" },
-  { op: "IS_NOT_NAN", label: "is not NaN", kind: "unary" },
-];
-
-const SCALAR_FILTER_TYPES = VALUE_TYPES.filter(
-  (t) => t.key !== "arrayValue" && t.key !== "mapValue" && t.key !== "nullValue"
-);
-const SCALAR_FILTER_TYPE_SET = new Set(SCALAR_FILTER_TYPES.map((t) => t.key));
-
-/**
- * @typedef {{
- *   id: number,
- *   fieldPath: string,
- *   op: string,
- *   valueType: ValueTypeKey,
- *   valueText: string,
- *   latText: string,
- *   lngText: string,
- *   valueTypeManuallySet: boolean,
- *   valueUserEdited: boolean,
- * }} QueryFilterRow
- */
-
-/**
- * @typedef {{
- *   id: number,
- *   fieldPath: string,
- *   direction: 'ASCENDING' | 'DESCENDING',
- * }} QueryOrderRow
- */
-
-/**
- * @typedef {{
- *   id: number,
- *   op: 'COUNT' | 'SUM' | 'AVG',
- *   fieldPath: string,
- *   alias: string,
- * }} QueryAggregationRow
- */
-
-/**
- * @typedef {{
- *   queryKind: 'documents' | 'aggregations',
- *   mode: 'visual' | 'raw',
- *   parentSubpath: string,
- *   collectionId: string,
- *   allDescendants: boolean,
- *   compositeOp: 'AND' | 'OR',
- *   filters: QueryFilterRow[],
- *   orders: QueryOrderRow[],
- *   limitText: string,
- *   limitUserModified: boolean,
- *   aggregations: QueryAggregationRow[],
- *   rawQueryText: string,
- *   rawAggregationText: string,
- *   error: string | null,
- *   running: boolean,
- *   elapsedMs: number | null,
- *   readTime: string | null,
- *   results: FirestoreDocument[] | null,
- *   aggResults: Record<string, FirestoreValue> | null,
- *   aggReadTime: string | null,
- *   aggElapsedMs: number | null,
- *   aggProvenance: { limit: number | null, hasOrderBy: boolean } | null,
- * }} QueryRunnerState
- */
-
-const utf8Encoder = new TextEncoder();
-const MAX_AGGREGATION_ALIAS_BYTES = 1500;
-const STANDARD_MAX_AGGREGATIONS = 5;
-const ENTERPRISE_MAX_AGGREGATIONS = 64;
-
-let nextRowId = 1;
-
-/**
- * Creates a new default visual Where filter row.
- * @returns {QueryFilterRow}
- */
-export function createFilterRow() {
-  return {
-    id: nextRowId++,
-    fieldPath: "",
-    op: "EQUAL",
-    valueType: "stringValue",
-    valueText: "",
-    latText: "0",
-    lngText: "0",
-    valueTypeManuallySet: false,
-    valueUserEdited: false,
-  };
-}
-
-/**
- * @param {string} seg
- * @returns {boolean}
- */
-function isSafeResourceSegment(seg) {
-  return isValidPathSegment(seg) && !isReservedName(seg);
-}
-
-/**
- * Normalizes a parent document subpath and validates that it is empty or an even-segment
- * path without empty, dot, or reserved segments.
- * @param {string} rawParentSubpath
- * @returns {{ valid: boolean, normParent: string, segments: string[] }}
- */
-function parseNormalizedParentSubpath(rawParentSubpath) {
-  const trimmed = rawParentSubpath.trim().replace(/^\/+|\/+$/g, "");
-  if (trimmed === "") {
-    return { valid: true, normParent: "", segments: [] };
-  }
-  const segments = trimmed.split("/");
-  if (
-    segments.length % 2 !== 0 ||
-    segments.some((s) => !isSafeResourceSegment(s))
-  ) {
-    return { valid: false, normParent: "", segments: [] };
-  }
-  return { valid: true, normParent: segments.join("/"), segments };
-}
-
-/**
- * @param {QuerySuggestionStore} store
- * @param {string[]} knownCollections
- * @param {string} rootPath
- * @param {string} rawInput
- * @returns {{ items: ComboboxItem[], loading: boolean, footerText: string }}
- */
-function resolveParentSubpathState(store, knownCollections, rootPath, rawInput) {
-  const lastSlash = rawInput.lastIndexOf("/");
-  if (lastSlash === -1) {
-    return {
-      items: knownCollections.map((col) => ({
-        value: `${col}/`,
-        label: `${col}/`,
-      })),
-      loading: false,
-      footerText: "",
-    };
-  }
-  if (!rootPath) {
-    return { items: [], loading: false, footerText: "" };
-  }
-  const prefix = rawInput.slice(0, lastSlash + 1);
-  const rawPrefix = rawInput.slice(0, lastSlash);
-  const segments = rawPrefix.split("/");
-  if (
-    segments.length === 0 ||
-    segments.some((s) => !isSafeResourceSegment(s))
-  ) {
-    return { items: [], loading: false, footerText: "" };
-  }
-  if (segments.length % 2 === 0) {
-    const normParent = segments.join("/");
-    const subEntry = store.subcollectionsByParent.get(normParent);
-    if (!subEntry) {
-      return { items: [], loading: false, footerText: "" };
-    }
-    return {
-      items: subEntry.items.map((item) => ({
-        ...item,
-        value: `${prefix}${item.value}/`,
-        label: `${item.label}/`,
-      })),
-      loading: subEntry.loading,
-      footerText: formatSuggestionFooter(subEntry),
-    };
-  }
-  const normColPath = segments.join("/");
-  const docEntry = store.docIdsByCollection.get(normColPath);
-  return {
-    items: docEntry?.items ?? [],
-    loading: docEntry?.loading ?? false,
-    footerText: formatSuggestionFooter(docEntry),
-  };
-}
-
-/**
- * @param {QuerySuggestionStore} store
- * @param {string[]} knownCollections
- * @param {{ valid: boolean, normParent: string }} parsedParent
- * @param {boolean} allDescendants
- * @returns {{ items: ComboboxItem[], loading: boolean, footerText: string }}
- */
-function resolveCollectionIdState(
-  store,
-  knownCollections,
-  parsedParent,
-  allDescendants
-) {
-  if (!parsedParent.valid) {
-    return { items: [], loading: false, footerText: "" };
-  }
-  if (allDescendants) {
-    const cgEntry = store.collectionGroupsByParent.get(parsedParent.normParent);
-    return {
-      items: cgEntry?.items ?? [],
-      loading: cgEntry?.loading ?? false,
-      footerText: formatSuggestionFooter(cgEntry),
-    };
-  }
-  if (parsedParent.normParent === "") {
-    return {
-      items: knownCollections.map((c) => ({ value: c, label: c })),
-      loading: false,
-      footerText: "",
-    };
-  }
-  const subEntry = store.subcollectionsByParent.get(parsedParent.normParent);
-  return {
-    items: subEntry?.items ?? [],
-    loading: subEntry?.loading ?? false,
-    footerText: formatSuggestionFooter(subEntry),
-  };
-}
-
-/**
- * @param {QuerySuggestionStore | undefined} store
- * @param {{ valid: boolean, normParent: string }} parsedParent
- * @param {string} collectionId
- * @param {boolean} allDescendants
- * @returns {FieldScopeEntry | null}
- */
-function resolveFieldScopeEntry(
-  store,
-  parsedParent,
-  collectionId,
-  allDescendants
-) {
-  if (!store || !parsedParent.valid) {
-    return null;
-  }
-  const colId = collectionId.trim();
-  if (!colId || !isSafeResourceSegment(colId)) {
-    return null;
-  }
-  const scopeKey = `${parsedParent.normParent}|${colId}|${allDescendants ? "1" : "0"}`;
-  return store.fieldsByScope.get(scopeKey) ?? null;
-}
-
-/**
- * Applies non-clobbering field value type detection from sampled `fieldHints`
- * when neither `valueTypeManuallySet` nor `valueUserEdited` is set.
- * @param {QueryFilterRow} f
- * @param {FieldScopeEntry | null} fieldEntry
- */
-function applyFilterAutoType(f, fieldEntry) {
-  if (f.valueTypeManuallySet || f.valueUserEdited || !fieldEntry) {
-    return;
-  }
-  const opMeta = FILTER_OPERATORS.find((o) => o.op === f.op);
-  if (!opMeta || opMeta.kind === "unary") {
-    return;
-  }
-  const trimmedPath = f.fieldPath.trim();
-  const hint =
-    fieldEntry.fieldHints.get(f.fieldPath) ??
-    (trimmedPath ? fieldEntry.fieldHints.get(trimmedPath) : undefined);
-  if (!hint) {
-    return;
-  }
-  const detectedType =
-    f.op === "ARRAY_CONTAINS" || f.op === "ARRAY_CONTAINS_ANY"
-      ? hint.arrayElementType
-      : hint.scalarType;
-  if (!detectedType || !SCALAR_FILTER_TYPE_SET.has(detectedType)) {
-    return;
-  }
-  const prevType = f.valueType;
-  f.valueType = detectedType;
-  if (opMeta.kind === "field") {
-    if (detectedType === "booleanValue") {
-      if (f.valueText !== "true" && f.valueText !== "false") {
-        f.valueText = "true";
-      }
-    } else if (prevType === "booleanValue" && !f.valueUserEdited) {
-      f.valueText = "";
-    }
-  }
-}
-
-/**
- * Creates initial state for the Structured Query Runner.
- * @param {string} [collectionId]
- * @param {string} [parentSubpath]
- * @returns {QueryRunnerState}
- */
-export function createQueryRunnerState(collectionId = "", parentSubpath = "") {
-  const targetCollection = collectionId || "users";
-  const initialQuery = {
-    from: [{ collectionId: targetCollection, allDescendants: false }],
-    limit: 50,
-  };
-  const initialAggregationQuery = {
-    structuredQuery: {
-      from: [{ collectionId: targetCollection, allDescendants: false }],
-    },
-    aggregations: [{ count: {} }],
-  };
-  return {
-    queryKind: "documents",
-    mode: "visual",
-    parentSubpath,
-    collectionId,
-    allDescendants: false,
-    compositeOp: "AND",
-    filters: [],
-    orders: [],
-    limitText: "50",
-    limitUserModified: false,
-    aggregations: [
-      { id: nextRowId++, op: "COUNT", fieldPath: "", alias: "" },
-    ],
-    rawQueryText: stringifyProtoJson(initialQuery, 2),
-    rawAggregationText: stringifyProtoJson(initialAggregationQuery, 2),
-    error: null,
-    running: false,
-    elapsedMs: null,
-    readTime: null,
-    results: null,
-    aggResults: null,
-    aggReadTime: null,
-    aggElapsedMs: null,
-    aggProvenance: null,
-  };
-}
-
-/**
- * Builds a canonical StructuredQuery JSON object from visual builder rows.
- * @param {QueryRunnerState} state
- * @param {string} projectId
- * @param {string} databaseId
- * @returns {{ valid: boolean, query?: Record<string, unknown>, error?: string }}
- */
-export function buildStructuredQueryFromVisual(state, projectId, databaseId) {
-  const colId = state.collectionId.trim();
-  if (!colId && !state.allDescendants) {
-    return {
-      valid: false,
-      error: "Collection ID is required (or enable Collection Group / allDescendants)",
-    };
-  }
-
-  /** @type {Record<string, unknown>} */
-  const query = {
-    from: [
-      {
-        collectionId: colId,
-        ...(state.allDescendants ? { allDescendants: true } : {}),
-      },
-    ],
-  };
-
-  /** @type {Record<string, unknown>[]} */
-  const builtFilters = [];
-  for (const f of state.filters) {
-    const fp = f.fieldPath.trim();
-    if (!fp) {
-      return { valid: false, error: "Every filter row must specify a field path" };
-    }
-    const opMeta = FILTER_OPERATORS.find((o) => o.op === f.op);
-    if (!opMeta) {
-      return { valid: false, error: `Unsupported operator: ${f.op}` };
-    }
-    if (opMeta.kind === "unary") {
-      builtFilters.push({
-        unaryFilter: {
-          op: f.op,
-          field: { fieldPath: fp },
-        },
-      });
-    } else if (opMeta.kind === "array") {
-      const unsafeLiteral = findUnsafeUnquotedInteger(f.valueText);
-      if (unsafeLiteral) {
-        return {
-          valid: false,
-          error: `Unquoted 64-bit integer ${unsafeLiteral} in ${f.op} filter for "${fp}" loses precision in JSON.parse; wrap in quotes inside ProtoJSON integerValue`,
-        };
-      }
-      /** @type {unknown} */
-      let parsedArr;
-      try {
-        parsedArr = JSON.parse(f.valueText);
-      } catch {
-        return {
-          valid: false,
-          error: `Filter "${fp} ${f.op}": enter a JSON array of ProtoJSON values or primitives, e.g. ["alice", "bob"]`,
-        };
-      }
-      if (!Array.isArray(parsedArr)) {
-        return { valid: false, error: `Filter "${fp} ${f.op}" requires a JSON array` };
-      }
-      const nonFinitePath = findNonFiniteNumber(parsedArr, fp);
-      if (nonFinitePath !== null) {
-        return {
-          valid: false,
-          error: `Numeric literal at ${nonFinitePath} in ${f.op} filter for "${fp}" overflows IEEE-754 double; use {"doubleValue": "Infinity"} or "-Infinity" instead`,
-        };
-      }
-      /** @type {FirestoreValue[]} */
-      const values = [];
-      for (let i = 0; i < parsedArr.length; i++) {
-        const item = parsedArr[i];
-        if (item === null) values.push({ nullValue: null });
-        else if (typeof item === "boolean") values.push({ booleanValue: item });
-        else if (typeof item === "string") values.push({ stringValue: item });
-        else if (typeof item === "number") {
-          if (Number.isSafeInteger(item) && !Object.is(item, -0)) {
-            values.push({ integerValue: String(item) });
-          } else {
-            values.push({ doubleValue: item });
-          }
-        } else if (Array.isArray(item)) {
-          return {
-            valid: false,
-            error:
-              f.op === "ARRAY_CONTAINS_ANY"
-                ? `Nested arrays are not supported in ${f.op} filter for "${fp}"`
-                : `Array elements in ${f.op} filter for "${fp}" must use explicit ProtoJSON {"arrayValue": {"values": [...]}}`,
-          };
-        } else if (item && typeof item === "object") {
-          const res = normalizeProtoValue(
-            item,
-            `${fp}[${i}]`,
-            f.op === "ARRAY_CONTAINS_ANY"
-          );
-          if (!res.valid || !res.value) {
-            return { valid: false, error: res.error };
-          }
-          values.push(res.value);
-        } else {
-          return { valid: false, error: `Invalid item in ${f.op} array for "${fp}"` };
-        }
-      }
-      builtFilters.push({
-        fieldFilter: {
-          field: { fieldPath: fp },
-          op: f.op,
-          value: { arrayValue: { values } },
-        },
-      });
-    } else {
-      const valRes = buildScalarFilterValue(f, projectId, databaseId);
-      if (!valRes.valid || !valRes.value) {
-        return { valid: false, error: `Filter "${fp}": ${valRes.error}` };
-      }
-      builtFilters.push({
-        fieldFilter: {
-          field: { fieldPath: fp },
-          op: f.op,
-          value: valRes.value,
-        },
-      });
-    }
-  }
-
-  if (builtFilters.length === 1) {
-    query.where = builtFilters[0];
-  } else if (builtFilters.length > 1) {
-    query.where = {
-      compositeFilter: {
-        op: state.compositeOp,
-        filters: builtFilters,
-      },
-    };
-  }
-
-  if (state.orders.length > 0) {
-    /** @type {Record<string, unknown>[]} */
-    const orderBy = [];
-    for (const o of state.orders) {
-      const fp = o.fieldPath.trim();
-      if (!fp) {
-        return { valid: false, error: "Every orderBy row must specify a field path" };
-      }
-      orderBy.push({
-        field: { fieldPath: fp },
-        direction: o.direction,
-      });
-    }
-    query.orderBy = orderBy;
-  }
-
-  const trimmedLimit = state.limitText.trim();
-  if (trimmedLimit) {
-    const n = Number(trimmedLimit);
-    if (!Number.isInteger(n) || n < 0) {
-      return { valid: false, error: "Limit must be a non-negative integer" };
-    }
-    query.limit = n;
-  }
-
-  return { valid: true, query };
-}
-
-/**
- * Builds a canonical StructuredAggregationQuery JSON object from visual builder rows.
- * @param {QueryRunnerState} state
- * @param {string} projectId
- * @param {string} databaseId
- * @param {{ enterprise?: boolean }} [opts]
- * @returns {{ valid: boolean, query?: Record<string, unknown>, error?: string }}
- */
-export function buildAggregationQueryFromVisual(
-  state,
-  projectId,
-  databaseId,
-  opts = {}
-) {
-  const base = buildStructuredQueryFromVisual(state, projectId, databaseId);
-  if (!base.valid || !base.query) {
-    return base;
-  }
-
-  const enterprise = Boolean(opts.enterprise);
-  const maxAggregations = enterprise
-    ? ENTERPRISE_MAX_AGGREGATIONS
-    : STANDARD_MAX_AGGREGATIONS;
-
-  if (!Array.isArray(state.aggregations) || state.aggregations.length === 0) {
-    return { valid: false, error: "At least one aggregation is required" };
-  }
-  if (state.aggregations.length > maxAggregations) {
-    return {
-      valid: false,
-      error: `Maximum ${maxAggregations} aggregations per query`,
-    };
-  }
-
-  let nextAutoAlias = 1;
-  /** @type {Set<string>} */
-  const seenAliases = new Set();
-  /** @type {Record<string, unknown>[]} */
-  const builtAggs = [];
-
-  for (const row of state.aggregations) {
-    /** @type {Record<string, unknown>} */
-    let opObj;
-    if (row.op === "COUNT") {
-      opObj = { count: {} };
-    } else if (row.op === "SUM" || row.op === "AVG") {
-      const fp = row.fieldPath.trim();
-      if (!fp) {
-        return {
-          valid: false,
-          error: `${row.op} aggregation must specify a field path`,
-        };
-      }
-      opObj =
-        row.op === "SUM"
-          ? { sum: { field: { fieldPath: fp } } }
-          : { avg: { field: { fieldPath: fp } } };
-    } else {
-      return {
-        valid: false,
-        error: `Unsupported aggregation operator: ${String(row.op)}`,
-      };
-    }
-
-    const rawAlias = row.alias.trim();
-    /** @type {string} */
-    let effectiveAlias;
-    if (rawAlias !== "") {
-      if (!enterprise && isReservedName(rawAlias)) {
-        return {
-          valid: false,
-          error: `Aggregation alias "${rawAlias}" cannot use reserved __...__ format`,
-        };
-      }
-      if (utf8Encoder.encode(rawAlias).length > MAX_AGGREGATION_ALIAS_BYTES) {
-        return {
-          valid: false,
-          error: `Aggregation alias "${rawAlias}" exceeds ${MAX_AGGREGATION_ALIAS_BYTES} UTF-8 bytes`,
-        };
-      }
-      effectiveAlias = rawAlias;
-    } else {
-      effectiveAlias = `field_${nextAutoAlias++}`;
-    }
-
-    if (seenAliases.has(effectiveAlias)) {
-      return {
-        valid: false,
-        error: `Duplicate aggregation alias "${effectiveAlias}"`,
-      };
-    }
-    seenAliases.add(effectiveAlias);
-
-    builtAggs.push({
-      ...opObj,
-      ...(rawAlias ? { alias: rawAlias } : {}),
-    });
-  }
-
-  return {
-    valid: true,
-    query: {
-      structuredQuery: base.query,
-      aggregations: builtAggs,
-    },
-  };
-}
-
-/**
- * Returns true when visual controls remain in their untouched default state.
- * @param {QueryRunnerState} state
- * @returns {boolean}
- */
-function isPristineVisual(state) {
-  const basePristine =
-    !state.collectionId.trim() &&
-    !state.parentSubpath.trim() &&
-    !state.allDescendants &&
-    !state.limitUserModified &&
-    state.filters.length === 0 &&
-    state.orders.length === 0;
-  if (!basePristine) return false;
-  if (state.queryKind === "aggregations") {
-    return (
-      state.aggregations.length === 1 &&
-      state.aggregations[0].op === "COUNT" &&
-      !state.aggregations[0].alias.trim() &&
-      !state.aggregations[0].fieldPath.trim()
-    );
-  }
-  return true;
-}
-
-/**
- * @param {QueryFilterRow} f
- * @param {string} projectId
- * @param {string} databaseId
- * @returns {{ valid: boolean, value?: FirestoreValue, error?: string }}
- */
-function buildScalarFilterValue(f, projectId, databaseId) {
-  switch (f.valueType) {
-    case "stringValue":
-      return { valid: true, value: { stringValue: f.valueText } };
-    case "booleanValue":
-      return {
-        valid: true,
-        value: { booleanValue: f.valueText.trim() === "true" },
-      };
-    case "integerValue": {
-      const c = validateInteger64(f.valueText);
-      return c.valid && c.canonical
-        ? { valid: true, value: { integerValue: c.canonical } }
-        : { valid: false, error: c.error };
-    }
-    case "doubleValue": {
-      const c = validateDouble(f.valueText);
-      return c.valid && c.value !== undefined
-        ? { valid: true, value: { doubleValue: c.value } }
-        : { valid: false, error: c.error };
-    }
-    case "timestampValue": {
-      const c = validateTimestamp(f.valueText);
-      return c.valid
-        ? { valid: true, value: { timestampValue: f.valueText.trim() } }
-        : { valid: false, error: c.error };
-    }
-    case "referenceValue": {
-      const c = normalizeReference(f.valueText, projectId, databaseId);
-      return c.valid && c.fullPath
-        ? { valid: true, value: { referenceValue: c.fullPath } }
-        : { valid: false, error: c.error };
-    }
-    case "bytesValue": {
-      const c = encodeBytes(f.valueText, "base64");
-      return c.valid && c.base64 !== undefined
-        ? { valid: true, value: { bytesValue: c.base64 } }
-        : { valid: false, error: c.error };
-    }
-    case "geoPointValue": {
-      const c = validateGeoPoint(f.latText, f.lngText);
-      return c.valid
-        ? {
-            valid: true,
-            value: {
-              geoPointValue: { latitude: c.latitude, longitude: c.longitude },
-            },
-          }
-        : { valid: false, error: c.error };
-    }
-    default:
-      return { valid: true, value: { stringValue: f.valueText } };
-  }
-}
+export {
+  buildAggregationQueryFromVisual,
+  buildStructuredQueryFromVisual,
+  createFilterRow,
+  createQueryRunnerState,
+  extractAggProvenance,
+  parseRawQueryPayload,
+  transitionFilterOperator,
+};
 
 /**
  * @typedef {{
@@ -755,6 +68,96 @@ function buildScalarFilterValue(f, projectId, databaseId) {
  *   renderedIds: Set<string>,
  * }} QueryComboboxContext
  */
+
+/**
+ * Renders either a plain `<input>` or an autosuggestion-backed field combobox.
+ * @param {{
+ *   id: string,
+ *   value: string,
+ *   placeholder: string,
+ *   ariaLabel: string,
+ *   inputStyle: string,
+ *   disabled?: boolean,
+ *   useAggItems?: boolean,
+ *   comboCtx: QueryComboboxContext | null,
+ *   onChangeValue: (val: string) => void,
+ *   onSelectItem?: (item: ComboboxItem) => void,
+ *   onRerender: () => void,
+ * }} opts
+ * @returns {TemplateResult}
+ */
+function renderFieldCombobox(opts) {
+  const {
+    id,
+    value,
+    placeholder,
+    ariaLabel,
+    inputStyle,
+    disabled = false,
+    useAggItems = false,
+    comboCtx,
+    onChangeValue,
+    onSelectItem,
+    onRerender,
+  } = opts;
+  if (disabled || !comboCtx) {
+    return html`
+      <input
+        type="text"
+        class="input mono"
+        style=${inputStyle}
+        aria-label=${ariaLabel}
+        placeholder=${placeholder}
+        ?disabled=${disabled}
+        .value=${value}
+        @input=${(/** @type {Event} */ e) => {
+          onChangeValue(/** @type {HTMLInputElement} */ (e.target).value);
+          onRerender();
+        }}
+      />
+    `;
+  }
+  comboCtx.renderedIds.add(id);
+  return renderCombobox({
+    id,
+    value,
+    placeholder,
+    ariaLabel,
+    inputStyle,
+    items: useAggItems
+      ? comboCtx.fieldEntry?.aggItems ?? []
+      : comboCtx.fieldEntry?.items ?? [],
+    uiState: comboCtx.store.comboboxUi,
+    footerText: formatSuggestionFooter(comboCtx.fieldEntry),
+    loading: comboCtx.fieldEntry?.loading ?? false,
+    topObstructionSelector: "#topbar",
+    clipContainerSelector: ".query-builder-pane",
+    onInput: onChangeValue,
+    onSelect: (item) => {
+      if (onSelectItem) {
+        onSelectItem(item);
+      } else {
+        onChangeValue(item.value);
+      }
+    },
+    onOpen: () => {
+      void ensureFieldSuggestions(
+        comboCtx.store,
+        comboCtx.ctx,
+        comboCtx.fieldScope
+      );
+    },
+    onRefresh: () => {
+      void ensureFieldSuggestions(
+        comboCtx.store,
+        comboCtx.ctx,
+        comboCtx.fieldScope,
+        true
+      );
+    },
+    onRerender,
+  });
+}
 
 /**
  * Renders the Structured Query Runner workspace.
@@ -768,6 +171,7 @@ function buildScalarFilterValue(f, projectId, databaseId) {
  *   state: QueryRunnerState,
  *   onRerender: () => void,
  *   onExecuteQuery: () => void,
+ *   onAbortQueryRun?: () => void,
  *   onOpenResultDocument: (docName: string) => void,
  * }} props
  * @returns {TemplateResult}
@@ -782,6 +186,7 @@ export function renderQueryRunner(props) {
     state,
     onRerender,
     onExecuteQuery,
+    onAbortQueryRun,
     onOpenResultDocument,
   } = props;
   const maxAggregations = enterprise
@@ -808,9 +213,9 @@ export function renderQueryRunner(props) {
   };
   const fieldEntry =
     useCombobox && suggestions
-      ? resolveFieldScopeEntry(
+      ? getFieldScopeEntry(
           suggestions,
-          parsedParent,
+          state.parentSubpath,
           state.collectionId,
           state.allDescendants
         )
@@ -831,6 +236,7 @@ export function renderQueryRunner(props) {
     /** @type {'documents' | 'aggregations'} */ nextKind
   ) => {
     if (state.queryKind === nextKind) return;
+    onAbortQueryRun?.();
     state.queryKind = nextKind;
     state.error = null;
     if (!state.limitUserModified) {
@@ -842,7 +248,7 @@ export function renderQueryRunner(props) {
   const switchTab = (/** @type {'visual' | 'raw'} */ nextMode) => {
     if (state.mode === nextMode) return;
     if (nextMode === "raw") {
-      if (isPristineVisual(state)) {
+      if (isUntouchedDefaultQueryState(state)) {
         state.error = null;
       } else {
         const built =
@@ -872,12 +278,7 @@ export function renderQueryRunner(props) {
 
   const addAggregation = () => {
     if (state.aggregations.length >= maxAggregations) return;
-    state.aggregations.push({
-      id: nextRowId++,
-      op: "COUNT",
-      fieldPath: "",
-      alias: "",
-    });
+    state.aggregations.push(createAggregationRow());
     onRerender();
   };
 
@@ -887,11 +288,7 @@ export function renderQueryRunner(props) {
   };
 
   const addOrder = () => {
-    state.orders.push({
-      id: nextRowId++,
-      fieldPath: "",
-      direction: "ASCENDING",
-    });
+    state.orders.push(createOrderRow());
     onRerender();
   };
 
@@ -917,7 +314,7 @@ export function renderQueryRunner(props) {
       `;
     }
     comboCtx.renderedIds.add("query-parent-subpath");
-    const parentState = resolveParentSubpathState(
+    const parentState = getParentSubpathSuggestions(
       comboCtx.store,
       knownCollections,
       rootPath,
@@ -933,6 +330,8 @@ export function renderQueryRunner(props) {
       footerText: parentState.footerText,
       loading: parentState.loading,
       keepOpenOnSelect: (item) => item.value.endsWith("/"),
+      topObstructionSelector: "#topbar",
+      clipContainerSelector: ".query-builder-pane",
       onInput: (val) => {
         state.parentSubpath = val;
         if (val.includes("/")) {
@@ -998,10 +397,10 @@ export function renderQueryRunner(props) {
       `;
     }
     comboCtx.renderedIds.add("query-collection-id");
-    const colState = resolveCollectionIdState(
+    const colState = getCollectionIdSuggestions(
       comboCtx.store,
       knownCollections,
-      parsedParent,
+      state.parentSubpath,
       state.allDescendants
     );
     return renderCombobox({
@@ -1014,6 +413,8 @@ export function renderQueryRunner(props) {
       uiState: comboCtx.store.comboboxUi,
       footerText: colState.footerText,
       loading: colState.loading,
+      topObstructionSelector: "#topbar",
+      clipContainerSelector: ".query-builder-pane",
       onInput: (val) => {
         state.collectionId = val;
       },
@@ -1206,63 +607,18 @@ export function renderQueryRunner(props) {
                       Default ordering (<code>__name__ ASC</code>).
                     </div>`
                   : state.orders.map((o, idx) => {
-                      const orderFieldControl = (() => {
-                        if (!comboCtx) {
-                          return html`
-                            <input
-                              type="text"
-                              class="input mono"
-                              style="flex: 1 1 150px;"
-                              aria-label=${`Sort ${idx + 1} field path`}
-                              placeholder="field path (e.g. age)"
-                              .value=${o.fieldPath}
-                              @input=${(/** @type {Event} */ e) => {
-                                o.fieldPath = /** @type {HTMLInputElement} */ (
-                                  e.target
-                                ).value;
-                                onRerender();
-                              }}
-                            />
-                          `;
-                        }
-                        const orderId = `query-order-field-${o.id}`;
-                        comboCtx.renderedIds.add(orderId);
-                        return renderCombobox({
-                          id: orderId,
-                          value: o.fieldPath,
-                          placeholder: "field path (e.g. age)",
-                          ariaLabel: `Sort ${idx + 1} field path`,
-                          inputStyle: "flex: 1 1 150px;",
-                          items: comboCtx.fieldEntry?.items ?? [],
-                          uiState: comboCtx.store.comboboxUi,
-                          footerText: formatSuggestionFooter(
-                            comboCtx.fieldEntry
-                          ),
-                          loading: comboCtx.fieldEntry?.loading ?? false,
-                          onInput: (val) => {
-                            o.fieldPath = val;
-                          },
-                          onSelect: (item) => {
-                            o.fieldPath = item.value;
-                          },
-                          onOpen: () => {
-                            void ensureFieldSuggestions(
-                              comboCtx.store,
-                              comboCtx.ctx,
-                              comboCtx.fieldScope
-                            );
-                          },
-                          onRefresh: () => {
-                            void ensureFieldSuggestions(
-                              comboCtx.store,
-                              comboCtx.ctx,
-                              comboCtx.fieldScope,
-                              true
-                            );
-                          },
-                          onRerender,
-                        });
-                      })();
+                      const orderFieldControl = renderFieldCombobox({
+                        id: `query-order-field-${o.id}`,
+                        value: o.fieldPath,
+                        placeholder: "field path (e.g. age)",
+                        ariaLabel: `Sort ${idx + 1} field path`,
+                        inputStyle: "flex: 1 1 150px;",
+                        comboCtx,
+                        onChangeValue: (val) => {
+                          o.fieldPath = val;
+                        },
+                        onRerender,
+                      });
                       return html`
                         <div class="query-row">
                           ${orderFieldControl}
@@ -1409,62 +765,20 @@ function renderAggregationsSection(
 
       ${state.aggregations.map((row, idx) => {
         const isCount = row.op === "COUNT";
-        const aggFieldControl = (() => {
-          if (isCount || !comboCtx) {
-            return html`
-              <input
-                type="text"
-                class="input mono"
-                style="flex: 1 1 120px;"
-                aria-label=${`Aggregation ${idx + 1} field path`}
-                placeholder=${isCount ? "—" : "field path (e.g. total)"}
-                ?disabled=${isCount}
-                .value=${row.fieldPath}
-                @input=${(/** @type {Event} */ e) => {
-                  row.fieldPath = /** @type {HTMLInputElement} */ (
-                    e.target
-                  ).value;
-                  onRerender();
-                }}
-              />
-            `;
-          }
-          const aggId = `query-agg-field-${row.id}`;
-          comboCtx.renderedIds.add(aggId);
-          return renderCombobox({
-            id: aggId,
-            value: row.fieldPath,
-            placeholder: "field path (e.g. total)",
-            ariaLabel: `Aggregation ${idx + 1} field path`,
-            inputStyle: "flex: 1 1 120px;",
-            items: comboCtx.fieldEntry?.aggItems ?? [],
-            uiState: comboCtx.store.comboboxUi,
-            footerText: formatSuggestionFooter(comboCtx.fieldEntry),
-            loading: comboCtx.fieldEntry?.loading ?? false,
-            onInput: (val) => {
-              row.fieldPath = val;
-            },
-            onSelect: (item) => {
-              row.fieldPath = item.value;
-            },
-            onOpen: () => {
-              void ensureFieldSuggestions(
-                comboCtx.store,
-                comboCtx.ctx,
-                comboCtx.fieldScope
-              );
-            },
-            onRefresh: () => {
-              void ensureFieldSuggestions(
-                comboCtx.store,
-                comboCtx.ctx,
-                comboCtx.fieldScope,
-                true
-              );
-            },
-            onRerender,
-          });
-        })();
+        const aggFieldControl = renderFieldCombobox({
+          id: `query-agg-field-${row.id}`,
+          value: row.fieldPath,
+          placeholder: isCount ? "—" : "field path (e.g. total)",
+          ariaLabel: `Aggregation ${idx + 1} field path`,
+          inputStyle: "flex: 1 1 120px;",
+          disabled: isCount,
+          useAggItems: true,
+          comboCtx,
+          onChangeValue: (val) => {
+            row.fieldPath = val;
+          },
+          onRerender,
+        });
         return html`
           <div class="query-agg-row">
             <select
@@ -1521,26 +835,6 @@ function renderAggregationsSection(
       })}
     </div>
   `;
-}
-
-/**
- * @param {{ limit: number | null, hasOrderBy: boolean } | null} provenance
- * @returns {string | null}
- */
-function formatAggProvenanceNote(provenance) {
-  if (!provenance) return null;
-  const hasLimit = provenance.limit !== null;
-  const hasOrder = provenance.hasOrderBy;
-  if (hasOrder && hasLimit) {
-    return `Constrained by orderBy + limit: ${provenance.limit}`;
-  }
-  if (hasLimit) {
-    return `Constrained by limit: ${provenance.limit}`;
-  }
-  if (hasOrder) {
-    return "Constrained by orderBy";
-  }
-  return null;
 }
 
 /**
@@ -1693,60 +987,22 @@ function renderFilterRow(f, idx, state, onRerender, comboCtx) {
   const opMeta = FILTER_OPERATORS.find((o) => o.op === f.op);
   const kind = opMeta?.kind ?? "field";
 
-  const fieldControl = (() => {
-    if (!comboCtx) {
-      return html`
-        <input
-          type="text"
-          class="input mono"
-          style="flex: 1 1 130px;"
-          aria-label=${`Filter ${idx + 1} field path`}
-          placeholder="field path (e.g. active)"
-          .value=${f.fieldPath}
-          @input=${(/** @type {Event} */ e) => {
-            f.fieldPath = /** @type {HTMLInputElement} */ (e.target).value;
-            onRerender();
-          }}
-        />
-      `;
-    }
-    const filterFieldId = `query-filter-field-${f.id}`;
-    comboCtx.renderedIds.add(filterFieldId);
-    return renderCombobox({
-      id: filterFieldId,
-      value: f.fieldPath,
-      placeholder: "field path (e.g. active)",
-      ariaLabel: `Filter ${idx + 1} field path`,
-      inputStyle: "flex: 1 1 130px;",
-      items: comboCtx.fieldEntry?.items ?? [],
-      uiState: comboCtx.store.comboboxUi,
-      footerText: formatSuggestionFooter(comboCtx.fieldEntry),
-      loading: comboCtx.fieldEntry?.loading ?? false,
-      onInput: (val) => {
-        f.fieldPath = val;
-      },
-      onSelect: (item) => {
-        f.fieldPath = item.value;
-        applyFilterAutoType(f, comboCtx.fieldEntry);
-      },
-      onOpen: () => {
-        void ensureFieldSuggestions(
-          comboCtx.store,
-          comboCtx.ctx,
-          comboCtx.fieldScope
-        );
-      },
-      onRefresh: () => {
-        void ensureFieldSuggestions(
-          comboCtx.store,
-          comboCtx.ctx,
-          comboCtx.fieldScope,
-          true
-        );
-      },
-      onRerender,
-    });
-  })();
+  const fieldControl = renderFieldCombobox({
+    id: `query-filter-field-${f.id}`,
+    value: f.fieldPath,
+    placeholder: "field path (e.g. active)",
+    ariaLabel: `Filter ${idx + 1} field path`,
+    inputStyle: "flex: 1 1 130px;",
+    comboCtx,
+    onChangeValue: (val) => {
+      f.fieldPath = val;
+    },
+    onSelectItem: (item) => {
+      f.fieldPath = item.value;
+      applyFilterAutoType(f, comboCtx?.fieldEntry ?? null);
+    },
+    onRerender,
+  });
 
   return html`
     <div
@@ -1759,22 +1015,8 @@ function renderFilterRow(f, idx, state, onRerender, comboCtx) {
           aria-label="Filter operator"
           .value=${f.op}
           @change=${(/** @type {Event} */ e) => {
-            const prevMeta = FILTER_OPERATORS.find((o) => o.op === f.op);
-            f.op = /** @type {HTMLSelectElement} */ (e.target).value;
-            const nextMeta = FILTER_OPERATORS.find((o) => o.op === f.op);
-            if (nextMeta?.kind === "array" && !f.valueText.trim().startsWith("[")) {
-              f.valueText = "[]";
-            }
-            applyFilterAutoType(f, comboCtx?.fieldEntry ?? null);
-            if (
-              prevMeta?.kind === "array" &&
-              nextMeta?.kind === "field" &&
-              f.valueType === "booleanValue" &&
-              f.valueText !== "true" &&
-              f.valueText !== "false"
-            ) {
-              f.valueText = "true";
-            }
+            const nextOp = /** @type {HTMLSelectElement} */ (e.target).value;
+            transitionFilterOperator(f, nextOp, comboCtx?.fieldEntry ?? null);
             onRerender();
           }}
         >

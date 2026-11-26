@@ -11,6 +11,9 @@ import { html, nothing } from "../lit-html.js";
  *   left: number,
  *   width: number,
  *   flipUp: boolean,
+ *   popupLeft: number,
+ *   popupWidth: number,
+ *   maxListboxHeight: number,
  * }} ComboboxRect
  */
 
@@ -50,12 +53,18 @@ import { html, nothing } from "../lit-html.js";
  *   isConnected?: boolean,
  *   value?: string,
  *   scrollIntoView?: (opts?: { block?: string }) => void,
+ *   contains?: (other: unknown) => boolean,
+ *   focus?: () => void,
  * }} ElementLike
  */
 
 const POPUP_FLIP_THRESHOLD_PX = 280;
 const POPUP_MIN_WIDTH_PX = 220;
 const DEFAULT_VIEWPORT_HEIGHT_PX = 800;
+const DEFAULT_VIEWPORT_WIDTH_PX = 1280;
+
+/** @type {string | null} */
+let suppressFocusOpenFor = null;
 
 /**
  * Creates initial combobox popup UI state.
@@ -105,23 +114,71 @@ function getViewportHeight() {
 }
 
 /**
- * Computes popup geometry and flip direction from an anchor bounding box.
+ * Returns the viewport width if available, or a safe fallback for headless tests.
+ * @returns {number}
+ */
+function getViewportWidth() {
+  return typeof window !== "undefined" && typeof window?.innerWidth === "number"
+    ? window.innerWidth
+    : DEFAULT_VIEWPORT_WIDTH_PX;
+}
+
+/**
+ * Computes popup geometry, clamped viewport bounds, and flip direction from an anchor bounding box.
  * @param {RectLike} rect
  * @returns {ComboboxRect}
  */
 function computeComboboxRect(rect) {
   const viewportHeight = getViewportHeight();
+  const viewportWidth = getViewportWidth();
   const availableBelow = viewportHeight - rect.bottom;
   const availableAbove = rect.top;
   const flipUp =
     availableBelow < POPUP_FLIP_THRESHOLD_PX && availableAbove > availableBelow;
+  const availableSpace = flipUp ? availableAbove : availableBelow;
+  const popupWidth = Math.min(
+    Math.max(rect.width, POPUP_MIN_WIDTH_PX),
+    Math.max(120, viewportWidth - 16)
+  );
+  const popupLeft = Math.min(
+    Math.max(8, rect.left),
+    Math.max(8, viewportWidth - popupWidth - 8)
+  );
+  const maxListboxHeight = Math.max(
+    80,
+    Math.min(260, Math.floor(availableSpace - 44))
+  );
   return {
     top: rect.top,
     bottom: rect.bottom,
     left: rect.left,
     width: rect.width,
     flipUp,
+    popupLeft,
+    popupWidth,
+    maxListboxHeight,
   };
+}
+
+/**
+ * Returns true if two `ComboboxRect` snapshots have identical geometry.
+ * @param {ComboboxRect | null} a
+ * @param {ComboboxRect | null} b
+ * @returns {boolean}
+ */
+function comboboxRectsEqual(a, b) {
+  if (a === b) return true;
+  if (!a || !b) return false;
+  return (
+    a.top === b.top &&
+    a.bottom === b.bottom &&
+    a.left === b.left &&
+    a.width === b.width &&
+    a.flipUp === b.flipUp &&
+    a.popupLeft === b.popupLeft &&
+    a.popupWidth === b.popupWidth &&
+    a.maxListboxHeight === b.maxListboxHeight
+  );
 }
 
 /**
@@ -169,11 +226,40 @@ function isEventInsideListbox(e) {
 }
 
 /**
- * Returns true if `rect` is outside viewport, clipped by `#topbar`, or outside `.query-builder-pane`.
+ * Looks up an element by CSS selector, falling back to `getElementById` for simple `#id` selectors.
+ * @param {string | undefined} selector
+ * @returns {ElementLike | null}
+ */
+function findElementBySelector(selector) {
+  if (!selector || typeof document === "undefined") {
+    return null;
+  }
+  if (typeof document?.querySelector === "function") {
+    const found = /** @type {ElementLike | null} */ (
+      /** @type {unknown} */ (document.querySelector(selector))
+    );
+    if (found) {
+      return found;
+    }
+  }
+  if (
+    /^#[^\s.[\]:>+~]+$/.test(selector) &&
+    typeof document?.getElementById === "function"
+  ) {
+    return /** @type {ElementLike | null} */ (
+      /** @type {unknown} */ (document.getElementById(selector.slice(1)))
+    );
+  }
+  return null;
+}
+
+/**
+ * Returns true if `rect` is outside the viewport or clipped by optional obstruction/container bounds.
  * @param {RectLike} rect
+ * @param {{ topObstructionSelector?: string, clipContainerSelector?: string }} [opts]
  * @returns {boolean}
  */
-function isAnchorClipped(rect) {
+function isAnchorClipped(rect, opts = {}) {
   if (typeof window !== "undefined" && typeof window?.innerHeight === "number") {
     if (rect.bottom <= 0 || rect.top >= window.innerHeight) {
       return true;
@@ -186,27 +272,19 @@ function isAnchorClipped(rect) {
     }
   }
 
-  if (typeof document !== "undefined" && typeof document?.getElementById === "function") {
-    const topbar = /** @type {ElementLike | null} */ (
-      /** @type {unknown} */ (document.getElementById("topbar"))
-    );
-    if (typeof topbar?.getBoundingClientRect === "function") {
-      const topbarRect = topbar.getBoundingClientRect();
-      if (rect.top < topbarRect.bottom || rect.bottom <= topbarRect.bottom) {
-        return true;
-      }
+  const topEl = findElementBySelector(opts.topObstructionSelector);
+  if (typeof topEl?.getBoundingClientRect === "function") {
+    const topRect = topEl.getBoundingClientRect();
+    if (rect.top < topRect.bottom || rect.bottom <= topRect.bottom) {
+      return true;
     }
   }
 
-  if (typeof document !== "undefined" && typeof document?.querySelector === "function") {
-    const pane = /** @type {ElementLike | null} */ (
-      /** @type {unknown} */ (document.querySelector(".query-builder-pane"))
-    );
-    if (typeof pane?.getBoundingClientRect === "function") {
-      const paneRect = pane.getBoundingClientRect();
-      if (rect.bottom <= paneRect.top || rect.top >= paneRect.bottom) {
-        return true;
-      }
+  const pane = findElementBySelector(opts.clipContainerSelector);
+  if (typeof pane?.getBoundingClientRect === "function") {
+    const paneRect = pane.getBoundingClientRect();
+    if (rect.bottom <= paneRect.top || rect.top >= paneRect.bottom) {
+      return true;
     }
   }
 
@@ -241,8 +319,9 @@ function scrollOptionIntoView(listboxId, index) {
  * @param {string} id
  * @param {ComboboxUiState} uiState
  * @param {() => void} onRerender
+ * @param {{ topObstructionSelector?: string, clipContainerSelector?: string }} [clipOpts]
  */
-function registerViewportListeners(id, uiState, onRerender) {
+function registerViewportListeners(id, uiState, onRerender, clipOpts = {}) {
   if (typeof window === "undefined" || typeof window?.addEventListener !== "function") {
     return;
   }
@@ -268,13 +347,17 @@ function registerViewportListeners(id, uiState, onRerender) {
     }
 
     const rect = anchor.getBoundingClientRect();
-    if (isAnchorClipped(rect)) {
+    if (isAnchorClipped(rect, clipOpts)) {
       closeActiveCombobox(uiState);
       onRerender();
       return;
     }
 
-    uiState.rect = computeComboboxRect(rect);
+    const nextRect = computeComboboxRect(rect);
+    if (comboboxRectsEqual(uiState.rect, nextRect)) {
+      return;
+    }
+    uiState.rect = nextRect;
     onRerender();
   };
 
@@ -334,6 +417,8 @@ function filterComboboxItems(items, rawValue) {
  *   inputClass?: string,
  *   inputStyle?: string,
  *   keepOpenOnSelect?: boolean | ((item: ComboboxItem) => boolean),
+ *   topObstructionSelector?: string,
+ *   clipContainerSelector?: string,
  *   onInput: (value: string) => void,
  *   onSelect: (item: ComboboxItem) => void,
  *   onOpen: () => void,
@@ -356,6 +441,8 @@ export function renderCombobox(opts) {
     inputClass = "input mono",
     inputStyle = "",
     keepOpenOnSelect = false,
+    topObstructionSelector,
+    clipContainerSelector,
     onInput,
     onSelect,
     onOpen,
@@ -367,6 +454,7 @@ export function renderCombobox(opts) {
     closeActiveCombobox(uiState);
   }
 
+  const popupId = `${id}-popup`;
   const listboxId = `${id}-listbox`;
   const isOpen = !disabled && uiState.openId === id;
   const filteredItems = isOpen ? filterComboboxItems(items, value) : [];
@@ -390,7 +478,10 @@ export function renderCombobox(opts) {
       closeActiveCombobox(uiState);
       uiState.openId = id;
       uiState.activeIndex = -1;
-      registerViewportListeners(id, uiState, onRerender);
+      registerViewportListeners(id, uiState, onRerender, {
+        topObstructionSelector,
+        clipContainerSelector,
+      });
     }
     uiState.rect = measureAnchorRect(el);
     if (!wasOpen) {
@@ -413,7 +504,7 @@ export function renderCombobox(opts) {
   };
 
   const handleOpenTrigger = (/** @type {Event} */ e) => {
-    if (disabled || uiState.openId === id) return;
+    if (disabled || uiState.openId === id || suppressFocusOpenFor === id) return;
     const el = /** @type {ElementLike | null} */ (
       /** @type {unknown} */ (e.currentTarget ?? e.target)
     );
@@ -424,7 +515,10 @@ export function renderCombobox(opts) {
   const rect = uiState.rect;
   const viewportHeight = getViewportHeight();
   const popupStyle = rect
-    ? `left: ${rect.left}px; width: ${Math.max(rect.width, POPUP_MIN_WIDTH_PX)}px; ${!rect.flipUp ? `top: ${rect.bottom + 2}px; bottom: auto;` : `bottom: ${viewportHeight - rect.top + 2}px; top: auto;`}`
+    ? `left: ${rect.popupLeft}px; width: ${rect.popupWidth}px; ${!rect.flipUp ? `top: ${rect.bottom + 2}px; bottom: auto;` : `bottom: ${viewportHeight - rect.top + 2}px; top: auto;`}`
+    : "";
+  const listboxStyle = rect
+    ? `max-height: ${rect.maxListboxHeight}px;`
     : "";
 
   const emptyMessage =
@@ -509,24 +603,6 @@ export function renderCombobox(opts) {
               onRerender();
               break;
             }
-            case "Home": {
-              if (currentOpen && filteredItems.length > 0) {
-                e.preventDefault();
-                uiState.activeIndex = 0;
-                scrollOptionIntoView(listboxId, 0);
-                onRerender();
-              }
-              break;
-            }
-            case "End": {
-              if (currentOpen && filteredItems.length > 0) {
-                e.preventDefault();
-                uiState.activeIndex = filteredItems.length - 1;
-                scrollOptionIntoView(listboxId, uiState.activeIndex);
-                onRerender();
-              }
-              break;
-            }
             case "Enter": {
               if (!currentOpen) return;
               if (
@@ -558,18 +634,103 @@ export function renderCombobox(opts) {
             }
           }
         }}
-        @blur=${() => {
-          if (uiState.openId === id) {
-            closeActiveCombobox(uiState);
-            onRerender();
+        @blur=${(/** @type {FocusEvent} */ e) => {
+          if (uiState.openId !== id) {
+            return;
           }
+          const related = /** @type {unknown} */ (e?.relatedTarget ?? null);
+          if (
+            related &&
+            typeof document !== "undefined" &&
+            typeof document?.getElementById === "function"
+          ) {
+            const popupEl = /** @type {ElementLike | null} */ (
+              /** @type {unknown} */ (document.getElementById(popupId))
+            );
+            if (
+              popupEl &&
+              (popupEl === related || Boolean(popupEl.contains?.(related)))
+            ) {
+              return;
+            }
+          }
+          closeActiveCombobox(uiState);
+          onRerender();
         }}
       />
 
       ${isOpen
         ? html`
-            <div class="combobox-popup" style=${popupStyle || nothing}>
-              <ul id=${listboxId} class="combobox-listbox" role="listbox">
+            <div
+              id=${popupId}
+              class="combobox-popup"
+              tabindex="-1"
+              style=${popupStyle || nothing}
+              @focusout=${(/** @type {FocusEvent} */ e) => {
+                if (uiState.openId !== id) {
+                  return;
+                }
+                const related = /** @type {unknown} */ (e?.relatedTarget ?? null);
+                if (related) {
+                  const popupEl = /** @type {ElementLike | null} */ (
+                    /** @type {unknown} */ (
+                      e?.currentTarget ??
+                        (typeof document !== "undefined" &&
+                        typeof document?.getElementById === "function"
+                          ? document.getElementById(popupId)
+                          : null)
+                    )
+                  );
+                  if (
+                    popupEl &&
+                    (popupEl === related || Boolean(popupEl.contains?.(related)))
+                  ) {
+                    return;
+                  }
+                  const inputEl =
+                    typeof document !== "undefined" &&
+                    typeof document?.getElementById === "function"
+                      ? document.getElementById(id)
+                      : null;
+                  if (inputEl && related === inputEl) {
+                    return;
+                  }
+                }
+                closeActiveCombobox(uiState);
+                onRerender();
+              }}
+              @keydown=${(/** @type {KeyboardEvent} */ e) => {
+                if (e.key === "Escape" && uiState.openId === id) {
+                  e.preventDefault();
+                  e.stopPropagation();
+                  closeActiveCombobox(uiState);
+                  if (
+                    typeof document !== "undefined" &&
+                    typeof document?.getElementById === "function"
+                  ) {
+                    const inputEl = /** @type {ElementLike | null} */ (
+                      /** @type {unknown} */ (document.getElementById(id))
+                    );
+                    if (typeof inputEl?.focus === "function") {
+                      suppressFocusOpenFor = id;
+                      try {
+                        inputEl.focus();
+                      } finally {
+                        suppressFocusOpenFor = null;
+                      }
+                    }
+                  }
+                  onRerender();
+                }
+              }}
+            >
+              <ul
+                id=${listboxId}
+                class="combobox-listbox"
+                role="listbox"
+                aria-label=${ariaLabel}
+                style=${listboxStyle || nothing}
+              >
                 ${filteredItems.map(
                   (item, idx) => html`
                     <li
