@@ -1,4 +1,7 @@
-use std::collections::{HashMap, HashSet};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+};
 
 use bytes::{BufMut, Bytes, BytesMut};
 use crc32fast::Hasher;
@@ -7,7 +10,8 @@ use prost::Message;
 use string_cache::DefaultAtom;
 
 use super::{
-    EOF_MAGIC, EXPORT_CHUNK_BYTES, FORMAT_MAJOR, MAX_FRAME_BYTES, SNAPSHOT_MAGIC, SnapshotError,
+    EOF_MAGIC, EXPORT_CHUNK_BYTES, FORMAT_MAJOR, MAX_FRAME_BYTES, MAX_SNAPSHOT_DATABASES,
+    SNAPSHOT_MAGIC, SnapshotError,
     wire::{
         self, ConcurrencyModeWire, DatabaseEditionWire, DatabaseStart, DocumentRecord,
         EndOfSnapshot, SnapshotHeader, TAG_DATABASE_START, TAG_DOCUMENT_RECORD,
@@ -15,10 +19,12 @@ use super::{
     },
 };
 use crate::{
-    GenericDatabaseError,
+    FirestoreDatabase, FirestoreProject, GenericDatabaseError,
     config::DatabaseSettings,
-    database::validation::validate_writable_fields,
-    reference::{DocumentRef, RootRef},
+    database::{
+        collection::Collection, document::DocumentMeta, validation::validate_writable_fields,
+    },
+    reference::{CollectionRef, DocumentRef, RootRef},
 };
 
 const FILE_HEADER_LEN: usize = SNAPSHOT_MAGIC.len() + size_of::<u16>();
@@ -26,21 +32,60 @@ const FRAME_PREFIX_LEN: usize = 1 + size_of::<u32>();
 const TRAILER_LEN: usize = size_of::<u32>() + EOF_MAGIC.len();
 const INITIAL_FRAME_BUF_CAP: usize = 64 * 1024;
 
-pub(crate) type PreparedCollectionDocs =
-    HashMap<DefaultAtom, (DocumentRef, HashMap<String, Value>)>;
+type PreparedCollectionDocs = HashMap<DefaultAtom, (DocumentRef, HashMap<String, Value>)>;
 
 #[derive(Debug)]
 pub(crate) struct PreparedDatabase {
-    pub(crate) name: RootRef,
-    pub(crate) settings: DatabaseSettings,
-    pub(crate) collections: HashMap<DefaultAtom, PreparedCollectionDocs>,
-    pub(crate) document_count: u64,
+    name: RootRef,
+    settings: DatabaseSettings,
+    collections: HashMap<DefaultAtom, PreparedCollectionDocs>,
+    document_count: u64,
+}
+
+impl PreparedDatabase {
+    pub(crate) fn name(&self) -> &RootRef {
+        &self.name
+    }
+
+    pub(crate) fn into_database(
+        self,
+        project: &'static FirestoreProject,
+        import_time: Timestamp,
+    ) -> (RootRef, DatabaseSettings, u64, Arc<FirestoreDatabase>) {
+        let root = self.name;
+        let settings = self.settings;
+        let document_count = self.document_count;
+
+        let mut collections = HashMap::with_capacity(self.collections.len());
+        for (col_id, raw_docs) in self.collections {
+            let col_ref = CollectionRef::new(root.clone(), col_id.clone());
+            let mut doc_metas = HashMap::with_capacity(raw_docs.len());
+            for (doc_id, (doc_ref, fields)) in raw_docs {
+                doc_metas.insert(
+                    doc_id,
+                    Arc::new(DocumentMeta::from_imported_version(
+                        doc_ref,
+                        fields,
+                        import_time,
+                    )),
+                );
+            }
+            collections.insert(col_id, Arc::new(Collection::from_docs(col_ref, doc_metas)));
+        }
+
+        let db = FirestoreDatabase::new_with_config_and_collections(
+            project,
+            root.clone(),
+            settings,
+            collections,
+        );
+        (root, settings, document_count, db)
+    }
 }
 
 #[derive(Debug)]
 pub(crate) struct SnapshotEncoder {
     out_buf: BytesMut,
-    frame_scratch: Vec<u8>,
     hasher: Hasher,
     current_root: Option<RootRef>,
     total_databases: u64,
@@ -52,7 +97,6 @@ impl SnapshotEncoder {
     pub(crate) fn new(snapshot_time: Timestamp) -> Self {
         let mut encoder = Self {
             out_buf: BytesMut::with_capacity(EXPORT_CHUNK_BYTES),
-            frame_scratch: Vec::new(),
             hasher: Hasher::new(),
             current_root: None,
             total_databases: 0,
@@ -121,14 +165,16 @@ impl SnapshotEncoder {
             )));
         }
 
-        let frame = DocumentRecord {
-            document_path: format!(
-                "{}/{}",
-                doc_ref.collection_ref.collection_id, doc_ref.document_id
-            ),
-            fields: fields.clone(),
-        };
-        self.write_frame(TAG_DOCUMENT_RECORD, &frame)?;
+        let parts = [
+            doc_ref.collection_ref.collection_id.as_ref(),
+            "/",
+            doc_ref.document_id.as_ref(),
+        ];
+        let encoded_len = wire::document_record_encoded_len_parts(&parts, fields);
+        self.write_frame_raw(TAG_DOCUMENT_RECORD, encoded_len, |buf| {
+            wire::encode_document_record_parts(&parts, fields, buf);
+            Ok(())
+        })?;
         self.total_documents += 1;
         Ok(())
     }
@@ -178,17 +224,19 @@ impl SnapshotEncoder {
 
     fn write_frame<M: Message>(&mut self, tag: u8, msg: &M) -> Result<(), SnapshotError> {
         let encoded_len = msg.encoded_len();
-        if encoded_len > MAX_FRAME_BYTES {
-            return Err(SnapshotError::FrameTooLarge {
-                len: encoded_len,
-                max: MAX_FRAME_BYTES,
-            });
-        }
-        self.frame_scratch.clear();
-        self.frame_scratch.reserve(encoded_len);
-        msg.encode(&mut self.frame_scratch)
-            .map_err(|err| SnapshotError::InvalidFormat(format!("protobuf encode error: {err}")))?;
-        let payload_len = self.frame_scratch.len();
+        self.write_frame_raw(tag, encoded_len, |buf| {
+            msg.encode(buf).map_err(|err| {
+                SnapshotError::InvalidFormat(format!("protobuf encode error: {err}"))
+            })
+        })
+    }
+
+    fn write_frame_raw(
+        &mut self,
+        tag: u8,
+        payload_len: usize,
+        encode_payload: impl FnOnce(&mut BytesMut) -> Result<(), SnapshotError>,
+    ) -> Result<(), SnapshotError> {
         if payload_len > MAX_FRAME_BYTES {
             return Err(SnapshotError::FrameTooLarge {
                 len: payload_len,
@@ -196,15 +244,25 @@ impl SnapshotEncoder {
             });
         }
 
-        let mut prefix = [0u8; FRAME_PREFIX_LEN];
-        prefix[0] = tag;
-        prefix[1..].copy_from_slice(&(payload_len as u32).to_le_bytes());
+        let start = self.out_buf.len();
+        self.out_buf.reserve(FRAME_PREFIX_LEN + payload_len);
+        self.out_buf.put_u8(tag);
+        self.out_buf.put_u32_le(payload_len as u32);
 
-        self.hasher.update(&prefix);
-        self.hasher.update(&self.frame_scratch);
+        if let Err(err) = encode_payload(&mut self.out_buf) {
+            self.out_buf.truncate(start);
+            return Err(err);
+        }
 
-        self.out_buf.extend_from_slice(&prefix);
-        self.out_buf.extend_from_slice(&self.frame_scratch);
+        let actual_len = self.out_buf.len() - start - FRAME_PREFIX_LEN;
+        if actual_len != payload_len {
+            self.out_buf.truncate(start);
+            return Err(SnapshotError::InvalidFormat(format!(
+                "snapshot frame encoded length mismatch: expected {payload_len}, got {actual_len}"
+            )));
+        }
+
+        self.hasher.update(&self.out_buf[start..]);
         Ok(())
     }
 }
@@ -220,6 +278,7 @@ enum DecodePhase {
     },
     Trailer,
     Done,
+    Failed,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -263,7 +322,23 @@ impl SnapshotDecoder {
         }
     }
 
-    pub(crate) fn feed(&mut self, mut chunk: &[u8]) -> Result<(), SnapshotError> {
+    fn failed_state_error() -> SnapshotError {
+        SnapshotError::InvalidFormat("snapshot decoder is in a failed state".to_string())
+    }
+
+    pub(crate) fn feed(&mut self, chunk: &[u8]) -> Result<(), SnapshotError> {
+        if matches!(self.phase, DecodePhase::Failed) {
+            return Err(Self::failed_state_error());
+        }
+        if let Err(err) = self.feed_inner(chunk) {
+            self.phase = DecodePhase::Failed;
+            self.small_buf.clear();
+            return Err(err);
+        }
+        Ok(())
+    }
+
+    fn feed_inner(&mut self, mut chunk: &[u8]) -> Result<(), SnapshotError> {
         while !chunk.is_empty() {
             match &mut self.phase {
                 DecodePhase::FileHeader => {
@@ -314,6 +389,7 @@ impl SnapshotDecoder {
                                 max: MAX_FRAME_BYTES,
                             });
                         }
+                        self.validate_frame_prefix(tag)?;
                         self.hasher.update(&self.small_buf[..FRAME_PREFIX_LEN]);
                         self.small_buf.clear();
 
@@ -393,6 +469,7 @@ impl SnapshotDecoder {
                         chunk.len()
                     )));
                 }
+                DecodePhase::Failed => return Err(Self::failed_state_error()),
             }
         }
         Ok(())
@@ -416,6 +493,43 @@ impl SnapshotDecoder {
             DecodePhase::Trailer => Err(SnapshotError::Truncated(
                 "unexpected EOF inside snapshot trailer".to_string(),
             )),
+            DecodePhase::Failed => Err(Self::failed_state_error()),
+        }
+    }
+
+    fn validate_frame_prefix(&self, tag: u8) -> Result<(), SnapshotError> {
+        match (self.grammar, self.current_db.is_some(), tag) {
+            (GrammarState::ExpectSnapshotHeader, _, TAG_SNAPSHOT_HEADER) => Ok(()),
+            (GrammarState::InSnapshot, _, TAG_DATABASE_START) => {
+                if self.total_databases >= MAX_SNAPSHOT_DATABASES as u64 {
+                    return Err(SnapshotError::InvalidFormat(format!(
+                        "snapshot exceeds maximum of {MAX_SNAPSHOT_DATABASES} databases"
+                    )));
+                }
+                Ok(())
+            }
+            (GrammarState::InSnapshot, true, TAG_DOCUMENT_RECORD) => Ok(()),
+            (GrammarState::InSnapshot, _, TAG_END_OF_SNAPSHOT) => Ok(()),
+            (_, _, TAG_SNAPSHOT_HEADER) => Err(SnapshotError::InvalidFormat(
+                "unexpected SnapshotHeader frame".to_string(),
+            )),
+            (_, _, TAG_DATABASE_START) => Err(SnapshotError::InvalidFormat(
+                "unexpected DatabaseStart frame".to_string(),
+            )),
+            (GrammarState::InSnapshot, false, TAG_DOCUMENT_RECORD) => {
+                Err(SnapshotError::InvalidFormat(
+                    "DocumentRecord appeared before any DatabaseStart frame".to_string(),
+                ))
+            }
+            (_, _, TAG_DOCUMENT_RECORD) => Err(SnapshotError::InvalidFormat(
+                "unexpected DocumentRecord frame".to_string(),
+            )),
+            (_, _, TAG_END_OF_SNAPSHOT) => Err(SnapshotError::InvalidFormat(
+                "unexpected EndOfSnapshot frame".to_string(),
+            )),
+            (_, _, other) => Err(SnapshotError::InvalidFormat(format!(
+                "unknown snapshot frame tag: {other:#04x}"
+            ))),
         }
     }
 
@@ -1193,6 +1307,331 @@ mod tests {
             decode_bytes(&bad_ts, 64).unwrap_err(),
             SnapshotError::Validation(GenericDatabaseError::InvalidArgument(_))
         ));
+    }
+
+    #[test]
+    fn borrowed_document_record_encoding_matches_prost_message() {
+        let root = RootRef::try_new("proj", "(default)").unwrap();
+        let all_eleven = all_eleven_value_types_fields(&root);
+        let cases = [
+            (
+                "items",
+                "single",
+                HashMap::from([("k".to_string(), Value::string("v"))]),
+            ),
+            ("flags", "empty", HashMap::new()),
+            (
+                "edge",
+                "empty_key",
+                HashMap::from([(String::new(), Value::integer(7))]),
+            ),
+            ("all", "doc1", all_eleven),
+        ];
+
+        for (col_id, doc_id, fields) in cases {
+            let document_path = format!("{col_id}/{doc_id}");
+            let expected = DocumentRecord {
+                document_path: document_path.clone(),
+                fields: fields.clone(),
+            }
+            .encode_to_vec();
+
+            let parts = [col_id, "/", doc_id];
+            assert_eq!(
+                wire::document_record_encoded_len_parts(&parts, &fields),
+                expected.len()
+            );
+            let mut direct_buf = BytesMut::new();
+            wire::encode_document_record_parts(&parts, &fields, &mut direct_buf);
+            assert_eq!(direct_buf.as_ref(), expected.as_slice());
+
+            assert_eq!(
+                wire::document_record_encoded_len_parts(&[document_path.as_str()], &fields),
+                expected.len()
+            );
+            let mut single_str_buf = BytesMut::new();
+            wire::encode_document_record_parts(
+                &[document_path.as_str()],
+                &fields,
+                &mut single_str_buf,
+            );
+            assert_eq!(single_str_buf.as_ref(), expected.as_slice());
+
+            // Also verify SnapshotEncoder::write_document emits the identical payload bytes.
+            let mut enc = SnapshotEncoder::new(Timestamp {
+                seconds: 100,
+                nanos:   0,
+            });
+            enc.start_database(
+                &root,
+                DatabaseSettings::for_edition(DatabaseEdition::Standard),
+            )
+            .unwrap();
+            let doc_offset = enc.out_buf.len();
+            let doc_ref = DocumentRef::new(CollectionRef::new(root.clone(), col_id), doc_id);
+            enc.write_document(&doc_ref, &fields).unwrap();
+            let frame_slice = &enc.out_buf[doc_offset..];
+            assert_eq!(frame_slice[0], TAG_DOCUMENT_RECORD);
+            let payload_len = u32::from_le_bytes(frame_slice[1..5].try_into().unwrap()) as usize;
+            assert_eq!(payload_len, expected.len());
+            assert_eq!(&frame_slice[5..], expected.as_slice());
+        }
+    }
+
+    #[test]
+    fn decoder_prefix_stage_rejects_invalid_frames_enforces_precedence_cap_and_failed_state() {
+        const TEN_MIB: u32 = 10 * 1024 * 1024;
+        let mut file_header = Vec::with_capacity(FILE_HEADER_LEN);
+        file_header.extend_from_slice(&SNAPSHOT_MAGIC);
+        file_header.put_u16_le(FORMAT_MAJOR);
+
+        let header_frame = {
+            let payload = SnapshotHeader::default().encode_to_vec();
+            let mut frame = Vec::new();
+            push_raw_frame(&mut frame, TAG_SNAPSHOT_HEADER, &payload);
+            frame
+        };
+
+        let assert_terminal_failed = |mut decoder: SnapshotDecoder| {
+            assert!(matches!(decoder.phase, DecodePhase::Failed));
+            assert!(decoder.small_buf.is_empty());
+            assert_eq!(
+                decoder.feed(&[]),
+                Err(SnapshotError::InvalidFormat(
+                    "snapshot decoder is in a failed state".to_string()
+                ))
+            );
+            assert_eq!(
+                decoder.feed(b"trailing"),
+                Err(SnapshotError::InvalidFormat(
+                    "snapshot decoder is in a failed state".to_string()
+                ))
+            );
+            assert_eq!(
+                decoder.finish().unwrap_err(),
+                SnapshotError::InvalidFormat("snapshot decoder is in a failed state".to_string())
+            );
+        };
+
+        // 1. Unknown tag and grammar violations with a 10 MiB payload reject immediately at
+        //    FramePrefix without buffering or allocating FramePayload.
+        for (feed_header_frame, bad_tag) in [
+            (true, 0x7f),
+            (false, TAG_DATABASE_START),
+            (false, TAG_DOCUMENT_RECORD),
+            (false, TAG_END_OF_SNAPSHOT),
+            (true, TAG_SNAPSHOT_HEADER),
+            (true, TAG_DOCUMENT_RECORD),
+        ] {
+            let mut decoder = SnapshotDecoder::new();
+            decoder.feed(&file_header).unwrap();
+            if feed_header_frame {
+                decoder.feed(&header_frame).unwrap();
+            }
+            let mut prefix = [0u8; FRAME_PREFIX_LEN];
+            prefix[0] = bad_tag;
+            prefix[1..].copy_from_slice(&TEN_MIB.to_le_bytes());
+            let err = decoder.feed(&prefix).unwrap_err();
+            assert!(
+                matches!(err, SnapshotError::InvalidFormat(_)),
+                "expected InvalidFormat for tag={bad_tag:#04x}, \
+                 feed_header_frame={feed_header_frame}, got {err:?}"
+            );
+            assert_terminal_failed(decoder);
+        }
+
+        // 2. FrameTooLarge takes precedence over invalid tag/grammar when payload_len >
+        //    MAX_FRAME_BYTES.
+        for (feed_header_frame, bad_tag) in [
+            (true, 0x7f),
+            (false, TAG_DOCUMENT_RECORD),
+            (true, TAG_DOCUMENT_RECORD),
+        ] {
+            let mut decoder = SnapshotDecoder::new();
+            decoder.feed(&file_header).unwrap();
+            if feed_header_frame {
+                decoder.feed(&header_frame).unwrap();
+            }
+            let mut prefix = [0u8; FRAME_PREFIX_LEN];
+            prefix[0] = bad_tag;
+            prefix[1..].copy_from_slice(&((MAX_FRAME_BYTES + 1) as u32).to_le_bytes());
+            assert_eq!(
+                decoder.feed(&prefix).unwrap_err(),
+                SnapshotError::FrameTooLarge {
+                    len: MAX_FRAME_BYTES + 1,
+                    max: MAX_FRAME_BYTES,
+                }
+            );
+            assert_terminal_failed(decoder);
+        }
+
+        // 3. Terminal Failed state also holds after trailing bytes past Done or header errors.
+        let root = RootRef::try_new("proj", "(default)").unwrap();
+        let valid = encode_single_db_bytes(
+            &root,
+            DatabaseSettings::for_edition(DatabaseEdition::Standard),
+            &[],
+        );
+        let mut done_dec = SnapshotDecoder::new();
+        done_dec.feed(&valid).unwrap();
+        assert!(matches!(
+            done_dec.feed(&[0x00]),
+            Err(SnapshotError::InvalidFormat(_))
+        ));
+        assert_terminal_failed(done_dec);
+
+        // 4. MAX_SNAPSHOT_DATABASES succeeds while MAX_SNAPSHOT_DATABASES + 1 rejects at
+        //    FramePrefix.
+        let mut decoder = SnapshotDecoder::new();
+        decoder.feed(&file_header).unwrap();
+        decoder.feed(&header_frame).unwrap();
+        for i in 0..MAX_SNAPSHOT_DATABASES {
+            let mut frame = Vec::new();
+            push_raw_frame(
+                &mut frame,
+                TAG_DATABASE_START,
+                &DatabaseStart {
+                    project_id: "p".to_string(),
+                    database_id: format!("db-{i}"),
+                    database_edition: DatabaseEditionWire::Standard as i32,
+                    concurrency_mode: ConcurrencyModeWire::Pessimistic as i32,
+                }
+                .encode_to_vec(),
+            );
+            decoder.feed(&frame).unwrap();
+        }
+        assert_eq!(decoder.total_databases, MAX_SNAPSHOT_DATABASES as u64);
+
+        // Feeding a 10,001st TAG_DATABASE_START prefix (even claiming a 10 MiB payload) fails
+        // immediately in FramePrefix before allocating FramePayload.
+        let mut overflow_prefix = [0u8; FRAME_PREFIX_LEN];
+        overflow_prefix[0] = TAG_DATABASE_START;
+        overflow_prefix[1..].copy_from_slice(&TEN_MIB.to_le_bytes());
+        assert!(matches!(
+            decoder.feed(&overflow_prefix).unwrap_err(),
+            SnapshotError::InvalidFormat(_)
+        ));
+        assert_terminal_failed(decoder);
+
+        // Exactly MAX_SNAPSHOT_DATABASES completes cleanly with EndOfSnapshot + trailer.
+        let mut max_raw = Vec::new();
+        max_raw.extend_from_slice(&file_header);
+        max_raw.extend_from_slice(&header_frame);
+        for i in 0..MAX_SNAPSHOT_DATABASES {
+            push_raw_frame(
+                &mut max_raw,
+                TAG_DATABASE_START,
+                &DatabaseStart {
+                    project_id: "p".to_string(),
+                    database_id: format!("db-{i}"),
+                    database_edition: DatabaseEditionWire::Standard as i32,
+                    concurrency_mode: ConcurrencyModeWire::Pessimistic as i32,
+                }
+                .encode_to_vec(),
+            );
+        }
+        push_raw_frame(
+            &mut max_raw,
+            TAG_END_OF_SNAPSHOT,
+            &EndOfSnapshot {
+                total_databases: MAX_SNAPSHOT_DATABASES as u64,
+                total_documents: 0,
+            }
+            .encode_to_vec(),
+        );
+        let max_full = finalize_raw_payload(&max_raw);
+        let decoded_max = decode_bytes(&max_full, 64 * 1024).unwrap();
+        assert_eq!(decoded_max.len(), MAX_SNAPSHOT_DATABASES);
+    }
+
+    #[test]
+    fn golden_v1_snapshot_decodes_and_matches_encoder() {
+        // Frozen v1 snapshot bytes:
+        // - FileHeader: "FSEMUSNP", major = 1 (LE)
+        // - SnapshotHeader: emulator_version = "1.0.0", snapshot_time = {1_700_000_000,
+        //   123_456_000}
+        // - DatabaseStart: project_id = "golden-proj", database_id = "(default)",
+        //   Enterprise/Pessimistic
+        // - DocumentRecord: document_path = "items/doc1", fields = {"k": StringValue("v")}
+        // - EndOfSnapshot: total_databases = 1, total_documents = 1
+        // - Trailer: LE CRC-32 (0xf7d0f42a), "FSEMUEOF"
+        const GOLDEN_V1_SNAPSHOT: &[u8] = &[
+            0x46, 0x53, 0x45, 0x4d, 0x55, 0x53, 0x4e, 0x50, 0x01, 0x00, 0x01, 0x14, 0x00, 0x00,
+            0x00, 0x0a, 0x05, 0x31, 0x2e, 0x30, 0x2e, 0x30, 0x12, 0x0b, 0x08, 0x80, 0xe2, 0xcf,
+            0xaa, 0x06, 0x10, 0x80, 0x94, 0xef, 0x3a, 0x02, 0x1c, 0x00, 0x00, 0x00, 0x0a, 0x0b,
+            0x67, 0x6f, 0x6c, 0x64, 0x65, 0x6e, 0x2d, 0x70, 0x72, 0x6f, 0x6a, 0x12, 0x09, 0x28,
+            0x64, 0x65, 0x66, 0x61, 0x75, 0x6c, 0x74, 0x29, 0x18, 0x02, 0x20, 0x01, 0x03, 0x17,
+            0x00, 0x00, 0x00, 0x0a, 0x0a, 0x69, 0x74, 0x65, 0x6d, 0x73, 0x2f, 0x64, 0x6f, 0x63,
+            0x31, 0x12, 0x09, 0x0a, 0x01, 0x6b, 0x12, 0x04, 0x8a, 0x01, 0x01, 0x76, 0x04, 0x04,
+            0x00, 0x00, 0x00, 0x08, 0x01, 0x10, 0x01, 0x2a, 0xf4, 0xd0, 0xf7, 0x46, 0x53, 0x45,
+            0x4d, 0x55, 0x45, 0x4f, 0x46,
+        ];
+
+        let root = RootRef::try_new("golden-proj", "(default)").unwrap();
+        let expected_settings = DatabaseSettings {
+            edition: DatabaseEdition::Enterprise,
+            concurrency_mode: DatabaseConcurrencyMode::Pessimistic,
+        };
+        let expected_fields = HashMap::from([("k".to_string(), Value::string("v"))]);
+
+        for chunk_size in [1, 7, GOLDEN_V1_SNAPSHOT.len()] {
+            let decoded = decode_bytes(GOLDEN_V1_SNAPSHOT, chunk_size).unwrap();
+            assert_eq!(decoded.len(), 1);
+            assert_eq!(decoded[0].name, root);
+            assert_eq!(decoded[0].settings, expected_settings);
+            assert_eq!(decoded[0].document_count, 1);
+            let col_docs = &decoded[0].collections[&DefaultAtom::from("items")];
+            let (got_ref, got_fields) = &col_docs[&DefaultAtom::from("doc1")];
+            assert_eq!(
+                got_ref,
+                &DocumentRef::new(CollectionRef::new(root.clone(), "items"), "doc1")
+            );
+            assert!(Value::fields_storage_eq(got_fields, &expected_fields));
+        }
+
+        let mut encoder = SnapshotEncoder::new(Timestamp {
+            seconds: 1_700_000_000,
+            nanos:   123_456_000,
+        });
+        encoder.start_database(&root, expected_settings).unwrap();
+        let doc_ref = DocumentRef::new(CollectionRef::new(root.clone(), "items"), "doc1");
+        encoder.write_document(&doc_ref, &expected_fields).unwrap();
+        encoder.finish().unwrap();
+
+        let mut encoded = Vec::new();
+        encoder.encode_to_writer(&mut encoded).unwrap();
+
+        let header_payload_len = u32::from_le_bytes(
+            encoded[FILE_HEADER_LEN + 1..FILE_HEADER_LEN + 5]
+                .try_into()
+                .unwrap(),
+        ) as usize;
+        let body_start = FILE_HEADER_LEN + FRAME_PREFIX_LEN + header_payload_len;
+
+        assert_eq!(&encoded[..FILE_HEADER_LEN], &GOLDEN_V1_SNAPSHOT[..10]);
+        assert_eq!(
+            &encoded[body_start..body_start + 33],
+            &GOLDEN_V1_SNAPSHOT[35..68]
+        );
+        assert_eq!(
+            &encoded[body_start + 33..body_start + 61],
+            &GOLDEN_V1_SNAPSHOT[68..96]
+        );
+        assert_eq!(
+            &encoded[body_start + 61..body_start + 70],
+            &GOLDEN_V1_SNAPSHOT[96..105]
+        );
+        let trailer_start = encoded.len() - TRAILER_LEN;
+        let mut expected_crc = Hasher::new();
+        expected_crc.update(&encoded[..trailer_start]);
+        assert_eq!(
+            &encoded[trailer_start..trailer_start + 4],
+            &expected_crc.finalize().to_le_bytes()
+        );
+        assert_eq!(&encoded[trailer_start + 4..], &GOLDEN_V1_SNAPSHOT[109..117]);
+        if env!("CARGO_PKG_VERSION") == "1.0.0" {
+            assert_eq!(encoded.as_slice(), GOLDEN_V1_SNAPSHOT);
+        }
     }
 
     mod proptests {

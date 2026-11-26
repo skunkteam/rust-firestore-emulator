@@ -181,13 +181,7 @@ impl Listener {
                     match database_event {
                         // Database was dropped, reconnect to automatically create a new Database.
                         (db_name, None) => {
-                            let database = reacquire_database(
-                                self.project,
-                                &mut self.database_events,
-                                &db_name,
-                            )
-                            .await;
-                            if let Err(err) = self.reset(database).await {
+                            if let Err(err) = self.reacquire_and_reset(&db_name).await {
                                 self.send_err(err).await?;
                                 return Ok(());
                             }
@@ -207,13 +201,7 @@ impl Listener {
                                 "listener missed {} events, because of buffer overflow",
                                 count
                             );
-                            let database = reacquire_database(
-                                self.project,
-                                &mut self.database_events,
-                                &db_name,
-                            )
-                            .await;
-                            if let Err(err) = self.reset(database).await {
+                            if let Err(err) = self.reacquire_and_reset(&db_name).await {
                                 self.send_err(err).await?;
                                 return Ok(());
                             }
@@ -332,6 +320,21 @@ impl Listener {
         self.send_complete(complete_time).await
     }
 
+    async fn reacquire_and_reset(&mut self, db_name: &RootRef) -> Result<()> {
+        let required_enterprise = self
+            .target
+            .as_ref()
+            .and_then(ListenerTarget::required_enterprise);
+        let database = reacquire_database(
+            self.project,
+            &mut self.database_events,
+            db_name,
+            required_enterprise,
+        )
+        .await?;
+        self.reset(database).await
+    }
+
     async fn reset(&mut self, database: Arc<FirestoreDatabase>) -> Result<()> {
         // We rely on the fact that this function will complete before any other events are
         // processed. That's why we know for sure that the output stream is not used for
@@ -399,9 +402,13 @@ impl Listener {
                     if is_cleared_retryable(&database, &err) && retries < MAX_RESET_RETRIES =>
                 {
                     retries += 1;
-                    database =
-                        reacquire_database(self.project, &mut self.database_events, &database.name)
-                            .await;
+                    database = reacquire_database(
+                        self.project,
+                        &mut self.database_events,
+                        &database.name,
+                        None,
+                    )
+                    .await?;
                 }
                 Err(err) => return Err(err),
             }
@@ -531,7 +538,29 @@ impl Listener {
 }
 
 fn is_cleared_retryable(database: &FirestoreDatabase, err: &GenericDatabaseError) -> bool {
-    database.is_cleared() && !matches!(err, GenericDatabaseError::FailedPrecondition(_))
+    database.is_cleared() && matches!(err, GenericDatabaseError::Aborted(_))
+}
+
+fn edition_mismatch_error(
+    db_name: &RootRef,
+    query_enterprise: bool,
+    db_enterprise: bool,
+) -> GenericDatabaseError {
+    let query_edition = DatabaseEdition::from_enterprise(query_enterprise);
+    let db_edition = DatabaseEdition::from_enterprise(db_enterprise);
+    error!(
+        database = %db_name,
+        %query_edition,
+        %db_edition,
+        "Database {} edition changed from {} to {}; terminating query listener",
+        db_name,
+        query_edition,
+        db_edition
+    );
+    GenericDatabaseError::failed_precondition(format!(
+        "Database {} edition changed from {} to {}; re-create query listener",
+        db_name, query_edition, db_edition
+    ))
 }
 
 async fn reacquire_database(
@@ -541,13 +570,24 @@ async fn reacquire_database(
         StreamNotifyClose<BroadcastStream<Arc<DatabaseEvent>>>,
     >,
     db_name: &RootRef,
-) -> Arc<FirestoreDatabase> {
-    let database = project.database(db_name).await;
+    required_enterprise: Option<bool>,
+) -> Result<Arc<FirestoreDatabase>> {
+    let Some(database) = project
+        .database_for_listener(db_name, required_enterprise)
+        .await
+    else {
+        let query_enterprise = required_enterprise.unwrap_or(!project.default_enterprise);
+        return Err(edition_mismatch_error(
+            db_name,
+            query_enterprise,
+            project.default_enterprise,
+        ));
+    };
     database_events.insert(
         database.name.clone(),
         StreamNotifyClose::new(BroadcastStream::new(database.subscribe())),
     );
-    database
+    Ok(database)
 }
 
 async fn reset_target(
@@ -565,7 +605,13 @@ async fn reset_target(
             Ok(res) => return Ok(res),
             Err(err) if is_cleared_retryable(&database, &err) && retries < MAX_RESET_RETRIES => {
                 retries += 1;
-                database = reacquire_database(project, database_events, &database.name).await;
+                database = reacquire_database(
+                    project,
+                    database_events,
+                    &database.name,
+                    target.required_enterprise(),
+                )
+                .await?;
             }
             Err(err) => return Err(err),
         }
@@ -578,6 +624,12 @@ enum ListenerTarget {
 }
 
 impl ListenerTarget {
+    fn required_enterprise(&self) -> Option<bool> {
+        match self {
+            ListenerTarget::DocumentTarget(_) => None,
+            ListenerTarget::QueryTarget(target) => Some(target.query.enterprise_edition()),
+        }
+    }
     async fn process_event(
         &mut self,
         database: &FirestoreDatabase,
@@ -671,21 +723,11 @@ impl QueryTarget {
         let query_enterprise = self.query.enterprise_edition();
         let db_enterprise = database.enterprise_edition();
         if query_enterprise != db_enterprise {
-            let query_edition = DatabaseEdition::from_enterprise(query_enterprise);
-            let db_edition = DatabaseEdition::from_enterprise(db_enterprise);
-            error!(
-                database = %database.name,
-                %query_edition,
-                %db_edition,
-                "Database {} edition changed from {} to {}; terminating query listener",
-                database.name,
-                query_edition,
-                db_edition
-            );
-            return Err(GenericDatabaseError::failed_precondition(format!(
-                "Database {} edition changed from {} to {}; re-create query listener",
-                database.name, query_edition, db_edition
-            )));
+            return Err(edition_mismatch_error(
+                &database.name,
+                query_enterprise,
+                db_enterprise,
+            ));
         }
         Ok(())
     }
@@ -1059,6 +1101,31 @@ mod tests {
         out
     }
 
+    async fn replace_database_via_import(
+        project: &'static FirestoreProject,
+        root: &RootRef,
+        settings: crate::DatabaseSettings,
+        docs: &[(
+            &crate::reference::DocumentRef,
+            &std::collections::HashMap<String, googleapis::google::firestore::v1::Value>,
+        )],
+    ) -> crate::snapshot::ImportSummary {
+        let mut encoder = crate::snapshot::codec::SnapshotEncoder::new(
+            googleapis::google::protobuf::Timestamp::now(),
+        );
+        encoder.start_database(root, settings).unwrap();
+        for (doc_ref, fields) in docs {
+            encoder.write_document(doc_ref, fields).unwrap();
+        }
+        encoder.finish().unwrap();
+        let mut bytes = Vec::new();
+        encoder.encode_to_writer(&mut bytes).unwrap();
+        project
+            .import_snapshot(tokio_stream::iter([Ok(bytes::Bytes::from(bytes))]))
+            .await
+            .unwrap()
+    }
+
     #[tokio::test]
     async fn buffered_pre_clear_events_are_ignored_on_compatible_listeners() {
         use std::collections::HashMap;
@@ -1159,8 +1226,8 @@ mod tests {
 
         let _initial = drain_until_no_change(&mut resp_stream).await;
 
-        // Enqueue a pre-clear event into `db_live`'s broadcast channel, then immediately clear and
-        // replace `db_live`.
+        // Enqueue a pre-clear event into `db_live`'s broadcast channel, then immediately replace
+        // `db_live` via `import_snapshot`.
         db_live
             .update_doc(
                 &doc_ref,
@@ -1171,17 +1238,14 @@ mod tests {
             )
             .await
             .unwrap();
-        project.clear_database(&root).await;
-        let db_next = project.database(&root).await;
-        db_next
-            .create_doc(
-                &col,
-                "doc1",
-                HashMap::from([("v".to_string(), Value::integer(30))]),
-                None,
-            )
-            .await
-            .unwrap();
+        let replacement_fields = HashMap::from([("v".to_string(), Value::integer(30))]);
+        replace_database_via_import(
+            project,
+            &root,
+            crate::DatabaseSettings::for_edition(crate::DatabaseEdition::Standard),
+            &[(&doc_ref, &replacement_fields)],
+        )
+        .await;
 
         let after_replace = drain_until_no_change(&mut resp_stream).await;
         let reset_count = after_replace
@@ -1261,16 +1325,15 @@ mod tests {
                 updates:     HashMap::new(),
             });
         }
-        project.clear_database(&root).await;
-        let db2 = project.database(&root).await;
-        db2.create_doc(
-            &col,
-            "doc1",
-            HashMap::from([("v".to_string(), Value::integer(2))]),
-            None,
+        let replacement_fields = HashMap::from([("v".to_string(), Value::integer(2))]);
+        replace_database_via_import(
+            project,
+            &root,
+            crate::DatabaseSettings::for_edition(crate::DatabaseEdition::Standard),
+            &[(&doc_ref, &replacement_fields)],
         )
-        .await
-        .unwrap();
+        .await;
+        let db2 = project.database(&root).await;
 
         let recovery = drain_until_no_change(&mut resp_stream).await;
         let reset_count = recovery
@@ -1488,7 +1551,9 @@ mod tests {
             1
         );
 
-        // FailedPrecondition must not be swallowed or retried even if `database.is_cleared()`.
+        // Only `Aborted` on a cleared DB is retryable; non-Aborted errors (including
+        // `FailedPrecondition`, `InvalidArgument`, and `Internal`) and `Aborted` on an active DB
+        // must not be treated as cleared-retryable.
         db4.set_enterprise_edition(true);
         let err = q_listener
             .reset(std::sync::Arc::clone(&db4))
@@ -1500,9 +1565,22 @@ mod tests {
         ));
         assert_eq!(super::MAX_RESET_RETRIES, 3);
         assert!(!super::is_cleared_retryable(&db4, &err));
+        assert!(!super::is_cleared_retryable(
+            &db4,
+            &crate::GenericDatabaseError::invalid_argument("bad cursor"),
+        ));
+        assert!(!super::is_cleared_retryable(
+            &db4,
+            &crate::GenericDatabaseError::internal("unexpected"),
+        ));
         assert!(super::is_cleared_retryable(
             &db4,
             &crate::GenericDatabaseError::aborted("cleared"),
+        ));
+        let active_db = project.database(&root).await;
+        assert!(!super::is_cleared_retryable(
+            &active_db,
+            &crate::GenericDatabaseError::aborted("contended"),
         ));
     }
 
@@ -1550,16 +1628,14 @@ mod tests {
 
         let _initial = drain_until_no_change(&mut resp_stream).await;
 
-        project.clear_database(&root).await;
-        let db2 = project.database(&root).await;
-        db2.create_doc(
-            &col,
-            "doc1",
-            HashMap::from([("v".to_string(), Value::integer(2))]),
-            None,
+        let replacement_fields = HashMap::from([("v".to_string(), Value::integer(2))]);
+        replace_database_via_import(
+            project,
+            &root,
+            crate::DatabaseSettings::for_edition(crate::DatabaseEdition::Standard),
+            &[(&doc_ref, &replacement_fields)],
         )
-        .await
-        .unwrap();
+        .await;
 
         let msgs = drain_until_no_change(&mut resp_stream).await;
         let reset_count = msgs
@@ -1636,10 +1712,15 @@ mod tests {
 
         let _initial = drain_until_no_change(&mut resp_stream).await;
 
-        // Replace `db1` (STANDARD) with `db2` configured as ENTERPRISE before yielding.
-        project.clear_database(&root).await;
+        // Replace `db1` (STANDARD) with `db2` configured as ENTERPRISE via `import_snapshot`.
+        replace_database_via_import(
+            project,
+            &root,
+            crate::DatabaseSettings::for_edition(crate::DatabaseEdition::Enterprise),
+            &[],
+        )
+        .await;
         let db2 = project.database(&root).await;
-        db2.set_enterprise_edition(true);
 
         let err = resp_stream
             .next()
@@ -1687,5 +1768,102 @@ mod tests {
         );
 
         drop(req_tx);
+    }
+
+    #[tokio::test]
+    async fn clearing_edition_overridden_database_terminates_query_listener_without_ghost_db() {
+        use googleapis::google::firestore::v1::{
+            StructuredQuery,
+            structured_query::CollectionSelector,
+            target::{self, QueryTarget as ProtoQueryTarget, query_target},
+        };
+
+        for (default_enterprise, overridden_enterprise, expected_msg) in [
+            (
+                false,
+                true,
+                "edition changed from ENTERPRISE to STANDARD; re-create query listener",
+            ),
+            (
+                true,
+                false,
+                "edition changed from STANDARD to ENTERPRISE; re-create query listener",
+            ),
+        ] {
+            let project = Box::leak(Box::new(FirestoreProject::new(FirestoreConfig {
+                default_enterprise,
+                ..Default::default()
+            })));
+            let root: RootRef = "projects/p/databases/(default)".parse().unwrap();
+            let db = project.database(&root).await;
+            db.set_enterprise_edition(overridden_enterprise);
+
+            let (req_tx, req_rx) = mpsc::channel(4);
+            let mut resp_stream = project.listen(ReceiverStream::new(req_rx));
+            req_tx
+                .send(ListenRequest {
+                    database: root.to_string(),
+                    labels: Default::default(),
+                    target_change: Some(listen_request::TargetChange::AddTarget(Target {
+                        target_id: 1,
+                        once: false,
+                        expected_count: None,
+                        target_type: Some(target::TargetType::Query(ProtoQueryTarget {
+                            parent:     root.to_string(),
+                            query_type: Some(query_target::QueryType::StructuredQuery(
+                                StructuredQuery {
+                                    from: vec![CollectionSelector {
+                                        collection_id:   "col".to_string(),
+                                        all_descendants: false,
+                                    }],
+                                    ..Default::default()
+                                },
+                            )),
+                        })),
+                        resume_type: None,
+                    })),
+                    request_options: None,
+                })
+                .await
+                .unwrap();
+
+            let _initial = drain_until_no_change(&mut resp_stream).await;
+
+            // Subscribe and drain any setup project events right before clearing.
+            let mut proj_rx = project.subscribe_project_events();
+            project.clear_database(&root).await;
+
+            let err = resp_stream
+                .next()
+                .await
+                .expect("stream must emit FailedPrecondition")
+                .unwrap_err();
+            assert_eq!(
+                err,
+                crate::GenericDatabaseError::failed_precondition(format!(
+                    "Database {root} {expected_msg}"
+                ))
+            );
+            assert!(
+                resp_stream.next().await.is_none(),
+                "listener stream must terminate immediately after FailedPrecondition"
+            );
+
+            assert!(
+                project.get_existing_database(&root).await.is_none(),
+                "clearing edition-overridden database must not lazily re-create a ghost database"
+            );
+
+            assert!(matches!(
+                proj_rx.try_recv().unwrap(),
+                crate::event::ProjectEvent::DatabaseCleared { ref database } if database == &root
+            ));
+            assert!(
+                proj_rx.try_recv().is_err(),
+                "no DatabaseCreated or other project events may follow DatabaseCleared"
+            );
+
+            drop(req_tx);
+        }
     }
 }

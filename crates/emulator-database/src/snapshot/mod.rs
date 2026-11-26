@@ -17,6 +17,7 @@ pub const SNAPSHOT_MAGIC: [u8; 8] = *b"FSEMUSNP";
 pub const EOF_MAGIC: [u8; 8] = *b"FSEMUEOF";
 pub const FORMAT_MAJOR: u16 = 1;
 pub const MAX_FRAME_BYTES: usize = 64 * 1024 * 1024;
+pub const MAX_SNAPSHOT_DATABASES: usize = 10_000;
 pub const EXPORT_CHUNK_BYTES: usize = 64 * 1024;
 
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
@@ -54,6 +55,7 @@ pub struct ImportedDatabase {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ImportSummary {
     pub databases: Vec<ImportedDatabase>,
+    pub import_id: Option<u64>,
 }
 
 impl ImportSummary {
@@ -101,6 +103,9 @@ impl ExportSnapshotPlan {
             let mut encoder = SnapshotEncoder::new(snapshot_time);
 
             for target in self.targets {
+                if tx.is_closed() {
+                    return;
+                }
                 if let Err(err) = encoder.start_database(&target.database.name, target.settings) {
                     let _unused = tx.send(Err(io::Error::other(err))).await;
                     return;
@@ -113,9 +118,15 @@ impl ExportSnapshotPlan {
                 collections.sort_by(|a, b| a.name.cmp(&b.name));
 
                 for col in collections {
+                    if tx.is_closed() {
+                        return;
+                    }
                     let mut docs = col.docs().await;
                     docs.sort_by(|a, b| a.name.cmp(&b.name));
-                    for meta in docs {
+                    for (idx, meta) in docs.into_iter().enumerate() {
+                        if idx % 256 == 0 && tx.is_closed() {
+                            return;
+                        }
                         let Some(stored) = meta.read_mvcc_at(snapshot_time) else {
                             continue;
                         };
@@ -130,6 +141,9 @@ impl ExportSnapshotPlan {
                 }
             }
 
+            if tx.is_closed() {
+                return;
+            }
             if let Err(err) = encoder.finish() {
                 let _unused = tx.send(Err(io::Error::other(err))).await;
                 return;
@@ -157,4 +171,43 @@ async fn flush_full_chunks(
         }
     }
     true
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use googleapis::google::firestore::v1::Value;
+    use tokio_stream::StreamExt;
+
+    use crate::{
+        FirestoreConfig, FirestoreProject,
+        reference::{CollectionRef, RootRef},
+    };
+
+    #[tokio::test]
+    async fn dropping_export_stream_aborts_background_producer_promptly() {
+        let project: &'static FirestoreProject =
+            Box::leak(Box::new(FirestoreProject::new(FirestoreConfig::default())));
+        let root: RootRef = "projects/p/databases/(default)".parse().unwrap();
+        let col: CollectionRef = format!("{root}/items").parse().unwrap();
+        let db = project.database(&root).await;
+
+        for i in 0..300 {
+            db.create_doc(
+                &col,
+                &format!("d{i:03}"),
+                HashMap::from([("v".to_string(), Value::integer(i))]),
+                None,
+            )
+            .await
+            .unwrap();
+        }
+
+        let plan = project.prepare_export(None).await.unwrap();
+        let mut stream = plan.into_stream();
+        drop(stream.next().await);
+        drop(stream);
+        tokio::task::yield_now().await;
+    }
 }

@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 
+use bytes::BufMut;
 use googleapis::google::{firestore::v1::Value, protobuf::Timestamp};
 
 use super::SnapshotError;
@@ -112,6 +113,56 @@ pub(super) struct DocumentRecord {
     pub(super) document_path: String,
     #[prost(map = "string, message", tag = "2")]
     pub(super) fields: HashMap<String, Value>,
+}
+
+fn encoded_len_str_parts(tag: u32, parts: &[&str]) -> usize {
+    let len: usize = parts.iter().map(|part| part.len()).sum();
+    if len == 0 {
+        0
+    } else {
+        prost::encoding::key_len(tag) + prost::encoding::encoded_len_varint(len as u64) + len
+    }
+}
+
+fn encode_str_parts(tag: u32, parts: &[&str], buf: &mut impl BufMut) {
+    let len: usize = parts.iter().map(|part| part.len()).sum();
+    if len != 0 {
+        prost::encoding::encode_key(tag, prost::encoding::WireType::LengthDelimited, buf);
+        prost::encoding::encode_varint(len as u64, buf);
+        for part in parts {
+            buf.put_slice(part.as_bytes());
+        }
+    }
+}
+
+pub(super) fn document_record_encoded_len_parts(
+    parts: &[&str],
+    fields: &HashMap<String, Value>,
+) -> usize {
+    encoded_len_str_parts(1, parts)
+        + prost::encoding::hash_map::encoded_len(
+            prost::encoding::string::encoded_len,
+            prost::encoding::message::encoded_len,
+            2,
+            fields,
+        )
+}
+
+pub(super) fn encode_document_record_parts(
+    parts: &[&str],
+    fields: &HashMap<String, Value>,
+    buf: &mut impl BufMut,
+) {
+    encode_str_parts(1, parts, buf);
+    prost::encoding::hash_map::encode(
+        prost::encoding::string::encode,
+        prost::encoding::string::encoded_len,
+        prost::encoding::message::encode,
+        prost::encoding::message::encoded_len,
+        2,
+        fields,
+        buf,
+    );
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, prost::Message)]

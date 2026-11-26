@@ -102,6 +102,13 @@ const fn unpack_settings(bits: u8) -> DatabaseSettings {
 }
 
 #[derive(Debug)]
+enum EventChannel {
+    Idle,
+    Active(broadcast::Sender<Arc<DatabaseEvent>>),
+    Cleared,
+}
+
+#[derive(Debug)]
 pub struct FirestoreDatabase {
     project: &'static FirestoreProject,
     pub name: RootRef,
@@ -111,7 +118,7 @@ pub struct FirestoreDatabase {
     pub(crate) locks: Arc<LockManager>,
     transactions: RunningTransactions,
     optimistic_commit_lock: Mutex<()>,
-    events: std::sync::Mutex<Option<broadcast::Sender<Arc<DatabaseEvent>>>>,
+    events: std::sync::Mutex<EventChannel>,
 }
 
 impl FirestoreDatabase {
@@ -154,7 +161,7 @@ impl FirestoreDatabase {
             locks: Arc::clone(&locks),
             transactions: RunningTransactions::new(Weak::clone(database), locks, project.timeouts),
             optimistic_commit_lock: Default::default(),
-            events: std::sync::Mutex::new(Some(broadcast::channel(MAX_EVENT_BACKLOG).0)),
+            events: std::sync::Mutex::new(EventChannel::Idle),
         });
         db.locks.set_reaper(Arc::downgrade(&db));
         db
@@ -162,12 +169,14 @@ impl FirestoreDatabase {
 
     pub(crate) fn mark_cleared(&self) {
         self.cleared.store(true, atomic::Ordering::Release);
-        let sender = self
-            .events
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .take();
-        drop(sender);
+        let prev = {
+            let mut events = self
+                .events
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            std::mem::replace(&mut *events, EventChannel::Cleared)
+        };
+        drop(prev);
         self.locks.abort_all(AbortReason::DatabaseCleared);
         self.transactions.clear_all();
     }
@@ -742,9 +751,9 @@ impl FirestoreDatabase {
             .events
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let Some(sender) = events.as_ref() else {
+        if matches!(*events, EventChannel::Cleared) {
             return;
-        };
+        }
         if !event.updates.is_empty() {
             let mut paths: Vec<String> = event.updates.keys().map(ToString::to_string).collect();
             paths.sort();
@@ -755,17 +764,27 @@ impl FirestoreDatabase {
                     update_time: event.update_time,
                 });
         }
-        // A send operation can only fail if there are no active receivers,
-        // which is ok by me.
-        let _unused = sender.send(event.into());
+        if let EventChannel::Active(sender) = &*events {
+            // A send operation can only fail if there are no active receivers,
+            // which is ok by me.
+            let _unused = sender.send(event.into());
+        }
     }
 
     pub fn subscribe(&self) -> Receiver<Arc<DatabaseEvent>> {
-        self.events
+        let mut events = self
+            .events
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .as_ref()
-            .map_or_else(|| broadcast::channel(1).1, broadcast::Sender::subscribe)
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match &*events {
+            EventChannel::Active(sender) => sender.subscribe(),
+            EventChannel::Idle => {
+                let (tx, rx) = broadcast::channel(MAX_EVENT_BACKLOG);
+                *events = EventChannel::Active(tx);
+                rx
+            }
+            EventChannel::Cleared => broadcast::channel(1).1,
+        }
     }
 
     pub fn settings(&self) -> DatabaseSettings {
@@ -799,7 +818,7 @@ impl FirestoreDatabase {
         });
     }
 
-    fn update_settings(&self, update: impl FnOnce(&mut DatabaseSettings)) {
+    pub fn update_settings(&self, update: impl FnOnce(&mut DatabaseSettings)) -> DatabaseSettings {
         let events = self
             .events
             .lock()
@@ -810,13 +829,14 @@ impl FirestoreDatabase {
         let next = pack_settings(next_settings);
         if next != prev {
             self.settings.store(next, atomic::Ordering::Release);
-            if events.is_some() {
+            if !matches!(*events, EventChannel::Cleared) {
                 self.project
                     .send_project_event(ProjectEvent::DatabaseConfigChanged {
                         database: self.name.clone(),
                     });
             }
         }
+        next_settings
     }
 }
 
@@ -2601,5 +2621,162 @@ mod tests {
             ent_db.settings(),
             DatabaseSettings::for_edition(DatabaseEdition::Enterprise)
         );
+    }
+
+    #[tokio::test]
+    async fn lazy_event_channel_creation_project_events_and_mark_cleared_states() {
+        let project: &'static FirestoreProject =
+            Box::leak(Box::new(FirestoreProject::new(FirestoreConfig::default())));
+        let root1: RootRef = "projects/p/databases/db1".parse().unwrap();
+        let root2: RootRef = "projects/p/databases/db2".parse().unwrap();
+        let mut proj_rx = project.subscribe_project_events();
+
+        // 1. Fresh DB starts in Idle without allocating a broadcast channel.
+        let db1 = project.database(&root1).await;
+        assert!(matches!(
+            proj_rx.try_recv().unwrap(),
+            ProjectEvent::DatabaseCreated { .. }
+        ));
+        assert!(matches!(
+            *db1.events
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            EventChannel::Idle
+        ));
+
+        // 2. Writes before subscribe() still emit ProjectEvent::DocumentsChanged while staying
+        //    Idle.
+        let doc1: DocumentRef = "projects/p/databases/db1/documents/c/d1".parse().unwrap();
+        db1.update_doc(
+            &doc1,
+            HashMap::from([("v".to_string(), Value::integer(1))]),
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            *db1.events
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            EventChannel::Idle
+        ));
+        assert!(matches!(
+            proj_rx.try_recv().unwrap(),
+            ProjectEvent::DocumentsChanged {
+                ref database,
+                ref paths,
+                ..
+            } if database == &root1 && paths == &vec![doc1.to_string()]
+        ));
+
+        // 3. subscribe() transitions Idle -> Active and receives only events sent afterward.
+        let mut db1_rx = db1.subscribe();
+        assert!(matches!(
+            *db1.events
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            EventChannel::Active(_)
+        ));
+        assert!(db1_rx.try_recv().is_err());
+
+        let doc2: DocumentRef = "projects/p/databases/db1/documents/c/d2".parse().unwrap();
+        db1.update_doc(
+            &doc2,
+            HashMap::from([("v".to_string(), Value::integer(2))]),
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let ev2 = db1_rx.recv().await.unwrap();
+        assert!(ev2.updates.contains_key(&doc2));
+        assert!(!ev2.updates.contains_key(&doc1));
+        assert!(matches!(
+            proj_rx.try_recv().unwrap(),
+            ProjectEvent::DocumentsChanged { ref database, .. } if database == &root1
+        ));
+
+        // 4. mark_cleared() after subscribe() transitions Active -> Cleared, closes rx, and
+        //    suppresses future events and config updates.
+        db1.mark_cleared();
+        assert!(matches!(
+            *db1.events
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            EventChannel::Cleared
+        ));
+        assert!(matches!(
+            db1_rx.recv().await,
+            Err(broadcast::error::RecvError::Closed)
+        ));
+        db1.send_event(DatabaseEvent {
+            database:    Arc::downgrade(&db1),
+            update_time: Timestamp::now(),
+            updates:     HashMap::from([(
+                doc1.clone(),
+                document::DocumentVersion::Deleted(Arc::new(document::DeletedDocumentVersion {
+                    name: doc1,
+                    delete_time: Timestamp::now(),
+                })),
+            )]),
+        });
+        assert!(proj_rx.try_recv().is_err());
+
+        // 5. mark_cleared() before subscribe() transitions Idle -> Cleared and later subscribe()
+        //    yields an already-closed receiver without transitioning back to Active.
+        let db2 = project.database(&root2).await;
+        assert!(matches!(
+            proj_rx.try_recv().unwrap(),
+            ProjectEvent::DatabaseCreated { .. }
+        ));
+        let returned_settings = db2.update_settings(|s| {
+            s.edition = DatabaseEdition::Enterprise;
+        });
+        assert_eq!(
+            returned_settings,
+            DatabaseSettings {
+                edition: DatabaseEdition::Enterprise,
+                concurrency_mode: DatabaseConcurrencyMode::Pessimistic,
+            }
+        );
+        assert!(matches!(
+            proj_rx.try_recv().unwrap(),
+            ProjectEvent::DatabaseConfigChanged { ref database } if database == &root2
+        ));
+
+        db2.mark_cleared();
+        assert!(matches!(
+            *db2.events
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            EventChannel::Cleared
+        ));
+        let mut db2_rx = db2.subscribe();
+        assert!(matches!(
+            db2_rx.recv().await,
+            Err(broadcast::error::RecvError::Closed)
+        ));
+        assert!(matches!(
+            *db2.events
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            EventChannel::Cleared
+        ));
+        let doc_db2: DocumentRef = "projects/p/databases/db2/documents/c/d1".parse().unwrap();
+        db2.send_event(DatabaseEvent {
+            database:    Arc::downgrade(&db2),
+            update_time: Timestamp::now(),
+            updates:     HashMap::from([(
+                doc_db2.clone(),
+                document::DocumentVersion::Deleted(Arc::new(document::DeletedDocumentVersion {
+                    name: doc_db2,
+                    delete_time: Timestamp::now(),
+                })),
+            )]),
+        });
+        assert!(proj_rx.try_recv().is_err());
     }
 }

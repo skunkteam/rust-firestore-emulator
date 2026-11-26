@@ -1,7 +1,10 @@
 use std::{
     collections::{BTreeSet, HashMap},
     ops::Deref,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
 };
 
 use bytes::Bytes;
@@ -17,11 +20,11 @@ use crate::{
     ContentionSnapshot, ContentionSseEvent, ContentionSubscription, DatabaseContentionSnapshot,
     FirestoreDatabase, GenericDatabaseError,
     config::FirestoreConfig,
-    database::{collection::Collection, document::DocumentMeta, lock::ContentionBroadcaster},
+    database::lock::ContentionBroadcaster,
     error::Result,
     event::ProjectEvent,
     listener::Listener,
-    reference::{CollectionRef, RootRef},
+    reference::RootRef,
     snapshot::{
         ExportSnapshotPlan, ExportTarget, ImportSummary, ImportedDatabase, SnapshotError,
         codec::SnapshotDecoder,
@@ -39,6 +42,7 @@ pub struct FirestoreProject {
     events: broadcast::Sender<ProjectEvent>,
     contention: ContentionBroadcaster,
     import_lock: Mutex<()>,
+    next_import_id: AtomicU64,
 }
 
 // A lot of structs refer back to FirestoreProject, so make sure not to print them out in Debug to
@@ -76,6 +80,7 @@ impl FirestoreProject {
             events: broadcast::channel(MAX_PROJECT_EVENT_BACKLOG).0,
             contention: ContentionBroadcaster::new(),
             import_lock: Mutex::new(()),
+            next_import_id: AtomicU64::new(1),
         }
     }
 
@@ -149,9 +154,11 @@ impl FirestoreProject {
     ///
     /// All documents and collections will be lost. Active transactions will fail with ABORTED.
     ///
-    /// Listeners that are still actively listening to this database will automatically reconnect
-    /// to a new database with the same name, so all activity on the same database will still be
-    /// observed by these listeners.
+    /// Compatible listeners that are still actively listening to this database will automatically
+    /// reconnect to a new or replacement database with the same name, so all activity on that
+    /// database will still be observed. Query listeners whose query edition no longer matches the
+    /// replacement (or project default) database edition terminate with `FAILED_PRECONDITION`
+    /// without lazily re-creating an edition-mismatched database.
     #[instrument(level = Level::DEBUG)]
     pub async fn clear_database(&self, name: &RootRef) {
         let mut databases = self.databases.write().await;
@@ -183,13 +190,38 @@ impl FirestoreProject {
                 .get_or_insert(name, || {
                     let db = FirestoreDatabase::new(self, name.clone(), self.default_enterprise);
                     self.send_project_event(ProjectEvent::DatabaseCreated {
-                        database: name.clone(),
+                        database:  name.clone(),
+                        import_id: None,
                     });
                     db
                 })
                 .await
                 .deref(),
         )
+    }
+
+    pub(crate) async fn database_for_listener(
+        &'static self,
+        name: &RootRef,
+        required_enterprise: Option<bool>,
+    ) -> Option<Arc<FirestoreDatabase>> {
+        if let Some(db) = self.databases.read().await.get(name) {
+            return Some(Arc::clone(db));
+        }
+        let mut databases = self.databases.write().await;
+        if let Some(db) = databases.get(name) {
+            return Some(Arc::clone(db));
+        }
+        if required_enterprise.is_some_and(|req| req != self.default_enterprise) {
+            return None;
+        }
+        let db = FirestoreDatabase::new(self, name.clone(), self.default_enterprise);
+        self.send_project_event(ProjectEvent::DatabaseCreated {
+            database:  name.clone(),
+            import_id: None,
+        });
+        databases.insert(name.clone(), Arc::clone(&db));
+        Some(db)
     }
 
     pub async fn database_names(&self) -> Vec<RootRef> {
@@ -260,7 +292,14 @@ impl FirestoreProject {
             decoder.feed(&chunk)?;
         }
         let prepared = decoder.finish()?;
+        if prepared.is_empty() {
+            return Ok(ImportSummary {
+                databases: Vec::new(),
+                import_id: None,
+            });
+        }
 
+        let import_id = self.next_import_id.fetch_add(1, Ordering::Relaxed);
         let mut replaced_dbs = Vec::new();
         let mut summary_dbs = Vec::with_capacity(prepared.len());
 
@@ -268,7 +307,7 @@ impl FirestoreProject {
             let mut databases = self.databases.write().await;
 
             for db_spec in &prepared {
-                if let Some(old_db) = databases.get(&db_spec.name) {
+                if let Some(old_db) = databases.get(db_spec.name()) {
                     old_db.mark_cleared();
                 }
             }
@@ -276,39 +315,15 @@ impl FirestoreProject {
             let import_time = Timestamp::now();
 
             for db_spec in prepared {
-                let root = db_spec.name;
-                let settings = db_spec.settings;
-                let document_count = db_spec.document_count;
-
-                let mut collections = HashMap::with_capacity(db_spec.collections.len());
-                for (col_id, raw_docs) in db_spec.collections {
-                    let col_ref = CollectionRef::new(root.clone(), col_id.clone());
-                    let mut doc_metas = HashMap::with_capacity(raw_docs.len());
-                    for (doc_id, (doc_ref, fields)) in raw_docs {
-                        doc_metas.insert(
-                            doc_id,
-                            Arc::new(DocumentMeta::from_imported_version(
-                                doc_ref,
-                                fields,
-                                import_time,
-                            )),
-                        );
-                    }
-                    collections.insert(col_id, Arc::new(Collection::from_docs(col_ref, doc_metas)));
-                }
-
-                let new_db = FirestoreDatabase::new_with_config_and_collections(
-                    self,
-                    root.clone(),
-                    settings,
-                    collections,
-                );
+                let (root, settings, document_count, new_db) =
+                    db_spec.into_database(self, import_time);
                 let old_db = databases.insert(root.clone(), new_db);
                 let replaced = old_db.is_some();
                 if let Some(old_db) = old_db {
                     replaced_dbs.push(old_db);
                     self.send_project_event(ProjectEvent::DatabaseReplaced {
                         database: root.clone(),
+                        import_id,
                     });
                     self.contention
                         .send_if_subscribed(|| ContentionSseEvent::DatabaseCleared {
@@ -316,7 +331,8 @@ impl FirestoreProject {
                         });
                 } else {
                     self.send_project_event(ProjectEvent::DatabaseCreated {
-                        database: root.clone(),
+                        database:  root.clone(),
+                        import_id: Some(import_id),
                     });
                 }
                 summary_dbs.push(ImportedDatabase {
@@ -333,6 +349,7 @@ impl FirestoreProject {
 
         Ok(ImportSummary {
             databases: summary_dbs,
+            import_id: Some(import_id),
         })
     }
 }
@@ -345,7 +362,10 @@ mod tests {
     use tokio::sync::broadcast::error::RecvError;
 
     use super::*;
-    use crate::{GenericDatabaseError, reference::DocumentRef};
+    use crate::{
+        GenericDatabaseError,
+        reference::{CollectionRef, DocumentRef},
+    };
 
     #[tokio::test]
     async fn clear_database_closes_events_and_suppresses_stale_inflight_emissions() {
@@ -886,6 +906,7 @@ mod tests {
 
         assert_eq!(summary.total_databases(), 2);
         assert_eq!(summary.total_documents(), 2);
+        assert_eq!(summary.import_id, Some(1));
         assert_eq!(
             summary.databases,
             vec![
@@ -910,10 +931,20 @@ mod tests {
 
         let ev1 = proj_rx.try_recv().unwrap();
         let ev2 = proj_rx.try_recv().unwrap();
-        assert!(matches!(ev1, ProjectEvent::DatabaseReplaced { ref database } if database == &app));
-        assert!(
-            matches!(ev2, ProjectEvent::DatabaseReplaced { ref database } if database == &audit)
-        );
+        assert!(matches!(
+            ev1,
+            ProjectEvent::DatabaseReplaced {
+                ref database,
+                import_id: 1,
+            } if database == &app
+        ));
+        assert!(matches!(
+            ev2,
+            ProjectEvent::DatabaseReplaced {
+                ref database,
+                import_id: 1,
+            } if database == &audit
+        ));
         assert!(proj_rx.try_recv().is_err());
 
         // `app` and `audit` restored; `scratch` untouched.
@@ -966,14 +997,21 @@ mod tests {
             .import_snapshot(bytes_stream(vec![Ok(Bytes::from(snapshot))]))
             .await
             .unwrap();
+        assert_eq!(created_summary.import_id, Some(1));
         assert!(created_summary.databases.iter().all(|d| !d.replaced));
         assert!(matches!(
             proj2_rx.try_recv().unwrap(),
-            ProjectEvent::DatabaseCreated { ref database } if database == &app
+            ProjectEvent::DatabaseCreated {
+                ref database,
+                import_id: Some(1),
+            } if database == &app
         ));
         assert!(matches!(
             proj2_rx.try_recv().unwrap(),
-            ProjectEvent::DatabaseCreated { ref database } if database == &audit
+            ProjectEvent::DatabaseCreated {
+                ref database,
+                import_id: Some(1),
+            } if database == &audit
         ));
 
         // Zero-database snapshot imports as a no-op without modifying live databases.
@@ -986,8 +1024,27 @@ mod tests {
             .unwrap();
         assert_eq!(noop_summary.total_databases(), 0);
         assert_eq!(noop_summary.total_documents(), 0);
+        assert_eq!(noop_summary.import_id, None);
         assert!(proj_rx.try_recv().is_err());
         assert_eq!(project.database_names().await.len(), 3);
+
+        // Next non-empty import increments import_id monotonically (skipping the 0-DB no-op).
+        let summary_next = project
+            .import_snapshot(bytes_stream(vec![Ok(Bytes::from(
+                collect_export_bytes(project, Some(std::slice::from_ref(&app)))
+                    .await
+                    .unwrap(),
+            ))]))
+            .await
+            .unwrap();
+        assert_eq!(summary_next.import_id, Some(2));
+        assert!(matches!(
+            proj_rx.try_recv().unwrap(),
+            ProjectEvent::DatabaseReplaced {
+                ref database,
+                import_id: 2,
+            } if database == &app
+        ));
     }
 
     #[tokio::test]

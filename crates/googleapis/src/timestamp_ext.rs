@@ -109,14 +109,18 @@ impl Timestamp {
         Ok(nanos.to_be_bytes().to_vec())
     }
 
-    /// Formats this timestamp as UTC `YYYYMMDDTHHMMSSZ`, falling back to Unix epoch when out of
-    /// `OffsetDateTime` range.
+    /// Formats this timestamp as UTC `YYYYMMDDTHHMMSSZ`, falling back to Unix epoch
+    /// (`19700101T000000Z`) when outside Proto3 `0001-01-01T00:00:00Z`..=
+    /// `9999-12-31T23:59:59.999999999Z` range or when nanoseconds are out of range.
     pub fn format_utc_compact(self) -> String {
         const COMPACT_UTC_FORMAT: &[FormatItem<'static>] =
             format_description!("[year][month][day]T[hour][minute][second]Z");
-        OffsetDateTime::try_from(self)
-            .unwrap_or(OffsetDateTime::UNIX_EPOCH)
-            .format(COMPACT_UTC_FORMAT)
+        let dt = if (MIN_TIMESTAMP_SECONDS..=MAX_TIMESTAMP_SECONDS).contains(&self.seconds) {
+            OffsetDateTime::try_from(self).unwrap_or(OffsetDateTime::UNIX_EPOCH)
+        } else {
+            OffsetDateTime::UNIX_EPOCH
+        };
+        dt.format(COMPACT_UTC_FORMAT)
             .expect("valid UTC timestamp format")
     }
 }
@@ -442,6 +446,22 @@ mod tests {
             },
             Timestamp {
                 seconds: i64::MIN,
+                nanos:   0,
+            },
+            Timestamp {
+                seconds: MIN_TIMESTAMP_SECONDS - 1,
+                nanos:   999_999_999,
+            },
+            Timestamp {
+                seconds: MIN_TIMESTAMP_SECONDS - 1,
+                nanos:   0,
+            },
+            Timestamp {
+                seconds: -62_167_219_200,
+                nanos:   0,
+            },
+            Timestamp {
+                seconds: MAX_TIMESTAMP_SECONDS + 1,
                 nanos:   0,
             },
             Timestamp {
