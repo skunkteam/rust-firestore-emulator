@@ -74,10 +74,11 @@ struct Args {
     #[arg(long, env = "FIRESTORE_EMULATOR_LONG_CONTENTION_TIMEOUT")]
     long_contention_timeout: bool,
 
-    /// Default to Enterprise Edition for all new databases.
+    /// Default to Enterprise Edition for new databases created after startup.
     ///
-    /// The Firestore emulator can simulate both the Standard and Enterprise editions.
-    /// Enable this flag to default new databases to the Enterprise edition.
+    /// By default, new databases use Standard Edition (pessimistic concurrency). Enable this flag
+    /// to default new databases to Enterprise Edition (optimistic concurrency). Databases
+    /// preloaded via --import retain the edition and concurrency mode saved in the snapshot.
     #[arg(long, env = "FIRESTORE_EMULATOR_DEFAULT_ENTERPRISE")]
     default_enterprise: bool,
 
@@ -93,7 +94,12 @@ struct Args {
     #[arg(long, env = "FIRESTORE_EMULATOR_TRANSACTION_MAX_LIFETIME_MS")]
     transaction_max_lifetime_ms: Option<NonZeroU64>,
 
-    /// Optional path to a `.fsemu` snapshot file to preload before listening.
+    /// Optional path to a .fsemu snapshot file to preload before listening.
+    ///
+    /// Reads a binary .fsemu snapshot exported from /emulator/v1/export or the Web UI (Firebase
+    /// Java emulator export directories are not supported). Imported databases retain their saved
+    /// edition and concurrency settings regardless of --default-enterprise. Invalid, unreadable,
+    /// or directory paths fail startup with a non-zero exit code before listening.
     #[arg(
         long = "import",
         value_name = "PATH",

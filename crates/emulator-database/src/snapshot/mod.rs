@@ -19,6 +19,8 @@ pub const FORMAT_MAJOR: u16 = 1;
 pub const MAX_FRAME_BYTES: usize = 64 * 1024 * 1024;
 pub const MAX_SNAPSHOT_DATABASES: usize = 10_000;
 pub const EXPORT_CHUNK_BYTES: usize = 64 * 1024;
+const EXPORT_CHANNEL_CAPACITY: usize = 16;
+const EXPORT_CANCEL_CHECK_INTERVAL: usize = 256;
 
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum SnapshotError {
@@ -97,7 +99,7 @@ impl ExportSnapshotPlan {
     }
 
     pub fn into_stream(self) -> impl Stream<Item = io::Result<Bytes>> + Send + 'static {
-        let (tx, rx) = mpsc::channel(16);
+        let (tx, rx) = mpsc::channel(EXPORT_CHANNEL_CAPACITY);
         tokio::spawn(async move {
             let snapshot_time = self.snapshot_time;
             let mut encoder = SnapshotEncoder::new(snapshot_time);
@@ -124,7 +126,7 @@ impl ExportSnapshotPlan {
                     let mut docs = col.docs().await;
                     docs.sort_by(|a, b| a.name.cmp(&b.name));
                     for (idx, meta) in docs.into_iter().enumerate() {
-                        if idx % 256 == 0 && tx.is_closed() {
+                        if idx.is_multiple_of(EXPORT_CANCEL_CHECK_INTERVAL) && tx.is_closed() {
                             return;
                         }
                         let Some(stored) = meta.read_mvcc_at(snapshot_time) else {

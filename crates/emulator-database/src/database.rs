@@ -818,18 +818,18 @@ impl FirestoreDatabase {
         });
     }
 
-    pub fn update_settings(&self, update: impl FnOnce(&mut DatabaseSettings)) -> DatabaseSettings {
-        let events = self
-            .events
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+    fn apply_settings_update(
+        &self,
+        events: &EventChannel,
+        update: impl FnOnce(&mut DatabaseSettings),
+    ) -> DatabaseSettings {
         let prev = self.settings.load(atomic::Ordering::Acquire);
         let mut next_settings = unpack_settings(prev);
         update(&mut next_settings);
         let next = pack_settings(next_settings);
         if next != prev {
             self.settings.store(next, atomic::Ordering::Release);
-            if !matches!(*events, EventChannel::Cleared) {
+            if !self.is_cleared() && !matches!(events, EventChannel::Cleared) {
                 self.project
                     .send_project_event(ProjectEvent::DatabaseConfigChanged {
                         database: self.name.clone(),
@@ -837,6 +837,28 @@ impl FirestoreDatabase {
             }
         }
         next_settings
+    }
+
+    pub fn update_settings(&self, update: impl FnOnce(&mut DatabaseSettings)) -> DatabaseSettings {
+        let events = self
+            .events
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.apply_settings_update(&events, update)
+    }
+
+    pub fn try_update_settings(
+        &self,
+        update: impl FnOnce(&mut DatabaseSettings),
+    ) -> Result<DatabaseSettings> {
+        let events = self
+            .events
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if self.is_cleared() || matches!(*events, EventChannel::Cleared) {
+            return Err(AbortReason::DatabaseCleared.into());
+        }
+        Ok(self.apply_settings_update(&events, update))
     }
 }
 
@@ -2725,6 +2747,22 @@ mod tests {
         });
         assert!(proj_rx.try_recv().is_err());
 
+        let prev_db1_settings = db1.settings();
+        let db1_try_err = db1
+            .try_update_settings(|s| {
+                s.edition = DatabaseEdition::Enterprise;
+            })
+            .unwrap_err();
+        assert!(matches!(db1_try_err, GenericDatabaseError::Aborted(_)));
+        assert_eq!(db1.settings(), prev_db1_settings);
+        assert!(proj_rx.try_recv().is_err());
+
+        let db1_updated = db1.update_settings(|s| {
+            s.edition = DatabaseEdition::Enterprise;
+        });
+        assert_eq!(db1_updated.edition, DatabaseEdition::Enterprise);
+        assert!(proj_rx.try_recv().is_err());
+
         // 5. mark_cleared() before subscribe() transitions Idle -> Cleared and later subscribe()
         //    yields an already-closed receiver without transitioning back to Active.
         let db2 = project.database(&root2).await;
@@ -2740,6 +2778,22 @@ mod tests {
             DatabaseSettings {
                 edition: DatabaseEdition::Enterprise,
                 concurrency_mode: DatabaseConcurrencyMode::Pessimistic,
+            }
+        );
+        assert!(matches!(
+            proj_rx.try_recv().unwrap(),
+            ProjectEvent::DatabaseConfigChanged { ref database } if database == &root2
+        ));
+        let live_try_settings = db2
+            .try_update_settings(|s| {
+                s.concurrency_mode = DatabaseConcurrencyMode::Optimistic;
+            })
+            .unwrap();
+        assert_eq!(
+            live_try_settings,
+            DatabaseSettings {
+                edition: DatabaseEdition::Enterprise,
+                concurrency_mode: DatabaseConcurrencyMode::Optimistic,
             }
         );
         assert!(matches!(
@@ -2777,6 +2831,22 @@ mod tests {
                 })),
             )]),
         });
+        assert!(proj_rx.try_recv().is_err());
+
+        let prev_db2_settings = db2.settings();
+        let db2_try_err = db2
+            .try_update_settings(|s| {
+                s.edition = DatabaseEdition::Standard;
+            })
+            .unwrap_err();
+        assert!(matches!(db2_try_err, GenericDatabaseError::Aborted(_)));
+        assert_eq!(db2.settings(), prev_db2_settings);
+        assert!(proj_rx.try_recv().is_err());
+
+        let db2_updated = db2.update_settings(|s| {
+            s.edition = DatabaseEdition::Standard;
+        });
+        assert_eq!(db2_updated.edition, DatabaseEdition::Standard);
         assert!(proj_rx.try_recv().is_err());
     }
 }

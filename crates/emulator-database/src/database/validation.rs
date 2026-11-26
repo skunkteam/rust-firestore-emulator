@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use googleapis::{
-    VectorClassification, classify_vector_map,
+    MAX_TIMESTAMP_SECONDS, MIN_TIMESTAMP_SECONDS, VectorClassification, classify_vector_map,
     google::{
         firestore::v1::{
             DocumentMask, Precondition, Value, Write,
@@ -127,8 +127,6 @@ pub(crate) fn validate_geo_point(geo: &LatLng) -> Result<()> {
 }
 
 pub(crate) fn validate_timestamp(ts: &Timestamp) -> Result<()> {
-    const MIN_TIMESTAMP_SECONDS: i64 = -62_135_596_800; // 0001-01-01T00:00:00Z
-    const MAX_TIMESTAMP_SECONDS: i64 = 253_402_300_799; // 9999-12-31T23:59:59Z
     if !(MIN_TIMESTAMP_SECONDS..=MAX_TIMESTAMP_SECONDS).contains(&ts.seconds) {
         return Err(GenericDatabaseError::invalid_argument(format!(
             "Timestamp seconds {} out of range [{MIN_TIMESTAMP_SECONDS}, {MAX_TIMESTAMP_SECONDS}]",
@@ -1206,11 +1204,11 @@ mod tests {
     #[gtest]
     fn validates_timestamp_bounds_zero_field_maps_and_invalid_writable_values() {
         let min_ts = Timestamp {
-            seconds: -62_135_596_800,
+            seconds: MIN_TIMESTAMP_SECONDS,
             nanos:   0,
         };
         let max_ts = Timestamp {
-            seconds: 253_402_300_799,
+            seconds: MAX_TIMESTAMP_SECONDS,
             nanos:   999_999_999,
         };
         let valid_fields = HashMap::from([
@@ -1238,11 +1236,11 @@ mod tests {
 
         for bad_ts in [
             Timestamp {
-                seconds: -62_135_596_801,
+                seconds: MIN_TIMESTAMP_SECONDS - 1,
                 nanos:   0,
             },
             Timestamp {
-                seconds: 253_402_300_800,
+                seconds: MAX_TIMESTAMP_SECONDS + 1,
                 nanos:   0,
             },
             Timestamp {
@@ -1301,5 +1299,81 @@ mod tests {
                 "the name __reserved__ is reserved"
             )))
         );
+    }
+
+    #[gtest]
+    fn validated_write_parse_rejects_invalid_timestamp_in_remove_all_from_array() {
+        let root = test_root();
+        let valid_doc = "projects/p/databases/(default)/documents/c/d".to_string();
+
+        for bad_ts in [
+            Timestamp {
+                seconds: MIN_TIMESTAMP_SECONDS - 1,
+                nanos:   0,
+            },
+            Timestamp {
+                seconds: MAX_TIMESTAMP_SECONDS + 1,
+                nanos:   0,
+            },
+            Timestamp {
+                seconds: 0,
+                nanos:   -1,
+            },
+            Timestamp {
+                seconds: 0,
+                nanos:   1_000_000_000,
+            },
+        ] {
+            assert_that!(
+                ValidatedWrite::parse(
+                    Write {
+                        update_transforms: vec![FieldTransform {
+                            field_path:     "tags".to_string(),
+                            transform_type: Some(TransformType::RemoveAllFromArray(ArrayValue {
+                                values: vec![Value::timestamp(bad_ts)],
+                            })),
+                        }],
+                        operation: Some(write::Operation::Update(Document {
+                            name: valid_doc.clone(),
+                            ..Default::default()
+                        })),
+                        ..Default::default()
+                    },
+                    &root,
+                ),
+                err(matches_pattern!(GenericDatabaseError::InvalidArgument(_)))
+            );
+        }
+
+        for valid_ts in [
+            Timestamp {
+                seconds: MIN_TIMESTAMP_SECONDS,
+                nanos:   0,
+            },
+            Timestamp {
+                seconds: MAX_TIMESTAMP_SECONDS,
+                nanos:   999_999_999,
+            },
+        ] {
+            assert_that!(
+                ValidatedWrite::parse(
+                    Write {
+                        update_transforms: vec![FieldTransform {
+                            field_path:     "tags".to_string(),
+                            transform_type: Some(TransformType::RemoveAllFromArray(ArrayValue {
+                                values: vec![Value::timestamp(valid_ts)],
+                            })),
+                        }],
+                        operation: Some(write::Operation::Update(Document {
+                            name: valid_doc.clone(),
+                            ..Default::default()
+                        })),
+                        ..Default::default()
+                    },
+                    &root,
+                ),
+                ok(anything())
+            );
+        }
     }
 }

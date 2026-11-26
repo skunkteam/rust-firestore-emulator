@@ -1,6 +1,8 @@
 use std::{
     collections::HashMap,
+    future::Future,
     marker::Unpin,
+    pin::Pin,
     sync::{
         Arc,
         atomic::{self, AtomicUsize},
@@ -321,15 +323,15 @@ impl Listener {
     }
 
     async fn reacquire_and_reset(&mut self, db_name: &RootRef) -> Result<()> {
-        let required_enterprise = self
+        let required_edition = self
             .target
             .as_ref()
-            .and_then(ListenerTarget::required_enterprise);
+            .and_then(ListenerTarget::required_edition);
         let database = reacquire_database(
             self.project,
             &mut self.database_events,
             db_name,
-            required_enterprise,
+            required_edition,
         )
         .await?;
         self.reset(database).await
@@ -356,8 +358,8 @@ impl Listener {
     #[instrument(level = Level::DEBUG, skip_all, err(level = Level::DEBUG))]
     async fn set_document(
         &mut self,
-        mut database: Arc<FirestoreDatabase>,
-        name: DocumentRef,
+        database: Arc<FirestoreDatabase>,
+        mut name: DocumentRef,
         resume_type: Option<target::ResumeType>,
     ) -> Result<()> {
         // We rely on the fact that this function will complete before any other events are
@@ -385,34 +387,28 @@ impl Listener {
         }))
         .await?;
 
-        let mut retries = 0;
-        let (read_time, doc) = loop {
-            let read_time = Timestamp::now();
-            debug!(%name);
+        let (read_time, doc) = retry_on_cleared(
+            self.project,
+            &mut self.database_events,
+            database,
+            None,
+            &mut name,
+            |doc_name, db| {
+                Box::pin(async move {
+                    let read_time = Timestamp::now();
+                    debug!(%doc_name);
 
-            // Now determine the latest version at the pinned snapshot timestamp so concurrent
-            // writes after `read_time` are delivered via the already-subscribed broadcast channel
-            // instead of duplicating the initial snapshot.
-            match database
-                .get_doc(&name, ReadConsistency::ReadTime(read_time))
-                .await
-            {
-                Ok(doc) => break (read_time, doc),
-                Err(err)
-                    if is_cleared_retryable(&database, &err) && retries < MAX_RESET_RETRIES =>
-                {
-                    retries += 1;
-                    database = reacquire_database(
-                        self.project,
-                        &mut self.database_events,
-                        &database.name,
-                        None,
-                    )
-                    .await?;
-                }
-                Err(err) => return Err(err),
-            }
-        };
+                    // Now determine the latest version at the pinned snapshot timestamp so
+                    // concurrent writes after `read_time` are delivered via the already-subscribed
+                    // broadcast channel instead of duplicating the initial snapshot.
+                    let doc = db
+                        .get_doc(doc_name, ReadConsistency::ReadTime(read_time))
+                        .await?;
+                    Ok((read_time, doc))
+                })
+            },
+        )
+        .await?;
 
         // Only send if newer than the resume_token
         let send_initial = match &send_if_newer_than {
@@ -543,11 +539,9 @@ fn is_cleared_retryable(database: &FirestoreDatabase, err: &GenericDatabaseError
 
 fn edition_mismatch_error(
     db_name: &RootRef,
-    query_enterprise: bool,
-    db_enterprise: bool,
+    query_edition: DatabaseEdition,
+    db_edition: DatabaseEdition,
 ) -> GenericDatabaseError {
-    let query_edition = DatabaseEdition::from_enterprise(query_enterprise);
-    let db_edition = DatabaseEdition::from_enterprise(db_enterprise);
     error!(
         database = %db_name,
         %query_edition,
@@ -570,24 +564,57 @@ async fn reacquire_database(
         StreamNotifyClose<BroadcastStream<Arc<DatabaseEvent>>>,
     >,
     db_name: &RootRef,
-    required_enterprise: Option<bool>,
+    required_edition: Option<DatabaseEdition>,
 ) -> Result<Arc<FirestoreDatabase>> {
-    let Some(database) = project
-        .database_for_listener(db_name, required_enterprise)
+    let database = match project
+        .database_for_listener(db_name, required_edition)
         .await
-    else {
-        let query_enterprise = required_enterprise.unwrap_or(!project.default_enterprise);
-        return Err(edition_mismatch_error(
-            db_name,
-            query_enterprise,
-            project.default_enterprise,
-        ));
+    {
+        Ok(database) => database,
+        Err(default_edition) => {
+            let query_edition = required_edition
+                .expect("database_for_listener only returns Err when required_edition is Some");
+            return Err(edition_mismatch_error(
+                db_name,
+                query_edition,
+                default_edition,
+            ));
+        }
     };
     database_events.insert(
         database.name.clone(),
         StreamNotifyClose::new(BroadcastStream::new(database.subscribe())),
     );
     Ok(database)
+}
+
+async fn retry_on_cleared<State: Send, T>(
+    project: &'static FirestoreProject,
+    database_events: &mut StreamMap<
+        RootRef,
+        StreamNotifyClose<BroadcastStream<Arc<DatabaseEvent>>>,
+    >,
+    mut database: Arc<FirestoreDatabase>,
+    required_edition: Option<DatabaseEdition>,
+    state: &mut State,
+    mut op: impl for<'a> FnMut(
+        &'a mut State,
+        &'a FirestoreDatabase,
+    ) -> Pin<Box<dyn Future<Output = Result<T>> + Send + 'a>>,
+) -> Result<T> {
+    let mut retries = 0;
+    loop {
+        match op(state, &database).await {
+            Ok(res) => return Ok(res),
+            Err(err) if is_cleared_retryable(&database, &err) && retries < MAX_RESET_RETRIES => {
+                retries += 1;
+                database =
+                    reacquire_database(project, database_events, &database.name, required_edition)
+                        .await?;
+            }
+            Err(err) => return Err(err),
+        }
+    }
 }
 
 async fn reset_target(
@@ -597,25 +624,18 @@ async fn reset_target(
         StreamNotifyClose<BroadcastStream<Arc<DatabaseEvent>>>,
     >,
     target: &mut ListenerTarget,
-    mut database: Arc<FirestoreDatabase>,
+    database: Arc<FirestoreDatabase>,
 ) -> Result<(Timestamp, Vec<ResponseType>)> {
-    let mut retries = 0;
-    loop {
-        match target.reset(&database).await {
-            Ok(res) => return Ok(res),
-            Err(err) if is_cleared_retryable(&database, &err) && retries < MAX_RESET_RETRIES => {
-                retries += 1;
-                database = reacquire_database(
-                    project,
-                    database_events,
-                    &database.name,
-                    target.required_enterprise(),
-                )
-                .await?;
-            }
-            Err(err) => return Err(err),
-        }
-    }
+    let required_edition = target.required_edition();
+    retry_on_cleared(
+        project,
+        database_events,
+        database,
+        required_edition,
+        target,
+        |target, db| Box::pin(target.reset(db)),
+    )
+    .await
 }
 
 enum ListenerTarget {
@@ -624,10 +644,12 @@ enum ListenerTarget {
 }
 
 impl ListenerTarget {
-    fn required_enterprise(&self) -> Option<bool> {
+    fn required_edition(&self) -> Option<DatabaseEdition> {
         match self {
             ListenerTarget::DocumentTarget(_) => None,
-            ListenerTarget::QueryTarget(target) => Some(target.query.enterprise_edition()),
+            ListenerTarget::QueryTarget(target) => Some(DatabaseEdition::from_enterprise(
+                target.query.enterprise_edition(),
+            )),
         }
     }
     async fn process_event(
@@ -720,13 +742,13 @@ impl QueryTarget {
     }
 
     fn ensure_matching_edition(&self, database: &FirestoreDatabase) -> Result<()> {
-        let query_enterprise = self.query.enterprise_edition();
-        let db_enterprise = database.enterprise_edition();
-        if query_enterprise != db_enterprise {
+        let query_edition = DatabaseEdition::from_enterprise(self.query.enterprise_edition());
+        let db_edition = database.settings().edition;
+        if query_edition != db_edition {
             return Err(edition_mismatch_error(
                 &database.name,
-                query_enterprise,
-                db_enterprise,
+                query_edition,
+                db_edition,
             ));
         }
         Ok(())
@@ -873,997 +895,4 @@ fn show_response_type(rt: &ResponseType) -> &'static str {
 }
 
 #[cfg(test)]
-mod tests {
-    use std::time::Duration;
-
-    use googleapis::google::firestore::v1::{
-        Document, ListenRequest, ListenResponse, Target, listen_request,
-        listen_response::ResponseType,
-        target::{self, DocumentsTarget},
-    };
-    use tokio::sync::mpsc;
-    use tokio_stream::{StreamExt, wrappers::ReceiverStream};
-
-    use crate::{FirestoreConfig, FirestoreProject, reference::RootRef};
-
-    #[tokio::test]
-    async fn dropping_response_stream_terminates_idle_listener_task() {
-        let project = Box::leak(Box::new(FirestoreProject::new(FirestoreConfig::default())));
-        let root: RootRef = "projects/p/databases/(default)".parse().unwrap();
-        let (req_tx, req_rx) = mpsc::channel(4);
-
-        let mut resp_stream = project.listen(ReceiverStream::new(req_rx));
-        req_tx
-            .send(ListenRequest {
-                database: root.to_string(),
-                labels: Default::default(),
-                target_change: Some(listen_request::TargetChange::AddTarget(Target {
-                    target_id: 1,
-                    once: false,
-                    expected_count: None,
-                    target_type: Some(target::TargetType::Documents(DocumentsTarget {
-                        documents: vec![format!("{root}/col/doc1")],
-                    })),
-                    resume_type: None,
-                })),
-                request_options: None,
-            })
-            .await
-            .unwrap();
-
-        // Wait until initial snapshot framing reaches TargetChange(NoChange).
-        while let Some(frame) = resp_stream.next().await {
-            let frame = frame.unwrap();
-            if let Some(ResponseType::TargetChange(tc)) = frame.response_type
-                && tc.target_ids.is_empty()
-            {
-                break;
-            }
-        }
-
-        // Drop the response stream while keeping `req_tx` alive on an idle database.
-        drop(resp_stream);
-
-        tokio::time::timeout(Duration::from_secs(1), req_tx.closed())
-            .await
-            .expect("listener task must exit when response receiver is dropped");
-    }
-
-    #[tokio::test]
-    async fn query_and_document_target_watermarks_and_reset_consistency() {
-        use googleapis::google::firestore::v1::{
-            Precondition, Write, precondition, target_change::TargetChangeType, write,
-        };
-
-        let project = Box::leak(Box::new(FirestoreProject::new(FirestoreConfig::default())));
-        let root: RootRef = "projects/p/databases/(default)".parse().unwrap();
-        let db = project.database(&root).await;
-        let doc_name = format!("{root}/col/doc1");
-
-        // Pre-populate col/doc1.
-        db.write(Write {
-            operation: Some(write::Operation::Update(Document {
-                name: doc_name.clone(),
-                ..Default::default()
-            })),
-            current_document: Some(Precondition {
-                condition_type: Some(precondition::ConditionType::Exists(false)),
-            }),
-            ..Default::default()
-        })
-        .await
-        .unwrap();
-
-        // 1. DocumentTarget::reset emits TargetChange(Reset) + DocumentChange and ignores stale
-        //    DatabaseEvents at or before the pinned reset read_time.
-        let doc_ref: crate::reference::DocumentRef = doc_name.parse().unwrap();
-        let mut doc_target = super::DocumentTarget {
-            name: doc_ref.clone(),
-            last_read_time: Default::default(),
-        };
-        let (doc_reset_time, doc_msgs) = doc_target.reset(&db).await.unwrap();
-        assert_eq!(doc_target.last_read_time, doc_reset_time);
-        assert_eq!(doc_msgs.len(), 2);
-        assert!(matches!(
-            &doc_msgs[0],
-            ResponseType::TargetChange(tc)
-                if tc.target_change_type == TargetChangeType::Reset as i32
-        ));
-        assert!(matches!(&doc_msgs[1], ResponseType::DocumentChange(_)));
-
-        let stale_doc_event = crate::event::DatabaseEvent {
-            database:    std::sync::Arc::downgrade(&db),
-            update_time: doc_reset_time,
-            updates:     [(
-                doc_ref.clone(),
-                crate::document::DocumentVersion::Stored(std::sync::Arc::new(
-                    crate::document::StoredDocumentVersion {
-                        name: doc_ref,
-                        create_time: doc_reset_time,
-                        update_time: doc_reset_time,
-                        fields: Default::default(),
-                    },
-                )),
-            )]
-            .into(),
-        };
-        assert!(
-            doc_target
-                .process_event(&stale_doc_event)
-                .unwrap()
-                .is_empty()
-        );
-
-        // 2. QueryTarget::reset pins `last_reset_time` and ignores events at or before it.
-        let mut target = super::QueryTarget::new(
-            crate::query::QueryBuilder::from_collection(format!("{root}/col").parse().unwrap())
-                .build()
-                .unwrap()
-                .into(),
-        );
-        let (reset_time, init_msgs) = target.reset(&db).await.unwrap();
-        assert_eq!(init_msgs.len(), 2); // Reset + DocumentChange(doc1)
-
-        // An event at `reset_time` (or earlier) must be ignored completely even for an unseen doc.
-        let stale_doc_ref: crate::reference::DocumentRef =
-            format!("{root}/col/transient").parse().unwrap();
-        let stale_event = crate::event::DatabaseEvent {
-            database:    std::sync::Arc::downgrade(&db),
-            update_time: reset_time,
-            updates:     [(
-                stale_doc_ref.clone(),
-                crate::document::DocumentVersion::Stored(std::sync::Arc::new(
-                    crate::document::StoredDocumentVersion {
-                        name: stale_doc_ref,
-                        create_time: reset_time,
-                        update_time: reset_time,
-                        fields: Default::default(),
-                    },
-                )),
-            )]
-            .into(),
-        };
-        let (_, skipped) = target.process_event(&db, &stale_event).await.unwrap();
-        assert!(skipped.is_empty());
-    }
-
-    #[tokio::test]
-    async fn document_listener_rejects_invalid_resume_read_time() {
-        use googleapis::google::protobuf::Timestamp;
-
-        let project = Box::leak(Box::new(FirestoreProject::new(FirestoreConfig::default())));
-        let root: RootRef = "projects/p/databases/(default)".parse().unwrap();
-        let (req_tx, req_rx) = mpsc::channel(4);
-
-        let mut resp_stream = project.listen(ReceiverStream::new(req_rx));
-        req_tx
-            .send(ListenRequest {
-                database: root.to_string(),
-                labels: Default::default(),
-                target_change: Some(listen_request::TargetChange::AddTarget(Target {
-                    target_id: 1,
-                    once: false,
-                    expected_count: None,
-                    target_type: Some(target::TargetType::Documents(DocumentsTarget {
-                        documents: vec![format!("{root}/col/doc1")],
-                    })),
-                    resume_type: Some(target::ResumeType::ReadTime(Timestamp {
-                        seconds: -1,
-                        nanos:   0,
-                    })),
-                })),
-                request_options: None,
-            })
-            .await
-            .unwrap();
-
-        let mut saw_invalid_arg = false;
-        while let Some(frame) = resp_stream.next().await {
-            match frame {
-                Err(crate::GenericDatabaseError::InvalidArgument(_)) => {
-                    saw_invalid_arg = true;
-                    break;
-                }
-                Ok(resp) => {
-                    if let Some(ResponseType::TargetChange(tc)) = resp.response_type
-                        && tc.target_ids.is_empty()
-                    {
-                        break;
-                    }
-                }
-                Err(other) => panic!("unexpected listener error: {other:?}"),
-            }
-        }
-        assert!(
-            saw_invalid_arg,
-            "expected InvalidArgument for negative resume_type ReadTime"
-        );
-    }
-
-    async fn drain_until_no_change(
-        stream: &mut (impl tokio_stream::Stream<Item = crate::error::Result<ListenResponse>> + Unpin),
-    ) -> Vec<ResponseType> {
-        let mut out = Vec::new();
-        while let Some(frame) = stream.next().await {
-            let resp = frame.expect("listener stream should not fail");
-            let rt = resp.response_type.expect("response_type");
-            let is_no_change = matches!(
-                &rt,
-                ResponseType::TargetChange(tc)
-                    if tc.target_change_type == super::TargetChangeType::NoChange as i32
-                        && tc.target_ids.is_empty()
-            );
-            out.push(rt);
-            if is_no_change {
-                break;
-            }
-        }
-        out
-    }
-
-    async fn replace_database_via_import(
-        project: &'static FirestoreProject,
-        root: &RootRef,
-        settings: crate::DatabaseSettings,
-        docs: &[(
-            &crate::reference::DocumentRef,
-            &std::collections::HashMap<String, googleapis::google::firestore::v1::Value>,
-        )],
-    ) -> crate::snapshot::ImportSummary {
-        let mut encoder = crate::snapshot::codec::SnapshotEncoder::new(
-            googleapis::google::protobuf::Timestamp::now(),
-        );
-        encoder.start_database(root, settings).unwrap();
-        for (doc_ref, fields) in docs {
-            encoder.write_document(doc_ref, fields).unwrap();
-        }
-        encoder.finish().unwrap();
-        let mut bytes = Vec::new();
-        encoder.encode_to_writer(&mut bytes).unwrap();
-        project
-            .import_snapshot(tokio_stream::iter([Ok(bytes::Bytes::from(bytes))]))
-            .await
-            .unwrap()
-    }
-
-    #[tokio::test]
-    async fn buffered_pre_clear_events_are_ignored_on_compatible_listeners() {
-        use std::collections::HashMap;
-
-        use googleapis::google::firestore::v1::{
-            StructuredQuery, Value,
-            structured_query::CollectionSelector,
-            target::{self, QueryTarget as ProtoQueryTarget, query_target},
-        };
-
-        let project = Box::leak(Box::new(FirestoreProject::new(FirestoreConfig::default())));
-        let root: RootRef = "projects/p/databases/(default)".parse().unwrap();
-        let db1 = project.database(&root).await;
-        assert!(!db1.enterprise_edition());
-        let col: crate::reference::CollectionRef = format!("{root}/col").parse().unwrap();
-        let doc_ref: crate::reference::DocumentRef = format!("{root}/col/doc1").parse().unwrap();
-
-        // 1. Direct Listener::process_event ignores events whose database handle is cleared.
-        let (sender, mut rx) = mpsc::channel(16);
-        let mut listener = super::Listener {
-            id: 999,
-            project,
-            database_events: Default::default(),
-            sender,
-            target: Some(super::ListenerTarget::DocumentTarget(
-                super::DocumentTarget {
-                    name: doc_ref.clone(),
-                    last_read_time: Default::default(),
-                },
-            )),
-        };
-
-        let ts_event = googleapis::google::protobuf::Timestamp::now();
-        let buffered_event = crate::event::DatabaseEvent {
-            database:    std::sync::Arc::downgrade(&db1),
-            update_time: ts_event,
-            updates:     [(
-                doc_ref.clone(),
-                crate::document::DocumentVersion::Stored(std::sync::Arc::new(
-                    crate::document::StoredDocumentVersion {
-                        name: doc_ref.clone(),
-                        create_time: ts_event,
-                        update_time: ts_event,
-                        fields: HashMap::from([("v".to_string(), Value::integer(1))]),
-                    },
-                )),
-            )]
-            .into(),
-        };
-        project.clear_database(&root).await;
-        assert!(listener.process_event(&buffered_event).await.is_ok());
-        assert!(
-            rx.try_recv().is_err(),
-            "cleared database event must emit no frames"
-        );
-
-        // 2. Live listen stream with buffered pre-clear event followed by replacement converges
-        //    without aborting.
-        let db_live = project.database(&root).await;
-        db_live
-            .create_doc(
-                &col,
-                "doc1",
-                HashMap::from([("v".to_string(), Value::integer(10))]),
-                None,
-            )
-            .await
-            .unwrap();
-
-        let (req_tx, req_rx) = mpsc::channel(4);
-        let mut resp_stream = project.listen(ReceiverStream::new(req_rx));
-        req_tx
-            .send(ListenRequest {
-                database: root.to_string(),
-                labels: Default::default(),
-                target_change: Some(listen_request::TargetChange::AddTarget(Target {
-                    target_id: 1,
-                    once: false,
-                    expected_count: None,
-                    target_type: Some(target::TargetType::Query(ProtoQueryTarget {
-                        parent:     root.to_string(),
-                        query_type: Some(query_target::QueryType::StructuredQuery(
-                            StructuredQuery {
-                                from: vec![CollectionSelector {
-                                    collection_id:   "col".to_string(),
-                                    all_descendants: false,
-                                }],
-                                ..Default::default()
-                            },
-                        )),
-                    })),
-                    resume_type: None,
-                })),
-                request_options: None,
-            })
-            .await
-            .unwrap();
-
-        let _initial = drain_until_no_change(&mut resp_stream).await;
-
-        // Enqueue a pre-clear event into `db_live`'s broadcast channel, then immediately replace
-        // `db_live` via `import_snapshot`.
-        db_live
-            .update_doc(
-                &doc_ref,
-                HashMap::from([("v".to_string(), Value::integer(20))]),
-                None,
-                None,
-                None,
-            )
-            .await
-            .unwrap();
-        let replacement_fields = HashMap::from([("v".to_string(), Value::integer(30))]);
-        replace_database_via_import(
-            project,
-            &root,
-            crate::DatabaseSettings::for_edition(crate::DatabaseEdition::Standard),
-            &[(&doc_ref, &replacement_fields)],
-        )
-        .await;
-
-        let after_replace = drain_until_no_change(&mut resp_stream).await;
-        let reset_count = after_replace
-            .iter()
-            .filter(|rt| {
-                matches!(
-                    rt,
-                    ResponseType::TargetChange(tc)
-                        if tc.target_change_type == super::TargetChangeType::Reset as i32
-                )
-            })
-            .count();
-        assert_eq!(reset_count, 1);
-        assert!(after_replace.iter().any(|rt| {
-            matches!(
-                rt,
-                ResponseType::DocumentChange(dc)
-                    if dc.document.as_ref().and_then(|d| d.fields.get("v"))
-                        == Some(&Value::integer(30))
-            )
-        }));
-
-        drop(req_tx);
-    }
-
-    #[tokio::test]
-    async fn lagged_resubscribes_before_reset_and_converges_in_single_reset() {
-        use std::collections::HashMap;
-
-        use googleapis::google::firestore::v1::Value;
-
-        let project = Box::leak(Box::new(FirestoreProject::new(FirestoreConfig::default())));
-        let root: RootRef = "projects/p/databases/(default)".parse().unwrap();
-        let db1 = project.database(&root).await;
-        assert!(!db1.enterprise_edition());
-        let col: crate::reference::CollectionRef = format!("{root}/col").parse().unwrap();
-        let doc_ref: crate::reference::DocumentRef = format!("{root}/col/doc1").parse().unwrap();
-
-        db1.create_doc(
-            &col,
-            "doc1",
-            HashMap::from([("v".to_string(), Value::integer(1))]),
-            None,
-        )
-        .await
-        .unwrap();
-
-        let (req_tx, req_rx) = mpsc::channel(4);
-        let mut resp_stream = project.listen(ReceiverStream::new(req_rx));
-        req_tx
-            .send(ListenRequest {
-                database: root.to_string(),
-                labels: Default::default(),
-                target_change: Some(listen_request::TargetChange::AddTarget(Target {
-                    target_id: 1,
-                    once: false,
-                    expected_count: None,
-                    target_type: Some(target::TargetType::Documents(DocumentsTarget {
-                        documents: vec![doc_ref.to_string()],
-                    })),
-                    resume_type: None,
-                })),
-                request_options: None,
-            })
-            .await
-            .unwrap();
-
-        let _initial = drain_until_no_change(&mut resp_stream).await;
-
-        // Overflow `db1`'s broadcast buffer (> MAX_EVENT_BACKLOG) AND replace `db1` before
-        // `Listener::go` polls `database_events` again. Re-subscribing inside the `Lagged` arm
-        // ensures `old_db`'s closed channel never emits a second `(db_name, None)` reset.
-        for _ in 0..(crate::database::MAX_EVENT_BACKLOG + 32) {
-            db1.send_event(crate::event::DatabaseEvent {
-                database:    std::sync::Arc::downgrade(&db1),
-                update_time: googleapis::google::protobuf::Timestamp::now(),
-                updates:     HashMap::new(),
-            });
-        }
-        let replacement_fields = HashMap::from([("v".to_string(), Value::integer(2))]);
-        replace_database_via_import(
-            project,
-            &root,
-            crate::DatabaseSettings::for_edition(crate::DatabaseEdition::Standard),
-            &[(&doc_ref, &replacement_fields)],
-        )
-        .await;
-        let db2 = project.database(&root).await;
-
-        let recovery = drain_until_no_change(&mut resp_stream).await;
-        let reset_count = recovery
-            .iter()
-            .filter(|rt| {
-                matches!(
-                    rt,
-                    ResponseType::TargetChange(tc)
-                        if tc.target_change_type == super::TargetChangeType::Reset as i32
-                )
-            })
-            .count();
-        assert_eq!(
-            reset_count, 1,
-            "Lagged recovery after replacement must emit exactly one Reset"
-        );
-        assert!(recovery.iter().any(|rt| {
-            matches!(
-                rt,
-                ResponseType::DocumentChange(dc)
-                    if dc.document.as_ref().and_then(|d| d.fields.get("v"))
-                        == Some(&Value::integer(2))
-            )
-        }));
-
-        // Verify the listener's subscription now tracks `db2` (not the dropped `db1`).
-        db2.update_doc(
-            &doc_ref,
-            HashMap::from([("v".to_string(), Value::integer(3))]),
-            None,
-            None,
-            None,
-        )
-        .await
-        .unwrap();
-        let follow_up = drain_until_no_change(&mut resp_stream).await;
-        assert!(follow_up.iter().any(|rt| {
-            matches!(
-                rt,
-                ResponseType::DocumentChange(dc)
-                    if dc.document.as_ref().and_then(|d| d.fields.get("v"))
-                        == Some(&Value::integer(3))
-            )
-        }));
-
-        drop(req_tx);
-    }
-
-    #[tokio::test]
-    async fn toctou_clear_retries_during_set_document_set_query_and_reset() {
-        use std::collections::HashMap;
-
-        use googleapis::google::firestore::v1::{Value, target_change::TargetChangeType};
-
-        let project = Box::leak(Box::new(FirestoreProject::new(FirestoreConfig::default())));
-        let root: RootRef = "projects/p/databases/(default)".parse().unwrap();
-        let col: crate::reference::CollectionRef = format!("{root}/col").parse().unwrap();
-        let doc_ref: crate::reference::DocumentRef = format!("{root}/col/doc1").parse().unwrap();
-
-        // 1. set_document retries onto replacement database without sending duplicate Add.
-        let db1 = project.database(&root).await;
-        project.clear_database(&root).await;
-        let db2 = project.database(&root).await;
-        db2.create_doc(
-            &col,
-            "doc1",
-            HashMap::from([("v".to_string(), Value::integer(42))]),
-            None,
-        )
-        .await
-        .unwrap();
-
-        let (sender, rx) = mpsc::channel(16);
-        let mut resp_stream = ReceiverStream::new(rx);
-        let mut listener = super::Listener {
-            id: 1001,
-            project,
-            database_events: Default::default(),
-            sender,
-            target: None,
-        };
-        listener
-            .set_document(std::sync::Arc::clone(&db1), doc_ref.clone(), None)
-            .await
-            .unwrap();
-        let set_doc_msgs = drain_until_no_change(&mut resp_stream).await;
-        let add_count = set_doc_msgs
-            .iter()
-            .filter(|rt| {
-                matches!(
-                    rt,
-                    ResponseType::TargetChange(tc)
-                        if tc.target_change_type == TargetChangeType::Add as i32
-                )
-            })
-            .count();
-        assert_eq!(add_count, 1);
-        assert!(set_doc_msgs.iter().any(|rt| {
-            matches!(
-                rt,
-                ResponseType::DocumentChange(dc)
-                    if dc.document.as_ref().and_then(|d| d.fields.get("v"))
-                        == Some(&Value::integer(42))
-            )
-        }));
-        assert!(listener.database_events.contains_key(&root));
-
-        // 2. reset on DocumentTarget retries onto replacement database.
-        project.clear_database(&root).await;
-        let db3 = project.database(&root).await;
-        db3.create_doc(
-            &col,
-            "doc1",
-            HashMap::from([("v".to_string(), Value::integer(77))]),
-            None,
-        )
-        .await
-        .unwrap();
-        listener.reset(std::sync::Arc::clone(&db2)).await.unwrap();
-        let reset_doc_msgs = drain_until_no_change(&mut resp_stream).await;
-        let reset_count = reset_doc_msgs
-            .iter()
-            .filter(|rt| {
-                matches!(
-                    rt,
-                    ResponseType::TargetChange(tc)
-                        if tc.target_change_type == TargetChangeType::Reset as i32
-                )
-            })
-            .count();
-        assert_eq!(reset_count, 1);
-        assert!(reset_doc_msgs.iter().any(|rt| {
-            matches!(
-                rt,
-                ResponseType::DocumentChange(dc)
-                    if dc.document.as_ref().and_then(|d| d.fields.get("v"))
-                        == Some(&Value::integer(77))
-            )
-        }));
-
-        // 3. set_query and reset on QueryTarget retry onto replacement database.
-        let query = crate::query::QueryBuilder::from_collection(col.clone())
-            .build()
-            .unwrap()
-            .into();
-        project.clear_database(&root).await;
-        let db4 = project.database(&root).await;
-        db4.create_doc(
-            &col,
-            "doc1",
-            HashMap::from([("v".to_string(), Value::integer(99))]),
-            None,
-        )
-        .await
-        .unwrap();
-        let (q_sender, q_rx) = mpsc::channel(16);
-        let mut q_stream = ReceiverStream::new(q_rx);
-        let mut q_listener = super::Listener {
-            id: 1002,
-            project,
-            database_events: Default::default(),
-            sender: q_sender,
-            target: None,
-        };
-        q_listener
-            .set_query(std::sync::Arc::clone(&db3), query)
-            .await
-            .unwrap();
-        let set_query_msgs = drain_until_no_change(&mut q_stream).await;
-        assert_eq!(
-            set_query_msgs
-                .iter()
-                .filter(|rt| matches!(
-                    rt,
-                    ResponseType::TargetChange(tc)
-                        if tc.target_change_type == TargetChangeType::Add as i32
-                ))
-                .count(),
-            1
-        );
-        assert_eq!(
-            set_query_msgs
-                .iter()
-                .filter(|rt| matches!(
-                    rt,
-                    ResponseType::TargetChange(tc)
-                        if tc.target_change_type == TargetChangeType::Reset as i32
-                ))
-                .count(),
-            1
-        );
-        assert!(set_query_msgs.iter().any(|rt| {
-            matches!(
-                rt,
-                ResponseType::DocumentChange(dc)
-                    if dc.document.as_ref().and_then(|d| d.fields.get("v"))
-                        == Some(&Value::integer(99))
-            )
-        }));
-
-        // Reset QueryTarget across clear.
-        project.clear_database(&root).await;
-        let _db5 = project.database(&root).await;
-        q_listener.reset(std::sync::Arc::clone(&db4)).await.unwrap();
-        let reset_query_msgs = drain_until_no_change(&mut q_stream).await;
-        assert_eq!(
-            reset_query_msgs
-                .iter()
-                .filter(|rt| matches!(
-                    rt,
-                    ResponseType::TargetChange(tc)
-                        if tc.target_change_type == TargetChangeType::Reset as i32
-                ))
-                .count(),
-            1
-        );
-
-        // Only `Aborted` on a cleared DB is retryable; non-Aborted errors (including
-        // `FailedPrecondition`, `InvalidArgument`, and `Internal`) and `Aborted` on an active DB
-        // must not be treated as cleared-retryable.
-        db4.set_enterprise_edition(true);
-        let err = q_listener
-            .reset(std::sync::Arc::clone(&db4))
-            .await
-            .unwrap_err();
-        assert!(matches!(
-            err,
-            crate::GenericDatabaseError::FailedPrecondition(_)
-        ));
-        assert_eq!(super::MAX_RESET_RETRIES, 3);
-        assert!(!super::is_cleared_retryable(&db4, &err));
-        assert!(!super::is_cleared_retryable(
-            &db4,
-            &crate::GenericDatabaseError::invalid_argument("bad cursor"),
-        ));
-        assert!(!super::is_cleared_retryable(
-            &db4,
-            &crate::GenericDatabaseError::internal("unexpected"),
-        ));
-        assert!(super::is_cleared_retryable(
-            &db4,
-            &crate::GenericDatabaseError::aborted("cleared"),
-        ));
-        let active_db = project.database(&root).await;
-        assert!(!super::is_cleared_retryable(
-            &active_db,
-            &crate::GenericDatabaseError::aborted("contended"),
-        ));
-    }
-
-    #[tokio::test]
-    async fn single_reset_convergence_for_compatible_document_listener() {
-        use std::collections::HashMap;
-
-        use googleapis::google::firestore::v1::{Value, target_change::TargetChangeType};
-
-        let project = Box::leak(Box::new(FirestoreProject::new(FirestoreConfig::default())));
-        let root: RootRef = "projects/p/databases/(default)".parse().unwrap();
-        let db1 = project.database(&root).await;
-        assert!(!db1.enterprise_edition());
-        let col: crate::reference::CollectionRef = format!("{root}/col").parse().unwrap();
-        let doc_ref: crate::reference::DocumentRef = format!("{root}/col/doc1").parse().unwrap();
-
-        db1.create_doc(
-            &col,
-            "doc1",
-            HashMap::from([("v".to_string(), Value::integer(1))]),
-            None,
-        )
-        .await
-        .unwrap();
-
-        let (req_tx, req_rx) = mpsc::channel(4);
-        let mut resp_stream = project.listen(ReceiverStream::new(req_rx));
-        req_tx
-            .send(ListenRequest {
-                database: root.to_string(),
-                labels: Default::default(),
-                target_change: Some(listen_request::TargetChange::AddTarget(Target {
-                    target_id: 1,
-                    once: false,
-                    expected_count: None,
-                    target_type: Some(target::TargetType::Documents(DocumentsTarget {
-                        documents: vec![doc_ref.to_string()],
-                    })),
-                    resume_type: None,
-                })),
-                request_options: None,
-            })
-            .await
-            .unwrap();
-
-        let _initial = drain_until_no_change(&mut resp_stream).await;
-
-        let replacement_fields = HashMap::from([("v".to_string(), Value::integer(2))]);
-        replace_database_via_import(
-            project,
-            &root,
-            crate::DatabaseSettings::for_edition(crate::DatabaseEdition::Standard),
-            &[(&doc_ref, &replacement_fields)],
-        )
-        .await;
-
-        let msgs = drain_until_no_change(&mut resp_stream).await;
-        let reset_count = msgs
-            .iter()
-            .filter(|rt| {
-                matches!(
-                    rt,
-                    ResponseType::TargetChange(tc)
-                        if tc.target_change_type == TargetChangeType::Reset as i32
-                )
-            })
-            .count();
-        assert_eq!(reset_count, 1);
-        assert!(
-            !msgs
-                .iter()
-                .any(|rt| matches!(rt, ResponseType::DocumentDelete(_))),
-            "single-reset convergence must not observe an intermediate empty database"
-        );
-        assert!(msgs.iter().any(|rt| {
-            matches!(
-                rt,
-                ResponseType::DocumentChange(dc)
-                    if dc.document.as_ref().and_then(|d| d.fields.get("v"))
-                        == Some(&Value::integer(2))
-            )
-        }));
-
-        drop(req_tx);
-    }
-
-    #[tokio::test]
-    async fn query_listener_terminates_with_failed_precondition_on_edition_change() {
-        use googleapis::google::firestore::v1::{
-            StructuredQuery,
-            structured_query::CollectionSelector,
-            target::{self, QueryTarget as ProtoQueryTarget, query_target},
-        };
-
-        let project = Box::leak(Box::new(FirestoreProject::new(FirestoreConfig::default())));
-        let root: RootRef = "projects/p/databases/(default)".parse().unwrap();
-        let db1 = project.database(&root).await;
-        assert!(!db1.enterprise_edition());
-        let col: crate::reference::CollectionRef = format!("{root}/col").parse().unwrap();
-
-        let (req_tx, req_rx) = mpsc::channel(4);
-        let mut resp_stream = project.listen(ReceiverStream::new(req_rx));
-        req_tx
-            .send(ListenRequest {
-                database: root.to_string(),
-                labels: Default::default(),
-                target_change: Some(listen_request::TargetChange::AddTarget(Target {
-                    target_id: 1,
-                    once: false,
-                    expected_count: None,
-                    target_type: Some(target::TargetType::Query(ProtoQueryTarget {
-                        parent:     root.to_string(),
-                        query_type: Some(query_target::QueryType::StructuredQuery(
-                            StructuredQuery {
-                                from: vec![CollectionSelector {
-                                    collection_id:   "col".to_string(),
-                                    all_descendants: false,
-                                }],
-                                ..Default::default()
-                            },
-                        )),
-                    })),
-                    resume_type: None,
-                })),
-                request_options: None,
-            })
-            .await
-            .unwrap();
-
-        let _initial = drain_until_no_change(&mut resp_stream).await;
-
-        // Replace `db1` (STANDARD) with `db2` configured as ENTERPRISE via `import_snapshot`.
-        replace_database_via_import(
-            project,
-            &root,
-            crate::DatabaseSettings::for_edition(crate::DatabaseEdition::Enterprise),
-            &[],
-        )
-        .await;
-        let db2 = project.database(&root).await;
-
-        let err = resp_stream
-            .next()
-            .await
-            .expect("stream must emit FailedPrecondition")
-            .unwrap_err();
-        assert_eq!(
-            err,
-            crate::GenericDatabaseError::failed_precondition(format!(
-                "Database {root} edition changed from STANDARD to ENTERPRISE; re-create query \
-                 listener"
-            ))
-        );
-        assert!(
-            resp_stream.next().await.is_none(),
-            "listener stream must terminate immediately after FailedPrecondition"
-        );
-
-        // Also verify `QueryTarget::process_event` checks edition before the stale-timestamp
-        // early return, including ENTERPRISE -> STANDARD direction.
-        let mut ent_target = super::QueryTarget::new(
-            crate::query::QueryBuilder::from_collection(col)
-                .enterprise_edition(true)
-                .build()
-                .unwrap()
-                .into(),
-        );
-        let (reset_time, _) = ent_target.reset(&db2).await.unwrap();
-        db2.set_enterprise_edition(false);
-        let stale_event = crate::event::DatabaseEvent {
-            database:    std::sync::Arc::downgrade(&db2),
-            update_time: reset_time,
-            updates:     Default::default(),
-        };
-        let err = ent_target
-            .process_event(&db2, &stale_event)
-            .await
-            .unwrap_err();
-        assert_eq!(
-            err,
-            crate::GenericDatabaseError::failed_precondition(format!(
-                "Database {root} edition changed from ENTERPRISE to STANDARD; re-create query \
-                 listener"
-            ))
-        );
-
-        drop(req_tx);
-    }
-
-    #[tokio::test]
-    async fn clearing_edition_overridden_database_terminates_query_listener_without_ghost_db() {
-        use googleapis::google::firestore::v1::{
-            StructuredQuery,
-            structured_query::CollectionSelector,
-            target::{self, QueryTarget as ProtoQueryTarget, query_target},
-        };
-
-        for (default_enterprise, overridden_enterprise, expected_msg) in [
-            (
-                false,
-                true,
-                "edition changed from ENTERPRISE to STANDARD; re-create query listener",
-            ),
-            (
-                true,
-                false,
-                "edition changed from STANDARD to ENTERPRISE; re-create query listener",
-            ),
-        ] {
-            let project = Box::leak(Box::new(FirestoreProject::new(FirestoreConfig {
-                default_enterprise,
-                ..Default::default()
-            })));
-            let root: RootRef = "projects/p/databases/(default)".parse().unwrap();
-            let db = project.database(&root).await;
-            db.set_enterprise_edition(overridden_enterprise);
-
-            let (req_tx, req_rx) = mpsc::channel(4);
-            let mut resp_stream = project.listen(ReceiverStream::new(req_rx));
-            req_tx
-                .send(ListenRequest {
-                    database: root.to_string(),
-                    labels: Default::default(),
-                    target_change: Some(listen_request::TargetChange::AddTarget(Target {
-                        target_id: 1,
-                        once: false,
-                        expected_count: None,
-                        target_type: Some(target::TargetType::Query(ProtoQueryTarget {
-                            parent:     root.to_string(),
-                            query_type: Some(query_target::QueryType::StructuredQuery(
-                                StructuredQuery {
-                                    from: vec![CollectionSelector {
-                                        collection_id:   "col".to_string(),
-                                        all_descendants: false,
-                                    }],
-                                    ..Default::default()
-                                },
-                            )),
-                        })),
-                        resume_type: None,
-                    })),
-                    request_options: None,
-                })
-                .await
-                .unwrap();
-
-            let _initial = drain_until_no_change(&mut resp_stream).await;
-
-            // Subscribe and drain any setup project events right before clearing.
-            let mut proj_rx = project.subscribe_project_events();
-            project.clear_database(&root).await;
-
-            let err = resp_stream
-                .next()
-                .await
-                .expect("stream must emit FailedPrecondition")
-                .unwrap_err();
-            assert_eq!(
-                err,
-                crate::GenericDatabaseError::failed_precondition(format!(
-                    "Database {root} {expected_msg}"
-                ))
-            );
-            assert!(
-                resp_stream.next().await.is_none(),
-                "listener stream must terminate immediately after FailedPrecondition"
-            );
-
-            assert!(
-                project.get_existing_database(&root).await.is_none(),
-                "clearing edition-overridden database must not lazily re-create a ghost database"
-            );
-
-            assert!(matches!(
-                proj_rx.try_recv().unwrap(),
-                crate::event::ProjectEvent::DatabaseCleared { ref database } if database == &root
-            ));
-            assert!(
-                proj_rx.try_recv().is_err(),
-                "no DatabaseCreated or other project events may follow DatabaseCleared"
-            );
-
-            drop(req_tx);
-        }
-    }
-}
+mod tests;

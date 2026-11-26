@@ -52,12 +52,8 @@ pub(crate) fn is_reserved_name(s: &str) -> bool {
     s.starts_with("__") && s.ends_with("__") && s.len() >= 5
 }
 
-pub(crate) fn is_valid_segment_base(s: &str) -> bool {
-    !s.is_empty() && !s.contains('/') && s != "." && s != ".." && s.len() <= 1500
-}
-
 fn is_valid_root_segment(s: &str) -> bool {
-    is_valid_segment_base(s) && !is_reserved_name(s)
+    validate_segment(s, false).is_ok()
 }
 
 pub(crate) fn is_datastore_numeric_id(s: &str) -> bool {

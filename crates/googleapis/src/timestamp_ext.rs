@@ -13,9 +13,9 @@ use time::{
 use crate::google::protobuf::Timestamp;
 
 /// Minimum valid Proto3 `Timestamp` seconds (`0001-01-01T00:00:00Z`).
-pub(crate) const MIN_TIMESTAMP_SECONDS: i64 = -62_135_596_800;
+pub const MIN_TIMESTAMP_SECONDS: i64 = -62_135_596_800;
 /// Maximum valid Proto3 `Timestamp` seconds (`9999-12-31T23:59:59Z`).
-pub(crate) const MAX_TIMESTAMP_SECONDS: i64 = 253_402_300_799;
+pub const MAX_TIMESTAMP_SECONDS: i64 = 253_402_300_799;
 
 const NANOS_PER_SECOND: i128 = 1_000_000_000;
 /// Minimum valid Proto3 `Timestamp` Unix nanoseconds (`0001-01-01T00:00:00.000000000Z`).
