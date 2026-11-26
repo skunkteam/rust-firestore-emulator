@@ -1920,3 +1920,282 @@ async fn missing_docs_and_list_docs_default_do_not_block_on_held_write_locks() -
 
     Ok(())
 }
+
+#[gtest]
+#[tokio::test(start_paused = true)]
+async fn missing_docs_at_respects_readonly_and_optimistic_mvcc_snapshots_and_rejects_inactive_txns()
+-> Result<()> {
+    use std::collections::HashMap;
+
+    use googleapis::google::protobuf::Timestamp;
+
+    use crate::database::DocumentRef;
+
+    // 1. ReadOnly (implicit snapshot + explicit historical read_time) and multi-subcollection
+    //    phantom ancestor deduplication.
+    let db = fresh_database()?;
+    let users_col = CollectionRef::new(db.name.clone(), "users");
+    let alice_ref: DocumentRef = format!("{}/users/alice", db.name).parse()?;
+    let p_multi_ref: DocumentRef = format!("{}/users/p_multi", db.name).parse()?;
+    let p_multi_s1: DocumentRef = format!("{}/users/p_multi/sub1/c1", db.name).parse()?;
+    let p_multi_s2: DocumentRef = format!("{}/users/p_multi/sub2/c2", db.name).parse()?;
+    let p_del_ref: DocumentRef = format!("{}/users/p_del", db.name).parse()?;
+    let p_del_sub: DocumentRef = format!("{}/users/p_del/sub/c1", db.name).parse()?;
+    let p_after_ref: DocumentRef = format!("{}/users/p_after", db.name).parse()?;
+    let p_after_sub: DocumentRef = format!("{}/users/p_after/sub/c1", db.name).parse()?;
+
+    for doc_ref in [&alice_ref, &p_multi_s1, &p_multi_s2, &p_del_sub] {
+        db.update_doc(
+            doc_ref,
+            HashMap::from([("v".to_string(), Value::integer(1))]),
+            None,
+            None,
+            None,
+        )
+        .await?;
+    }
+    let t_past = Timestamp::now();
+
+    let ro_implicit = db
+        .new_txn(TransactionOptions {
+            mode: Some(transaction_options::Mode::ReadOnly(
+                transaction_options::ReadOnly::default(),
+            )),
+        })
+        .await?;
+    let ro_historical = db
+        .new_txn(TransactionOptions {
+            mode: Some(transaction_options::Mode::ReadOnly(
+                transaction_options::ReadOnly {
+                    consistency_selector: Some(
+                        transaction_options::read_only::ConsistencySelector::ReadTime(t_past),
+                    ),
+                },
+            )),
+        })
+        .await?;
+
+    // Mutations after `t_past` and `ro_implicit` snapshot:
+    // - Create subchild under `p_after` (must NOT be phantom at `t_past` / `ro_implicit`)
+    // - Delete sole subchild under `p_del` (MUST STILL be phantom at `t_past` / `ro_implicit`)
+    // - Materialize `p_multi` (MUST STILL be phantom at `t_past` / `ro_implicit`)
+    db.update_doc(
+        &p_after_sub,
+        HashMap::from([("v".to_string(), Value::integer(2))]),
+        None,
+        None,
+        None,
+    )
+    .await?;
+    db.delete_doc(&p_del_sub, None).await?;
+    db.update_doc(
+        &p_multi_ref,
+        HashMap::from([("materialized".to_string(), Value::boolean(true))]),
+        None,
+        None,
+        None,
+    )
+    .await?;
+
+    let expected_past = vec![p_del_ref.to_string(), p_multi_ref.to_string()];
+    for ro_txn in [ro_implicit, ro_historical] {
+        let q = QueryBuilder::from_collection(users_col.clone())
+            .consistency(ReadConsistency::Transaction(ro_txn))
+            .build()?;
+        assert_eq!(q.missing_docs(&db).await?, expected_past);
+        assert_eq!(
+            q.missing_docs_at(&db, None, Some(&p_del_ref.to_string()))
+                .await?,
+            vec![p_multi_ref.to_string()]
+        );
+        db.rollback(ro_txn).await?;
+    }
+
+    // Default listing sees latest state (`p_after` only).
+    let q_default = QueryBuilder::from_collection(users_col).build()?;
+    assert_eq!(
+        q_default.missing_docs(&db).await?,
+        vec![p_after_ref.to_string()]
+    );
+
+    // 2. Enterprise Optimistic transaction: MVCC snapshot isolation + write-skew preservation on
+    //    observed phantom ancestor.
+    let ent_db = fresh_database()?;
+    ent_db.set_config(true, true);
+    let ent_users = CollectionRef::new(ent_db.name.clone(), "users");
+    let ent_seed: DocumentRef = format!("{}/users/seed", ent_db.name).parse()?;
+    let ent_p_keep: DocumentRef = format!("{}/users/p_keep", ent_db.name).parse()?;
+    let ent_p_keep_s1: DocumentRef = format!("{}/users/p_keep/s1/d1", ent_db.name).parse()?;
+    let ent_p_keep_s2: DocumentRef = format!("{}/users/p_keep/s2/d2", ent_db.name).parse()?;
+    let ent_p_del: DocumentRef = format!("{}/users/p_del", ent_db.name).parse()?;
+    let ent_p_del_sub: DocumentRef = format!("{}/users/p_del/sub/d1", ent_db.name).parse()?;
+    let ent_p_after_sub: DocumentRef = format!("{}/users/p_after/sub/d1", ent_db.name).parse()?;
+
+    for doc_ref in [&ent_seed, &ent_p_keep_s1, &ent_p_keep_s2, &ent_p_del_sub] {
+        ent_db
+            .update_doc(
+                doc_ref,
+                HashMap::from([("v".to_string(), Value::integer(1))]),
+                None,
+                None,
+                None,
+            )
+            .await?;
+    }
+
+    let opt_txn = start_rw_txn(&ent_db);
+    // Pin optimistic `read_time` before concurrent writes.
+    let _unused = ent_db
+        .get_doc(&ent_seed, ReadConsistency::Transaction(opt_txn))
+        .await?;
+
+    // Concurrent writes after `opt_txn` pinned its snapshot:
+    ent_db
+        .update_doc(
+            &ent_p_after_sub,
+            HashMap::from([("v".to_string(), Value::integer(2))]),
+            None,
+            None,
+            None,
+        )
+        .await?;
+    ent_db.delete_doc(&ent_p_del_sub, None).await?;
+
+    let opt_q = QueryBuilder::from_collection(ent_users.clone())
+        .enterprise_edition(true)
+        .consistency(ReadConsistency::Transaction(opt_txn))
+        .build()?;
+    let opt_missing = opt_q.missing_docs(&ent_db).await?;
+    assert_eq!(
+        opt_missing,
+        vec![ent_p_del.to_string(), ent_p_keep.to_string()]
+    );
+
+    // Concurrent materialization of observed phantom ancestor `p_keep` triggers optimistic
+    // write-skew abort on commit.
+    ent_db
+        .update_doc(
+            &ent_p_keep,
+            HashMap::from([("materialized".to_string(), Value::boolean(true))]),
+            None,
+            None,
+            None,
+        )
+        .await?;
+    let summary_ref: DocumentRef = format!("{}/other/summary", ent_db.name).parse()?;
+    let commit_err = ent_db
+        .commit(
+            vec![Write {
+                operation: Some(write::Operation::Update(Document {
+                    name: summary_ref.to_string(),
+                    fields: HashMap::from([("ok".to_string(), Value::boolean(true))]),
+                    ..Default::default()
+                })),
+                ..Default::default()
+            }],
+            Some(opt_txn),
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(commit_err, GenericDatabaseError::Aborted(_)),
+        "expected OptimisticWriteSkew Aborted after phantom ancestor materialization, got \
+         {commit_err:?}"
+    );
+
+    // 3. Zero-subcollection database: expired and rolled-back `Transaction(id)` are rejected
+    //    upfront instead of returning `Ok(vec![])`.
+    let empty_db = fresh_database()?;
+    let empty_users = CollectionRef::new(empty_db.name.clone(), "users");
+
+    let rb_txn = start_rw_txn(&empty_db);
+    empty_db.rollback(rb_txn).await?;
+    let q_rb = QueryBuilder::from_collection(empty_users.clone())
+        .consistency(ReadConsistency::Transaction(rb_txn))
+        .build()?;
+    assert!(matches!(
+        q_rb.missing_docs(&empty_db).await,
+        Err(GenericDatabaseError::InvalidArgument(_))
+    ));
+
+    let exp_ro = empty_db.new_txn(TransactionOptions::default()).await?;
+    let exp_rw = start_rw_txn(&empty_db);
+    let exp_rw_rb = start_rw_txn(&empty_db);
+    tokio::time::advance(std::time::Duration::from_secs(61)).await;
+    empty_db.rollback(exp_rw_rb).await?;
+
+    for expired_txn in [exp_ro, exp_rw, exp_rw_rb] {
+        let q_exp = QueryBuilder::from_collection(empty_users.clone())
+            .consistency(ReadConsistency::Transaction(expired_txn))
+            .build()?;
+        assert!(
+            matches!(
+                q_exp.missing_docs(&empty_db).await,
+                Err(GenericDatabaseError::Aborted(_))
+            ),
+            "expected Aborted for expired transaction with zero subcollections"
+        );
+    }
+
+    Ok(())
+}
+
+#[gtest]
+fn require_existing_fields_filters_missing_fields_and_preserves_explicit_nulls_in_prefilters()
+-> Result<()> {
+    use std::collections::HashMap;
+
+    use crate::document::StoredDocumentVersion;
+
+    let root: RootRef = "projects/p/databases/(default)".parse()?;
+    let col = CollectionRef::new(root, "items");
+    let make_doc = |id: &str, fields: HashMap<String, Value>| StoredDocumentVersion {
+        name: crate::reference::DocumentRef::new(col.clone(), id),
+        create_time: Default::default(),
+        update_time: Default::default(),
+        fields,
+    };
+
+    let mut q = QueryBuilder::from_collection(col.clone()).build()?;
+    q.require_existing_fields(vec![
+        "b".parse()?,
+        "a".parse()?,
+        "a".parse()?,
+        "nested.x".parse()?,
+    ]);
+
+    let has_both_null = make_doc(
+        "d1",
+        HashMap::from([
+            ("a".to_string(), Value::null()),
+            ("b".to_string(), Value::integer(1)),
+            (
+                "nested".to_string(),
+                Value::map(HashMap::from([("x".to_string(), Value::null())])),
+            ),
+        ]),
+    );
+    let missing_b = make_doc(
+        "d2",
+        HashMap::from([
+            ("a".to_string(), Value::integer(1)),
+            (
+                "nested".to_string(),
+                Value::map(HashMap::from([("x".to_string(), Value::integer(2))])),
+            ),
+        ]),
+    );
+    let non_map_nested = make_doc(
+        "d3",
+        HashMap::from([
+            ("a".to_string(), Value::integer(1)),
+            ("b".to_string(), Value::integer(2)),
+            ("nested".to_string(), Value::integer(42)),
+        ]),
+    );
+
+    assert!(q.matches_prefilters(&has_both_null));
+    assert!(!q.matches_prefilters(&missing_b));
+    assert!(!q.matches_prefilters(&non_map_nested));
+    Ok(())
+}

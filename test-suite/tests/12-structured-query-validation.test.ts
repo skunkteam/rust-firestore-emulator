@@ -1574,7 +1574,7 @@ describe.each(editions)('$description', fs => {
             });
         });
 
-    describe('RunAggregationQuery wire validation', () => {
+    describe('3. RunAggregationQuery wire validation', () => {
         const aggFieldsOf = async (
             parent: string,
             structuredAggregationQuery: Record<string, unknown>,
@@ -2029,15 +2029,13 @@ describe.each(editions)('$description', fs => {
                 }
                 expect(limitZero.avg && 'nullValue' in limitZero.avg).toBe(true);
 
-                // Empty collection & non-numeric collection: SUM -> 0 (Standard) / null (Enterprise), AVG -> null
-                // Keep count() separate on nonNumCol because combining count() + sum(a) excludes docs missing 'a' on Standard.
-                const sumAvgAggs = [
-                    { alias: 's', sum: { field: { fieldPath: 'a' } } },
-                    { alias: 'avg', avg: { field: { fieldPath: 'a' } } },
-                ];
-                for (const [label, targetParent, colId, expectedCount] of [
-                    ['empty-col', emptyParent, emptyCol.id, '0'],
-                    ['non-numeric-col', nonNumParent, nonNumCol.id, '3'],
+                // Empty & non-numeric collections:
+                // - Standalone count() returns '0' on emptyCol and '3' on nonNumCol across both editions.
+                // - Combined [count(), sum('a'), avg('a')] adds an implicit field-existence filter for 'a' on Standard
+                //   (excluding n3={other:42} -> count '2' on Standard vs '3' on Enterprise), while SUM -> '0' (Standard) / null (Enterprise) and AVG -> null.
+                for (const [label, targetParent, colId, expectedStandaloneCount, expectedCombinedCount] of [
+                    ['empty-col', emptyParent, emptyCol.id, '0', '0'],
+                    ['non-numeric-col', nonNumParent, nonNumCol.id, '3', fs.enterprise ? '3' : '2'],
                 ] as const) {
                     const countRes = await aggFieldsOf(
                         targetParent,
@@ -2047,16 +2045,17 @@ describe.each(editions)('$description', fs => {
                         },
                         `${label}-count`,
                     );
-                    expect(countRes.c?.integerValue).toBe(expectedCount);
+                    expect(countRes.c?.integerValue).toBe(expectedStandaloneCount);
 
                     const res = await aggFieldsOf(
                         targetParent,
                         {
                             structuredQuery: { from: [{ collectionId: colId }] },
-                            aggregations: sumAvgAggs,
+                            aggregations: aggs,
                         },
                         label,
                     );
+                    expect(res.c?.integerValue).toBe(expectedCombinedCount);
                     if (fs.enterprise) {
                         expect(res.s && 'nullValue' in res.s).toBe(true);
                     } else {

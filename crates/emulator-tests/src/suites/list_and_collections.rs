@@ -1284,3 +1284,214 @@ async fn list_documents_show_missing_historical_read_time_excludes_future_phanto
     expect_that!(latest.documents[1].create_time, none());
     expect_that!(latest.documents[2].create_time, some(anything()));
 }
+
+#[gtest]
+#[tokio::test]
+async fn list_documents_show_missing_readonly_and_enterprise_optimistic_mvcc_snapshots() {
+    // 1. ReadOnly transaction (implicit snapshot + explicit historical read_time).
+    let mut std_db = TestEnv::new().build_db();
+    std_db
+        .put("users/alice", fields!({ "v": 1i64 }))
+        .await
+        .unwrap();
+    std_db
+        .put("users/phantom_multi/sub1/c1", fields!({ "v": 1i64 }))
+        .await
+        .unwrap();
+    std_db
+        .put("users/phantom_multi/sub2/c2", fields!({ "v": 2i64 }))
+        .await
+        .unwrap();
+    let del_child = std_db
+        .put("users/phantom_del/sub/c3", fields!({ "v": 3i64 }))
+        .await
+        .unwrap();
+    let t_past = del_child.update_time.unwrap();
+
+    let ro_implicit = std_db.begin_ro_txn(None).await.unwrap();
+    let ro_historical = std_db.begin_ro_txn(Some(t_past)).await.unwrap();
+
+    // Concurrent mutations after `t_past` and `ro_implicit` snapshot:
+    std_db
+        .put("users/phantom_after/sub/c4", fields!({ "v": 4i64 }))
+        .await
+        .unwrap();
+    std_db
+        .delete("users/phantom_del/sub/c3", None)
+        .await
+        .unwrap();
+    std_db
+        .put("users/phantom_multi", fields!({ "materialized": true }))
+        .await
+        .unwrap();
+
+    for ro_txn in [&ro_implicit, &ro_historical] {
+        let listed = std_db
+            .list_docs(
+                "users",
+                0,
+                "",
+                "",
+                None,
+                true,
+                Some(ConsistencySelector::Transaction(ro_txn.id().to_vec())),
+            )
+            .await
+            .unwrap();
+        expect_eq!(
+            short_ids(&listed.documents),
+            vec!["alice", "phantom_del", "phantom_multi"]
+        );
+        expect_that!(listed.documents[0].create_time, some(anything()));
+        expect_that!(listed.documents[1].create_time, none());
+        expect_that!(listed.documents[2].create_time, none());
+    }
+    ro_implicit.rollback().await.unwrap();
+    ro_historical.rollback().await.unwrap();
+
+    // 2. Enterprise Optimistic transaction: snapshot isolation + phantom write-skew preservation.
+    let mut ent_db = TestEnv::enterprise().build_db();
+    ent_db
+        .put("users/alice", fields!({ "v": 1i64 }))
+        .await
+        .unwrap();
+    ent_db
+        .put("users/phantom_keep/sub1/c1", fields!({ "v": 1i64 }))
+        .await
+        .unwrap();
+    ent_db
+        .put("users/phantom_keep/sub2/c2", fields!({ "v": 2i64 }))
+        .await
+        .unwrap();
+    ent_db
+        .put("users/phantom_del/sub/c3", fields!({ "v": 3i64 }))
+        .await
+        .unwrap();
+
+    let mut opt_txn = ent_db.begin_rw_txn().await.unwrap();
+    // Pin optimistic snapshot before concurrent writes.
+    let _unused = opt_txn.get("users/alice").await.unwrap();
+
+    ent_db
+        .put("users/phantom_after/sub/c4", fields!({ "v": 4i64 }))
+        .await
+        .unwrap();
+    ent_db
+        .delete("users/phantom_del/sub/c3", None)
+        .await
+        .unwrap();
+
+    let opt_list = ent_db
+        .list_docs(
+            "users",
+            0,
+            "",
+            "",
+            None,
+            true,
+            Some(ConsistencySelector::Transaction(opt_txn.id().to_vec())),
+        )
+        .await
+        .unwrap();
+    expect_eq!(
+        short_ids(&opt_list.documents),
+        vec!["alice", "phantom_del", "phantom_keep"]
+    );
+    expect_that!(opt_list.documents[1].create_time, none());
+    expect_that!(opt_list.documents[2].create_time, none());
+
+    // Materializing observed phantom ancestor `users/phantom_keep` causes write-skew Aborted on
+    // commit.
+    ent_db
+        .put("users/phantom_keep", fields!({ "materialized": true }))
+        .await
+        .unwrap();
+    opt_txn.put("other/out", fields!({ "ok": true }));
+    assert_status_code(opt_txn.commit().await, Code::Aborted);
+
+    // Without concurrent conflict on observed docs/range, commit succeeds.
+    let mut clean_txn = ent_db.begin_rw_txn().await.unwrap();
+    let clean_list = ent_db
+        .list_docs(
+            "users",
+            0,
+            "",
+            "",
+            None,
+            true,
+            Some(ConsistencySelector::Transaction(clean_txn.id().to_vec())),
+        )
+        .await
+        .unwrap();
+    expect_eq!(
+        short_ids(&clean_list.documents),
+        vec!["alice", "phantom_after", "phantom_keep"]
+    );
+    ent_db
+        .put("other/unrelated", fields!({ "ok": true }))
+        .await
+        .unwrap();
+    clean_txn.put("other/out2", fields!({ "ok": true }));
+    clean_txn.commit().await.unwrap();
+}
+
+#[gtest]
+#[tokio::test(start_paused = true)]
+async fn list_documents_show_missing_rejects_expired_and_rolled_back_txns_with_zero_subcollections()
+{
+    let mut db = TestEnv::new().build_db();
+    let ro_exp = db.begin_ro_txn(None).await.unwrap();
+    let ro_exp_id = ro_exp.id().to_vec();
+    let rw_exp = db.begin_rw_txn().await.unwrap();
+    let rw_exp_id = rw_exp.id().to_vec();
+    let rw_rb = db.begin_rw_txn().await.unwrap();
+    let rw_rb_id = rw_rb.id().to_vec();
+    rw_rb.rollback().await.unwrap();
+
+    assert_status_code(
+        db.list_docs(
+            "users",
+            0,
+            "",
+            "",
+            None,
+            true,
+            Some(ConsistencySelector::Transaction(rw_rb_id)),
+        )
+        .await,
+        Code::InvalidArgument,
+    );
+
+    tokio::time::advance(std::time::Duration::from_secs(61)).await;
+    tokio::task::yield_now().await;
+
+    for exp_id in [&ro_exp_id, &rw_exp_id] {
+        assert_status_code(
+            db.list_docs(
+                "users",
+                0,
+                "",
+                "",
+                None,
+                true,
+                Some(ConsistencySelector::Transaction(exp_id.clone())),
+            )
+            .await,
+            Code::Aborted,
+        );
+    }
+    db.rollback_raw(&rw_exp_id).await.unwrap();
+    assert_status_code(
+        db.list_docs(
+            "users",
+            0,
+            "",
+            "",
+            None,
+            true,
+            Some(ConsistencySelector::Transaction(rw_exp_id)),
+        )
+        .await,
+        Code::Aborted,
+    );
+}

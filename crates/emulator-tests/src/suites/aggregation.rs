@@ -867,3 +867,131 @@ async fn grpc_aggregation_edition_validation_aliases_select_and_pre_execution_or
         );
     }
 }
+
+#[gtest]
+#[tokio::test]
+async fn standard_sum_avg_implicit_field_existence_filter_across_mixed_nested_limit_and_multi() {
+    for enterprise in [false, true] {
+        let mut db = if enterprise {
+            TestEnv::enterprise().build_db()
+        } else {
+            TestEnv::new().build_db()
+        };
+
+        // 1. Combined [count(), sum('a'), avg('a')] vs standalone [count()] on mixed {a:'text'},
+        //    {a:null}, {other:42}.
+        db.put("non_num/n1", fields!({ "a": "text" }))
+            .await
+            .unwrap();
+        db.put("non_num/n2", fields!({ "a": null })).await.unwrap();
+        db.put("non_num/n3", fields!({ "other": 42i64 }))
+            .await
+            .unwrap();
+
+        let combined = db
+            .aggregate(
+                QuerySpec::collection("non_num"),
+                AggregationSpec::new()
+                    .count("c")
+                    .sum("s", "a")
+                    .avg("avg", "a"),
+            )
+            .await
+            .unwrap();
+        if enterprise {
+            expect_eq!(combined.fields.get("c"), Some(&Value::integer(3)));
+            expect_eq!(combined.fields.get("s"), Some(&Value::null()));
+            expect_eq!(combined.fields.get("avg"), Some(&Value::null()));
+        } else {
+            expect_eq!(combined.fields.get("c"), Some(&Value::integer(2)));
+            expect_eq!(combined.fields.get("s"), Some(&Value::integer(0)));
+            expect_eq!(combined.fields.get("avg"), Some(&Value::null()));
+        }
+
+        let count_only = db
+            .aggregate(
+                QuerySpec::collection("non_num"),
+                AggregationSpec::new().count("c"),
+            )
+            .await
+            .unwrap();
+        expect_eq!(count_only.fields.get("c"), Some(&Value::integer(3)));
+
+        // 2. Nested `sum('nested.x')`.
+        db.put("nested/d1", fields!({ "nested": { "x": 10i64 } }))
+            .await
+            .unwrap();
+        db.put("nested/d2", fields!({ "nested": { "x": null } }))
+            .await
+            .unwrap();
+        db.put("nested/d3", fields!({ "nested": { "y": 1i64 } }))
+            .await
+            .unwrap();
+        db.put("nested/d4", fields!({ "nested": 42i64 }))
+            .await
+            .unwrap();
+
+        let nested_res = db
+            .aggregate(
+                QuerySpec::collection("nested"),
+                AggregationSpec::new().count("c").sum("s", "nested.x"),
+            )
+            .await
+            .unwrap();
+        expect_eq!(
+            nested_res.fields.get("c"),
+            Some(&Value::integer(if enterprise { 4 } else { 2 }))
+        );
+        expect_eq!(nested_res.fields.get("s"), Some(&Value::integer(10)));
+
+        // 3. `limit` interaction: docs missing 'a' do NOT consume `limit` slots on Standard.
+        db.put("lim/d1", fields!({ "other": 1i64 })).await.unwrap();
+        db.put("lim/d2", fields!({ "a": 10i64 })).await.unwrap();
+        db.put("lim/d3", fields!({ "a": 20i64 })).await.unwrap();
+
+        let lim_query = if enterprise {
+            QuerySpec::collection("lim").order_asc("__name__").limit(2)
+        } else {
+            QuerySpec::collection("lim").limit(2)
+        };
+        let lim_res = db
+            .aggregate(lim_query, AggregationSpec::new().count("c").sum("s", "a"))
+            .await
+            .unwrap();
+        expect_eq!(lim_res.fields.get("c"), Some(&Value::integer(2)));
+        expect_eq!(
+            lim_res.fields.get("s"),
+            Some(&Value::integer(if enterprise { 10 } else { 30 }))
+        );
+
+        // 4. Multi-field `[count(), sum('a'), avg('b')]` requires both 'a' and 'b' on Standard.
+        db.put("multi/m1", fields!({ "a": 10i64, "b": 20i64 }))
+            .await
+            .unwrap();
+        db.put("multi/m2", fields!({ "a": 5i64 })).await.unwrap();
+        db.put("multi/m3", fields!({ "b": 7i64 })).await.unwrap();
+        db.put("multi/m4", fields!({ "a": null, "b": null }))
+            .await
+            .unwrap();
+
+        let multi_res = db
+            .aggregate(
+                QuerySpec::collection("multi"),
+                AggregationSpec::new()
+                    .count("c")
+                    .sum("s", "a")
+                    .avg("avg", "b"),
+            )
+            .await
+            .unwrap();
+        if enterprise {
+            expect_eq!(multi_res.fields.get("c"), Some(&Value::integer(4)));
+            expect_eq!(multi_res.fields.get("s"), Some(&Value::integer(15)));
+            expect_eq!(multi_res.fields.get("avg"), Some(&Value::double(13.5)));
+        } else {
+            expect_eq!(multi_res.fields.get("c"), Some(&Value::integer(2)));
+            expect_eq!(multi_res.fields.get("s"), Some(&Value::integer(10)));
+            expect_eq!(multi_res.fields.get("avg"), Some(&Value::double(20.0)));
+        }
+    }
+}

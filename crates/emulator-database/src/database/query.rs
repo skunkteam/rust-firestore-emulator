@@ -252,6 +252,7 @@ impl QueryBuilder {
             limit: self.limit,
             find_nearest: self.find_nearest,
             consistency: self.consistency,
+            required_fields: vec![],
             collection_cache: Default::default(),
         };
         query.validate()?;
@@ -359,6 +360,8 @@ pub struct Query {
     find_nearest: Option<FindNearest>,
 
     consistency: ReadConsistency,
+
+    required_fields: Vec<FieldPath>,
 
     collection_cache: HashMap<DefaultAtom, bool>,
 }
@@ -742,6 +745,7 @@ impl Query {
             limit: limit.map(|v| v.value as usize),
             find_nearest,
             consistency,
+            required_fields: vec![],
             collection_cache: Default::default(),
         });
         query.validate_inner(false)?;
@@ -881,6 +885,12 @@ impl Query {
 
     pub(crate) fn order_by(&self) -> &[Order] {
         &self.order_by
+    }
+
+    pub(crate) fn require_existing_fields(&mut self, fields: Vec<FieldPath>) {
+        self.required_fields.extend(fields);
+        self.required_fields.sort();
+        self.required_fields.dedup();
     }
 
     pub fn has_find_nearest(&self) -> bool {
@@ -1053,11 +1063,13 @@ impl Query {
         self.missing_docs_at(db, None, None).await
     }
 
-    /// Like [`Query::missing_docs`], evaluating lock-free MVCC snapshots for
-    /// [`ReadConsistency::Default`] and [`ReadConsistency::ReadTime`] (using `snapshot_time`
-    /// when supplied, or resolving via [`FirestoreDatabase::get_read_time`]) while optionally
-    /// skipping candidate ancestor paths `<= after_cursor` in Firestore reference order before
-    /// inspecting collection or document state.
+    /// Like [`Query::missing_docs`], evaluating MVCC snapshots for [`ReadConsistency::Default`],
+    /// [`ReadConsistency::ReadTime`], and snapshot-based transactions (`ReadOnly` and Enterprise
+    /// `Optimistic`) when checking child collections, while verifying ancestor absence via
+    /// [`FirestoreDatabase::get_doc`] under [`ReadConsistency::Transaction`] (preserving
+    /// pessimistic read leases and optimistic `observed_docs`) and optionally skipping candidate
+    /// ancestor paths `<= after_cursor` in Firestore reference order before inspecting collection
+    /// or document state.
     pub(crate) async fn missing_docs_at(
         &self,
         db: &FirestoreDatabase,
@@ -1091,18 +1103,23 @@ impl Query {
             return Err(AbortReason::DatabaseCleared.into());
         }
 
-        let lock_free_ts = match self.consistency {
-            ReadConsistency::Default | ReadConsistency::ReadTime(_) => Some(match snapshot_time {
-                Some(ts) => {
-                    if db.is_cleared() {
-                        return Err(AbortReason::DatabaseCleared.into());
+        let (subcol_ts, lock_free_ancestor_ts) = match self.consistency {
+            ReadConsistency::Default | ReadConsistency::ReadTime(_) => {
+                let ts = match snapshot_time {
+                    Some(ts) => {
+                        db.transactions.reap_if_due();
+                        ts
                     }
-                    db.transactions.reap_if_due();
-                    ts
-                }
-                None => db.get_read_time(self.consistency).await?,
-            }),
-            ReadConsistency::Transaction(_) => None,
+                    None => db.get_read_time(self.consistency).await?,
+                };
+                (Some(ts), Some(ts))
+            }
+            ReadConsistency::Transaction(id) => {
+                let txn = db.transactions.get_active(id)?;
+                let subcol_ts = txn.read_time();
+                drop(txn);
+                (subcol_ts, None)
+            }
         };
 
         // Checked above that self.from has exactly one non empty collection_id.
@@ -1110,7 +1127,8 @@ impl Query {
         let parent: CollectionRef =
             format!("{}/{}", self.parent, self.from[0].collection_id).parse()?;
 
-        let mut all_docs = HashSet::new();
+        let mut seen_doc_ids = HashSet::new();
+        let mut all_docs = Vec::new();
         for col in db.get_all_collections().await {
             let Some(rest) = col.name.strip_collection_prefix(&parent) else {
                 continue;
@@ -1118,6 +1136,9 @@ impl Query {
             let Some((document_id, _)) = rest.split_once('/') else {
                 continue;
             };
+            if seen_doc_ids.contains(document_id) {
+                continue;
+            }
             if let Some(cursor) = after_cursor {
                 let doc_segments = [
                     "projects",
@@ -1133,18 +1154,20 @@ impl Query {
                     continue;
                 }
             }
-            let has_doc = match lock_free_ts {
+            let has_doc = match subcol_ts {
                 Some(ts) => col.has_doc_at(ts).await,
                 None => col.has_doc().await?,
             };
             if !has_doc {
                 continue;
             }
-            all_docs.insert(DocumentRef::new(parent.clone(), document_id));
+            seen_doc_ids.insert(document_id.to_string());
+            all_docs.push(DocumentRef::new(parent.clone(), document_id));
         }
+        all_docs.sort();
         let mut result = vec![];
         for name in all_docs {
-            let is_missing = match lock_free_ts {
+            let is_missing = match lock_free_ancestor_ts {
                 Some(ts) => db
                     .peek_doc_meta(&name)
                     .await?
@@ -1219,6 +1242,11 @@ impl Query {
         }
         for order_by in &self.order_by {
             if order_by.field.get_value(doc).is_none() {
+                return false;
+            }
+        }
+        for field in &self.required_fields {
+            if field.get_value(&doc.fields).is_none() {
                 return false;
             }
         }
