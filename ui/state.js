@@ -22,7 +22,7 @@ import {
  *   | { kind: 'delete_doc', docPath: string, recursive: boolean, hasSubcollections: boolean, busy: boolean, error: string | null }
  *   | { kind: 'delete_col', colPath: string, colId: string, busy: boolean, error: string | null }
  *   | { kind: 'clear_db', projectId: string, databaseId: string, busy: boolean, error: string | null }
- *   | { kind: 'export_snapshot', busy: boolean, error: string | null }
+ *   | { kind: 'export_snapshot', busy: boolean, busyScope: 'current' | 'all' | null, error: string | null }
  *   | { kind: 'import_snapshot', file: File | null, busy: boolean, error: string | null }
  * } ActiveModal
  */

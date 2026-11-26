@@ -32,6 +32,7 @@ import { stringifyProtoJson } from "./values.js";
  *   databases: ImportedDatabaseSummary[],
  *   totalDatabases: number,
  *   totalDocuments: number,
+ *   importId?: number,
  * }} ImportSummary
  */
 
@@ -42,6 +43,7 @@ import { stringifyProtoJson } from "./values.js";
  *   paths?: string[],
  *   updateTime?: string,
  *   skipped?: number,
+ *   importId?: number,
  * }} EmulatorSseEvent
  */
 

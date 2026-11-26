@@ -807,28 +807,35 @@ function renderExportSnapshotModal(m, state, callbacks, close) {
     if (m.busy) return;
     if (scope === "current" && !activeRoot) return;
     m.busy = true;
+    m.busyScope = scope;
     m.error = null;
     callbacks.onRerender();
     try {
       const targets = scope === "current" && activeRoot ? [activeRoot] : [];
       const { blob, filename } = await exportSnapshot(targets);
       const objectUrl = URL.createObjectURL(blob);
-      const a = document.createElement("a");
-      a.href = objectUrl;
-      a.download = filename;
-      if (a.style) {
-        a.style.display = "none";
+      /** @type {HTMLAnchorElement | null} */
+      let a = null;
+      try {
+        a = document.createElement("a");
+        a.href = objectUrl;
+        a.download = filename;
+        if (a.style) {
+          a.style.display = "none";
+        }
+        document.body?.appendChild(a);
+        a.click();
+      } finally {
+        a?.remove?.();
+        setTimeout(() => {
+          URL.revokeObjectURL(objectUrl);
+        }, 60_000);
       }
-      document.body?.appendChild(a);
-      a.click();
-      a.remove?.();
-      setTimeout(() => {
-        URL.revokeObjectURL(objectUrl);
-      }, 1000);
       state.modal = null;
       callbacks.onToast(`Exported snapshot ${filename}`, "info");
     } catch (err) {
       m.busy = false;
+      m.busyScope = null;
       m.error = err instanceof Error ? err.message : String(err);
       callbacks.onRerender();
     }
@@ -859,7 +866,9 @@ function renderExportSnapshotModal(m, state, callbacks, close) {
           ?disabled=${m.busy || !activeRoot}
           @click=${() => triggerDownload("current")}
         >
-          ${m.busy ? "Exporting..." : "Current Database"}
+          ${m.busy && m.busyScope === "current"
+            ? "Exporting..."
+            : "Current Database"}
         </button>
         <button
           type="button"
@@ -867,7 +876,9 @@ function renderExportSnapshotModal(m, state, callbacks, close) {
           ?disabled=${m.busy}
           @click=${() => triggerDownload("all")}
         >
-          All Databases
+          ${m.busy && m.busyScope === "all"
+            ? "Exporting..."
+            : "All Databases"}
         </button>
       </div>
     `,

@@ -121,6 +121,32 @@ let contentionTickerId = null;
 let connectingContention = false;
 
 const MAX_COLLECTION_COLUMN_PAGES = 1000;
+const MAX_LOCAL_APPLIED_IMPORT_IDS = 64;
+const MAX_SSE_APPLIED_IMPORT_KEYS = 256;
+
+/** @type {Set<number>} */
+const localAppliedImportIds = new Set();
+/** @type {Set<string>} */
+const sseAppliedImportKeys = new Set();
+
+/**
+ * Inserts `value` into `set`, evicting the oldest entry once `maxSize` is reached.
+ * @template T
+ * @param {Set<T>} set
+ * @param {T} value
+ * @param {number} maxSize
+ */
+function addBoundedSetEntry(set, value, maxSize) {
+  if (set.has(value)) {
+    set.delete(value);
+  } else if (set.size >= maxSize) {
+    const oldest = set.values().next();
+    if (!oldest.done) {
+      set.delete(oldest.value);
+    }
+  }
+  set.add(value);
+}
 
 /**
  * Returns true unless the document is currently hidden.
@@ -1058,6 +1084,7 @@ export async function loadDocumentLevel(
  *   fullResyncActiveDb: boolean,
  *   clearedActiveDb: boolean,
  *   replacedActiveDb: boolean,
+ *   anyDatabaseReplaced: boolean,
  *   ignorePaused: boolean,
  *   changedPaths: Set<string>,
  * }} SseRefreshPlan
@@ -1153,6 +1180,7 @@ export function applySyncSseBatch(events, options = {}) {
   let fullResyncActiveDb = false;
   let clearedActiveDb = false;
   let replacedActiveDb = false;
+  let anyDatabaseReplaced = false;
   /** @type {Set<string>} */
   const changedPaths = new Set();
 
@@ -1162,6 +1190,20 @@ export function applySyncSseBatch(events, options = {}) {
   );
 
   for (const ev of events) {
+    if (
+      (ev.type === "database_replaced" || ev.type === "database_created") &&
+      typeof ev.importId === "number" &&
+      Number.isFinite(ev.importId)
+    ) {
+      if (localAppliedImportIds.has(ev.importId)) {
+        continue;
+      }
+      addBoundedSetEntry(
+        sseAppliedImportKeys,
+        `${ev.importId}:${ev.database ?? ""}`,
+        MAX_SSE_APPLIED_IMPORT_KEYS
+      );
+    }
     if (ev.type === "resync") {
       shouldRefreshDbList = true;
       if (!clearedActiveDb) {
@@ -1200,6 +1242,7 @@ export function applySyncSseBatch(events, options = {}) {
     }
     if (ev.type === "database_replaced") {
       shouldRefreshDbList = true;
+      anyDatabaseReplaced = true;
       if (!clearedActiveDb && activeRoot !== null && ev.database === activeRoot) {
         fullResyncActiveDb = true;
         replacedActiveDb = true;
@@ -1239,6 +1282,7 @@ export function applySyncSseBatch(events, options = {}) {
     !fullResyncActiveDb &&
     !clearedActiveDb &&
     !replacedActiveDb &&
+    !anyDatabaseReplaced &&
     changedPaths.size === 0
   ) {
     return null;
@@ -1253,6 +1297,7 @@ export function applySyncSseBatch(events, options = {}) {
     fullResyncActiveDb,
     clearedActiveDb,
     replacedActiveDb,
+    anyDatabaseReplaced,
     ignorePaused,
     changedPaths,
   };
@@ -1279,7 +1324,7 @@ export async function applyAsyncSseRefresh(plan) {
     replacedActiveDb,
     shouldRefreshMeta,
   } = plan;
-  const { changedPaths, activeRoot } = plan;
+  const { anyDatabaseReplaced, changedPaths, activeRoot } = plan;
 
   if (shouldRefreshDbList) {
     let applied = false;
@@ -1330,19 +1375,24 @@ export async function applyAsyncSseRefresh(plan) {
     renderApp();
   }
 
-  if (
+  const isStaleDb = () =>
     isPausedBlocked() ||
     isStale() ||
+    getActiveRootPath(state.activeProjectId, state.activeDatabaseId) !==
+      activeRoot;
+
+  if (
     clearedActiveDb ||
     state.rootLoading ||
     !state.activeProjectId ||
     !state.activeDatabaseId ||
     !activeRoot ||
-    getActiveRootPath(state.activeProjectId, state.activeDatabaseId) !==
-      activeRoot
+    isStaleDb()
   ) {
     return;
   }
+
+  let didUpdateState = replacedActiveDb;
 
   if (shouldRefreshMeta || fullResyncActiveDb) {
     try {
@@ -1351,126 +1401,133 @@ export async function applyAsyncSseRefresh(plan) {
         state.activeDatabaseId,
         { signal }
       );
-      if (
-        isPausedBlocked() ||
-        isStale() ||
-        getActiveRootPath(state.activeProjectId, state.activeDatabaseId) !==
-          activeRoot
-      ) {
+      if (isStaleDb()) {
         return;
       }
       state.activeDbMeta = meta;
+      didUpdateState = true;
     } catch (err) {
-      if (isPausedBlocked() || isStale() || isAbortError(err)) return;
+      if (isStaleDb() || isAbortError(err)) return;
       // Ignore transient error
     }
   }
 
-  if (isPausedBlocked() || isStale()) return;
+  if (isStaleDb()) return;
 
   if (fullResyncActiveDb || changedPaths.size > 0) {
     const myNavEpoch = getNavEpoch();
+    const isStaleNav = () => myNavEpoch !== getNavEpoch();
     const segmentsSnapshot = [...state.segments];
     let rootColsLoaded = false;
     try {
       const cols = await listCollectionIds(activeRoot, {
         signal,
-        shouldAbort: () =>
-          isPausedBlocked() ||
-          isStale() ||
-          getActiveRootPath(state.activeProjectId, state.activeDatabaseId) !==
-            activeRoot,
+        shouldAbort: isStaleDb,
       });
-      if (
-        isPausedBlocked() ||
-        isStale() ||
-        getActiveRootPath(state.activeProjectId, state.activeDatabaseId) !==
-          activeRoot
-      ) {
+      if (isStaleDb()) {
         return;
       }
       state.rootCollections = cols;
       rootColsLoaded = true;
     } catch (err) {
-      if (isPausedBlocked() || isStale() || isAbortError(err)) return;
+      if (isStaleDb() || isAbortError(err)) return;
       // Ignore transient error
     }
-    if (
-      isPausedBlocked() ||
-      isStale() ||
-      myNavEpoch !== getNavEpoch() ||
-      getActiveRootPath(state.activeProjectId, state.activeDatabaseId) !==
-        activeRoot
-    ) {
+    if (isStaleDb()) {
       return;
     }
 
-    for (let i = 0; i < segmentsSnapshot.length; i += 2) {
-      if (
-        isPausedBlocked() ||
-        isStale() ||
-        myNavEpoch !== getNavEpoch() ||
-        getActiveRootPath(state.activeProjectId, state.activeDatabaseId) !==
-          activeRoot
-      ) {
-        return;
-      }
-      const colId = segmentsSnapshot[i];
-      const parentSegments = segmentsSnapshot.slice(0, i);
-      const colSegments = segmentsSnapshot.slice(0, i + 1);
-      const parentPath =
-        parentSegments.length === 0
-          ? activeRoot
-          : `${activeRoot}/${parentSegments.join("/")}`;
-      const colPath = `${activeRoot}/${colSegments.join("/")}`;
+    if (!isStaleNav()) {
+      for (let i = 0; i < segmentsSnapshot.length; i += 2) {
+        if (isStaleDb()) {
+          return;
+        }
+        if (isStaleNav()) {
+          break;
+        }
+        const colId = segmentsSnapshot[i];
+        const parentSegments = segmentsSnapshot.slice(0, i);
+        const colSegments = segmentsSnapshot.slice(0, i + 1);
+        const parentPath =
+          parentSegments.length === 0
+            ? activeRoot
+            : `${activeRoot}/${parentSegments.join("/")}`;
+        const colPath = `${activeRoot}/${colSegments.join("/")}`;
 
-      const affectsCollection =
-        fullResyncActiveDb ||
-        Array.from(changedPaths).some((p) => p.startsWith(`${colPath}/`));
-
-      if (affectsCollection) {
-        await loadCollectionColumn(colPath, parentPath, colId, false, myDbEpoch);
-      }
-      if (
-        isPausedBlocked() ||
-        isStale() ||
-        myNavEpoch !== getNavEpoch() ||
-        getActiveRootPath(state.activeProjectId, state.activeDatabaseId) !==
-          activeRoot
-      ) {
-        return;
-      }
-
-      if (segmentsSnapshot.length > i + 1) {
-        const docId = segmentsSnapshot[i + 1];
-        const docPath = `${colPath}/${docId}`;
-        const affectsDoc =
+        const affectsCollection =
           fullResyncActiveDb ||
-          changedPaths.has(docPath) ||
-          Array.from(changedPaths).some((p) => p.startsWith(`${docPath}/`));
-        if (affectsDoc) {
-          await loadDocumentLevel(docPath, docId, true, myDbEpoch);
+          Array.from(changedPaths).some((p) => p.startsWith(`${colPath}/`));
+
+        if (affectsCollection) {
+          await loadCollectionColumn(
+            colPath,
+            parentPath,
+            colId,
+            false,
+            myDbEpoch
+          );
+        }
+        if (isStaleDb()) {
+          return;
+        }
+        if (isStaleNav()) {
+          break;
+        }
+
+        if (segmentsSnapshot.length > i + 1) {
+          const docId = segmentsSnapshot[i + 1];
+          const docPath = `${colPath}/${docId}`;
+          const affectsDoc =
+            fullResyncActiveDb ||
+            changedPaths.has(docPath) ||
+            Array.from(changedPaths).some((p) => p.startsWith(`${docPath}/`));
+          if (affectsDoc) {
+            await loadDocumentLevel(docPath, docId, true, myDbEpoch);
+          }
+          if (isStaleDb()) {
+            return;
+          }
+          if (isStaleNav()) {
+            break;
+          }
         }
       }
     }
 
-    if (
-      isPausedBlocked() ||
-      isStale() ||
-      myNavEpoch !== getNavEpoch() ||
-      getActiveRootPath(state.activeProjectId, state.activeDatabaseId) !==
-        activeRoot
-    ) {
+    if (isStaleDb()) {
       return;
     }
 
     if (replacedActiveDb) {
-      if (rootColsLoaded) {
+      if (!isStaleNav() && rootColsLoaded) {
         truncateStaleSegmentsAfterReplace(activeRoot);
       }
       pruneInvisibleCachesAfterReplace(activeRoot);
     }
 
+    didUpdateState = true;
+  }
+
+  if (anyDatabaseReplaced) {
+    const affectsContention =
+      replacedActiveDb || state.contention.scope === "all";
+    if (affectsContention) {
+      state.contention.snapshot = null;
+      state.contention.lastFetchedAtMs = null;
+      state.contention.lastFetchedIso = null;
+      state.contention.error = null;
+      didUpdateState = true;
+      if (state.view === "contention") {
+        await refreshContention();
+        if (isStaleDb()) {
+          return;
+        }
+        didUpdateState = false;
+      }
+    }
+  }
+
+  if (didUpdateState) {
     renderApp();
   }
 }
@@ -1720,6 +1777,7 @@ function openExportModal() {
   state.modal = {
     kind: "export_snapshot",
     busy: false,
+    busyScope: null,
     error: null,
   };
   renderApp();
@@ -2109,11 +2167,32 @@ export function renderModal() {
     onRefreshDatabaseList: refreshDatabaseList,
     onToast: notifyToast,
     onImportSuccess: async (summary) => {
-      const events = summary.databases.map((d) => ({
+      const importId =
+        typeof summary.importId === "number" &&
+        Number.isFinite(summary.importId)
+          ? summary.importId
+          : null;
+      const databasesToApply =
+        importId !== null
+          ? summary.databases.filter(
+              (d) => !sseAppliedImportKeys.has(`${importId}:${d.name}`)
+            )
+          : summary.databases;
+      if (importId !== null) {
+        addBoundedSetEntry(
+          localAppliedImportIds,
+          importId,
+          MAX_LOCAL_APPLIED_IMPORT_IDS
+        );
+      }
+      if (databasesToApply.length === 0) {
+        return;
+      }
+      const filteredEvents = databasesToApply.map((d) => ({
         type: /** @type {const} */ ("database_replaced"),
         database: d.name,
       }));
-      await enqueueSseBatch(events, { ignorePaused: true });
+      await enqueueSseBatch(filteredEvents, { ignorePaused: true });
     },
   });
 }
@@ -2275,6 +2354,8 @@ function ensureVisibilityListener() {
  * Initializes event listeners, SSE streaming, and initial database/route hydration.
  */
 export async function init() {
+  localAppliedImportIds.clear();
+  sseAppliedImportKeys.clear();
   state.sseStatus = "live";
   nextContentionSeq();
   closeContentionEventStream();
