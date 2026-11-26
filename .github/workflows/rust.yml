@@ -108,7 +108,7 @@ jobs:
         working-directory: test-suite
       - name: Check test-suite lint and types
         run: just sdk-lint
-      - name: Check Web UI JSDoc types
+      - name: Check Web UI JSDoc types and test lint
         run: just ui-check
       - name: Run Web UI tests
         run: just ui-test

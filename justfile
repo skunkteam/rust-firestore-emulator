@@ -126,7 +126,7 @@ sdk-lint: sdk-deps
 ui-check: sdk-deps
     echo Running TypeScript JSDoc and ESLint checks for Web UI
     ./test-suite/node_modules/.bin/tsc --noEmit --allowJs --checkJs --strict --target es2022 --module es2022 --lib es2022,dom,dom.iterable ui/app.js
-    ./test-suite/node_modules/.bin/tsc --typeRoots test-suite/node_modules/@types --types node --module nodenext --moduleResolution nodenext --target es2022 --allowJs --checkJs --strict --noEmit ui/tests/*.test.mjs ui/tests/helpers/*.mjs
+    ./test-suite/node_modules/.bin/tsc --typeRoots test-suite/node_modules/@types --types node --module nodenext --moduleResolution nodenext --target es2022 --allowJs --checkJs --strict --noEmit ui/tests/*.mjs ui/tests/helpers/*.mjs
     ./test-suite/node_modules/.bin/eslint --config ui/tests/eslint.config.mjs ui/tests
 
 # Run the Web UI unit and regression tests via Node's built-in test runner

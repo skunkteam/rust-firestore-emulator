@@ -6,4 +6,4 @@ Crate directory for `emulator-http`, providing the Axum-based HTTP interface: Fi
 ## Subdirectories & Boundaries
 - `[build.rs]`: Walks `../../ui` at build time only when the `ui` Cargo feature (`CARGO_FEATURE_UI`) is enabled—emitting `build.rs` / `CARGO_FEATURE_UI` rerun directives and returning early otherwise—and generates `$OUT_DIR/ui_assets.rs` (`UI_ASSETS`, with an empty `naersk`-safe fallback when `../../ui` is absent).
 - [src](./src/README.md) - Core HTTP router builder (`RouterBuilder`), error mapping (`RestError`), and nested route handlers (`routes/`).
-- `tests`: In-memory Axum REST/Admin/SSE/UI integration tests (`tests/admin_api.rs`), fallback/UI route regression tests (`tests/http_routes.rs`), and Node.js Web UI regression tests (`tests/ui_regressions.rs`).
+- `tests`: In-memory Axum REST/Admin/SSE/UI integration tests (`tests/admin_api.rs`), fallback/UI route regression tests (`tests/http_routes.rs`), and `#![cfg(feature = "ui")]` pure-Rust Web UI CSS/WCAG regression tests (`tests/ui_regressions.rs`; JavaScript Web UI unit and regression tests live in `ui/tests/*.test.mjs` and run via `just ui-test`).

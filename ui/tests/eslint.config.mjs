@@ -1,5 +1,11 @@
 // @ts-check
-import js from "../../test-suite/node_modules/@eslint/js/src/index.js";
+import { createRequire } from "node:module";
+
+const require = createRequire(
+  new URL("../../test-suite/package.json", import.meta.url)
+);
+/** @type {import("../../test-suite/node_modules/@eslint/js/types/index.js")} */
+const js = require("@eslint/js");
 
 /** @type {import("../../test-suite/node_modules/eslint/lib/types/index.js").Linter.Config[]} */
 export default [
