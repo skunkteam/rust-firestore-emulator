@@ -73,14 +73,17 @@ FIRESTORE_EMULATOR_HOST=127.0.0.1:8080 cargo run -- --import checkpoint.fsemu
 FIRESTORE_EMULATOR_HOST=127.0.0.1:8080 FIRESTORE_EMULATOR_IMPORT=checkpoint.fsemu cargo run --release
 ```
 
-Save and restore `.fsemu` snapshots from a running emulator over HTTP (`Content-Type: application/octet-stream` is required on import) or via the **Export** / **Import** controls in the Web UI (`http://127.0.0.1:8080/`):
+Save and restore checkpoints in the emulator's native `.fsemu` binary snapshot format (not Firebase CLI or Cloud Firestore exports) over HTTP or via the **Export** / **Import** controls in the Web UI (`http://127.0.0.1:8080/`):
+
+- **Export (`GET /emulator/v1/export`)**: Captures all databases by default, or specific databases via repeatable `?database=projects/<project>/databases/<database>` parameters (trailing `/documents` is optional; unknown databases return `404`).
+- **Import (`POST /emulator/v1/import`)**: Requires `Content-Type: application/octet-stream` with `--data-binary` (avoid `curl -d`, which strips newlines and sends `application/x-www-form-urlencoded`, returning `415`). Import completely replaces and overwrites (never merges) all documents, subcollections, and edition/concurrency settings for every database present in the snapshot (empty snapshot databases reset populated ones to zero documents), while leaving unlisted databases untouched.
 
 ```shell
-# Export all databases (or a single database with ?database=...)
-curl -fSL http://127.0.0.1:8080/emulator/v1/export -o snapshot.fsemu
-curl -fSL "http://127.0.0.1:8080/emulator/v1/export?database=projects/demo/databases/(default)" -o default.fsemu
+# Export all databases, or selected databases with repeatable ?database=...
+curl -fsSL http://127.0.0.1:8080/emulator/v1/export -o snapshot.fsemu
+curl -fsSL "http://127.0.0.1:8080/emulator/v1/export?database=projects/demo/databases/(default)" -o default.fsemu
 
-# Restore databases from a saved snapshot (replaces only databases present in the file)
+# Restore databases from a saved snapshot (--data-binary preserves exact bytes)
 curl -fsS -X POST --data-binary @snapshot.fsemu \
   -H "Content-Type: application/octet-stream" \
   http://127.0.0.1:8080/emulator/v1/import
@@ -92,8 +95,8 @@ curl -fsS -X POST --data-binary @snapshot.fsemu \
 | :--- | :--- | :--- |
 | `--host-port <HOST:PORT>` | `FIRESTORE_EMULATOR_HOST` | Required `SocketAddr` to bind the multiplexed gRPC/HTTP listener (use `127.0.0.1:0` for an ephemeral port). |
 | `--long-contention-timeout` | `FIRESTORE_EMULATOR_LONG_CONTENTION_TIMEOUT` | Use Cloud-like lock contention timeouts (`15s` write / `16s` read) instead of fast test defaults (`2s` write / `5s` read). |
-| `--default-enterprise` | `FIRESTORE_EMULATOR_DEFAULT_ENTERPRISE` | Default newly created databases (after startup) to Enterprise Edition (optimistic concurrency) instead of Standard Edition. |
-| `--import <PATH>` | `FIRESTORE_EMULATOR_IMPORT` | Preload a `.fsemu` binary snapshot before binding the listening TCP socket (retaining each database's snapshot edition and concurrency settings). |
+| `--default-enterprise` | `FIRESTORE_EMULATOR_DEFAULT_ENTERPRISE` | Default newly created databases (after startup) to Enterprise Edition (optimistic concurrency) instead of Standard Edition (pessimistic concurrency). |
+| `--import <PATH>` | `FIRESTORE_EMULATOR_IMPORT` | Preload a native `.fsemu` binary snapshot before binding the listening TCP socket (retaining each database's snapshot edition and concurrency settings; invalid files or directories fail fast with a non-zero exit). |
 | `--transaction-idle-timeout-ms <MS>` | `FIRESTORE_EMULATOR_TRANSACTION_IDLE_TIMEOUT_MS` | Optional positive override (ms) for active transaction idle timeout (defaults to `60s` unused / `120s` used minimum). |
 | `--transaction-max-lifetime-ms <MS>` | `FIRESTORE_EMULATOR_TRANSACTION_MAX_LIFETIME_MS` | Optional positive override (ms) for active transaction maximum lifetime (defaults to `270s`). |
 
