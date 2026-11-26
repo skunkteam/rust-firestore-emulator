@@ -214,42 +214,36 @@ async fn handle_list_collection_ids(
     .into_response())
 }
 
-fn reject_unsupported_json_object_field(
-    container: &serde_json::Value,
-    field: &str,
-    unimplemented_msg: impl FnOnce() -> String,
-    invalid_msg: impl FnOnce() -> String,
+fn validate_request_parent(req_parent: &str, url_parent: &Ref) -> Result<()> {
+    if !req_parent.is_empty() && req_parent != url_parent.to_string() {
+        return Err(RestError::bad_request(
+            "request.parent does not match target URL path",
+        ));
+    }
+    Ok(())
+}
+
+fn ensure_supported_query_options(
+    has_explain_options: bool,
+    has_request_options: bool,
+    has_find_nearest: bool,
 ) -> Result<()> {
-    if let Some(val) = container.get(field)
-        && !val.is_null()
-    {
-        if val.is_object() {
-            return Err(RestError::not_implemented(unimplemented_msg()));
-        }
-        return Err(RestError::bad_request(invalid_msg()));
+    if has_explain_options {
+        return Err(RestError::not_implemented(
+            "explainOptions over REST is not implemented",
+        ));
+    }
+    if has_request_options {
+        return Err(RestError::not_implemented(
+            "requestOptions over REST is not implemented",
+        ));
+    }
+    if has_find_nearest {
+        return Err(RestError::not_implemented(
+            "StructuredQuery.findNearest over REST is not implemented",
+        ));
     }
     Ok(())
-}
-
-fn reject_unsupported_query_envelope_fields(raw: &serde_json::Value) -> Result<()> {
-    for field in ["newTransaction", "explainOptions", "requestOptions"] {
-        reject_unsupported_json_object_field(
-            raw,
-            field,
-            || format!("{field} over REST is not implemented"),
-            || format!("invalid {field} in request"),
-        )?;
-    }
-    Ok(())
-}
-
-fn reject_unsupported_structured_query_fields(sq: &serde_json::Value) -> Result<()> {
-    reject_unsupported_json_object_field(
-        sq,
-        "findNearest",
-        || "StructuredQuery.findNearest over REST is not implemented".to_string(),
-        || "invalid findNearest in StructuredQuery".to_string(),
-    )
 }
 
 #[instrument(level = Level::DEBUG, skip_all, fields(parent = %parent), err(level = Level::DEBUG))]
@@ -259,23 +253,28 @@ async fn handle_run_query(
     headers: &HeaderMap,
     body: &[u8],
 ) -> Result<Response> {
-    let raw: serde_json::Value = parse_json_body(headers, body)?;
-    reject_unsupported_query_envelope_fields(&raw)?;
-    if let Some(sq) = raw.get("structuredQuery") {
-        reject_unsupported_structured_query_fields(sq)?;
-    }
-    let req: RunQueryRequest =
-        serde_json::from_value(raw).map_err(|e| RestError::bad_request(e.to_string()))?;
+    let req: RunQueryRequest = parse_json_body(headers, body)?;
+    validate_request_parent(&req.parent, &parent)?;
     let Some(run_query_request::QueryType::StructuredQuery(structured_query)) = req.query_type
     else {
         return Err(RestError::bad_request(
             "missing structuredQuery in RunQueryRequest",
         ));
     };
+    ensure_supported_query_options(
+        req.explain_options.is_some(),
+        req.request_options.is_some(),
+        structured_query.find_nearest.is_some(),
+    )?;
     let read_consistency = match req.consistency_selector {
         None => ReadConsistency::Default,
         Some(run_query_request::ConsistencySelector::ReadTime(ts)) => ReadConsistency::ReadTime(ts),
-        Some(_) => {
+        Some(run_query_request::ConsistencySelector::NewTransaction(_)) => {
+            return Err(RestError::not_implemented(
+                "newTransaction over REST is not implemented",
+            ));
+        }
+        Some(run_query_request::ConsistencySelector::Transaction(_)) => {
             return Err(RestError::not_implemented(
                 "transactional runQuery over REST is not implemented yet",
             ));
@@ -317,21 +316,8 @@ async fn handle_run_aggregation_query(
     headers: &HeaderMap,
     body: &[u8],
 ) -> Result<Response> {
-    let raw: serde_json::Value = parse_json_body(headers, body)?;
-    reject_unsupported_query_envelope_fields(&raw)?;
-    if let Some(sq) = raw
-        .get("structuredAggregationQuery")
-        .and_then(|saq| saq.get("structuredQuery"))
-    {
-        reject_unsupported_structured_query_fields(sq)?;
-    }
-    let req: RunAggregationQueryRequest =
-        serde_json::from_value(raw).map_err(|e| RestError::bad_request(e.to_string()))?;
-    if !req.parent.is_empty() && req.parent != parent.to_string() {
-        return Err(RestError::bad_request(
-            "request.parent does not match target URL path",
-        ));
-    }
+    let req: RunAggregationQueryRequest = parse_json_body(headers, body)?;
+    validate_request_parent(&req.parent, &parent)?;
     let Some(run_aggregation_query_request::QueryType::StructuredAggregationQuery(agg_query)) =
         req.query_type
     else {
@@ -346,12 +332,22 @@ async fn handle_run_aggregation_query(
             "missing structuredQuery in StructuredAggregationQuery",
         ));
     };
+    ensure_supported_query_options(
+        req.explain_options.is_some(),
+        req.request_options.is_some(),
+        structured_query.find_nearest.is_some(),
+    )?;
     let read_consistency = match req.consistency_selector {
         None => ReadConsistency::Default,
         Some(run_aggregation_query_request::ConsistencySelector::ReadTime(ts)) => {
             ReadConsistency::ReadTime(ts)
         }
-        Some(_) => {
+        Some(run_aggregation_query_request::ConsistencySelector::NewTransaction(_)) => {
+            return Err(RestError::not_implemented(
+                "newTransaction over REST is not implemented",
+            ));
+        }
+        Some(run_aggregation_query_request::ConsistencySelector::Transaction(_)) => {
             return Err(RestError::not_implemented(
                 "transactional runAggregationQuery over REST is not implemented yet",
             ));

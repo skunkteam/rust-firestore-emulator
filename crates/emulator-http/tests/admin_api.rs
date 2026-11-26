@@ -1074,6 +1074,59 @@ async fn test_rest_custom_verbs_percent_encoded_colons_and_empty_prefixes() -> R
         "projects/p/databases/(default)/documents/col/doc:1/sub/s1"
     );
 
+    // Percent-encoded database ID and document ID with :runAggregationQuery work, while
+    // percent-encoded %3ArunAggregationQuery does not split as a custom verb.
+    let (status, root_pct_agg) = send_oneshot(
+        &router,
+        Method::POST,
+        "/v1/projects/p/databases/%28default%29/documents:runAggregationQuery",
+        Some(json!({
+            "structuredAggregationQuery": {
+                "structuredQuery": { "from": [{ "collectionId": "events:commit" }] },
+                "aggregations": [{ "count": {}, "alias": "c" }]
+            }
+        })),
+    )
+    .await?;
+    expect_eq!(status, StatusCode::OK);
+    expect_eq!(
+        root_pct_agg[0]["result"]["aggregateFields"],
+        json!({ "c": { "integerValue": "1" } })
+    );
+
+    let (status, doc_pct_agg) = send_oneshot(
+        &router,
+        Method::POST,
+        &format!("{docs_root}/col/doc%3A1:runAggregationQuery"),
+        Some(json!({
+            "structuredAggregationQuery": {
+                "structuredQuery": { "from": [{ "collectionId": "sub" }] },
+                "aggregations": [{ "count": {}, "alias": "c" }]
+            }
+        })),
+    )
+    .await?;
+    expect_eq!(status, StatusCode::OK);
+    expect_eq!(
+        doc_pct_agg[0]["result"]["aggregateFields"],
+        json!({ "c": { "integerValue": "1" } })
+    );
+
+    let (status, encoded_verb_agg) = send_oneshot(
+        &router,
+        Method::POST,
+        &format!("{docs_root}/col/doc%3ArunAggregationQuery"),
+        Some(json!({
+            "structuredAggregationQuery": {
+                "structuredQuery": { "from": [{ "collectionId": "sub" }] },
+                "aggregations": [{ "count": {}, "alias": "c" }]
+            }
+        })),
+    )
+    .await?;
+    expect_eq!(status, StatusCode::NOT_FOUND);
+    expect_eq!(encoded_verb_agg["error"]["status"], "NOT_FOUND");
+
     // 4. Root-only Phase-2 verbs (:commit) return 501 only on valid database/documents:commit, and
     //    404 on subpaths or bogus paths; document-capable Phase-2 verbs return 501 on doc paths.
     let (status, root_commit) = send_oneshot(
@@ -3203,6 +3256,53 @@ async fn test_firestore_v1_rest_run_aggregation_query_execution_and_editions() -
         expect_eq!(err["error"]["status"], "INVALID_ARGUMENT");
     }
 
+    // 6. Proto3 JSON `"NaN"`, `"Infinity"`, and `"-Infinity"` `doubleValue` serialization from
+    //    `SUM` / `AVG` over `:runAggregationQuery`.
+    for (col, doc_id, val) in [
+        ("nf_nan", "d1", json!("NaN")),
+        ("nf_inf", "d1", json!("Infinity")),
+        ("nf_neginf", "d1", json!("-Infinity")),
+    ] {
+        let (status, _) = send_oneshot(
+            &router,
+            Method::POST,
+            &format!("{docs_root}/{col}?documentId={doc_id}"),
+            Some(json!({ "fields": { "v": { "doubleValue": val } } })),
+        )
+        .await?;
+        expect_eq!(status, StatusCode::OK);
+    }
+    for (col, expected_wire) in [
+        ("nf_nan", "NaN"),
+        ("nf_inf", "Infinity"),
+        ("nf_neginf", "-Infinity"),
+    ] {
+        let (status, nf_res) = send_oneshot(
+            &router,
+            Method::POST,
+            &root_agg_url,
+            Some(json!({
+                "structuredAggregationQuery": {
+                    "structuredQuery": { "from": [{ "collectionId": col }] },
+                    "aggregations": [
+                        { "sum": { "field": { "fieldPath": "v" } }, "alias": "s" },
+                        { "avg": { "field": { "fieldPath": "v" } }, "alias": "a" }
+                    ]
+                }
+            })),
+        )
+        .await?;
+        expect_eq!(status, StatusCode::OK, "col={col}");
+        expect_eq!(
+            nf_res[0]["result"]["aggregateFields"],
+            json!({
+                "s": { "doubleValue": expected_wire },
+                "a": { "doubleValue": expected_wire }
+            }),
+            "col={col}"
+        );
+    }
+
     Ok(())
 }
 
@@ -3216,9 +3316,11 @@ async fn test_firestore_v1_rest_run_aggregation_query_validation_errors_and_501_
     let root_agg_url = format!("{docs_root}:runAggregationQuery");
     let doc_agg_url = format!("{docs_root}/orgs/acme:runAggregationQuery");
     let root_query_url = format!("{docs_root}:runQuery");
+    let doc_query_url = format!("{docs_root}/orgs/acme:runQuery");
 
+    let valid_sq = json!({ "from": [{ "collectionId": "items" }] });
     let valid_saq = json!({
-        "structuredQuery": { "from": [{ "collectionId": "items" }] },
+        "structuredQuery": valid_sq,
         "aggregations": [{ "count": {}, "alias": "c" }]
     });
 
@@ -3235,7 +3337,7 @@ async fn test_firestore_v1_rest_run_aggregation_query_validation_errors_and_501_
         json!({ "structuredAggregationQuery": { "structuredQuery": null, "aggregations": [{ "count": {} }] } }),
         // Body parent mismatches
         json!({ "parent": "projects/other/databases/(default)/documents", "structuredAggregationQuery": valid_saq }),
-        json!({ "parent": format!("{docs_root}/orgs/acme"), "structuredAggregationQuery": valid_saq }),
+        json!({ "parent": "projects/p/databases/(default)/documents/orgs/acme", "structuredAggregationQuery": valid_saq }),
         // Empty aggregations, > 5 on Standard, missing operator
         json!({ "structuredAggregationQuery": { "structuredQuery": { "from": [{ "collectionId": "items" }] }, "aggregations": [] } }),
         json!({ "structuredAggregationQuery": { "structuredQuery": { "from": [{ "collectionId": "items" }] }, "aggregations": too_many_std } }),
@@ -3259,9 +3361,24 @@ async fn test_firestore_v1_rest_run_aggregation_query_validation_errors_and_501_
         // Invalid StructuredQuery.select paths
         json!({ "structuredAggregationQuery": { "structuredQuery": { "select": { "fields": [{ "fieldPath": "__custom__" }] }, "from": [{ "collectionId": "items" }] }, "aggregations": [{ "count": {}, "alias": "c" }] } }),
         json!({ "structuredAggregationQuery": { "structuredQuery": { "select": { "fields": [{ "fieldPath": "a..b" }] }, "from": [{ "collectionId": "items" }] }, "aggregations": [{ "count": {}, "alias": "c" }] } }),
-        // Malformed base64 transaction & conflicting readTime + transaction
+        // Malformed base64 transaction & conflicting consistency_selector branches
         json!({ "transaction": "not!valid!base64!", "structuredAggregationQuery": valid_saq }),
         json!({ "readTime": "2026-11-24T10:00:00Z", "transaction": "AAEC", "structuredAggregationQuery": valid_saq }),
+        json!({ "readTime": "2026-11-24T10:00:00Z", "newTransaction": {}, "structuredAggregationQuery": valid_saq }),
+        json!({ "transaction": "AAEC", "newTransaction": {}, "structuredAggregationQuery": valid_saq }),
+        // 400 vs 501 precedence: unknown fields, mismatched parent, or missing query take 400
+        json!({ "unknownField": 1, "explainOptions": {}, "structuredAggregationQuery": valid_saq }),
+        json!({ "explainOptions": {}, "unknownField": 1, "structuredAggregationQuery": valid_saq }),
+        json!({ "newTransaction": {}, "unknownField": 1, "structuredAggregationQuery": valid_saq }),
+        json!({
+            "structuredAggregationQuery": {
+                "structuredQuery": { "from": [{ "collectionId": "items" }], "findNearest": {}, "unknown": 1 },
+                "aggregations": [{ "count": {} }]
+            }
+        }),
+        json!({ "parent": "projects/other/databases/(default)/documents", "explainOptions": {}, "structuredAggregationQuery": valid_saq }),
+        json!({ "explainOptions": {} }),
+        json!({ "newTransaction": {}, "structuredAggregationQuery": { "aggregations": [{ "count": {} }] } }),
         // Snake-case envelope / query keys rejected
         json!({ "structured_aggregation_query": valid_saq }),
         json!({ "structuredAggregationQuery": { "structured_query": { "from": [{ "collectionId": "items" }] }, "aggregations": [{ "count": {} }] } }),
@@ -3289,7 +3406,7 @@ async fn test_firestore_v1_rest_run_aggregation_query_validation_errors_and_501_
         Method::POST,
         &doc_agg_url,
         Some(json!({
-            "parent": format!("{docs_root}/orgs/other"),
+            "parent": "projects/p/databases/(default)/documents/orgs/other",
             "structuredAggregationQuery": valid_saq
         })),
     )
@@ -3297,9 +3414,104 @@ async fn test_firestore_v1_rest_run_aggregation_query_validation_errors_and_501_
     expect_eq!(status, StatusCode::BAD_REQUEST);
     expect_eq!(doc_mismatch_err["error"]["status"], "INVALID_ARGUMENT");
 
+    // `:runQuery` body `parent` matching & mismatching + 400 vs 501 precedence checks.
+    for (uri, body_parent) in [
+        (
+            root_query_url.as_str(),
+            "projects/p/databases/(default)/documents",
+        ),
+        (
+            doc_query_url.as_str(),
+            "projects/p/databases/(default)/documents/orgs/acme",
+        ),
+    ] {
+        let (status, rows) = send_oneshot(
+            &router,
+            Method::POST,
+            uri,
+            Some(json!({
+                "parent": body_parent,
+                "structuredQuery": valid_sq
+            })),
+        )
+        .await?;
+        expect_eq!(status, StatusCode::OK, "uri={uri}");
+        expect_eq!(rows.as_array().unwrap().len(), 1);
+    }
+    for (uri, bad_rq_payload) in [
+        (
+            root_query_url.as_str(),
+            json!({ "parent": "projects/other/databases/(default)/documents", "structuredQuery": valid_sq }),
+        ),
+        (
+            root_query_url.as_str(),
+            json!({ "parent": "projects/p/databases/(default)/documents/orgs/acme", "structuredQuery": valid_sq }),
+        ),
+        (
+            doc_query_url.as_str(),
+            json!({ "parent": "projects/p/databases/(default)/documents/orgs/other", "structuredQuery": valid_sq }),
+        ),
+        (
+            doc_query_url.as_str(),
+            json!({ "parent": "projects/p/databases/(default)/documents", "structuredQuery": valid_sq }),
+        ),
+        (
+            root_query_url.as_str(),
+            json!({ "readTime": "2026-11-24T10:00:00Z", "transaction": "AAEC", "structuredQuery": valid_sq }),
+        ),
+        (
+            root_query_url.as_str(),
+            json!({ "readTime": "2026-11-24T10:00:00Z", "newTransaction": {}, "structuredQuery": valid_sq }),
+        ),
+        (
+            root_query_url.as_str(),
+            json!({ "transaction": "AAEC", "newTransaction": {}, "structuredQuery": valid_sq }),
+        ),
+        (
+            root_query_url.as_str(),
+            json!({ "unknownField": 1, "explainOptions": {}, "structuredQuery": valid_sq }),
+        ),
+        (
+            root_query_url.as_str(),
+            json!({ "explainOptions": {}, "unknownField": 1, "structuredQuery": valid_sq }),
+        ),
+        (
+            root_query_url.as_str(),
+            json!({ "structuredQuery": { "from": [{ "collectionId": "items" }], "findNearest": {}, "unknown": 1 } }),
+        ),
+        (
+            root_query_url.as_str(),
+            json!({ "parent": "projects/other/databases/(default)/documents", "explainOptions": {}, "structuredQuery": valid_sq }),
+        ),
+        (root_query_url.as_str(), json!({ "explainOptions": {} })),
+        (root_query_url.as_str(), json!({ "newTransaction": {} })),
+    ] {
+        let (status, err) =
+            send_oneshot(&router, Method::POST, uri, Some(bad_rq_payload.clone())).await?;
+        expect_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "uri={uri} payload={bad_rq_payload}"
+        );
+        expect_eq!(err["error"]["code"], 400);
+        expect_eq!(err["error"]["status"], "INVALID_ARGUMENT");
+    }
+
     // 2. Unsupported object/transaction selectors return `501 UNIMPLEMENTED` on
-    //    `:runAggregationQuery` (and shared envelope fields on `:runQuery`).
+    //    `:runAggregationQuery` (and shared envelope / findNearest fields on `:runQuery`).
     for (uri, payload) in [
+        (
+            root_agg_url.as_str(),
+            json!({
+                "structuredAggregationQuery": {
+                    "structuredQuery": {
+                        "from": [{ "collectionId": "items" }],
+                        "findNearest": {}
+                    },
+                    "aggregations": [{ "count": {} }]
+                }
+            }),
+        ),
         (
             root_agg_url.as_str(),
             json!({
@@ -3329,6 +3541,13 @@ async fn test_firestore_v1_rest_run_aggregation_query_validation_errors_and_501_
         (
             root_agg_url.as_str(),
             json!({
+                "newTransaction": {},
+                "structuredAggregationQuery": valid_saq
+            }),
+        ),
+        (
+            root_agg_url.as_str(),
+            json!({
                 "newTransaction": { "readWrite": {} },
                 "structuredAggregationQuery": valid_saq
             }),
@@ -3336,7 +3555,21 @@ async fn test_firestore_v1_rest_run_aggregation_query_validation_errors_and_501_
         (
             root_agg_url.as_str(),
             json!({
+                "explainOptions": {},
+                "structuredAggregationQuery": valid_saq
+            }),
+        ),
+        (
+            root_agg_url.as_str(),
+            json!({
                 "explainOptions": { "analyze": true },
+                "structuredAggregationQuery": valid_saq
+            }),
+        ),
+        (
+            root_agg_url.as_str(),
+            json!({
+                "requestOptions": {},
                 "structuredAggregationQuery": valid_saq
             }),
         ),
@@ -3351,21 +3584,30 @@ async fn test_firestore_v1_rest_run_aggregation_query_validation_errors_and_501_
             root_query_url.as_str(),
             json!({
                 "newTransaction": {},
-                "structuredQuery": { "from": [{ "collectionId": "items" }] }
+                "structuredQuery": valid_sq
             }),
         ),
         (
             root_query_url.as_str(),
             json!({
                 "explainOptions": {},
-                "structuredQuery": { "from": [{ "collectionId": "items" }] }
+                "structuredQuery": valid_sq
             }),
         ),
         (
             root_query_url.as_str(),
             json!({
                 "requestOptions": {},
-                "structuredQuery": { "from": [{ "collectionId": "items" }] }
+                "structuredQuery": valid_sq
+            }),
+        ),
+        (
+            root_query_url.as_str(),
+            json!({
+                "structuredQuery": {
+                    "from": [{ "collectionId": "items" }],
+                    "findNearest": {}
+                }
             }),
         ),
     ] {
@@ -3417,7 +3659,7 @@ async fn test_firestore_v1_rest_run_aggregation_query_validation_errors_and_501_
                 &root_query_url,
                 Some(json!({
                     key: bad_val.clone(),
-                    "structuredQuery": { "from": [{ "collectionId": "items" }] }
+                    "structuredQuery": valid_sq
                 })),
             )
             .await?;
@@ -3443,6 +3685,25 @@ async fn test_firestore_v1_rest_run_aggregation_query_validation_errors_and_501_
         .await?;
         expect_eq!(status, StatusCode::BAD_REQUEST, "findNearest={bad_fn}");
         expect_eq!(err["error"]["status"], "INVALID_ARGUMENT");
+
+        let (rq_status, rq_err) = send_oneshot(
+            &router,
+            Method::POST,
+            &root_query_url,
+            Some(json!({
+                "structuredQuery": {
+                    "from": [{ "collectionId": "items" }],
+                    "findNearest": bad_fn.clone()
+                }
+            })),
+        )
+        .await?;
+        expect_eq!(
+            rq_status,
+            StatusCode::BAD_REQUEST,
+            "rq findNearest={bad_fn}"
+        );
+        expect_eq!(rq_err["error"]["status"], "INVALID_ARGUMENT");
     }
 
     // 4. `GET .../documents:runAggregationQuery` -> 405 METHOD_NOT_ALLOWED with `Allow: POST`, and

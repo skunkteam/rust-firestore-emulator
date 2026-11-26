@@ -1740,4 +1740,64 @@ async fn http_rest_run_aggregation_query_cross_protocol_and_editions() {
         expect_eq!(err["error"]["status"], expected_status);
         expect_true!(!err["error"]["message"].as_str().unwrap_or("").is_empty());
     }
+
+    // 4. Proto3 JSON `"NaN"`, `"Infinity"`, and `"-Infinity"` `doubleValue` serialization from
+    //    `SUM` / `AVG` over `:runAggregationQuery` (seeded via gRPC).
+    db.put("non_finite_nan/d1", fields!({ "v": f64::NAN }))
+        .await
+        .unwrap();
+    db.put("non_finite_nan/d2", fields!({ "v": 5_i64 }))
+        .await
+        .unwrap();
+    db.put("non_finite_inf/d1", fields!({ "v": f64::INFINITY }))
+        .await
+        .unwrap();
+    db.put("non_finite_inf/d2", fields!({ "v": 1.0_f64 }))
+        .await
+        .unwrap();
+    db.put("non_finite_neginf/d1", fields!({ "v": f64::NEG_INFINITY }))
+        .await
+        .unwrap();
+    db.put("non_finite_neginf/d2", fields!({ "v": 2_i64 }))
+        .await
+        .unwrap();
+    db.put("non_finite_cancel/d1", fields!({ "v": f64::INFINITY }))
+        .await
+        .unwrap();
+    db.put("non_finite_cancel/d2", fields!({ "v": f64::NEG_INFINITY }))
+        .await
+        .unwrap();
+
+    for (collection, expected_wire) in [
+        ("non_finite_nan", "NaN"),
+        ("non_finite_inf", "Infinity"),
+        ("non_finite_neginf", "-Infinity"),
+        ("non_finite_cancel", "NaN"),
+    ] {
+        let (nf_st, nf_bytes) = db
+            .http_oneshot(
+                Method::POST,
+                &agg_uri,
+                Some(&json!({
+                    "structuredAggregationQuery": {
+                        "structuredQuery": { "from": [{ "collectionId": collection }] },
+                        "aggregations": [
+                            { "sum": { "field": { "fieldPath": "v" } }, "alias": "s" },
+                            { "avg": { "field": { "fieldPath": "v" } }, "alias": "a" }
+                        ]
+                    }
+                })),
+            )
+            .await;
+        expect_eq!(nf_st, StatusCode::OK, "collection={collection}");
+        let nf_json: serde_json::Value = serde_json::from_slice(&nf_bytes).unwrap();
+        expect_eq!(
+            nf_json[0]["result"]["aggregateFields"],
+            json!({
+                "s": { "doubleValue": expected_wire },
+                "a": { "doubleValue": expected_wire }
+            }),
+            "collection={collection}"
+        );
+    }
 }
