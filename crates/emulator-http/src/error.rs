@@ -157,11 +157,7 @@ impl From<SnapshotError> for RestError {
     fn from(value: SnapshotError) -> Self {
         match value {
             SnapshotError::ImportInProgress => Self::conflict(value.to_string()),
-            SnapshotError::FrameTooLarge { .. } => Self::new(
-                StatusCode::PAYLOAD_TOO_LARGE,
-                "INVALID_ARGUMENT",
-                value.to_string(),
-            ),
+            SnapshotError::FrameTooLarge { .. } => Self::payload_too_large(value.to_string()),
             SnapshotError::InvalidFormat(_)
             | SnapshotError::UnsupportedVersion { .. }
             | SnapshotError::Truncated(_)

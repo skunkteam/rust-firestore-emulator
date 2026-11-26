@@ -3283,6 +3283,7 @@ async fn test_emulator_import_export_roundtrip_selective_and_large_payload() -> 
             ],
             "totalDatabases": 2,
             "totalDocuments": 3,
+            "importId": 1,
         })
     );
 
@@ -3375,6 +3376,7 @@ async fn test_emulator_import_export_roundtrip_selective_and_large_payload() -> 
     let selective_summary: serde_json::Value = selective_res.json().await?;
     expect_eq!(selective_summary["databases"][0]["replaced"], true);
     expect_eq!(selective_summary["databases"][1]["replaced"], true);
+    expect_eq!(selective_summary["importId"], 2);
 
     expect_eq!(
         client_b
@@ -3440,6 +3442,7 @@ async fn test_emulator_import_export_roundtrip_selective_and_large_payload() -> 
     let big_summary: serde_json::Value = big_import.json().await?;
     expect_eq!(big_summary["totalDatabases"], 1);
     expect_eq!(big_summary["totalDocuments"], 30);
+    expect_eq!(big_summary["importId"], 1);
 
     // 4. Zero-database snapshot imports as a no-op while keeping live databases intact.
     let (_empty_proj, empty_client, _) = spawn_server(false).await?;
@@ -4153,7 +4156,7 @@ async fn test_emulator_import_error_matrix_and_live_state_isolation() -> Result<
     expect_eq!(too_large.status(), StatusCode::PAYLOAD_TOO_LARGE);
     let too_large_err: serde_json::Value = too_large.json().await?;
     expect_eq!(too_large_err["error"]["code"], 413);
-    expect_eq!(too_large_err["error"]["status"], "INVALID_ARGUMENT");
+    expect_eq!(too_large_err["error"]["status"], "RESOURCE_EXHAUSTED");
 
     // Live database state must remain untouched after every rejected import.
     let live_doc: serde_json::Value = client.get(doc_url).send().await?.json().await?;
@@ -4681,6 +4684,14 @@ async fn test_emulator_import_concurrent_conflict_409() -> Result<()> {
 async fn test_sse_events_database_replaced_and_created_on_import() -> Result<()> {
     let (_project, client, _) = spawn_server(false).await?;
 
+    let (_empty_proj, empty_client, _) = spawn_server(false).await?;
+    let empty_snap = empty_client
+        .get("/emulator/v1/export")
+        .send()
+        .await?
+        .bytes()
+        .await?;
+
     expect_eq!(
         client
             .patch("/v1/projects/sse/databases/existing/documents/c/d1")
@@ -4720,16 +4731,56 @@ async fn test_sse_events_database_replaced_and_created_on_import() -> Result<()>
     let mut sse_res = client.get("/emulator/v1/events").send().await?;
     expect_eq!(sse_res.status(), StatusCode::OK);
 
-    let import_res = client
+    // 1. First non-empty import gets importId 1 and tags both database_replaced and
+    //    database_created.
+    let import_res_1 = client
+        .post("/emulator/v1/import")
+        .octet_stream(snap.clone())
+        .send()
+        .await?;
+    expect_eq!(import_res_1.status(), StatusCode::OK);
+    let summary_1: serde_json::Value = import_res_1.json().await?;
+    expect_eq!(summary_1["totalDatabases"], 2);
+    let import_id_1 = summary_1["importId"]
+        .as_u64()
+        .expect("non-empty import should include importId");
+    expect_eq!(import_id_1, 1);
+
+    // 2. Zero-database import omits importId from ImportSummaryResponse and emits no DB events.
+    let zero_import_res = client
+        .post("/emulator/v1/import")
+        .octet_stream(empty_snap)
+        .send()
+        .await?;
+    expect_eq!(zero_import_res.status(), StatusCode::OK);
+    let zero_summary: serde_json::Value = zero_import_res.json().await?;
+    expect_true!(zero_summary.get("importId").is_none());
+
+    // 3. Non-import lazy creation emits database_created without importId.
+    expect_eq!(
+        client
+            .get("/v1/projects/sse/databases/lazy-created")
+            .send()
+            .await?
+            .status(),
+        StatusCode::OK
+    );
+
+    // 4. Second non-empty import gets a strictly larger monotonic importId matching SSE events.
+    let import_res_2 = client
         .post("/emulator/v1/import")
         .octet_stream(snap)
         .send()
         .await?;
-    expect_eq!(import_res.status(), StatusCode::OK);
-    let summary: serde_json::Value = import_res.json().await?;
-    expect_eq!(summary["totalDatabases"], 2);
+    expect_eq!(import_res_2.status(), StatusCode::OK);
+    let summary_2: serde_json::Value = import_res_2.json().await?;
+    let import_id_2 = summary_2["importId"]
+        .as_u64()
+        .expect("second non-empty import should include importId");
+    expect_pred!(import_id_2 > import_id_1);
+    expect_eq!(import_id_2, 2);
 
-    // Emit a sentinel document change so we know all import SSE events have flushed.
+    // Emit a sentinel document change so we know all prior SSE events have flushed.
     expect_eq!(
         client
             .post("/v1/projects/sse/databases/existing/documents/c?documentId=sentinel")
@@ -4765,6 +4816,7 @@ async fn test_sse_events_database_replaced_and_created_on_import() -> Result<()>
         contains(eq(&json!({
             "type": "database_replaced",
             "database": "projects/sse/databases/existing/documents",
+            "importId": import_id_1,
         })))
     );
     expect_that!(
@@ -4772,9 +4824,193 @@ async fn test_sse_events_database_replaced_and_created_on_import() -> Result<()>
         contains(eq(&json!({
             "type": "database_created",
             "database": "projects/sse/databases/fresh/documents",
+            "importId": import_id_1,
+        })))
+    );
+    expect_that!(
+        events,
+        contains(eq(&json!({
+            "type": "database_created",
+            "database": "projects/sse/databases/lazy-created/documents",
+        })))
+    );
+    expect_that!(
+        events,
+        contains(eq(&json!({
+            "type": "database_replaced",
+            "database": "projects/sse/databases/existing/documents",
+            "importId": import_id_2,
+        })))
+    );
+    expect_that!(
+        events,
+        contains(eq(&json!({
+            "type": "database_replaced",
+            "database": "projects/sse/databases/fresh/documents",
+            "importId": import_id_2,
         })))
     );
     expect_false!(events.iter().any(|ev| ev["type"] == "database_cleared"));
+
+    Ok(())
+}
+
+fn assert_no_cors_headers(headers: &HeaderMap, context: &str) {
+    assert!(
+        headers.get(header::ACCESS_CONTROL_ALLOW_ORIGIN).is_none(),
+        "{context}: unexpected Access-Control-Allow-Origin header"
+    );
+    for name in headers.keys() {
+        assert!(
+            !name.as_str().starts_with("access-control-allow-"),
+            "{context}: unexpected CORS header {name}"
+        );
+    }
+}
+
+#[gtest]
+#[tokio::test]
+async fn test_emulator_export_head_headers_and_empty_body() -> Result<()> {
+    let (_project, client, _) = spawn_server(false).await?;
+
+    expect_eq!(
+        client
+            .post("/v1/projects/demo/databases/(default)/documents/items?documentId=d1")
+            .json(&json!({ "fields": { "v": { "integerValue": "1" } } }))
+            .send()
+            .await?
+            .status(),
+        StatusCode::OK
+    );
+    expect_eq!(
+        client
+            .post("/v1/projects/demo/databases/analytics/documents/items?documentId=d2")
+            .json(&json!({ "fields": { "v": { "integerValue": "2" } } }))
+            .send()
+            .await?
+            .status(),
+        StatusCode::OK
+    );
+
+    // 1. HEAD /emulator/v1/export (all DBs) preserves 200 and filename headers with an empty body.
+    let head_all = client
+        .request(Method::HEAD, "/emulator/v1/export")
+        .send()
+        .await?;
+    expect_eq!(head_all.status(), StatusCode::OK);
+    let all_filename = extract_export_filename(head_all.headers());
+    expect_that!(all_filename, starts_with("firestore-emulator-snapshot-"));
+    expect_true!(head_all.bytes().await?.is_empty());
+
+    // 2. HEAD /emulator/v1/export?database=... preserves single-DB filename header and empty body.
+    let head_single = client
+        .request(
+            Method::HEAD,
+            "/emulator/v1/export?database=projects/demo/databases/(default)",
+        )
+        .send()
+        .await?;
+    expect_eq!(head_single.status(), StatusCode::OK);
+    let single_filename = extract_export_filename(head_single.headers());
+    expect_that!(single_filename, starts_with("demo-_default_-"));
+    expect_true!(head_single.bytes().await?.is_empty());
+
+    // 3. HEAD on unknown ?database=... returns 404 with empty body and does not lazily create it.
+    let head_missing = client
+        .request(
+            Method::HEAD,
+            "/emulator/v1/export?database=projects/demo/databases/ghost",
+        )
+        .send()
+        .await?;
+    expect_eq!(head_missing.status(), StatusCode::NOT_FOUND);
+    expect_true!(head_missing.bytes().await?.is_empty());
+
+    let db_list: Vec<String> = client.get("/emulator/v1").send().await?.json().await?;
+    expect_false!(db_list.iter().any(|d| d.contains("ghost")));
+
+    Ok(())
+}
+
+#[gtest]
+#[tokio::test]
+async fn test_emulator_no_cors_headers_and_options_preflight_rejection() -> Result<()> {
+    let (_project, client, _) = spawn_server(false).await?;
+
+    expect_eq!(
+        client
+            .post("/v1/projects/cors/databases/(default)/documents/items?documentId=d1")
+            .json(&json!({ "fields": { "v": { "integerValue": "1" } } }))
+            .send()
+            .await?
+            .status(),
+        StatusCode::OK
+    );
+
+    // 1. OPTIONS preflight on /emulator/v1/import is rejected with 405, Allow: POST, JSON envelope,
+    //    and no access-control-allow-* headers.
+    let preflight = client
+        .request(Method::OPTIONS, "/emulator/v1/import")
+        .header(
+            header::ORIGIN,
+            HeaderValue::from_static("https://evil.example"),
+        )
+        .header(
+            header::ACCESS_CONTROL_REQUEST_METHOD,
+            HeaderValue::from_static("POST"),
+        )
+        .header(
+            header::ACCESS_CONTROL_REQUEST_HEADERS,
+            HeaderValue::from_static("content-type"),
+        )
+        .send()
+        .await?;
+    expect_eq!(preflight.status(), StatusCode::METHOD_NOT_ALLOWED);
+    expect_eq!(
+        preflight
+            .headers()
+            .get(header::ALLOW)
+            .and_then(|v| v.to_str().ok()),
+        Some("POST")
+    );
+    let preflight_ct = preflight
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    expect_that!(preflight_ct, starts_with("application/json"));
+    assert_no_cors_headers(preflight.headers(), "OPTIONS /emulator/v1/import");
+    let preflight_err: serde_json::Value = preflight.json().await?;
+    expect_eq!(preflight_err["error"]["code"], 405);
+    expect_eq!(preflight_err["error"]["status"], "METHOD_NOT_ALLOWED");
+
+    // 2. GET /emulator/v1/export with Origin omits Access-Control-Allow-Origin and all CORS
+    //    headers.
+    let export_res = client
+        .get("/emulator/v1/export")
+        .header(
+            header::ORIGIN,
+            HeaderValue::from_static("https://evil.example"),
+        )
+        .send()
+        .await?;
+    expect_eq!(export_res.status(), StatusCode::OK);
+    assert_no_cors_headers(export_res.headers(), "GET /emulator/v1/export");
+    let snap = export_res.bytes().await?;
+
+    // 3. POST /emulator/v1/import with Origin omits Access-Control-Allow-Origin and all CORS
+    //    headers.
+    let import_res = client
+        .post("/emulator/v1/import")
+        .header(
+            header::ORIGIN,
+            HeaderValue::from_static("https://evil.example"),
+        )
+        .octet_stream(snap)
+        .send()
+        .await?;
+    expect_eq!(import_res.status(), StatusCode::OK);
+    assert_no_cors_headers(import_res.headers(), "POST /emulator/v1/import");
 
     Ok(())
 }

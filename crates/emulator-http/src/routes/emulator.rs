@@ -87,12 +87,15 @@ struct ImportSummaryResponse {
     databases: Vec<ImportedDatabaseResponse>,
     total_databases: usize,
     total_documents: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    import_id: Option<u64>,
 }
 
 impl From<ImportSummary> for ImportSummaryResponse {
     fn from(summary: ImportSummary) -> Self {
         let total_databases = summary.total_databases();
         let total_documents = summary.total_documents();
+        let import_id = summary.import_id;
         let databases = summary
             .databases
             .into_iter()
@@ -110,6 +113,7 @@ impl From<ImportSummary> for ImportSummaryResponse {
             databases,
             total_databases,
             total_documents,
+            import_id,
         }
     }
 }
@@ -146,6 +150,7 @@ fn default_export_filename(single_target: Option<&RootRef>, snapshot_time: Times
 
 async fn export_snapshot(
     State(project): State<&'static FirestoreProject>,
+    method: Method,
     uri: Uri,
 ) -> Result<Response> {
     let mut targets = Vec::new();
@@ -178,6 +183,12 @@ async fn export_snapshot(
     let disposition = HeaderValue::from_str(&format!("attachment; filename=\"{filename}\""))
         .map_err(|err| RestError::internal(format!("Invalid Content-Disposition header: {err}")))?;
 
+    let body = if method == Method::HEAD {
+        Body::empty()
+    } else {
+        Body::from_stream(plan.into_stream())
+    };
+
     Ok((
         StatusCode::OK,
         [
@@ -187,7 +198,7 @@ async fn export_snapshot(
             ),
             (header::CONTENT_DISPOSITION, disposition),
         ],
-        Body::from_stream(plan.into_stream()),
+        body,
     )
         .into_response())
 }
@@ -261,17 +272,31 @@ async fn sse_events(
     let stream = BroadcastStream::new(rx).filter_map(|item| match item {
         Ok(event) => {
             let payload = match event {
-                ProjectEvent::DatabaseCreated { database } => json!({
-                    "type": "database_created",
-                    "database": database.to_string(),
-                }),
+                ProjectEvent::DatabaseCreated {
+                    database,
+                    import_id,
+                } => match import_id {
+                    Some(id) => json!({
+                        "type": "database_created",
+                        "database": database.to_string(),
+                        "importId": id,
+                    }),
+                    None => json!({
+                        "type": "database_created",
+                        "database": database.to_string(),
+                    }),
+                },
                 ProjectEvent::DatabaseCleared { database } => json!({
                     "type": "database_cleared",
                     "database": database.to_string(),
                 }),
-                ProjectEvent::DatabaseReplaced { database } => json!({
+                ProjectEvent::DatabaseReplaced {
+                    database,
+                    import_id,
+                } => json!({
                     "type": "database_replaced",
                     "database": database.to_string(),
+                    "importId": import_id,
                 }),
                 ProjectEvent::DatabaseConfigChanged { database } => json!({
                     "type": "database_config_changed",
@@ -338,13 +363,7 @@ fn parse_database_query(query: Option<&str>) -> Result<Option<RootRef>> {
         return Ok(None);
     };
     let mut database = None;
-    for pair in query.split('&') {
-        if pair.is_empty() {
-            continue;
-        }
-        let (raw_k, raw_v) = pair.split_once('=').unwrap_or((pair, ""));
-        let key = super::projects::percent_decode(raw_k)?;
-        let val = super::projects::percent_decode(raw_v)?;
+    for (key, val) in super::projects::parse_query_pairs(query)? {
         if key == "database" {
             if database.is_some() {
                 return Err(RestError::bad_request(

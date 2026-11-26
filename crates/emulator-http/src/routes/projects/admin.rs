@@ -102,23 +102,22 @@ pub(super) async fn patch_database(
         None
     };
 
-    let prev = db.settings();
-    let prev_enterprise = prev.edition == DatabaseEdition::Enterprise;
-    let target_enterprise = effective_edition
-        .map(|edition| matches!(edition, DatabaseEdition::Enterprise))
-        .unwrap_or(prev_enterprise);
-    let target_optimistic = if let Some(mode) = effective_concurrency {
-        matches!(mode, DatabaseConcurrencyMode::Optimistic)
-    } else if target_enterprise != prev_enterprise {
-        // Derive optimistic concurrency mode automatically when edition changes
-        target_enterprise
-    } else {
-        prev.concurrency_mode == DatabaseConcurrencyMode::Optimistic
-    };
+    let settings = db.update_settings(|settings| {
+        if let Some(edition) = effective_edition
+            && edition != settings.edition
+        {
+            settings.edition = edition;
+            if effective_concurrency.is_none() {
+                // Derive optimistic concurrency mode automatically when edition changes
+                settings.concurrency_mode = DatabaseSettings::for_edition(edition).concurrency_mode;
+            }
+        }
+        if let Some(mode) = effective_concurrency {
+            settings.concurrency_mode = mode;
+        }
+    });
 
-    db.set_config(target_enterprise, target_optimistic);
-
-    Ok(Json(DatabaseMetadata::new(&name, db.settings())))
+    Ok(Json(DatabaseMetadata::new(&name, settings)))
 }
 
 #[derive(Debug, Default)]

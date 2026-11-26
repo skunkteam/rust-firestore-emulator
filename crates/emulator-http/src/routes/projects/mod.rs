@@ -17,7 +17,7 @@ mod admin;
 mod documents;
 mod query_params;
 
-pub(super) use query_params::{decode_raw_path_segments, parse_query_pairs, percent_decode};
+pub(super) use query_params::{decode_raw_path_segments, parse_query_pairs};
 
 const SUBPATH_CUSTOM_VERBS: &[&str] = &[
     "listCollectionIds",
