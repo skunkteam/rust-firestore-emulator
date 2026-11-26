@@ -153,22 +153,7 @@ async fn export_snapshot(
     method: Method,
     uri: Uri,
 ) -> Result<Response> {
-    let mut targets = Vec::new();
-    if let Some(raw_query) = uri.query() {
-        for (key, val) in super::projects::parse_query_pairs(raw_query)? {
-            if key != "database" {
-                return Err(RestError::bad_request(format!(
-                    "Unsupported query parameter for export: {key}"
-                )));
-            }
-            if val.is_empty() {
-                return Err(RestError::bad_request(
-                    "database query parameter cannot be empty",
-                ));
-            }
-            targets.push(RootRef::from_str(&val)?);
-        }
-    }
+    let targets = parse_database_targets(uri.query(), true)?;
 
     let plan = if targets.is_empty() {
         project.prepare_export(None).await?
@@ -249,7 +234,8 @@ async fn import_snapshot(
 ) -> Result<Json<ImportSummaryResponse>> {
     if uri.query().is_some_and(|q| !q.is_empty()) {
         return Err(RestError::bad_request(
-            "Snapshot import does not accept query parameters",
+            "Snapshot import does not accept query parameters (POST the .fsemu body directly; all \
+             databases in the snapshot are imported).",
         ));
     }
     ensure_octet_stream_content_type(&headers, &uri)?;
@@ -265,56 +251,73 @@ async fn list_databases(State(project): State<&'static FirestoreProject>) -> imp
     Json(project.database_names().await)
 }
 
+#[derive(Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum SseProjectEvent {
+    DatabaseCreated {
+        database:  RootRef,
+        #[serde(rename = "importId", skip_serializing_if = "Option::is_none")]
+        import_id: Option<u64>,
+    },
+    DatabaseCleared {
+        database: RootRef,
+    },
+    DatabaseReplaced {
+        database:  RootRef,
+        #[serde(rename = "importId")]
+        import_id: u64,
+    },
+    DatabaseConfigChanged {
+        database: RootRef,
+    },
+    DocumentsChanged {
+        database: RootRef,
+        paths: Vec<String>,
+        #[serde(rename = "updateTime")]
+        update_time: Timestamp,
+    },
+}
+
+impl From<ProjectEvent> for SseProjectEvent {
+    fn from(event: ProjectEvent) -> Self {
+        match event {
+            ProjectEvent::DatabaseCreated {
+                database,
+                import_id,
+            } => Self::DatabaseCreated {
+                database,
+                import_id,
+            },
+            ProjectEvent::DatabaseCleared { database } => Self::DatabaseCleared { database },
+            ProjectEvent::DatabaseReplaced {
+                database,
+                import_id,
+            } => Self::DatabaseReplaced {
+                database,
+                import_id,
+            },
+            ProjectEvent::DatabaseConfigChanged { database } => {
+                Self::DatabaseConfigChanged { database }
+            }
+            ProjectEvent::DocumentsChanged {
+                database,
+                paths,
+                update_time,
+            } => Self::DocumentsChanged {
+                database,
+                paths,
+                update_time,
+            },
+        }
+    }
+}
+
 async fn sse_events(
     State(project): State<&'static FirestoreProject>,
 ) -> Sse<impl Stream<Item = std::result::Result<Event, Infallible>>> {
     let rx = project.subscribe_project_events();
     let stream = BroadcastStream::new(rx).filter_map(|item| match item {
-        Ok(event) => {
-            let payload = match event {
-                ProjectEvent::DatabaseCreated {
-                    database,
-                    import_id,
-                } => match import_id {
-                    Some(id) => json!({
-                        "type": "database_created",
-                        "database": database.to_string(),
-                        "importId": id,
-                    }),
-                    None => json!({
-                        "type": "database_created",
-                        "database": database.to_string(),
-                    }),
-                },
-                ProjectEvent::DatabaseCleared { database } => json!({
-                    "type": "database_cleared",
-                    "database": database.to_string(),
-                }),
-                ProjectEvent::DatabaseReplaced {
-                    database,
-                    import_id,
-                } => json!({
-                    "type": "database_replaced",
-                    "database": database.to_string(),
-                    "importId": import_id,
-                }),
-                ProjectEvent::DatabaseConfigChanged { database } => json!({
-                    "type": "database_config_changed",
-                    "database": database.to_string(),
-                }),
-                ProjectEvent::DocumentsChanged {
-                    database,
-                    paths,
-                    update_time,
-                } => json!({
-                    "type": "documents_changed",
-                    "database": database.to_string(),
-                    "paths": paths,
-                    "updateTime": update_time,
-                }),
-            };
-            json_sse_event("change", payload)
-        }
+        Ok(event) => json_sse_event("change", SseProjectEvent::from(event)),
         Err(BroadcastStreamRecvError::Lagged(skipped)) => {
             lagged_resync_event(skipped, "project event stream")
         }
@@ -358,39 +361,46 @@ fn sse_keep_alive() -> KeepAlive {
         .text("heartbeat")
 }
 
-fn parse_database_query(query: Option<&str>) -> Result<Option<RootRef>> {
+fn parse_database_targets(query: Option<&str>, allow_multiple: bool) -> Result<Vec<RootRef>> {
     let Some(query) = query else {
-        return Ok(None);
+        return Ok(Vec::new());
     };
-    let mut database = None;
+    let mut targets = Vec::new();
     for (key, val) in super::projects::parse_query_pairs(query)? {
-        if key == "database" {
-            if database.is_some() {
-                return Err(RestError::bad_request(
-                    "Duplicate database query parameter is not supported",
-                ));
-            }
-            if val.is_empty() {
-                return Err(RestError::bad_request("database cannot be empty"));
-            }
-            let root: RootRef = val.parse().map_err(|_| {
-                RestError::bad_request(format!("Invalid database resource name: {val}"))
-            })?;
-            database = Some(root);
-        } else {
+        if key != "database" {
             return Err(RestError::bad_request(format!(
                 "Unsupported query parameter: {key}"
             )));
         }
+        if !allow_multiple && !targets.is_empty() {
+            return Err(RestError::bad_request(
+                "Duplicate database query parameter is not supported",
+            ));
+        }
+        if val.is_empty() {
+            return Err(RestError::bad_request(
+                "database query parameter cannot be empty (expected \
+                 projects/{project_id}/databases/{database_id})",
+            ));
+        }
+        let root = RootRef::from_str(&val).map_err(|_| {
+            RestError::bad_request(format!(
+                "Invalid database resource name: {val} (expected \
+                 projects/{{project_id}}/databases/{{database_id}})"
+            ))
+        })?;
+        targets.push(root);
     }
-    Ok(database)
+    Ok(targets)
 }
 
 async fn get_contention(
     State(project): State<&'static FirestoreProject>,
     uri: Uri,
 ) -> Result<Json<ContentionSnapshot>> {
-    let database = parse_database_query(uri.query())?;
+    let database = parse_database_targets(uri.query(), false)?
+        .into_iter()
+        .next();
     Ok(Json(project.contention_snapshot(database.as_ref()).await))
 }
 
@@ -398,7 +408,9 @@ async fn delete_contention(
     State(project): State<&'static FirestoreProject>,
     uri: Uri,
 ) -> Result<Json<serde_json::Value>> {
-    let database = parse_database_query(uri.query())?;
+    let database = parse_database_targets(uri.query(), false)?
+        .into_iter()
+        .next();
     project.clear_contention_history(database.as_ref()).await;
     Ok(Json(json!({})))
 }
@@ -491,6 +503,137 @@ mod tests {
         assert_eq!(
             default_export_filename(None, out_of_range),
             "firestore-emulator-snapshot-19700101T000000Z.fsemu"
+        );
+    }
+
+    #[test]
+    fn parse_database_targets_unifies_single_multi_and_error_messages() {
+        assert!(parse_database_targets(None, false).unwrap().is_empty());
+        assert!(parse_database_targets(Some(""), true).unwrap().is_empty());
+
+        let multi = parse_database_targets(
+            Some(
+                "database=projects/p/databases/(default)&database=projects/p/databases/other/\
+                 documents",
+            ),
+            true,
+        )
+        .unwrap();
+        assert_eq!(
+            multi,
+            vec![
+                RootRef::try_new("p", "(default)").unwrap(),
+                RootRef::try_new("p", "other").unwrap(),
+            ]
+        );
+
+        let dup_err = parse_database_targets(
+            Some("database=projects/p/databases/a&database=projects/p/databases/b"),
+            false,
+        )
+        .unwrap_err();
+        assert_eq!(
+            dup_err.to_string(),
+            "400 (INVALID_ARGUMENT): Duplicate database query parameter is not supported"
+        );
+
+        let unsupported_err = parse_database_targets(Some("foo=bar"), true).unwrap_err();
+        assert_eq!(
+            unsupported_err.to_string(),
+            "400 (INVALID_ARGUMENT): Unsupported query parameter: foo"
+        );
+
+        let empty_err = parse_database_targets(Some("database="), true).unwrap_err();
+        assert_eq!(
+            empty_err.to_string(),
+            "400 (INVALID_ARGUMENT): database query parameter cannot be empty (expected \
+             projects/{project_id}/databases/{database_id})"
+        );
+
+        let invalid_err = parse_database_targets(Some("database=bad"), false).unwrap_err();
+        assert_eq!(
+            invalid_err.to_string(),
+            "400 (INVALID_ARGUMENT): Invalid database resource name: bad (expected \
+             projects/{project_id}/databases/{database_id})"
+        );
+    }
+
+    #[test]
+    fn sse_project_event_serializes_exact_camel_case_json() {
+        let db = RootRef::try_new("p", "(default)").unwrap();
+        let ts = Timestamp {
+            seconds: 1_764_151_205,
+            nanos:   0,
+        };
+
+        assert_eq!(
+            serde_json::to_value(SseProjectEvent::from(ProjectEvent::DatabaseCreated {
+                database:  db.clone(),
+                import_id: None,
+            }))
+            .unwrap(),
+            json!({
+                "type": "database_created",
+                "database": "projects/p/databases/(default)/documents",
+            })
+        );
+        assert_eq!(
+            serde_json::to_value(SseProjectEvent::from(ProjectEvent::DatabaseCreated {
+                database:  db.clone(),
+                import_id: Some(7),
+            }))
+            .unwrap(),
+            json!({
+                "type": "database_created",
+                "database": "projects/p/databases/(default)/documents",
+                "importId": 7,
+            })
+        );
+        assert_eq!(
+            serde_json::to_value(SseProjectEvent::from(ProjectEvent::DatabaseCleared {
+                database: db.clone(),
+            }))
+            .unwrap(),
+            json!({
+                "type": "database_cleared",
+                "database": "projects/p/databases/(default)/documents",
+            })
+        );
+        assert_eq!(
+            serde_json::to_value(SseProjectEvent::from(ProjectEvent::DatabaseReplaced {
+                database:  db.clone(),
+                import_id: 9,
+            }))
+            .unwrap(),
+            json!({
+                "type": "database_replaced",
+                "database": "projects/p/databases/(default)/documents",
+                "importId": 9,
+            })
+        );
+        assert_eq!(
+            serde_json::to_value(SseProjectEvent::from(ProjectEvent::DatabaseConfigChanged {
+                database: db.clone(),
+            }))
+            .unwrap(),
+            json!({
+                "type": "database_config_changed",
+                "database": "projects/p/databases/(default)/documents",
+            })
+        );
+        assert_eq!(
+            serde_json::to_value(SseProjectEvent::from(ProjectEvent::DocumentsChanged {
+                database: db,
+                paths: vec!["col/doc1".to_string()],
+                update_time: ts,
+            }))
+            .unwrap(),
+            json!({
+                "type": "documents_changed",
+                "database": "projects/p/databases/(default)/documents",
+                "paths": ["col/doc1"],
+                "updateTime": ts,
+            })
         );
     }
 }

@@ -1,22 +1,22 @@
 #![allow(unused_crate_dependencies)]
 
-use std::{
-    pin::Pin,
-    task::{Context, Poll},
-    time::Duration,
-};
+use std::time::Duration;
 
 use axum::{
     Router,
     body::{Body, BodyDataStream, Bytes, to_bytes},
     http::{HeaderMap, HeaderValue, Method, Request, StatusCode, header},
 };
-use emulator_database::{FirestoreProject, config::FirestoreConfig, snapshot::MAX_FRAME_BYTES};
+use emulator_database::{
+    FirestoreProject,
+    config::FirestoreConfig,
+    snapshot::{EOF_MAGIC, FORMAT_MAJOR, MAX_FRAME_BYTES, SNAPSHOT_MAGIC},
+};
 use emulator_http::RouterBuilder;
 use googletest::prelude::*;
 use serde::{Serialize, de::DeserializeOwned};
 use serde_json::json;
-use tokio_stream::{Stream, StreamExt};
+use tokio_stream::{Stream, StreamExt, wrappers::ReceiverStream};
 use tower::ServiceExt;
 
 #[derive(Clone)]
@@ -1244,6 +1244,8 @@ async fn test_rest_rejects_percent_encoded_slashes_and_preserves_plus() -> Resul
         (Method::GET, "/v1/projects/p/databases/__reserved__"),
         (Method::GET, "/v1/projects/__reserved__/databases/(default)"),
         (Method::GET, "/v1/projects/p/databases/.."),
+        (Method::GET, "/v1/projects/p/databases/%2E%2E"),
+        (Method::GET, "/v1/projects/p/databases/%2E"),
         (
             Method::GET,
             "/v1/projects/p/databases/(default)%2Fdocuments%2Fcol%2Fdoc/documents/sub",
@@ -1930,16 +1932,27 @@ fn extract_export_filename(headers: &HeaderMap) -> String {
     filename.to_string()
 }
 
+const SNAPSHOT_FILE_HEADER_LEN: usize = SNAPSHOT_MAGIC.len() + size_of::<u16>();
+const SNAPSHOT_FRAME_PREFIX_LEN: usize = 1 + size_of::<u32>();
+const SNAPSHOT_TRAILER_LEN: usize = size_of::<u32>() + EOF_MAGIC.len();
+
 fn duplicate_frame_at(snapshot: &[u8], frame_index: usize, expected_tag: u8) -> Vec<u8> {
-    let mut offset = 10;
+    let mut offset = SNAPSHOT_FILE_HEADER_LEN;
     for _ in 0..frame_index {
-        let len = u32::from_le_bytes(snapshot[offset + 1..offset + 5].try_into().unwrap()) as usize;
-        offset += 5 + len;
+        let len = u32::from_le_bytes(
+            snapshot[offset + 1..offset + SNAPSHOT_FRAME_PREFIX_LEN]
+                .try_into()
+                .unwrap(),
+        ) as usize;
+        offset += SNAPSHOT_FRAME_PREFIX_LEN + len;
     }
     assert_eq!(snapshot[offset], expected_tag);
-    let frame_len =
-        u32::from_le_bytes(snapshot[offset + 1..offset + 5].try_into().unwrap()) as usize;
-    let frame_end = offset + 5 + frame_len;
+    let frame_len = u32::from_le_bytes(
+        snapshot[offset + 1..offset + SNAPSHOT_FRAME_PREFIX_LEN]
+            .try_into()
+            .unwrap(),
+    ) as usize;
+    let frame_end = offset + SNAPSHOT_FRAME_PREFIX_LEN + frame_len;
 
     let mut out = Vec::with_capacity(snapshot.len() + (frame_end - offset));
     out.extend_from_slice(&snapshot[..frame_end]);
@@ -1953,64 +1966,6 @@ fn duplicate_first_database_frame(single_db_snapshot: &[u8]) -> Vec<u8> {
 
 fn duplicate_first_document_frame(single_doc_snapshot: &[u8]) -> Vec<u8> {
     duplicate_frame_at(single_doc_snapshot, 2, 0x03)
-}
-
-enum GatedChunkStream {
-    SendFirst {
-        first: Bytes,
-        rest: Bytes,
-        entered_tx: Option<tokio::sync::oneshot::Sender<()>>,
-        release_rx: tokio::sync::oneshot::Receiver<()>,
-    },
-    WaitForRelease {
-        rest: Bytes,
-        entered_tx: Option<tokio::sync::oneshot::Sender<()>>,
-        release_rx: tokio::sync::oneshot::Receiver<()>,
-    },
-    Done,
-}
-
-impl Stream for GatedChunkStream {
-    type Item = std::io::Result<Bytes>;
-
-    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        match std::mem::replace(&mut *self, Self::Done) {
-            Self::SendFirst {
-                first,
-                rest,
-                entered_tx,
-                release_rx,
-            } => {
-                *self = Self::WaitForRelease {
-                    rest,
-                    entered_tx,
-                    release_rx,
-                };
-                Poll::Ready(Some(Ok(first)))
-            }
-            Self::WaitForRelease {
-                rest,
-                mut entered_tx,
-                mut release_rx,
-            } => {
-                if let Some(tx) = entered_tx.take() {
-                    let _unused = tx.send(());
-                }
-                match Pin::new(&mut release_rx).poll(cx) {
-                    Poll::Ready(_) => Poll::Ready(Some(Ok(rest))),
-                    Poll::Pending => {
-                        *self = Self::WaitForRelease {
-                            rest,
-                            entered_tx: None,
-                            release_rx,
-                        };
-                        Poll::Pending
-                    }
-                }
-            }
-            Self::Done => Poll::Ready(None),
-        }
-    }
 }
 
 #[gtest]
@@ -2754,6 +2709,20 @@ async fn test_emulator_export_targets_filenames_and_errors() -> Result<()> {
             "INVALID_ARGUMENT",
             "query: {bad_query}"
         );
+        if bad_query == "foo=bar" {
+            expect_eq!(err["error"]["message"], "Unsupported query parameter: foo");
+        } else if bad_query == "database=" {
+            expect_that!(
+                err["error"]["message"].as_str().unwrap(),
+                contains_substring("(expected projects/{project_id}/databases/{database_id})")
+            );
+        } else if bad_query == "database=not-a-root-ref" {
+            expect_eq!(
+                err["error"]["message"],
+                "Invalid database resource name: not-a-root-ref (expected \
+                 projects/{project_id}/databases/{database_id})"
+            );
+        }
     }
 
     Ok(())
@@ -3191,6 +3160,7 @@ async fn test_emulator_import_export_roundtrip_selective_and_large_payload() -> 
                 "negZero": { "doubleValue": -0.0 },
                 "nanFloat": { "doubleValue": "NaN" },
                 "infFloat": { "doubleValue": "Infinity" },
+                "negInfFloat": { "doubleValue": "-Infinity" },
                 "tsField": { "timestampValue": "2026-11-10T15:30:45.123456789Z" },
                 "strField": { "stringValue": "hello" },
                 "bytesField": { "bytesValue": "AAECAw==" },
@@ -3199,6 +3169,14 @@ async fn test_emulator_import_export_roundtrip_selective_and_large_payload() -> 
                 "arrField": {
                     "arrayValue": {
                         "values": [{ "integerValue": "42" }, { "stringValue": "nested" }]
+                    }
+                },
+                "mapField": {
+                    "mapValue": {
+                        "fields": {
+                            "nested": { "stringValue": "ok" },
+                            "count": { "integerValue": "7" }
+                        }
                     }
                 },
                 "vectorField": {
@@ -3310,10 +3288,19 @@ async fn test_emulator_import_export_roundtrip_selective_and_large_payload() -> 
     );
     expect_eq!(all_doc["fields"]["nanFloat"]["doubleValue"], "NaN");
     expect_eq!(all_doc["fields"]["infFloat"]["doubleValue"], "Infinity");
+    expect_eq!(all_doc["fields"]["negInfFloat"]["doubleValue"], "-Infinity");
     expect_eq!(all_doc["fields"]["bytesField"]["bytesValue"], "AAECAw==");
     expect_eq!(
         all_doc["fields"]["tsField"]["timestampValue"],
         "2026-11-10T15:30:45.123456789Z"
+    );
+    expect_eq!(
+        all_doc["fields"]["mapField"]["mapValue"]["fields"]["nested"]["stringValue"],
+        "ok"
+    );
+    expect_eq!(
+        all_doc["fields"]["mapField"]["mapValue"]["fields"]["count"]["integerValue"],
+        "7"
     );
     expect_eq!(
         all_doc["fields"]["vectorField"]["mapValue"]["fields"]["__type__"]["stringValue"],
@@ -4085,13 +4072,23 @@ async fn test_emulator_import_error_matrix_and_live_state_isolation() -> Result<
     let query_err: serde_json::Value = query_reject.json().await?;
     expect_eq!(query_err["error"]["code"], 400);
     expect_eq!(query_err["error"]["status"], "INVALID_ARGUMENT");
+    expect_eq!(
+        query_err["error"]["message"],
+        "Snapshot import does not accept query parameters (POST the .fsemu body directly; all \
+         databases in the snapshot are imported)."
+    );
 
     let mut wrong_major = valid_snap.to_vec();
-    wrong_major[8..10].copy_from_slice(&2u16.to_le_bytes());
+    wrong_major[SNAPSHOT_MAGIC.len()..SNAPSHOT_FILE_HEADER_LEN]
+        .copy_from_slice(&(FORMAT_MAJOR + 1).to_le_bytes());
 
     let mut bad_crc = valid_snap.to_vec();
-    let crc_idx = bad_crc.len() - 12;
+    let crc_idx = bad_crc.len() - SNAPSHOT_TRAILER_LEN;
     bad_crc[crc_idx] ^= 0x01;
+
+    let mut bad_magic = Vec::with_capacity(SNAPSHOT_FILE_HEADER_LEN);
+    bad_magic.extend_from_slice(b"BADMAGIC");
+    bad_magic.extend_from_slice(&FORMAT_MAJOR.to_le_bytes());
 
     let mut trailing = valid_snap.to_vec();
     trailing.extend_from_slice(b"trailing");
@@ -4100,7 +4097,7 @@ async fn test_emulator_import_error_matrix_and_live_state_isolation() -> Result<
     let dup_doc = duplicate_first_document_frame(&valid_snap);
 
     for (label, bad_bytes) in [
-        ("bad_magic", b"BADMAGIC\x01\x00".to_vec()),
+        ("bad_magic", bad_magic),
         ("truncated_mid", valid_snap[..valid_snap.len() / 2].to_vec()),
         (
             "truncated_trailer",
@@ -4124,7 +4121,9 @@ async fn test_emulator_import_error_matrix_and_live_state_isolation() -> Result<
     }
 
     let broken_stream = tokio_stream::iter([
-        Ok(Bytes::copy_from_slice(&valid_snap[..10])),
+        Ok(Bytes::copy_from_slice(
+            &valid_snap[..SNAPSHOT_FILE_HEADER_LEN],
+        )),
         Err(std::io::Error::other("simulated disconnect")),
     ]);
     let stream_err_res = client
@@ -4142,9 +4141,10 @@ async fn test_emulator_import_error_matrix_and_live_state_isolation() -> Result<
     expect_eq!(stream_err["error"]["status"], "INVALID_ARGUMENT");
 
     // 3. 413 Payload Too Large when a single frame prefix exceeds MAX_FRAME_BYTES (64 MiB).
-    let mut oversized_frame = Vec::with_capacity(15);
-    oversized_frame.extend_from_slice(b"FSEMUSNP");
-    oversized_frame.extend_from_slice(&1u16.to_le_bytes());
+    let mut oversized_frame =
+        Vec::with_capacity(SNAPSHOT_FILE_HEADER_LEN + SNAPSHOT_FRAME_PREFIX_LEN);
+    oversized_frame.extend_from_slice(&SNAPSHOT_MAGIC);
+    oversized_frame.extend_from_slice(&FORMAT_MAJOR.to_le_bytes());
     oversized_frame.push(0x01);
     oversized_frame.extend_from_slice(&((MAX_FRAME_BYTES as u32) + 1).to_le_bytes());
 
@@ -4623,15 +4623,10 @@ async fn test_emulator_import_concurrent_conflict_409() -> Result<()> {
         StatusCode::OK
     );
 
-    let split = snap.len() / 2;
-    let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
-    let (release_tx, release_rx) = tokio::sync::oneshot::channel();
-    let gated = GatedChunkStream::SendFirst {
-        first: snap.slice(..split),
-        rest: snap.slice(split..),
-        entered_tx: Some(entered_tx),
-        release_rx,
-    };
+    let split_1 = snap.len() / 3;
+    let split_2 = (snap.len() * 2) / 3;
+    let (chunk_tx, chunk_rx) = tokio::sync::mpsc::channel::<std::io::Result<Bytes>>(1);
+    chunk_tx.send(Ok(snap.slice(..split_1))).await.unwrap();
 
     let client_1 = client.clone();
     let first_handle = tokio::spawn(async move {
@@ -4641,12 +4636,17 @@ async fn test_emulator_import_concurrent_conflict_409() -> Result<()> {
                 header::CONTENT_TYPE,
                 HeaderValue::from_static("application/octet-stream"),
             )
-            .stream(gated)
+            .stream(ReceiverStream::new(chunk_rx))
             .send()
             .await
     });
 
-    entered_rx.await?;
+    // Sending chunk 2 across a capacity-1 channel only completes once the import handler has
+    // acquired `import_lock` and consumed chunk 1 inside `import_snapshot`.
+    chunk_tx
+        .send(Ok(snap.slice(split_1..split_2)))
+        .await
+        .unwrap();
 
     // Overlapping second import fails immediately with 409 Conflict (ABORTED).
     let conflict = client
@@ -4659,7 +4659,8 @@ async fn test_emulator_import_concurrent_conflict_409() -> Result<()> {
     expect_eq!(conflict_err["error"]["code"], 409);
     expect_eq!(conflict_err["error"]["status"], "ABORTED");
 
-    let _unused = release_tx.send(());
+    chunk_tx.send(Ok(snap.slice(split_2..))).await.unwrap();
+    drop(chunk_tx);
     let first_res = first_handle.await??;
     expect_eq!(first_res.status(), StatusCode::OK);
     let first_summary: serde_json::Value = first_res.json().await?;
