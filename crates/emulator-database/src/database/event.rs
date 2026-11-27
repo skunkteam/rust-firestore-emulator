@@ -18,10 +18,15 @@ pub struct DatabaseEvent {
 #[derive(Clone, Debug)]
 pub enum ProjectEvent {
     DatabaseCreated {
-        database: RootRef,
+        database:  RootRef,
+        import_id: Option<u64>,
     },
     DatabaseCleared {
         database: RootRef,
+    },
+    DatabaseReplaced {
+        database:  RootRef,
+        import_id: u64,
     },
     DatabaseConfigChanged {
         database: RootRef,

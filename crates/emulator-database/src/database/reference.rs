@@ -52,6 +52,10 @@ pub(crate) fn is_reserved_name(s: &str) -> bool {
     s.starts_with("__") && s.ends_with("__") && s.len() >= 5
 }
 
+fn is_valid_root_segment(s: &str) -> bool {
+    validate_segment(s, false).is_ok()
+}
+
 pub(crate) fn is_datastore_numeric_id(s: &str) -> bool {
     s.strip_prefix("__id")
         .and_then(|rest| rest.strip_suffix("__"))
@@ -123,7 +127,7 @@ fn parse_resource_path(
     let s = s.strip_prefix("projects/")?;
     // Next is the project_id until the next "/"
     let (project_id, s) = s.split_once('/')?;
-    if project_id.is_empty() {
+    if !is_valid_root_segment(project_id) {
         return None;
     }
     // Fixed token "databases/".
@@ -133,7 +137,7 @@ fn parse_resource_path(
         Some((database_id, rest)) => (database_id, rest.strip_prefix("documents")?),
         None => (s, ""),
     };
-    if database_id.is_empty() {
+    if !is_valid_root_segment(database_id) {
         return None;
     }
     if s.is_empty() {
@@ -414,6 +418,16 @@ impl RootRef {
             project_id:  project_id.into(),
             database_id: database_id.into(),
         }
+    }
+
+    pub fn try_new(project_id: &str, database_id: &str) -> crate::error::Result<Self> {
+        if !is_valid_root_segment(project_id) || !is_valid_root_segment(database_id) {
+            return Err(GenericDatabaseError::InvalidReference(
+                "database",
+                format!("projects/{project_id}/databases/{database_id}"),
+            ));
+        }
+        Ok(Self::new(project_id, database_id))
     }
 }
 
@@ -769,6 +783,124 @@ mod tests {
                 _
             )))
         );
+    }
+
+    #[gtest]
+    fn root_ref_try_new_and_from_str_validate_root_segments() {
+        let valid_default = RootRef::try_new("demo-project", "(default)").unwrap();
+        assert_eq!(
+            valid_default,
+            "projects/demo-project/databases/(default)"
+                .parse::<RootRef>()
+                .unwrap()
+        );
+        assert_eq!(
+            valid_default,
+            "projects/demo-project/databases/(default)/documents"
+                .parse::<RootRef>()
+                .unwrap()
+        );
+        assert_eq!(
+            valid_default.to_string(),
+            "projects/demo-project/databases/(default)/documents"
+        );
+
+        let exact_1500_ascii = "a".repeat(1500);
+        let exact_500_cjk = "あ".repeat(500); // 500 * 3 UTF-8 bytes == 1500 bytes
+        assert_that!(
+            RootRef::try_new(&exact_1500_ascii, "(default)"),
+            ok(anything())
+        );
+        assert_that!(RootRef::try_new("p", &exact_500_cjk), ok(anything()));
+
+        assert_that!(
+            RootRef::try_new("p", "d/documents"),
+            err(eq(&GenericDatabaseError::InvalidReference(
+                "database",
+                "projects/p/databases/d/documents".to_string()
+            )))
+        );
+        assert_eq!(
+            "projects/p/databases/d/documents"
+                .parse::<RootRef>()
+                .unwrap(),
+            RootRef::new("p", "d")
+        );
+        for bad_root in [
+            "projects/p/databases/d/extra",
+            "projects/p/databases/d/documents/documents",
+            "projects/d/documents/databases/(default)",
+        ] {
+            assert_that!(
+                bad_root.parse::<RootRef>(),
+                err(matches_pattern!(GenericDatabaseError::InvalidReference(
+                    _,
+                    _
+                )))
+            );
+        }
+
+        let over_1500_ascii = "a".repeat(1501);
+        let over_1500_utf8 = "é".repeat(751); // 751 * 2 UTF-8 bytes == 1502 bytes (> 1500)
+        for (project_id, database_id) in [
+            ("p/sub", "d"),
+            ("d/documents", "d"),
+            ("p", "d/extra"),
+            ("p", "."),
+            (".", "d"),
+            ("p", ".."),
+            ("..", "d"),
+            ("p", ""),
+            ("", "d"),
+            ("p", over_1500_ascii.as_str()),
+            (over_1500_ascii.as_str(), "d"),
+            ("p", over_1500_utf8.as_str()),
+            ("p", "__reserved__"),
+            ("__reserved__", "d"),
+            ("p", "__id123__"),
+            ("__id123__", "d"),
+        ] {
+            let expected_ref = format!("projects/{project_id}/databases/{database_id}");
+            assert_that!(
+                RootRef::try_new(project_id, database_id),
+                err(eq(&GenericDatabaseError::InvalidReference(
+                    "database",
+                    expected_ref.clone()
+                )))
+            );
+            assert_that!(
+                expected_ref.parse::<RootRef>(),
+                err(matches_pattern!(GenericDatabaseError::InvalidReference(
+                    _,
+                    _
+                )))
+            );
+            assert_that!(
+                format!("{expected_ref}/documents").parse::<RootRef>(),
+                err(matches_pattern!(GenericDatabaseError::InvalidReference(
+                    _,
+                    _
+                )))
+            );
+            assert_that!(
+                format!("{expected_ref}/documents/col").parse::<CollectionRef>(),
+                err(matches_pattern!(GenericDatabaseError::InvalidReference(
+                    _,
+                    _
+                )))
+            );
+            assert_that!(
+                format!("{expected_ref}/documents/col/doc").parse::<DocumentRef>(),
+                err(matches_pattern!(GenericDatabaseError::InvalidReference(
+                    _,
+                    _
+                )))
+            );
+            assert_that!(
+                parse_query_ref_root(&format!("{expected_ref}/documents/col/doc")),
+                err(matches_pattern!(GenericDatabaseError::InvalidArgument(_)))
+            );
+        }
     }
 
     #[gtest]

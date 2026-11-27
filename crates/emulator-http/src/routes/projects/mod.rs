@@ -17,7 +17,7 @@ mod admin;
 mod documents;
 mod query_params;
 
-pub(super) use query_params::{decode_raw_path_segments, percent_decode};
+pub(super) use query_params::{decode_raw_path_segments, parse_query_pairs};
 
 const SUBPATH_CUSTOM_VERBS: &[&str] = &[
     "listCollectionIds",
@@ -155,14 +155,7 @@ pub(super) fn parse_raw_root_ref(raw_path: &str) -> Result<RootRef> {
 }
 
 pub(super) fn parse_root_ref(project_id: &str, database_id: &str) -> Result<RootRef> {
-    if project_id.is_empty()
-        || project_id.contains('/')
-        || database_id.is_empty()
-        || database_id.contains('/')
-    {
-        return Err(RestError::bad_request("Invalid project_id or database_id"));
-    }
-    Ok(format!("projects/{project_id}/databases/{database_id}").parse()?)
+    Ok(RootRef::try_new(project_id, database_id)?)
 }
 
 fn extract_raw_project_and_database(raw_path: &str) -> Result<(String, String)> {

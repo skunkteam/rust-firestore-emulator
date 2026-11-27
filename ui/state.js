@@ -22,6 +22,8 @@ import {
  *   | { kind: 'delete_doc', docPath: string, recursive: boolean, hasSubcollections: boolean, busy: boolean, error: string | null }
  *   | { kind: 'delete_col', colPath: string, colId: string, busy: boolean, error: string | null }
  *   | { kind: 'clear_db', projectId: string, databaseId: string, busy: boolean, error: string | null }
+ *   | { kind: 'export_snapshot', busy: boolean, busyScope: 'current' | 'all' | null, error: string | null }
+ *   | { kind: 'import_snapshot', file: File | null, busy: boolean, error: string | null }
  * } ActiveModal
  */
 
@@ -262,6 +264,18 @@ export function deleteDocumentLevelCache(docPath, targetState = state) {
   targetState.documentLevels.delete(docPath);
   if (targetState === state) {
     docRequestSeq.delete(docPath);
+  }
+}
+
+/**
+ * Removes cached collection column state (and its request sequence when targeting the global state) for `colPath`.
+ * @param {string} colPath
+ * @param {AppState} [targetState]
+ */
+export function deleteCollectionColumnCache(colPath, targetState = state) {
+  targetState.collectionColumns.delete(colPath);
+  if (targetState === state) {
+    colRequestSeq.delete(colPath);
   }
 }
 

@@ -49,7 +49,10 @@ import {
   parseRawQueryPayload,
 } from "./components/query-model.js";
 import { renderQueryRunner } from "./components/query.js";
-import { markSuggestionsStale } from "./components/query-suggestions.js";
+import {
+  markSuggestionsStale,
+  resetQuerySuggestionStore,
+} from "./components/query-suggestions.js";
 import {
   getActiveRootPath,
   isValidPathSegment,
@@ -62,6 +65,8 @@ import {
   bumpDbEpoch,
   bumpNavEpoch,
   clearActiveDatabaseState,
+  deleteCollectionColumnCache,
+  deleteDocumentLevelCache,
   dismissToast,
   finishQueryRun,
   getDbEpoch,
@@ -116,6 +121,60 @@ let contentionTickerId = null;
 let connectingContention = false;
 
 const MAX_COLLECTION_COLUMN_PAGES = 1000;
+const MAX_TRACKED_IMPORTS = 64;
+
+/** @type {Map<number, 'local' | Set<string>>} */
+const appliedImports = new Map();
+
+/**
+ * Records a locally applied importId or SSE-applied `(importId, databaseName)` entry
+ * in FIFO insertion order capped at `MAX_TRACKED_IMPORTS` imports.
+ * @param {number} importId
+ * @param {string | null} databaseName Null marks the entire importId as locally applied.
+ */
+function recordTrackedImport(importId, databaseName) {
+  const existing = appliedImports.get(importId);
+  if (databaseName === null) {
+    if (
+      existing === undefined &&
+      appliedImports.size >= MAX_TRACKED_IMPORTS
+    ) {
+      const oldest = appliedImports.keys().next();
+      if (!oldest.done) {
+        appliedImports.delete(oldest.value);
+      }
+    }
+    appliedImports.set(importId, "local");
+    return;
+  }
+  if (existing === "local") {
+    return;
+  }
+  if (existing instanceof Set) {
+    existing.add(databaseName);
+    return;
+  }
+  if (appliedImports.size >= MAX_TRACKED_IMPORTS) {
+    const oldest = appliedImports.keys().next();
+    if (!oldest.done) {
+      appliedImports.delete(oldest.value);
+    }
+  }
+  appliedImports.set(importId, new Set([databaseName]));
+}
+
+/**
+ * Formats an error for UI banners, preserving `[code status] message` for `ApiError`.
+ * @param {unknown} err
+ * @returns {string}
+ */
+function formatApiError(err) {
+  return err instanceof ApiError
+    ? `[${err.code} ${err.status}] ${err.message}`
+    : err instanceof Error
+      ? err.message
+      : String(err);
+}
 
 /**
  * Returns true unless the document is currently hidden.
@@ -287,13 +346,14 @@ function syncContentionLifecycle() {
 }
 
 /**
- * Enqueues an SSE event batch onto the serialized `sseQueue` after running
- * synchronous preemption (`applySyncSseBatch`).
+ * Enqueues an SSE or local snapshot-refresh batch onto the serialized `sseQueue`
+ * after running synchronous preemption (`applySyncSseBatch`).
  * @param {EmulatorSseEvent[]} batch
+ * @param {{ ignorePaused?: boolean }} [options]
  * @returns {Promise<void>}
  */
-function enqueueSseBatch(batch) {
-  const plan = applySyncSseBatch(batch);
+function enqueueSseBatch(batch, options) {
+  const plan = applySyncSseBatch(batch, options);
   if (!plan) return sseQueue;
   sseQueue = sseQueue
     .then(() => applyAsyncSseRefresh(plan))
@@ -359,12 +419,7 @@ export async function refreshContention() {
     ) {
       return;
     }
-    state.contention.error =
-      err instanceof ApiError
-        ? `[${err.code} ${err.status}] ${err.message}`
-        : err instanceof Error
-          ? err.message
-          : String(err);
+    state.contention.error = formatApiError(err);
   } finally {
     if (myDbEpoch === getDbEpoch() && isCurrentContentionSeq(mySeq)) {
       state.contention.loading = false;
@@ -424,12 +479,7 @@ export async function clearContentionHistory() {
     }
   } catch (err) {
     if (myDbEpoch !== getDbEpoch()) return;
-    const message =
-      err instanceof ApiError
-        ? `[${err.code} ${err.status}] ${err.message}`
-        : err instanceof Error
-          ? err.message
-          : String(err);
+    const message = formatApiError(err);
     if (isCurrentClearContext()) {
       state.contention.error = message;
     }
@@ -733,49 +783,86 @@ export async function selectDatabase(
 }
 
 /**
- * Loads all collection columns and document levels along `segmentsSnapshot`.
+ * Loads collection columns and document levels along `segmentsSnapshot`, optionally filtered
+ * by `shouldLoadCol`/`shouldLoadDoc` predicates, returning whether hydration completed or
+ * stopped due to a database or navigation epoch change.
  * @param {number} [expectedDbEpoch]
  * @param {number} [expectedNavEpoch]
  * @param {string[]} [segmentsSnapshot]
+ * @param {{
+ *   expectedActiveRoot?: string | null,
+ *   signal?: AbortSignal,
+ *   isPausedBlocked?: () => boolean,
+ *   shouldLoadCol?: (colPath: string) => boolean,
+ *   shouldLoadDoc?: (docPath: string) => boolean,
+ * }} [options]
+ * @returns {Promise<'ok' | 'stale_db' | 'stale_nav'>}
  */
 export async function hydrateVisiblePath(
   expectedDbEpoch = getDbEpoch(),
   expectedNavEpoch = getNavEpoch(),
-  segmentsSnapshot = [...state.segments]
+  segmentsSnapshot = [...state.segments],
+  options = {}
 ) {
-  if (!state.activeProjectId || !state.activeDatabaseId) return;
-  const rootPath = `projects/${state.activeProjectId}/databases/${state.activeDatabaseId}/documents`;
+  const {
+    expectedActiveRoot = getActiveRootPath(
+      state.activeProjectId,
+      state.activeDatabaseId
+    ),
+    signal,
+    isPausedBlocked,
+    shouldLoadCol,
+    shouldLoadDoc,
+  } = options;
+  const isStaleDb = () =>
+    Boolean(isPausedBlocked?.()) ||
+    Boolean(signal?.aborted) ||
+    expectedDbEpoch !== getDbEpoch() ||
+    !state.activeProjectId ||
+    !state.activeDatabaseId ||
+    getActiveRootPath(state.activeProjectId, state.activeDatabaseId) !==
+      expectedActiveRoot;
+  const isStaleNav = () => expectedNavEpoch !== getNavEpoch();
+
+  if (isStaleDb() || !expectedActiveRoot) return "stale_db";
+  if (isStaleNav()) return "stale_nav";
 
   for (let i = 0; i < segmentsSnapshot.length; i += 2) {
-    if (expectedDbEpoch !== getDbEpoch() || expectedNavEpoch !== getNavEpoch()) {
-      return;
-    }
+    if (isStaleDb()) return "stale_db";
+    if (isStaleNav()) return "stale_nav";
+
     const colId = segmentsSnapshot[i];
     const parentSegments = segmentsSnapshot.slice(0, i);
     const colSegments = segmentsSnapshot.slice(0, i + 1);
     const parentPath =
       parentSegments.length === 0
-        ? rootPath
-        : `${rootPath}/${parentSegments.join("/")}`;
-    const colPath = `${rootPath}/${colSegments.join("/")}`;
+        ? expectedActiveRoot
+        : `${expectedActiveRoot}/${parentSegments.join("/")}`;
+    const colPath = `${expectedActiveRoot}/${colSegments.join("/")}`;
 
-    await loadCollectionColumn(
-      colPath,
-      parentPath,
-      colId,
-      false,
-      expectedDbEpoch
-    );
-    if (expectedDbEpoch !== getDbEpoch() || expectedNavEpoch !== getNavEpoch()) {
-      return;
+    if (!shouldLoadCol || shouldLoadCol(colPath)) {
+      await loadCollectionColumn(
+        colPath,
+        parentPath,
+        colId,
+        false,
+        expectedDbEpoch
+      );
+      if (isStaleDb()) return "stale_db";
+      if (isStaleNav()) return "stale_nav";
     }
 
     if (segmentsSnapshot.length > i + 1) {
       const docId = segmentsSnapshot[i + 1];
       const docPath = `${colPath}/${docId}`;
-      await loadDocumentLevel(docPath, docId, true, expectedDbEpoch);
+      if (!shouldLoadDoc || shouldLoadDoc(docPath)) {
+        await loadDocumentLevel(docPath, docId, true, expectedDbEpoch);
+        if (isStaleDb()) return "stale_db";
+        if (isStaleNav()) return "stale_nav";
+      }
     }
   }
+  return "ok";
 }
 
 /**
@@ -1051,24 +1138,133 @@ export async function loadDocumentLevel(
  *   shouldRefreshMeta: boolean,
  *   fullResyncActiveDb: boolean,
  *   clearedActiveDb: boolean,
+ *   replacedActiveDb: boolean,
+ *   anyDatabaseReplaced: boolean,
+ *   ignorePaused: boolean,
  *   changedPaths: Set<string>,
  * }} SseRefreshPlan
  */
 
 /**
- * Synchronously processes an SSE batch: preempts cleared databases (rotating DB
- * cancellation signals, clearing active caches and query suggestions), updates URL/toasts,
- * and marks matching suggestion caches stale without firing HTTP requests.
+ * Returns true if any open document along `segments` under `activeRoot` has unsaved edits.
+ * @param {string} activeRoot
+ * @param {string[]} segments
+ * @returns {boolean}
+ */
+function hasDirtySegmentAlongPath(activeRoot, segments) {
+  for (let i = 1; i < segments.length; i += 2) {
+    const docPath = `${activeRoot}/${segments.slice(0, i + 1).join("/")}`;
+    if (state.documentLevels.get(docPath)?.editorSession?.isDirty) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * Truncates clean stale explorer segments to the deepest surviving prefix after replacement.
+ * Leaves `state.segments` untouched if any open document along the path has unsaved edits.
+ * @param {string} activeRoot
+ */
+function truncateStaleSegmentsAfterReplace(activeRoot) {
+  if (
+    state.segments.length === 0 ||
+    hasDirtySegmentAlongPath(activeRoot, state.segments)
+  ) {
+    return;
+  }
+
+  let survivingLen = 0;
+  if (state.rootCollections.includes(state.segments[0])) {
+    survivingLen = 1;
+    for (let i = 1; i < state.segments.length; i += 2) {
+      const docPath = `${activeRoot}/${state.segments.slice(0, i + 1).join("/")}`;
+      const level = state.documentLevels.get(docPath);
+      if (!level || (!level.exists && level.subcollections.length === 0)) {
+        break;
+      }
+      survivingLen = i + 1;
+      if (i + 1 < state.segments.length) {
+        const subcolId = state.segments[i + 1];
+        if (!level.subcollections.includes(subcolId)) {
+          break;
+        }
+        survivingLen = i + 2;
+      }
+    }
+  }
+
+  if (survivingLen < state.segments.length) {
+    state.segments = state.segments.slice(0, survivingLen);
+    bumpNavEpoch();
+    syncUrl(true);
+  }
+}
+
+/**
+ * Prunes non-visible collection columns and non-dirty non-visible document levels after replacement.
+ * @param {string} activeRoot
+ */
+function pruneInvisibleCachesAfterReplace(activeRoot) {
+  /** @type {Set<string>} */
+  const visibleColPaths = new Set();
+  /** @type {Set<string>} */
+  const visibleDocPaths = new Set();
+  for (let i = 0; i < state.segments.length; i += 2) {
+    visibleColPaths.add(
+      `${activeRoot}/${state.segments.slice(0, i + 1).join("/")}`
+    );
+    if (i + 1 < state.segments.length) {
+      visibleDocPaths.add(
+        `${activeRoot}/${state.segments.slice(0, i + 2).join("/")}`
+      );
+    }
+  }
+
+  for (const key of Array.from(state.collectionColumns.keys())) {
+    if (!visibleColPaths.has(key)) {
+      deleteCollectionColumnCache(key);
+    }
+  }
+  for (const [key, level] of Array.from(state.documentLevels.entries())) {
+    if (!visibleDocPaths.has(key) && !level.editorSession?.isDirty) {
+      deleteDocumentLevelCache(key);
+    }
+  }
+}
+
+/**
+ * Clears active database caches and URL without issuing metadata reads that would recreate a cleared DB.
+ * @param {string} clearedRoot
+ * @returns {number} New database epoch
+ */
+function clearActiveDatabaseFromSse(clearedRoot) {
+  const nextEpoch = bumpDbEpoch();
+  bumpNavEpoch();
+  clearActiveDatabaseState(state);
+  syncUrl(true);
+  notifyToast(`Database ${clearedRoot} was cleared`, "info");
+  return nextEpoch;
+}
+
+/**
+ * Synchronously processes an SSE batch: preempts cleared or replaced databases
+ * (rotating cancellation signals, clearing active caches/query state and suggestions),
+ * updates URL/toasts, and marks matching suggestion caches stale without firing HTTP requests.
  * @param {EmulatorSseEvent[]} events
+ * @param {{ ignorePaused?: boolean }} [options]
  * @returns {SseRefreshPlan | null}
  */
-export function applySyncSseBatch(events) {
-  if (state.ssePaused) return null;
+export function applySyncSseBatch(events, options = {}) {
+  const ignorePaused = Boolean(options?.ignorePaused);
+  if (state.ssePaused && !ignorePaused) return null;
 
   let shouldRefreshDbList = false;
   let shouldRefreshMeta = false;
   let fullResyncActiveDb = false;
   let clearedActiveDb = false;
+  let replacedActiveDb = false;
+  let anyDatabaseReplaced = false;
   /** @type {Set<string>} */
   const changedPaths = new Set();
 
@@ -1077,10 +1273,31 @@ export function applySyncSseBatch(events) {
     state.activeDatabaseId
   );
 
+  const markActiveDatabaseCleared = (/** @type {string} */ clearedRoot) => {
+    clearActiveDatabaseFromSse(clearedRoot);
+    clearedActiveDb = true;
+    replacedActiveDb = false;
+    fullResyncActiveDb = false;
+    shouldRefreshMeta = false;
+    changedPaths.clear();
+  };
+
   for (const ev of events) {
+    if (
+      (ev.type === "database_replaced" || ev.type === "database_created") &&
+      typeof ev.importId === "number" &&
+      Number.isFinite(ev.importId)
+    ) {
+      if (appliedImports.get(ev.importId) === "local") {
+        continue;
+      }
+      recordTrackedImport(ev.importId, ev.database ?? "");
+    }
     if (ev.type === "resync") {
       shouldRefreshDbList = true;
-      fullResyncActiveDb = true;
+      if (!clearedActiveDb) {
+        fullResyncActiveDb = true;
+      }
       continue;
     }
     if (ev.type === "database_created") {
@@ -1097,25 +1314,28 @@ export function applySyncSseBatch(events) {
           (db) => db.rootPath !== ev.database
         );
       }
-      if (ev.database && ev.database === activeRoot) {
-        // Clear cached state WITHOUT calling /v1/projects/... so we never re-create the cleared database!
-        bumpDbEpoch();
-        bumpNavEpoch();
-        clearedActiveDb = true;
-        clearActiveDatabaseState(state);
-        syncUrl(true);
-        notifyToast(`Database ${ev.database} was cleared`, "info");
+      if (ev.database && activeRoot !== null && ev.database === activeRoot) {
+        markActiveDatabaseCleared(ev.database);
+      }
+      continue;
+    }
+    if (ev.type === "database_replaced") {
+      shouldRefreshDbList = true;
+      anyDatabaseReplaced = true;
+      if (!clearedActiveDb && activeRoot !== null && ev.database === activeRoot) {
+        fullResyncActiveDb = true;
+        replacedActiveDb = true;
       }
       continue;
     }
     if (ev.type === "database_config_changed") {
-      if (ev.database && ev.database === activeRoot) {
+      if (!clearedActiveDb && activeRoot !== null && ev.database === activeRoot) {
         shouldRefreshMeta = true;
       }
       continue;
     }
     if (ev.type === "documents_changed") {
-      if (ev.database && ev.database === activeRoot) {
+      if (!clearedActiveDb && activeRoot !== null && ev.database === activeRoot) {
         for (const p of ev.paths ?? []) {
           changedPaths.add(p);
         }
@@ -1123,7 +1343,11 @@ export function applySyncSseBatch(events) {
     }
   }
 
-  if (!clearedActiveDb) {
+  if (replacedActiveDb && !clearedActiveDb) {
+    abortActiveQueryRun();
+    state.queryState = createQueryRunnerState();
+    resetQuerySuggestionStore(state.querySuggestions);
+  } else if (!clearedActiveDb) {
     if (fullResyncActiveDb) {
       markSuggestionsStale(state.querySuggestions, "all");
     } else if (changedPaths.size > 0) {
@@ -1136,6 +1360,8 @@ export function applySyncSseBatch(events) {
     !shouldRefreshMeta &&
     !fullResyncActiveDb &&
     !clearedActiveDb &&
+    !replacedActiveDb &&
+    !anyDatabaseReplaced &&
     changedPaths.size === 0
   ) {
     return null;
@@ -1149,6 +1375,9 @@ export function applySyncSseBatch(events) {
     shouldRefreshMeta,
     fullResyncActiveDb,
     clearedActiveDb,
+    replacedActiveDb,
+    anyDatabaseReplaced,
+    ignorePaused,
     changedPaths,
   };
 }
@@ -1160,7 +1389,9 @@ export function applySyncSseBatch(events) {
  * @returns {Promise<void>}
  */
 export async function applyAsyncSseRefresh(plan) {
-  if (!plan || state.ssePaused) return;
+  if (!plan) return;
+  const isPausedBlocked = () => state.ssePaused && !plan.ignorePaused;
+  if (isPausedBlocked()) return;
   const myDbEpoch = plan.dbEpoch ?? getDbEpoch();
   const signal = plan.signal ?? getDbSignal();
   const isStale = () => myDbEpoch !== getDbEpoch() || signal.aborted;
@@ -1169,22 +1400,24 @@ export async function applyAsyncSseRefresh(plan) {
     shouldRefreshDbList,
     fullResyncActiveDb,
     clearedActiveDb,
+    replacedActiveDb,
+    shouldRefreshMeta,
   } = plan;
-  const { shouldRefreshMeta, changedPaths, activeRoot } = plan;
+  const { anyDatabaseReplaced, changedPaths, activeRoot } = plan;
 
   if (shouldRefreshDbList) {
     let applied = false;
     try {
       applied = await refreshDatabaseList();
     } catch (err) {
-      if (state.ssePaused || isStale() || isAbortError(err)) return;
+      if (isPausedBlocked() || isStale() || isAbortError(err)) return;
       fullResyncActiveDb = false;
       notifyToast(
         `Failed to refresh database list: ${err instanceof Error ? err.message : String(err)}`,
         "error"
       );
     }
-    if (state.ssePaused) return;
+    if (isPausedBlocked()) return;
     if (
       applied &&
       !isStale() &&
@@ -1196,19 +1429,19 @@ export async function applyAsyncSseRefresh(plan) {
       !state.databases.some((db) => db.rootPath === activeRoot)
     ) {
       // Clear cached state WITHOUT calling getDatabase(), which would lazily recreate the cleared DB!
-      bumpDbEpoch();
-      bumpNavEpoch();
+      clearActiveDatabaseFromSse(activeRoot);
       clearedActiveDb = true;
-      clearActiveDatabaseState(state);
-      syncUrl(true);
-      notifyToast(`Database ${activeRoot} was cleared`, "info");
+      replacedActiveDb = false;
+      fullResyncActiveDb = false;
+      shouldRefreshMeta = false;
+      changedPaths.clear();
     }
     // If no active DB is selected and a DB now exists, auto-select the first one cleanly.
     if (
       applied &&
       !state.activeProjectId &&
       state.databases.length > 0 &&
-      !state.ssePaused
+      !isPausedBlocked()
     ) {
       const first = state.databases[0];
       await selectDatabase(first.projectId, first.databaseId, [], true);
@@ -1217,19 +1450,24 @@ export async function applyAsyncSseRefresh(plan) {
     renderApp();
   }
 
-  if (
-    state.ssePaused ||
+  const isStaleDb = () =>
+    isPausedBlocked() ||
     isStale() ||
+    getActiveRootPath(state.activeProjectId, state.activeDatabaseId) !==
+      activeRoot;
+
+  if (
     clearedActiveDb ||
     state.rootLoading ||
     !state.activeProjectId ||
     !state.activeDatabaseId ||
     !activeRoot ||
-    getActiveRootPath(state.activeProjectId, state.activeDatabaseId) !==
-      activeRoot
+    isStaleDb()
   ) {
     return;
   }
+
+  let didUpdateState = replacedActiveDb;
 
   if (shouldRefreshMeta || fullResyncActiveDb) {
     try {
@@ -1238,94 +1476,123 @@ export async function applyAsyncSseRefresh(plan) {
         state.activeDatabaseId,
         { signal }
       );
-      if (
-        state.ssePaused ||
-        isStale() ||
-        getActiveRootPath(state.activeProjectId, state.activeDatabaseId) !==
-          activeRoot
-      ) {
+      if (isStaleDb()) {
         return;
       }
       state.activeDbMeta = meta;
+      didUpdateState = true;
     } catch (err) {
-      if (state.ssePaused || isStale() || isAbortError(err)) return;
+      if (isStaleDb() || isAbortError(err)) return;
       // Ignore transient error
     }
   }
 
-  if (state.ssePaused || isStale()) return;
+  if (isStaleDb()) return;
+
+  if (anyDatabaseReplaced) {
+    const affectsContention =
+      replacedActiveDb || state.contention.scope === "all";
+    if (affectsContention) {
+      const needsFallbackRefresh =
+        state.view === "contention" &&
+        (!shouldConnectContentionSse() || state.contentionSseStatus !== "live");
+      if (state.view !== "contention" || needsFallbackRefresh) {
+        state.contention.snapshot = null;
+        state.contention.lastFetchedAtMs = null;
+        state.contention.lastFetchedIso = null;
+        state.contention.error = null;
+        didUpdateState = true;
+      }
+      if (needsFallbackRefresh) {
+        await refreshContention();
+        if (isStaleDb()) {
+          return;
+        }
+        didUpdateState = false;
+      }
+    }
+  }
 
   if (fullResyncActiveDb || changedPaths.size > 0) {
+    const myNavEpoch = getNavEpoch();
+    const segmentsSnapshot = [...state.segments];
+    let rootColsLoaded = false;
     try {
       const cols = await listCollectionIds(activeRoot, {
         signal,
-        shouldAbort: () =>
-          state.ssePaused ||
-          isStale() ||
-          getActiveRootPath(state.activeProjectId, state.activeDatabaseId) !==
-            activeRoot,
+        shouldAbort: isStaleDb,
       });
-      if (
-        state.ssePaused ||
-        isStale() ||
-        getActiveRootPath(state.activeProjectId, state.activeDatabaseId) !==
-          activeRoot
-      ) {
+      if (isStaleDb()) {
         return;
       }
       state.rootCollections = cols;
+      rootColsLoaded = true;
     } catch (err) {
-      if (state.ssePaused || isStale() || isAbortError(err)) return;
+      if (isStaleDb() || isAbortError(err)) return;
       // Ignore transient error
     }
+    if (isStaleDb()) {
+      return;
+    }
 
-    if (state.ssePaused || isStale()) return;
-    const myNavEpoch = getNavEpoch();
-    const segmentsSnapshot = [...state.segments];
-    for (let i = 0; i < segmentsSnapshot.length; i += 2) {
-      if (state.ssePaused || isStale() || myNavEpoch !== getNavEpoch()) return;
-      const colId = segmentsSnapshot[i];
-      const parentSegments = segmentsSnapshot.slice(0, i);
-      const colSegments = segmentsSnapshot.slice(0, i + 1);
-      const parentPath =
-        parentSegments.length === 0
-          ? activeRoot
-          : `${activeRoot}/${parentSegments.join("/")}`;
-      const colPath = `${activeRoot}/${colSegments.join("/")}`;
+    const changedPathList = [...changedPaths];
+    const skipVanishedReplacedPath =
+      replacedActiveDb &&
+      rootColsLoaded &&
+      segmentsSnapshot.length > 0 &&
+      !state.rootCollections.includes(segmentsSnapshot[0]) &&
+      !hasDirtySegmentAlongPath(activeRoot, segmentsSnapshot);
 
-      const affectsCollection =
-        fullResyncActiveDb ||
-        Array.from(changedPaths).some((p) => p.startsWith(`${colPath}/`));
-
-      if (affectsCollection) {
-        await loadCollectionColumn(colPath, parentPath, colId, false, myDbEpoch);
-      }
-      if (state.ssePaused || isStale() || myNavEpoch !== getNavEpoch()) return;
-
-      if (segmentsSnapshot.length > i + 1) {
-        const docId = segmentsSnapshot[i + 1];
-        const docPath = `${colPath}/${docId}`;
-        const affectsDoc =
-          fullResyncActiveDb ||
-          changedPaths.has(docPath) ||
-          Array.from(changedPaths).some((p) => p.startsWith(`${docPath}/`));
-        if (affectsDoc) {
-          await loadDocumentLevel(docPath, docId, true, myDbEpoch);
+    /** @type {'ok' | 'stale_db' | 'stale_nav'} */
+    let hydrateOutcome = "ok";
+    if (myNavEpoch !== getNavEpoch()) {
+      hydrateOutcome = "stale_nav";
+    } else if (!skipVanishedReplacedPath) {
+      hydrateOutcome = await hydrateVisiblePath(
+        myDbEpoch,
+        myNavEpoch,
+        segmentsSnapshot,
+        {
+          expectedActiveRoot: activeRoot,
+          signal,
+          isPausedBlocked,
+          shouldLoadCol: (colPath) =>
+            fullResyncActiveDb ||
+            changedPathList.some((p) => p.startsWith(`${colPath}/`)),
+          shouldLoadDoc: (docPath) =>
+            fullResyncActiveDb ||
+            changedPaths.has(docPath) ||
+            changedPathList.some((p) => p.startsWith(`${docPath}/`)),
         }
+      );
+    }
+
+    if (hydrateOutcome === "stale_db" || isStaleDb()) {
+      return;
+    }
+
+    if (replacedActiveDb) {
+      if (hydrateOutcome === "ok" && rootColsLoaded) {
+        truncateStaleSegmentsAfterReplace(activeRoot);
       }
+      pruneInvisibleCachesAfterReplace(activeRoot);
     }
-    if (!state.ssePaused && !isStale()) {
-      renderApp();
-    }
+
+    didUpdateState = true;
+  }
+
+  if (didUpdateState) {
+    renderApp();
   }
 }
 
 /**
  * Handles debounced SSE invalidation batches without clobbering dirty edits or resurrecting cleared databases.
  * @param {EmulatorSseEvent[]} events
+ * @param {{ ignorePaused?: boolean }} [options]
  */
-export async function handleSseBatch(events) {
-  const plan = applySyncSseBatch(events);
+export async function handleSseBatch(events, options = {}) {
+  const plan = applySyncSseBatch(events, options);
   if (plan) {
     await applyAsyncSseRefresh(plan);
   }
@@ -1486,12 +1753,7 @@ export async function executeCurrentQuery() {
     if (!isCurrentRun() || isAbortError(err)) {
       return;
     }
-    qState.error =
-      err instanceof ApiError
-        ? `[${err.code} ${err.status}] ${err.message}`
-        : err instanceof Error
-          ? err.message
-          : String(err);
+    qState.error = formatApiError(err);
   } finally {
     finishQueryRun(controller);
     if (myDbEpoch === getDbEpoch() && isCurrentQueryRunSeq(mySeq)) {
@@ -1554,6 +1816,26 @@ function openDatabaseModal() {
     projectId: state.activeProjectId ?? "demo-project",
     databaseId: state.activeDatabaseId ?? "(default)",
     edition: "STANDARD",
+    busy: false,
+    error: null,
+  };
+  renderApp();
+}
+
+function openExportModal() {
+  state.modal = {
+    kind: "export_snapshot",
+    busy: false,
+    busyScope: null,
+    error: null,
+  };
+  renderApp();
+}
+
+function openImportModal() {
+  state.modal = {
+    kind: "import_snapshot",
+    file: null,
     busy: false,
     error: null,
   };
@@ -1753,6 +2035,28 @@ export function renderTopbar() {
 
         <button
           type="button"
+          class="btn btn-sm"
+          title="Import a .fsemu snapshot"
+          @click=${openImportModal}
+        >
+          Import
+        </button>
+
+        ${state.databases.length > 0
+          ? html`
+              <button
+                type="button"
+                class="btn btn-sm"
+                title="Export databases to a .fsemu snapshot"
+                @click=${openExportModal}
+              >
+                Export
+              </button>
+            `
+          : nothing}
+
+        <button
+          type="button"
           class="sse-badge"
           title="Click to pause or resume live SSE updates"
           @click=${toggleSsePaused}
@@ -1775,16 +2079,20 @@ export function renderWorkspace() {
       <div class="empty-hero">
         <h2>No Active Firestore Database</h2>
         <p>
-          Connect your test suite to automatically populate databases, or create
-          a database right now to start adding collections and documents.
+          Connect your test suite to automatically populate databases, create a database right now, or import a saved .fsemu snapshot.
         </p>
-        <button
-          type="button"
-          class="btn btn-primary"
-          @click=${openDatabaseModal}
-        >
-          + Open / Create Database
-        </button>
+        <div class="empty-hero-actions">
+          <button
+            type="button"
+            class="btn btn-primary"
+            @click=${openDatabaseModal}
+          >
+            + Open / Create Database
+          </button>
+          <button type="button" class="btn" @click=${openImportModal}>
+            Import Snapshot
+          </button>
+        </div>
       </div>
     `;
   }
@@ -1912,6 +2220,34 @@ export function renderModal() {
     onHydrateVisiblePath: hydrateVisiblePath,
     onRefreshDatabaseList: refreshDatabaseList,
     onToast: notifyToast,
+    onImportSuccess: async (summary) => {
+      const importId =
+        typeof summary.importId === "number" &&
+        Number.isFinite(summary.importId)
+          ? summary.importId
+          : null;
+      const tracked =
+        importId !== null ? appliedImports.get(importId) : undefined;
+      const databasesToApply =
+        tracked === "local"
+          ? []
+          : tracked instanceof Set
+            ? summary.databases.filter((d) => !tracked.has(d.name))
+            : summary.databases;
+      if (importId !== null) {
+        recordTrackedImport(importId, null);
+      }
+      if (databasesToApply.length === 0) {
+        return;
+      }
+      const filteredEvents = databasesToApply.map((d) => ({
+        type: /** @type {'database_replaced' | 'database_created'} */ (
+          d.replaced ? "database_replaced" : "database_created"
+        ),
+        database: d.name,
+      }));
+      await enqueueSseBatch(filteredEvents, { ignorePaused: true });
+    },
   });
 }
 
@@ -1981,12 +2317,16 @@ function syncModalAccessibility(wasOpenBefore, prevActiveBeforeRender) {
           ? modalRootEl.querySelector('[role="dialog"]')
           : null;
       if (!dialogEl) return;
-      const initialField =
+      const query =
         typeof dialogEl.querySelector === "function"
-          ? dialogEl.querySelector(
-              'input:not([disabled]):not([type="hidden"]), select:not([disabled]), textarea:not([disabled])'
-            )
+          ? (/** @type {string} */ sel) => dialogEl.querySelector(sel)
           : null;
+      const initialField = query
+        ? (query("[data-autofocus]:not([disabled])") ??
+          query(
+            'input:not([disabled]):not([type="hidden"]), select:not([disabled]), textarea:not([disabled])'
+          ))
+        : null;
       const fallback = getModalFocusableElements(dialogEl)[0] ?? dialogEl;
       const target = /** @type {Partial<HTMLElement>} */ (
         initialField ?? fallback
@@ -2072,6 +2412,7 @@ function ensureVisibilityListener() {
  * Initializes event listeners, SSE streaming, and initial database/route hydration.
  */
 export async function init() {
+  appliedImports.clear();
   state.sseStatus = "live";
   nextContentionSeq();
   closeContentionEventStream();

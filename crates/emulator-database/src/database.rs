@@ -2,7 +2,7 @@ use std::{
     collections::{BTreeSet, HashMap, HashSet},
     sync::{
         Arc, Weak,
-        atomic::{self, AtomicBool},
+        atomic::{self, AtomicBool, AtomicU8},
     },
 };
 
@@ -41,6 +41,7 @@ use self::{
 };
 use crate::{
     FirestoreProject, GenericDatabaseError,
+    config::{DatabaseConcurrencyMode, DatabaseEdition, DatabaseSettings},
     database::field_path::FieldReference,
     error::{AbortReason, Result},
     unimplemented_bool,
@@ -48,7 +49,7 @@ use crate::{
 };
 
 mod aggregation;
-mod collection;
+pub(crate) mod collection;
 mod commit;
 pub(crate) mod document;
 pub mod event;
@@ -61,7 +62,7 @@ pub mod read_consistency;
 pub mod reference;
 pub(crate) mod timeouts;
 pub(crate) mod transaction;
-mod validation;
+pub(crate) mod validation;
 pub(crate) mod vector;
 
 pub(crate) fn ensure_owns_root(expected: &RootRef, actual: &RootRef) -> Result<()> {
@@ -73,20 +74,51 @@ pub(crate) fn ensure_owns_root(expected: &RootRef, actual: &RootRef) -> Result<(
     Ok(())
 }
 
-const MAX_EVENT_BACKLOG: usize = 1024;
+pub(crate) const MAX_EVENT_BACKLOG: usize = 1024;
+const BIT_ENTERPRISE: u8 = 0b01;
+const BIT_OPTIMISTIC: u8 = 0b10;
+
+const fn pack_settings(settings: DatabaseSettings) -> u8 {
+    let mut bits = 0;
+    if matches!(settings.edition, DatabaseEdition::Enterprise) {
+        bits |= BIT_ENTERPRISE;
+    }
+    if matches!(
+        settings.concurrency_mode,
+        DatabaseConcurrencyMode::Optimistic
+    ) {
+        bits |= BIT_OPTIMISTIC;
+    }
+    bits
+}
+
+const fn unpack_settings(bits: u8) -> DatabaseSettings {
+    let edition = DatabaseEdition::from_enterprise(bits & BIT_ENTERPRISE != 0);
+    let concurrency_mode = DatabaseConcurrencyMode::from_optimistic(bits & BIT_OPTIMISTIC != 0);
+    DatabaseSettings {
+        edition,
+        concurrency_mode,
+    }
+}
+
+#[derive(Debug)]
+enum EventChannel {
+    Idle,
+    Active(broadcast::Sender<Arc<DatabaseEvent>>),
+    Cleared,
+}
 
 #[derive(Debug)]
 pub struct FirestoreDatabase {
     project: &'static FirestoreProject,
     pub name: RootRef,
-    enterprise_edition: AtomicBool,
-    optimistic_concurrency: AtomicBool,
+    settings: AtomicU8,
     cleared: AtomicBool,
     collections: RwLock<HashMap<DefaultAtom, Arc<Collection>>>,
     pub(crate) locks: Arc<LockManager>,
     transactions: RunningTransactions,
     optimistic_commit_lock: Mutex<()>,
-    events: std::sync::Mutex<Option<broadcast::Sender<Arc<DatabaseEvent>>>>,
+    events: std::sync::Mutex<EventChannel>,
 }
 
 impl FirestoreDatabase {
@@ -95,6 +127,26 @@ impl FirestoreDatabase {
         name: RootRef,
         enterprise_edition: bool,
     ) -> Arc<Self> {
+        let edition = DatabaseEdition::from_enterprise(enterprise_edition);
+        Self::new_with_config_and_collections(
+            project,
+            name,
+            DatabaseSettings::for_edition(edition),
+            HashMap::new(),
+        )
+    }
+
+    pub(crate) fn new_with_config_and_collections(
+        project: &'static FirestoreProject,
+        name: RootRef,
+        settings: DatabaseSettings,
+        collections: HashMap<DefaultAtom, Arc<Collection>>,
+    ) -> Arc<Self> {
+        debug_assert!(
+            collections
+                .iter()
+                .all(|(id, col)| *id == col.name.collection_id && col.name.root_ref == name)
+        );
         let locks = Arc::new(LockManager::with_broadcaster(
             name.clone(),
             project.timeouts,
@@ -103,14 +155,13 @@ impl FirestoreDatabase {
         let db = Arc::new_cyclic(|database| FirestoreDatabase {
             project,
             name,
-            enterprise_edition: AtomicBool::new(enterprise_edition),
-            optimistic_concurrency: AtomicBool::new(enterprise_edition),
+            settings: AtomicU8::new(pack_settings(settings)),
             cleared: AtomicBool::new(false),
-            collections: Default::default(),
+            collections: RwLock::new(collections),
             locks: Arc::clone(&locks),
             transactions: RunningTransactions::new(Weak::clone(database), locks, project.timeouts),
             optimistic_commit_lock: Default::default(),
-            events: std::sync::Mutex::new(Some(broadcast::channel(MAX_EVENT_BACKLOG).0)),
+            events: std::sync::Mutex::new(EventChannel::Idle),
         });
         db.locks.set_reaper(Arc::downgrade(&db));
         db
@@ -118,12 +169,14 @@ impl FirestoreDatabase {
 
     pub(crate) fn mark_cleared(&self) {
         self.cleared.store(true, atomic::Ordering::Release);
-        let sender = self
-            .events
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .take();
-        drop(sender);
+        let prev = {
+            let mut events = self
+                .events
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            std::mem::replace(&mut *events, EventChannel::Cleared)
+        };
+        drop(prev);
         self.locks.abort_all(AbortReason::DatabaseCleared);
         self.transactions.clear_all();
     }
@@ -309,7 +362,7 @@ impl FirestoreDatabase {
     }
     /// Get all collections asap collected into a [`Vec`] in order to keep the read lock time
     /// minimal.
-    async fn get_all_collections(&self) -> Vec<Arc<Collection>> {
+    pub(crate) async fn get_all_collections(&self) -> Vec<Arc<Collection>> {
         self.collections
             .read()
             .await
@@ -698,9 +751,9 @@ impl FirestoreDatabase {
             .events
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let Some(sender) = events.as_ref() else {
+        if matches!(*events, EventChannel::Cleared) {
             return;
-        };
+        }
         if !event.updates.is_empty() {
             let mut paths: Vec<String> = event.updates.keys().map(ToString::to_string).collect();
             paths.sort();
@@ -711,57 +764,101 @@ impl FirestoreDatabase {
                     update_time: event.update_time,
                 });
         }
-        // A send operation can only fail if there are no active receivers,
-        // which is ok by me.
-        let _unused = sender.send(event.into());
+        if let EventChannel::Active(sender) = &*events {
+            // A send operation can only fail if there are no active receivers,
+            // which is ok by me.
+            let _unused = sender.send(event.into());
+        }
     }
 
     pub fn subscribe(&self) -> Receiver<Arc<DatabaseEvent>> {
-        self.events
+        let mut events = self
+            .events
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .as_ref()
-            .map_or_else(|| broadcast::channel(1).1, broadcast::Sender::subscribe)
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match &*events {
+            EventChannel::Active(sender) => sender.subscribe(),
+            EventChannel::Idle => {
+                let (tx, rx) = broadcast::channel(MAX_EVENT_BACKLOG);
+                *events = EventChannel::Active(tx);
+                rx
+            }
+            EventChannel::Cleared => broadcast::channel(1).1,
+        }
+    }
+
+    pub fn settings(&self) -> DatabaseSettings {
+        unpack_settings(self.settings.load(atomic::Ordering::Acquire))
     }
 
     pub fn enterprise_edition(&self) -> bool {
-        self.enterprise_edition.load(atomic::Ordering::Relaxed)
+        self.settings().edition == DatabaseEdition::Enterprise
     }
 
     pub fn set_enterprise_edition(&self, enterprise_edition: bool) {
-        self.update_config(Some(enterprise_edition), None);
+        self.update_settings(|s| {
+            s.edition = DatabaseEdition::from_enterprise(enterprise_edition);
+        });
     }
 
     pub fn optimistic_concurrency(&self) -> bool {
-        self.optimistic_concurrency.load(atomic::Ordering::Relaxed)
+        self.settings().concurrency_mode == DatabaseConcurrencyMode::Optimistic
     }
 
     pub fn set_optimistic_concurrency(&self, optimistic_concurrency: bool) {
-        self.update_config(None, Some(optimistic_concurrency));
+        self.update_settings(|s| {
+            s.concurrency_mode = DatabaseConcurrencyMode::from_optimistic(optimistic_concurrency);
+        });
     }
 
     pub fn set_config(&self, enterprise_edition: bool, optimistic_concurrency: bool) {
-        self.update_config(Some(enterprise_edition), Some(optimistic_concurrency));
+        self.update_settings(|s| {
+            s.edition = DatabaseEdition::from_enterprise(enterprise_edition);
+            s.concurrency_mode = DatabaseConcurrencyMode::from_optimistic(optimistic_concurrency);
+        });
     }
 
-    fn update_config(&self, enterprise: Option<bool>, optimistic: Option<bool>) {
+    fn apply_settings_update(
+        &self,
+        events: &EventChannel,
+        update: impl FnOnce(&mut DatabaseSettings),
+    ) -> DatabaseSettings {
+        let prev = self.settings.load(atomic::Ordering::Acquire);
+        let mut next_settings = unpack_settings(prev);
+        update(&mut next_settings);
+        let next = pack_settings(next_settings);
+        if next != prev {
+            self.settings.store(next, atomic::Ordering::Release);
+            if !self.is_cleared() && !matches!(events, EventChannel::Cleared) {
+                self.project
+                    .send_project_event(ProjectEvent::DatabaseConfigChanged {
+                        database: self.name.clone(),
+                    });
+            }
+        }
+        next_settings
+    }
+
+    pub fn update_settings(&self, update: impl FnOnce(&mut DatabaseSettings)) -> DatabaseSettings {
         let events = self
             .events
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let enterprise_changed = enterprise
-            .is_some_and(|val| self.enterprise_edition.swap(val, atomic::Ordering::Relaxed) != val);
-        let optimistic_changed = optimistic.is_some_and(|val| {
-            self.optimistic_concurrency
-                .swap(val, atomic::Ordering::Relaxed)
-                != val
-        });
-        if (enterprise_changed || optimistic_changed) && events.is_some() {
-            self.project
-                .send_project_event(ProjectEvent::DatabaseConfigChanged {
-                    database: self.name.clone(),
-                });
+        self.apply_settings_update(&events, update)
+    }
+
+    pub fn try_update_settings(
+        &self,
+        update: impl FnOnce(&mut DatabaseSettings),
+    ) -> Result<DatabaseSettings> {
+        let events = self
+            .events
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if self.is_cleared() || matches!(*events, EventChannel::Cleared) {
+            return Err(AbortReason::DatabaseCleared.into());
         }
+        Ok(self.apply_settings_update(&events, update))
     }
 }
 
@@ -2467,5 +2564,289 @@ mod tests {
                 .unwrap(),
             (vec!["parents".to_string()], String::new())
         );
+    }
+
+    #[tokio::test]
+    async fn packed_settings_and_new_with_config_and_collections_roundtrip() {
+        let project: &'static FirestoreProject =
+            Box::leak(Box::new(FirestoreProject::new(FirestoreConfig::default())));
+        let mut proj_rx = project.subscribe_project_events();
+        let root: RootRef = "projects/p/databases/(default)".parse().unwrap();
+
+        let sub_col_ref: CollectionRef = "projects/p/databases/(default)/documents/rooms/r1/\
+                                          messages"
+            .parse()
+            .unwrap();
+        let sub_col = Arc::new(Collection::new(sub_col_ref.clone()));
+        let custom_settings = DatabaseSettings {
+            edition: DatabaseEdition::Standard,
+            concurrency_mode: DatabaseConcurrencyMode::Optimistic,
+        };
+
+        let db = FirestoreDatabase::new_with_config_and_collections(
+            project,
+            root.clone(),
+            custom_settings,
+            HashMap::from([(sub_col_ref.collection_id.clone(), Arc::clone(&sub_col))]),
+        );
+
+        assert_eq!(db.settings(), custom_settings);
+        assert!(!db.enterprise_edition());
+        assert!(db.optimistic_concurrency());
+        assert_eq!(db.get_all_collections().await.len(), 1);
+        assert!(
+            proj_rx.try_recv().is_err(),
+            "new_with_config_and_collections must not emit DatabaseConfigChanged"
+        );
+
+        // No-op config update must not emit DatabaseConfigChanged.
+        db.set_config(false, true);
+        assert!(proj_rx.try_recv().is_err());
+
+        db.set_enterprise_edition(true);
+        assert_eq!(
+            db.settings(),
+            DatabaseSettings {
+                edition: DatabaseEdition::Enterprise,
+                concurrency_mode: DatabaseConcurrencyMode::Optimistic,
+            }
+        );
+        assert!(db.enterprise_edition());
+        assert!(db.optimistic_concurrency());
+        assert!(matches!(
+            proj_rx.try_recv().unwrap(),
+            ProjectEvent::DatabaseConfigChanged { .. }
+        ));
+
+        db.set_optimistic_concurrency(false);
+        assert_eq!(
+            db.settings(),
+            DatabaseSettings {
+                edition: DatabaseEdition::Enterprise,
+                concurrency_mode: DatabaseConcurrencyMode::Pessimistic,
+            }
+        );
+        assert!(db.enterprise_edition());
+        assert!(!db.optimistic_concurrency());
+        assert!(matches!(
+            proj_rx.try_recv().unwrap(),
+            ProjectEvent::DatabaseConfigChanged { .. }
+        ));
+
+        let std_db = FirestoreDatabase::new(project, root.clone(), false);
+        assert_eq!(
+            std_db.settings(),
+            DatabaseSettings::for_edition(DatabaseEdition::Standard)
+        );
+        let ent_db = FirestoreDatabase::new(project, root, true);
+        assert_eq!(
+            ent_db.settings(),
+            DatabaseSettings::for_edition(DatabaseEdition::Enterprise)
+        );
+    }
+
+    #[tokio::test]
+    async fn lazy_event_channel_creation_project_events_and_mark_cleared_states() {
+        let project: &'static FirestoreProject =
+            Box::leak(Box::new(FirestoreProject::new(FirestoreConfig::default())));
+        let root1: RootRef = "projects/p/databases/db1".parse().unwrap();
+        let root2: RootRef = "projects/p/databases/db2".parse().unwrap();
+        let mut proj_rx = project.subscribe_project_events();
+
+        // 1. Fresh DB starts in Idle without allocating a broadcast channel.
+        let db1 = project.database(&root1).await;
+        assert!(matches!(
+            proj_rx.try_recv().unwrap(),
+            ProjectEvent::DatabaseCreated { .. }
+        ));
+        assert!(matches!(
+            *db1.events
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            EventChannel::Idle
+        ));
+
+        // 2. Writes before subscribe() still emit ProjectEvent::DocumentsChanged while staying
+        //    Idle.
+        let doc1: DocumentRef = "projects/p/databases/db1/documents/c/d1".parse().unwrap();
+        db1.update_doc(
+            &doc1,
+            HashMap::from([("v".to_string(), Value::integer(1))]),
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            *db1.events
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            EventChannel::Idle
+        ));
+        assert!(matches!(
+            proj_rx.try_recv().unwrap(),
+            ProjectEvent::DocumentsChanged {
+                ref database,
+                ref paths,
+                ..
+            } if database == &root1 && paths == &vec![doc1.to_string()]
+        ));
+
+        // 3. subscribe() transitions Idle -> Active and receives only events sent afterward.
+        let mut db1_rx = db1.subscribe();
+        assert!(matches!(
+            *db1.events
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            EventChannel::Active(_)
+        ));
+        assert!(db1_rx.try_recv().is_err());
+
+        let doc2: DocumentRef = "projects/p/databases/db1/documents/c/d2".parse().unwrap();
+        db1.update_doc(
+            &doc2,
+            HashMap::from([("v".to_string(), Value::integer(2))]),
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let ev2 = db1_rx.recv().await.unwrap();
+        assert!(ev2.updates.contains_key(&doc2));
+        assert!(!ev2.updates.contains_key(&doc1));
+        assert!(matches!(
+            proj_rx.try_recv().unwrap(),
+            ProjectEvent::DocumentsChanged { ref database, .. } if database == &root1
+        ));
+
+        // 4. mark_cleared() after subscribe() transitions Active -> Cleared, closes rx, and
+        //    suppresses future events and config updates.
+        db1.mark_cleared();
+        assert!(matches!(
+            *db1.events
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            EventChannel::Cleared
+        ));
+        assert!(matches!(
+            db1_rx.recv().await,
+            Err(broadcast::error::RecvError::Closed)
+        ));
+        db1.send_event(DatabaseEvent {
+            database:    Arc::downgrade(&db1),
+            update_time: Timestamp::now(),
+            updates:     HashMap::from([(
+                doc1.clone(),
+                document::DocumentVersion::Deleted(Arc::new(document::DeletedDocumentVersion {
+                    name: doc1,
+                    delete_time: Timestamp::now(),
+                })),
+            )]),
+        });
+        assert!(proj_rx.try_recv().is_err());
+
+        let prev_db1_settings = db1.settings();
+        let db1_try_err = db1
+            .try_update_settings(|s| {
+                s.edition = DatabaseEdition::Enterprise;
+            })
+            .unwrap_err();
+        assert!(matches!(db1_try_err, GenericDatabaseError::Aborted(_)));
+        assert_eq!(db1.settings(), prev_db1_settings);
+        assert!(proj_rx.try_recv().is_err());
+
+        let db1_updated = db1.update_settings(|s| {
+            s.edition = DatabaseEdition::Enterprise;
+        });
+        assert_eq!(db1_updated.edition, DatabaseEdition::Enterprise);
+        assert!(proj_rx.try_recv().is_err());
+
+        // 5. mark_cleared() before subscribe() transitions Idle -> Cleared and later subscribe()
+        //    yields an already-closed receiver without transitioning back to Active.
+        let db2 = project.database(&root2).await;
+        assert!(matches!(
+            proj_rx.try_recv().unwrap(),
+            ProjectEvent::DatabaseCreated { .. }
+        ));
+        let returned_settings = db2.update_settings(|s| {
+            s.edition = DatabaseEdition::Enterprise;
+        });
+        assert_eq!(
+            returned_settings,
+            DatabaseSettings {
+                edition: DatabaseEdition::Enterprise,
+                concurrency_mode: DatabaseConcurrencyMode::Pessimistic,
+            }
+        );
+        assert!(matches!(
+            proj_rx.try_recv().unwrap(),
+            ProjectEvent::DatabaseConfigChanged { ref database } if database == &root2
+        ));
+        let live_try_settings = db2
+            .try_update_settings(|s| {
+                s.concurrency_mode = DatabaseConcurrencyMode::Optimistic;
+            })
+            .unwrap();
+        assert_eq!(
+            live_try_settings,
+            DatabaseSettings {
+                edition: DatabaseEdition::Enterprise,
+                concurrency_mode: DatabaseConcurrencyMode::Optimistic,
+            }
+        );
+        assert!(matches!(
+            proj_rx.try_recv().unwrap(),
+            ProjectEvent::DatabaseConfigChanged { ref database } if database == &root2
+        ));
+
+        db2.mark_cleared();
+        assert!(matches!(
+            *db2.events
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            EventChannel::Cleared
+        ));
+        let mut db2_rx = db2.subscribe();
+        assert!(matches!(
+            db2_rx.recv().await,
+            Err(broadcast::error::RecvError::Closed)
+        ));
+        assert!(matches!(
+            *db2.events
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            EventChannel::Cleared
+        ));
+        let doc_db2: DocumentRef = "projects/p/databases/db2/documents/c/d1".parse().unwrap();
+        db2.send_event(DatabaseEvent {
+            database:    Arc::downgrade(&db2),
+            update_time: Timestamp::now(),
+            updates:     HashMap::from([(
+                doc_db2.clone(),
+                document::DocumentVersion::Deleted(Arc::new(document::DeletedDocumentVersion {
+                    name: doc_db2,
+                    delete_time: Timestamp::now(),
+                })),
+            )]),
+        });
+        assert!(proj_rx.try_recv().is_err());
+
+        let prev_db2_settings = db2.settings();
+        let db2_try_err = db2
+            .try_update_settings(|s| {
+                s.edition = DatabaseEdition::Standard;
+            })
+            .unwrap_err();
+        assert!(matches!(db2_try_err, GenericDatabaseError::Aborted(_)));
+        assert_eq!(db2.settings(), prev_db2_settings);
+        assert!(proj_rx.try_recv().is_err());
+
+        let db2_updated = db2.update_settings(|s| {
+            s.edition = DatabaseEdition::Standard;
+        });
+        assert_eq!(db2_updated.edition, DatabaseEdition::Standard);
+        assert!(proj_rx.try_recv().is_err());
     }
 }

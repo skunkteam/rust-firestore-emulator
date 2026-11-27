@@ -5,14 +5,18 @@ use std::time::Duration;
 use axum::{
     Router,
     body::{Body, BodyDataStream, Bytes, to_bytes},
-    http::{HeaderMap, Method, Request, StatusCode, header},
+    http::{HeaderMap, HeaderValue, Method, Request, StatusCode, header},
 };
-use emulator_database::{FirestoreProject, config::FirestoreConfig};
+use emulator_database::{
+    FirestoreProject,
+    config::FirestoreConfig,
+    snapshot::{EOF_MAGIC, FORMAT_MAJOR, MAX_FRAME_BYTES, SNAPSHOT_MAGIC},
+};
 use emulator_http::RouterBuilder;
 use googletest::prelude::*;
 use serde::{Serialize, de::DeserializeOwned};
 use serde_json::json;
-use tokio_stream::StreamExt;
+use tokio_stream::{Stream, StreamExt, wrappers::ReceiverStream};
 use tower::ServiceExt;
 
 #[derive(Clone)]
@@ -26,8 +30,8 @@ impl Client {
             router: self.router.clone(),
             method,
             uri: uri.into(),
-            content_type: None,
-            body: Vec::new(),
+            headers: HeaderMap::new(),
+            body: Body::empty(),
         }
     }
 
@@ -49,29 +53,64 @@ impl Client {
 }
 
 struct TestRequestBuilder {
-    router: Router,
-    method: Method,
-    uri: String,
-    content_type: Option<&'static str>,
-    body: Vec<u8>,
+    router:  Router,
+    method:  Method,
+    uri:     String,
+    headers: HeaderMap,
+    body:    Body,
 }
 
 impl TestRequestBuilder {
+    fn header(mut self, name: header::HeaderName, value: HeaderValue) -> Self {
+        self.headers.insert(name, value);
+        self
+    }
+
+    fn append_header(mut self, name: header::HeaderName, value: HeaderValue) -> Self {
+        self.headers.append(name, value);
+        self
+    }
+
     fn json<T: Serialize + ?Sized>(mut self, value: &T) -> Self {
-        self.content_type = Some("application/json");
-        self.body = serde_json::to_vec(value).expect("serialize JSON request body");
+        self.headers.insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("application/json"),
+        );
+        self.body = Body::from(serde_json::to_vec(value).expect("serialize JSON request body"));
+        self
+    }
+
+    fn octet_stream(mut self, body: impl Into<Bytes>) -> Self {
+        self.headers.insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("application/octet-stream"),
+        );
+        self.body = Body::from(body.into());
+        self
+    }
+
+    fn bytes_body(mut self, body: impl Into<Bytes>) -> Self {
+        self.body = Body::from(body.into());
+        self
+    }
+
+    fn stream<S, D, E>(mut self, stream: S) -> Self
+    where
+        S: Stream<Item = std::result::Result<D, E>> + Send + 'static,
+        D: Into<Bytes> + 'static,
+        E: Into<Box<dyn std::error::Error + Send + Sync>> + 'static,
+    {
+        self.body = Body::from_stream(stream);
         self
     }
 
     async fn send(self) -> Result<TestResponse> {
-        let mut builder = Request::builder().method(self.method).uri(self.uri);
-        if let Some(ct) = self.content_type {
-            builder = builder.header(header::CONTENT_TYPE, ct);
-        }
-        let resp = self
-            .router
-            .oneshot(builder.body(Body::from(self.body))?)
-            .await?;
+        let mut request = Request::builder()
+            .method(self.method)
+            .uri(self.uri)
+            .body(self.body)?;
+        *request.headers_mut() = self.headers;
+        let resp = self.router.oneshot(request).await?;
         let status = resp.status();
         let headers = resp.headers().clone();
         Ok(TestResponse {
@@ -95,7 +134,6 @@ impl TestResponse {
         self.status
     }
 
-    #[cfg_attr(not(feature = "ui"), allow(dead_code))]
     fn headers(&self) -> &HeaderMap {
         &self.headers
     }
@@ -1203,6 +1241,11 @@ async fn test_rest_rejects_percent_encoded_slashes_and_preserves_plus() -> Resul
             "/v1/projects/p/databases/(default)%2Fdocuments",
         ),
         (Method::GET, "/v1/projects/p%2Fx/databases/(default)"),
+        (Method::GET, "/v1/projects/p/databases/__reserved__"),
+        (Method::GET, "/v1/projects/__reserved__/databases/(default)"),
+        (Method::GET, "/v1/projects/p/databases/.."),
+        (Method::GET, "/v1/projects/p/databases/%2E%2E"),
+        (Method::GET, "/v1/projects/p/databases/%2E"),
         (
             Method::GET,
             "/v1/projects/p/databases/(default)%2Fdocuments%2Fcol%2Fdoc/documents/sub",
@@ -1857,6 +1900,74 @@ async fn test_rest_unimplemented_request_options_and_new_database_admin_fields()
     Ok(())
 }
 
+fn extract_export_filename(headers: &HeaderMap) -> String {
+    assert_eq!(
+        headers
+            .get(header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok()),
+        Some("application/octet-stream")
+    );
+    let disposition = headers
+        .get(header::CONTENT_DISPOSITION)
+        .and_then(|v| v.to_str().ok())
+        .expect("Content-Disposition header should be present");
+    let filename = disposition
+        .strip_prefix("attachment; filename=\"")
+        .and_then(|rest| rest.strip_suffix('"'))
+        .expect("Content-Disposition should have attachment filename");
+    assert!(filename.ends_with(".fsemu"), "filename={filename}");
+    let stem = filename.strip_suffix(".fsemu").unwrap();
+    let (_, utc) = stem
+        .rsplit_once('-')
+        .expect("export filename should end with -<UTC>.fsemu");
+    assert_eq!(utc.len(), 16, "utc={utc}");
+    assert_eq!(utc.as_bytes()[8], b'T');
+    assert_eq!(utc.as_bytes()[15], b'Z');
+    assert!(
+        utc.bytes()
+            .enumerate()
+            .all(|(i, b)| i == 8 || i == 15 || b.is_ascii_digit()),
+        "utc={utc}"
+    );
+    filename.to_string()
+}
+
+const SNAPSHOT_FILE_HEADER_LEN: usize = SNAPSHOT_MAGIC.len() + size_of::<u16>();
+const SNAPSHOT_FRAME_PREFIX_LEN: usize = 1 + size_of::<u32>();
+const SNAPSHOT_TRAILER_LEN: usize = size_of::<u32>() + EOF_MAGIC.len();
+
+fn duplicate_frame_at(snapshot: &[u8], frame_index: usize, expected_tag: u8) -> Vec<u8> {
+    let mut offset = SNAPSHOT_FILE_HEADER_LEN;
+    for _ in 0..frame_index {
+        let len = u32::from_le_bytes(
+            snapshot[offset + 1..offset + SNAPSHOT_FRAME_PREFIX_LEN]
+                .try_into()
+                .unwrap(),
+        ) as usize;
+        offset += SNAPSHOT_FRAME_PREFIX_LEN + len;
+    }
+    assert_eq!(snapshot[offset], expected_tag);
+    let frame_len = u32::from_le_bytes(
+        snapshot[offset + 1..offset + SNAPSHOT_FRAME_PREFIX_LEN]
+            .try_into()
+            .unwrap(),
+    ) as usize;
+    let frame_end = offset + SNAPSHOT_FRAME_PREFIX_LEN + frame_len;
+
+    let mut out = Vec::with_capacity(snapshot.len() + (frame_end - offset));
+    out.extend_from_slice(&snapshot[..frame_end]);
+    out.extend_from_slice(&snapshot[offset..]);
+    out
+}
+
+fn duplicate_first_database_frame(single_db_snapshot: &[u8]) -> Vec<u8> {
+    duplicate_frame_at(single_db_snapshot, 1, 0x02)
+}
+
+fn duplicate_first_document_frame(single_doc_snapshot: &[u8]) -> Vec<u8> {
+    duplicate_frame_at(single_doc_snapshot, 2, 0x03)
+}
+
 #[gtest]
 #[tokio::test(start_paused = true)]
 async fn test_contention_get_delete_and_database_query_validation() -> Result<()> {
@@ -2457,6 +2568,168 @@ async fn test_protocol_fixes_database_metadata_run_query_snake_case_and_non_crea
 
 #[gtest]
 #[tokio::test]
+async fn test_emulator_export_targets_filenames_and_errors() -> Result<()> {
+    let (_project, client, _base) = spawn_server(false).await?;
+
+    // 1. Export on an empty emulator returns 200 OK with generic snapshot filename and imports as
+    //    no-op.
+    let empty_export = client.get("/emulator/v1/export").send().await?;
+    expect_eq!(empty_export.status(), StatusCode::OK);
+    let empty_filename = extract_export_filename(empty_export.headers());
+    expect_that!(empty_filename, starts_with("firestore-emulator-snapshot-"));
+    let empty_bytes = empty_export.bytes().await?;
+    let empty_import = client
+        .post("/emulator/v1/import")
+        .octet_stream(empty_bytes)
+        .send()
+        .await?;
+    expect_eq!(empty_import.status(), StatusCode::OK);
+    let empty_summary: serde_json::Value = empty_import.json().await?;
+    expect_eq!(
+        empty_summary,
+        json!({ "databases": [], "totalDatabases": 0, "totalDocuments": 0 })
+    );
+
+    // 2. Seed one database; all-database export still uses generic filename, whereas explicit and
+    //    deduplicated repeated single-database exports use <project>-<database>-<UTC>.fsemu.
+    let res = client
+        .get("/v1/projects/demo/databases/(default)")
+        .send()
+        .await?;
+    expect_eq!(res.status(), StatusCode::OK);
+
+    let all_with_one_db = client.get("/emulator/v1/export").send().await?;
+    expect_eq!(all_with_one_db.status(), StatusCode::OK);
+    let all_one_filename = extract_export_filename(all_with_one_db.headers());
+    expect_that!(
+        all_one_filename,
+        starts_with("firestore-emulator-snapshot-")
+    );
+
+    for query in [
+        "database=projects/demo/databases/(default)",
+        "database=projects/demo/databases/(default)/documents",
+        "database=projects%2Fdemo%2Fdatabases%2F(default)",
+        "database=projects/demo/databases/(default)&database=projects/demo/databases/(default)/\
+         documents",
+    ] {
+        let single = client
+            .get(format!("/emulator/v1/export?{query}"))
+            .send()
+            .await?;
+        expect_eq!(single.status(), StatusCode::OK, "query: {query}");
+        let filename = extract_export_filename(single.headers());
+        expect_that!(filename, starts_with("demo-_default_-"), "query: {query}");
+    }
+
+    // 3. Multi-database explicit export uses the generic snapshot filename.
+    let res = client
+        .get("/v1/projects/demo/databases/analytics")
+        .send()
+        .await?;
+    expect_eq!(res.status(), StatusCode::OK);
+
+    let multi = client
+        .get(
+            "/emulator/v1/export?database=projects/demo/databases/(default)&database=projects/\
+             demo/databases/analytics",
+        )
+        .send()
+        .await?;
+    expect_eq!(multi.status(), StatusCode::OK);
+    let multi_filename = extract_export_filename(multi.headers());
+    expect_that!(multi_filename, starts_with("firestore-emulator-snapshot-"));
+
+    // 4. Oversized project/database names sanitize to ASCII [A-Za-z0-9._-] and cap prefix at 200
+    //    bytes so filenames stay within 255-byte NAME_MAX.
+    let long_proj = "p".repeat(150);
+    let long_db = format!("{}@(", "d".repeat(148));
+    let encoded_db = long_db.replace('@', "%40");
+    let create_long = client
+        .get(format!("/v1/projects/{long_proj}/databases/{encoded_db}"))
+        .send()
+        .await?;
+    expect_eq!(create_long.status(), StatusCode::OK);
+
+    let long_export = client
+        .get(format!(
+            "/emulator/v1/export?database=projects/{long_proj}/databases/{encoded_db}"
+        ))
+        .send()
+        .await?;
+    expect_eq!(long_export.status(), StatusCode::OK);
+    let long_filename = extract_export_filename(long_export.headers());
+    expect_pred!(long_filename.len() <= 255);
+    let prefix = long_filename
+        .rsplit_once('-')
+        .map(|(p, _)| p)
+        .expect("filename should contain -<utc>.fsemu");
+    expect_eq!(prefix.len(), 200);
+    let all_ascii_filename_chars = prefix
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'));
+    expect_true!(all_ascii_filename_chars);
+
+    // 5. Missing explicit database returns 404 NOT_FOUND without lazy creation.
+    let missing = client
+        .get("/emulator/v1/export?database=projects/demo/databases/ghost")
+        .send()
+        .await?;
+    expect_eq!(missing.status(), StatusCode::NOT_FOUND);
+    let missing_err: serde_json::Value = missing.json().await?;
+    expect_eq!(missing_err["error"]["code"], 404);
+    expect_eq!(missing_err["error"]["status"], "NOT_FOUND");
+
+    let db_list: Vec<String> = client.get("/emulator/v1").send().await?.json().await?;
+    expect_false!(db_list.iter().any(|d| d.contains("ghost")));
+
+    // 6. Malformed query parameters return 400 INVALID_ARGUMENT.
+    for bad_query in [
+        "database",
+        "database=",
+        "foo=bar",
+        "databases=projects/demo/databases/(default)",
+        "database=not-a-root-ref",
+        "database=projects/demo/databases/(default)/documents/users",
+        "database=projects/demo/databases/.",
+        "database=projects/demo/databases/..",
+        "database=projects/demo/databases/__reserved__",
+        "database=projects%2Fdemo%2Fdatabases%2Fbad%2Fsub",
+        "database=%ZZ",
+    ] {
+        let bad = client
+            .get(format!("/emulator/v1/export?{bad_query}"))
+            .send()
+            .await?;
+        expect_eq!(bad.status(), StatusCode::BAD_REQUEST, "query: {bad_query}");
+        let err: serde_json::Value = bad.json().await?;
+        expect_eq!(err["error"]["code"], 400, "query: {bad_query}");
+        expect_eq!(
+            err["error"]["status"],
+            "INVALID_ARGUMENT",
+            "query: {bad_query}"
+        );
+        if bad_query == "foo=bar" {
+            expect_eq!(err["error"]["message"], "Unsupported query parameter: foo");
+        } else if bad_query == "database=" {
+            expect_that!(
+                err["error"]["message"].as_str().unwrap(),
+                contains_substring("(expected projects/{project_id}/databases/{database_id})")
+            );
+        } else if bad_query == "database=not-a-root-ref" {
+            expect_eq!(
+                err["error"]["message"],
+                "Invalid database resource name: not-a-root-ref (expected \
+                 projects/{project_id}/databases/{database_id})"
+            );
+        }
+    }
+
+    Ok(())
+}
+
+#[gtest]
+#[tokio::test]
 async fn test_uniform_json_error_envelopes_405_head_413_logging_and_rest_debug_level() -> Result<()>
 {
     use emulator_tracing::DefaultTracing;
@@ -2499,6 +2772,18 @@ async fn test_uniform_json_error_envelopes_405_head_413_logging_and_rest_debug_l
             Method::POST,
             "/emulator/v1/events",
             "GET, HEAD",
+        ),
+        (
+            &router_without_logging,
+            Method::POST,
+            "/emulator/v1/export",
+            "GET, HEAD",
+        ),
+        (
+            &router_without_logging,
+            Method::GET,
+            "/emulator/v1/import",
+            "POST",
         ),
         (
             &router_without_logging,
@@ -2568,6 +2853,7 @@ async fn test_uniform_json_error_envelopes_405_head_413_logging_and_rest_debug_l
     for uri in [
         "/emulator/v1",
         "/emulator/v1/events",
+        "/emulator/v1/export",
         "/emulator/v1/contention",
         "/emulator/v1/contention/events",
         "/v1/projects/p/databases/(default)",
@@ -2838,6 +3124,339 @@ async fn test_uniform_json_error_envelopes_405_head_413_logging_and_rest_debug_l
             line.contains("handle_create_document") && line.contains("400 (INVALID_ARGUMENT)")
         }),
         "expected DEBUG error line from handle_create_document; got:\n{plain_debug_logs}"
+    );
+
+    Ok(())
+}
+
+#[gtest]
+#[tokio::test]
+async fn test_emulator_import_export_roundtrip_selective_and_large_payload() -> Result<()> {
+    let (_proj_a, client_a, _) = spawn_server(false).await?;
+    let db1_admin = "/v1/projects/p/databases/(default)";
+    let db1_docs = "/v1/projects/p/databases/(default)/documents";
+    let db2_admin = "/v1/projects/p/databases/empty-ent";
+
+    // Configure DB1 as ENTERPRISE + PESSIMISTIC with all 11 storable value types, a zero-field
+    // document, and a subcollection under a non-existent phantom parent.
+    let res = client_a
+        .patch(db1_admin)
+        .json(&json!({
+            "databaseEdition": "ENTERPRISE",
+            "concurrencyMode": "PESSIMISTIC",
+        }))
+        .send()
+        .await?;
+    expect_eq!(res.status(), StatusCode::OK);
+
+    let res = client_a
+        .post(format!("{db1_docs}/types?documentId=all"))
+        .json(&json!({
+            "fields": {
+                "nullField": { "nullValue": null },
+                "boolField": { "booleanValue": true },
+                "maxInt": { "integerValue": "9223372036854775807" },
+                "minInt": { "integerValue": "-9223372036854775808" },
+                "negZero": { "doubleValue": -0.0 },
+                "nanFloat": { "doubleValue": "NaN" },
+                "infFloat": { "doubleValue": "Infinity" },
+                "negInfFloat": { "doubleValue": "-Infinity" },
+                "tsField": { "timestampValue": "2026-11-10T15:30:45.123456789Z" },
+                "strField": { "stringValue": "hello" },
+                "bytesField": { "bytesValue": "AAECAw==" },
+                "refField": { "referenceValue": "projects/p/databases/(default)/documents/users/alice" },
+                "geoField": { "geoPointValue": { "latitude": 52.3676, "longitude": 4.9041 } },
+                "arrField": {
+                    "arrayValue": {
+                        "values": [{ "integerValue": "42" }, { "stringValue": "nested" }]
+                    }
+                },
+                "mapField": {
+                    "mapValue": {
+                        "fields": {
+                            "nested": { "stringValue": "ok" },
+                            "count": { "integerValue": "7" }
+                        }
+                    }
+                },
+                "vectorField": {
+                    "mapValue": {
+                        "fields": {
+                            "__type__": { "stringValue": "__vector__" },
+                            "value": {
+                                "arrayValue": {
+                                    "values": [{ "doubleValue": -0.0 }, { "doubleValue": 1.25 }]
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }))
+        .send()
+        .await?;
+    expect_eq!(res.status(), StatusCode::OK);
+
+    let res = client_a
+        .post(format!("{db1_docs}/flags?documentId=ready"))
+        .json(&json!({ "fields": {} }))
+        .send()
+        .await?;
+    expect_eq!(res.status(), StatusCode::OK);
+
+    let res = client_a
+        .post(format!("{db1_docs}/rooms/r1/messages?documentId=m1"))
+        .json(&json!({ "fields": { "text": { "stringValue": "phantom" } } }))
+        .send()
+        .await?;
+    expect_eq!(res.status(), StatusCode::OK);
+
+    // Configure DB2 as empty ENTERPRISE + OPTIMISTIC.
+    let res = client_a
+        .patch(db2_admin)
+        .json(&json!({ "databaseEdition": "ENTERPRISE" }))
+        .send()
+        .await?;
+    expect_eq!(res.status(), StatusCode::OK);
+
+    let exported = client_a.get("/emulator/v1/export").send().await?;
+    expect_eq!(exported.status(), StatusCode::OK);
+    let snap_bytes = exported.bytes().await?;
+
+    // 1. Fresh emulator import verifies lossless round-trip and `replaced: false`.
+    let (_proj_b, client_b, _) = spawn_server(false).await?;
+    let import_res = client_b
+        .post("/emulator/v1/import")
+        .header(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("APPLICATION/OCTET-STREAM; charset=binary"),
+        )
+        .bytes_body(snap_bytes.clone())
+        .send()
+        .await?;
+    expect_eq!(import_res.status(), StatusCode::OK);
+    let summary: serde_json::Value = import_res.json().await?;
+    expect_eq!(
+        summary,
+        json!({
+            "databases": [
+                {
+                    "name": "projects/p/databases/(default)/documents",
+                    "projectId": "p",
+                    "databaseId": "(default)",
+                    "databaseEdition": "ENTERPRISE",
+                    "concurrencyMode": "PESSIMISTIC",
+                    "documentCount": 3,
+                    "replaced": false,
+                },
+                {
+                    "name": "projects/p/databases/empty-ent/documents",
+                    "projectId": "p",
+                    "databaseId": "empty-ent",
+                    "databaseEdition": "ENTERPRISE",
+                    "concurrencyMode": "OPTIMISTIC",
+                    "documentCount": 0,
+                    "replaced": false,
+                },
+            ],
+            "totalDatabases": 2,
+            "totalDocuments": 3,
+            "importId": 1,
+        })
+    );
+
+    let db1_meta: serde_json::Value = client_b.get(db1_admin).send().await?.json().await?;
+    expect_eq!(db1_meta["databaseEdition"], "ENTERPRISE");
+    expect_eq!(db1_meta["concurrencyMode"], "PESSIMISTIC");
+
+    let db2_meta: serde_json::Value = client_b.get(db2_admin).send().await?.json().await?;
+    expect_eq!(db2_meta["databaseEdition"], "ENTERPRISE");
+    expect_eq!(db2_meta["concurrencyMode"], "OPTIMISTIC");
+
+    let all_doc_res = client_b.get(format!("{db1_docs}/types/all")).send().await?;
+    expect_eq!(all_doc_res.status(), StatusCode::OK);
+    let all_doc_text = all_doc_res.text().await?;
+    expect_that!(all_doc_text, contains_substring("-0.0"));
+    let all_doc: serde_json::Value = serde_json::from_str(&all_doc_text)?;
+    expect_eq!(
+        all_doc["fields"]["maxInt"]["integerValue"],
+        "9223372036854775807"
+    );
+    expect_eq!(
+        all_doc["fields"]["minInt"]["integerValue"],
+        "-9223372036854775808"
+    );
+    expect_eq!(all_doc["fields"]["nanFloat"]["doubleValue"], "NaN");
+    expect_eq!(all_doc["fields"]["infFloat"]["doubleValue"], "Infinity");
+    expect_eq!(all_doc["fields"]["negInfFloat"]["doubleValue"], "-Infinity");
+    expect_eq!(all_doc["fields"]["bytesField"]["bytesValue"], "AAECAw==");
+    expect_eq!(
+        all_doc["fields"]["tsField"]["timestampValue"],
+        "2026-11-10T15:30:45.123456789Z"
+    );
+    expect_eq!(
+        all_doc["fields"]["mapField"]["mapValue"]["fields"]["nested"]["stringValue"],
+        "ok"
+    );
+    expect_eq!(
+        all_doc["fields"]["mapField"]["mapValue"]["fields"]["count"]["integerValue"],
+        "7"
+    );
+    expect_eq!(
+        all_doc["fields"]["vectorField"]["mapValue"]["fields"]["__type__"]["stringValue"],
+        "__vector__"
+    );
+
+    let ready_doc_res = client_b
+        .get(format!("{db1_docs}/flags/ready"))
+        .send()
+        .await?;
+    expect_eq!(ready_doc_res.status(), StatusCode::OK);
+    let ready_doc: serde_json::Value = ready_doc_res.json().await?;
+    expect_eq!(
+        ready_doc
+            .get("fields")
+            .and_then(|f| f.as_object())
+            .map_or(0, serde_json::Map::len),
+        0
+    );
+
+    let phantom_get = client_b.get(format!("{db1_docs}/rooms/r1")).send().await?;
+    expect_eq!(phantom_get.status(), StatusCode::NOT_FOUND);
+    let msg_get = client_b
+        .get(format!("{db1_docs}/rooms/r1/messages/m1"))
+        .send()
+        .await?;
+    expect_eq!(msg_get.status(), StatusCode::OK);
+
+    // 2. Mutate restored DBs, add an unrelated `scratch` DB, and re-import selectively.
+    let res = client_b
+        .delete(format!("{db1_docs}/flags/ready"))
+        .send()
+        .await?;
+    expect_eq!(res.status(), StatusCode::OK);
+    let res = client_b
+        .patch(db1_admin)
+        .json(&json!({ "databaseEdition": "STANDARD" }))
+        .send()
+        .await?;
+    expect_eq!(res.status(), StatusCode::OK);
+    let res = client_b
+        .post("/v1/projects/p/databases/empty-ent/documents/leaked?documentId=x1")
+        .json(&json!({ "fields": { "bad": { "booleanValue": true } } }))
+        .send()
+        .await?;
+    expect_eq!(res.status(), StatusCode::OK);
+    let res = client_b
+        .post("/v1/projects/p/databases/scratch/documents/notes?documentId=n1")
+        .json(&json!({ "fields": { "keep": { "stringValue": "yes" } } }))
+        .send()
+        .await?;
+    expect_eq!(res.status(), StatusCode::OK);
+
+    let selective_res = client_b
+        .post("/emulator/v1/import")
+        .octet_stream(snap_bytes)
+        .send()
+        .await?;
+    expect_eq!(selective_res.status(), StatusCode::OK);
+    let selective_summary: serde_json::Value = selective_res.json().await?;
+    expect_eq!(selective_summary["databases"][0]["replaced"], true);
+    expect_eq!(selective_summary["databases"][1]["replaced"], true);
+    expect_eq!(selective_summary["importId"], 2);
+
+    expect_eq!(
+        client_b
+            .get(format!("{db1_docs}/flags/ready"))
+            .send()
+            .await?
+            .status(),
+        StatusCode::OK
+    );
+    let restored_db1: serde_json::Value = client_b.get(db1_admin).send().await?.json().await?;
+    expect_eq!(restored_db1["databaseEdition"], "ENTERPRISE");
+    expect_eq!(restored_db1["concurrencyMode"], "PESSIMISTIC");
+
+    let empty_cols: serde_json::Value = client_b
+        .post("/v1/projects/p/databases/empty-ent/documents:listCollectionIds")
+        .json(&json!({}))
+        .send()
+        .await?
+        .json()
+        .await?;
+    expect_eq!(
+        empty_cols
+            .get("collectionIds")
+            .and_then(|c| c.as_array())
+            .map_or(0, Vec::len),
+        0
+    );
+
+    let scratch_doc = client_b
+        .get("/v1/projects/p/databases/scratch/documents/notes/n1")
+        .send()
+        .await?;
+    expect_eq!(scratch_doc.status(), StatusCode::OK);
+
+    // 3. Multi-megabyte (> 2 MiB) upload succeeds because DefaultBodyLimit is disabled on /import.
+    let (_proj_c, client_c, _) = spawn_server(false).await?;
+    let payload_90k = "x".repeat(90 * 1024);
+    for idx in 0..30 {
+        let res = client_c
+            .post(format!(
+                "/v1/projects/big/databases/(default)/documents/blobs?documentId=b{idx}"
+            ))
+            .json(&json!({ "fields": { "data": { "stringValue": payload_90k } } }))
+            .send()
+            .await?;
+        expect_eq!(res.status(), StatusCode::OK);
+    }
+    let big_bytes = client_c
+        .get("/emulator/v1/export")
+        .send()
+        .await?
+        .bytes()
+        .await?;
+    expect_pred!(big_bytes.len() > 2 * 1024 * 1024);
+
+    let (_proj_d, client_d, _) = spawn_server(false).await?;
+    let big_import = client_d
+        .post("/emulator/v1/import")
+        .octet_stream(big_bytes)
+        .send()
+        .await?;
+    expect_eq!(big_import.status(), StatusCode::OK);
+    let big_summary: serde_json::Value = big_import.json().await?;
+    expect_eq!(big_summary["totalDatabases"], 1);
+    expect_eq!(big_summary["totalDocuments"], 30);
+    expect_eq!(big_summary["importId"], 1);
+
+    // 4. Zero-database snapshot imports as a no-op while keeping live databases intact.
+    let (_empty_proj, empty_client, _) = spawn_server(false).await?;
+    let zero_db_bytes = empty_client
+        .get("/emulator/v1/export")
+        .send()
+        .await?
+        .bytes()
+        .await?;
+    let zero_import = client_d
+        .post("/emulator/v1/import")
+        .octet_stream(zero_db_bytes)
+        .send()
+        .await?;
+    expect_eq!(zero_import.status(), StatusCode::OK);
+    let zero_summary: serde_json::Value = zero_import.json().await?;
+    expect_eq!(
+        zero_summary,
+        json!({ "databases": [], "totalDatabases": 0, "totalDocuments": 0 })
+    );
+    expect_eq!(
+        client_d
+            .get("/v1/projects/big/databases/(default)/documents/blobs/b0")
+            .send()
+            .await?
+            .status(),
+        StatusCode::OK
     );
 
     Ok(())
@@ -3322,6 +3941,232 @@ async fn test_firestore_v1_rest_run_aggregation_query_execution_and_editions() -
 
 #[gtest]
 #[tokio::test]
+async fn test_emulator_import_error_matrix_and_live_state_isolation() -> Result<()> {
+    let (_project, client, _) = spawn_server(false).await?;
+    let doc_url = "/v1/projects/p/databases/(default)/documents/keep/doc1";
+
+    let seed = client
+        .patch(doc_url)
+        .json(&json!({ "fields": { "v": { "integerValue": "1" } } }))
+        .send()
+        .await?;
+    expect_eq!(seed.status(), StatusCode::OK);
+
+    let valid_snap = client
+        .get("/emulator/v1/export")
+        .send()
+        .await?
+        .bytes()
+        .await?;
+
+    // Empty 0-doc single-database snapshot for duplicate-database error check.
+    let (_empty_db_proj, empty_db_client, _) = spawn_server(false).await?;
+    expect_eq!(
+        empty_db_client
+            .get("/v1/projects/p/databases/only")
+            .send()
+            .await?
+            .status(),
+        StatusCode::OK
+    );
+    let single_empty_snap = empty_db_client
+        .get("/emulator/v1/export")
+        .send()
+        .await?
+        .bytes()
+        .await?;
+
+    // 1. 415 Unsupported Media Type matrix (missing, multiple, non-UTF-8, CORS-safelisted, JSON).
+    let missing_ct = client
+        .post("/emulator/v1/import")
+        .header(header::HOST, HeaderValue::from_static("devbox.local:9999"))
+        .bytes_body(valid_snap.clone())
+        .send()
+        .await?;
+    expect_eq!(missing_ct.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+    let missing_err: serde_json::Value = missing_ct.json().await?;
+    expect_eq!(missing_err["error"]["code"], 415);
+    expect_eq!(missing_err["error"]["status"], "INVALID_ARGUMENT");
+    expect_that!(
+        missing_err["error"]["message"].as_str().unwrap(),
+        all!(
+            contains_substring("'<missing>'"),
+            contains_substring("http://devbox.local:9999/emulator/v1/import"),
+            contains_substring("-H \"Content-Type: application/octet-stream\""),
+        )
+    );
+
+    let dup_ct = client
+        .post("/emulator/v1/import")
+        .append_header(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("application/octet-stream"),
+        )
+        .append_header(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("application/octet-stream"),
+        )
+        .bytes_body(valid_snap.clone())
+        .send()
+        .await?;
+    expect_eq!(dup_ct.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+    let dup_err: serde_json::Value = dup_ct.json().await?;
+    expect_that!(
+        dup_err["error"]["message"].as_str().unwrap(),
+        all!(
+            contains_substring("'<multiple>'"),
+            contains_substring("http://127.0.0.1:8080/emulator/v1/import"),
+        )
+    );
+
+    let non_utf8_ct = client
+        .post("/emulator/v1/import")
+        .header(header::CONTENT_TYPE, HeaderValue::from_bytes(b"\xff\xfe")?)
+        .header(header::HOST, HeaderValue::from_static("   "))
+        .bytes_body(valid_snap.clone())
+        .send()
+        .await?;
+    expect_eq!(non_utf8_ct.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+    let non_utf8_err: serde_json::Value = non_utf8_ct.json().await?;
+    expect_that!(
+        non_utf8_err["error"]["message"].as_str().unwrap(),
+        all!(
+            contains_substring("'<non-utf8>'"),
+            contains_substring("http://127.0.0.1:8080/emulator/v1/import"),
+        )
+    );
+
+    for bad_ct in [
+        "text/plain",
+        "application/x-www-form-urlencoded",
+        "multipart/form-data; boundary=abc",
+        "application/json",
+    ] {
+        let res = client
+            .post("http://h2-authority:7777/emulator/v1/import")
+            .header(header::CONTENT_TYPE, HeaderValue::from_static(bad_ct))
+            .bytes_body(valid_snap.clone())
+            .send()
+            .await?;
+        expect_eq!(res.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE, "{bad_ct}");
+        let err: serde_json::Value = res.json().await?;
+        expect_eq!(err["error"]["code"], 415);
+        expect_eq!(err["error"]["status"], "INVALID_ARGUMENT");
+        expect_that!(
+            err["error"]["message"].as_str().unwrap(),
+            all!(
+                contains_substring(format!("'{bad_ct}'")),
+                contains_substring("http://h2-authority:7777/emulator/v1/import"),
+            )
+        );
+    }
+
+    // 2. 400 Bad Request matrix (query string, corrupt magic, truncated, bad CRC, wrong major,
+    //    duplicate database, trailing bytes, abrupt body stream error).
+    let query_reject = client
+        .post("/emulator/v1/import?database=projects/p/databases/(default)")
+        .octet_stream(valid_snap.clone())
+        .send()
+        .await?;
+    expect_eq!(query_reject.status(), StatusCode::BAD_REQUEST);
+    let query_err: serde_json::Value = query_reject.json().await?;
+    expect_eq!(query_err["error"]["code"], 400);
+    expect_eq!(query_err["error"]["status"], "INVALID_ARGUMENT");
+    expect_eq!(
+        query_err["error"]["message"],
+        "Snapshot import does not accept query parameters (POST the .fsemu body directly; all \
+         databases in the snapshot are imported)."
+    );
+
+    let mut wrong_major = valid_snap.to_vec();
+    wrong_major[SNAPSHOT_MAGIC.len()..SNAPSHOT_FILE_HEADER_LEN]
+        .copy_from_slice(&(FORMAT_MAJOR + 1).to_le_bytes());
+
+    let mut bad_crc = valid_snap.to_vec();
+    let crc_idx = bad_crc.len() - SNAPSHOT_TRAILER_LEN;
+    bad_crc[crc_idx] ^= 0x01;
+
+    let mut bad_magic = Vec::with_capacity(SNAPSHOT_FILE_HEADER_LEN);
+    bad_magic.extend_from_slice(b"BADMAGIC");
+    bad_magic.extend_from_slice(&FORMAT_MAJOR.to_le_bytes());
+
+    let mut trailing = valid_snap.to_vec();
+    trailing.extend_from_slice(b"trailing");
+
+    let dup_db = duplicate_first_database_frame(&single_empty_snap);
+    let dup_doc = duplicate_first_document_frame(&valid_snap);
+
+    for (label, bad_bytes) in [
+        ("bad_magic", bad_magic),
+        ("truncated_mid", valid_snap[..valid_snap.len() / 2].to_vec()),
+        (
+            "truncated_trailer",
+            valid_snap[..valid_snap.len() - 2].to_vec(),
+        ),
+        ("wrong_major", wrong_major),
+        ("bad_crc", bad_crc),
+        ("trailing_bytes", trailing),
+        ("duplicate_db", dup_db),
+        ("duplicate_doc", dup_doc),
+    ] {
+        let res = client
+            .post("/emulator/v1/import")
+            .octet_stream(bad_bytes)
+            .send()
+            .await?;
+        expect_eq!(res.status(), StatusCode::BAD_REQUEST, "{label}");
+        let err: serde_json::Value = res.json().await?;
+        expect_eq!(err["error"]["code"], 400, "{label}");
+        expect_eq!(err["error"]["status"], "INVALID_ARGUMENT", "{label}");
+    }
+
+    let broken_stream = tokio_stream::iter([
+        Ok(Bytes::copy_from_slice(
+            &valid_snap[..SNAPSHOT_FILE_HEADER_LEN],
+        )),
+        Err(std::io::Error::other("simulated disconnect")),
+    ]);
+    let stream_err_res = client
+        .post("/emulator/v1/import")
+        .header(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("application/octet-stream"),
+        )
+        .stream(broken_stream)
+        .send()
+        .await?;
+    expect_eq!(stream_err_res.status(), StatusCode::BAD_REQUEST);
+    let stream_err: serde_json::Value = stream_err_res.json().await?;
+    expect_eq!(stream_err["error"]["code"], 400);
+    expect_eq!(stream_err["error"]["status"], "INVALID_ARGUMENT");
+
+    // 3. 413 Payload Too Large when a single frame prefix exceeds MAX_FRAME_BYTES (64 MiB).
+    let mut oversized_frame =
+        Vec::with_capacity(SNAPSHOT_FILE_HEADER_LEN + SNAPSHOT_FRAME_PREFIX_LEN);
+    oversized_frame.extend_from_slice(&SNAPSHOT_MAGIC);
+    oversized_frame.extend_from_slice(&FORMAT_MAJOR.to_le_bytes());
+    oversized_frame.push(0x01);
+    oversized_frame.extend_from_slice(&((MAX_FRAME_BYTES as u32) + 1).to_le_bytes());
+
+    let too_large = client
+        .post("/emulator/v1/import")
+        .octet_stream(oversized_frame)
+        .send()
+        .await?;
+    expect_eq!(too_large.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    let too_large_err: serde_json::Value = too_large.json().await?;
+    expect_eq!(too_large_err["error"]["code"], 413);
+    expect_eq!(too_large_err["error"]["status"], "RESOURCE_EXHAUSTED");
+
+    // Live database state must remain untouched after every rejected import.
+    let live_doc: serde_json::Value = client.get(doc_url).send().await?.json().await?;
+    expect_eq!(live_doc["fields"]["v"]["integerValue"], "1");
+
+    Ok(())
+}
+
+#[gtest]
+#[tokio::test]
 async fn test_firestore_v1_rest_run_aggregation_query_validation_errors_and_501_405() -> Result<()>
 {
     let project = Box::leak(Box::new(FirestoreProject::new(FirestoreConfig::default())));
@@ -3742,6 +4587,431 @@ async fn test_firestore_v1_rest_run_aggregation_query_validation_errors_and_501_
     .await?;
     expect_eq!(col_status, StatusCode::NOT_FOUND);
     expect_eq!(col_err["error"]["status"], "NOT_FOUND");
+
+    Ok(())
+}
+
+#[gtest]
+#[tokio::test]
+async fn test_emulator_import_concurrent_conflict_409() -> Result<()> {
+    let (_project, client, _) = spawn_server(false).await?;
+    let doc_url = "/v1/projects/p/databases/(default)/documents/items/i1";
+
+    expect_eq!(
+        client
+            .patch(doc_url)
+            .json(&json!({ "fields": { "v": { "integerValue": "1" } } }))
+            .send()
+            .await?
+            .status(),
+        StatusCode::OK
+    );
+    let snap = client
+        .get("/emulator/v1/export")
+        .send()
+        .await?
+        .bytes()
+        .await?;
+
+    expect_eq!(
+        client
+            .patch(doc_url)
+            .json(&json!({ "fields": { "v": { "integerValue": "2" } } }))
+            .send()
+            .await?
+            .status(),
+        StatusCode::OK
+    );
+
+    let split_1 = snap.len() / 3;
+    let split_2 = (snap.len() * 2) / 3;
+    let (chunk_tx, chunk_rx) = tokio::sync::mpsc::channel::<std::io::Result<Bytes>>(1);
+    chunk_tx.send(Ok(snap.slice(..split_1))).await.unwrap();
+
+    let client_1 = client.clone();
+    let first_handle = tokio::spawn(async move {
+        client_1
+            .post("/emulator/v1/import")
+            .header(
+                header::CONTENT_TYPE,
+                HeaderValue::from_static("application/octet-stream"),
+            )
+            .stream(ReceiverStream::new(chunk_rx))
+            .send()
+            .await
+    });
+
+    // Sending chunk 2 across a capacity-1 channel only completes once the import handler has
+    // acquired `import_lock` and consumed chunk 1 inside `import_snapshot`.
+    chunk_tx
+        .send(Ok(snap.slice(split_1..split_2)))
+        .await
+        .unwrap();
+
+    // Overlapping second import fails immediately with 409 Conflict (ABORTED).
+    let conflict = client
+        .post("/emulator/v1/import")
+        .octet_stream(snap.clone())
+        .send()
+        .await?;
+    expect_eq!(conflict.status(), StatusCode::CONFLICT);
+    let conflict_err: serde_json::Value = conflict.json().await?;
+    expect_eq!(conflict_err["error"]["code"], 409);
+    expect_eq!(conflict_err["error"]["status"], "ABORTED");
+
+    chunk_tx.send(Ok(snap.slice(split_2..))).await.unwrap();
+    drop(chunk_tx);
+    let first_res = first_handle.await??;
+    expect_eq!(first_res.status(), StatusCode::OK);
+    let first_summary: serde_json::Value = first_res.json().await?;
+    expect_eq!(first_summary["databases"][0]["replaced"], true);
+
+    let restored: serde_json::Value = client.get(doc_url).send().await?.json().await?;
+    expect_eq!(restored["fields"]["v"]["integerValue"], "1");
+
+    // Sequential import after completion succeeds cleanly.
+    let followup = client
+        .post("/emulator/v1/import")
+        .octet_stream(snap)
+        .send()
+        .await?;
+    expect_eq!(followup.status(), StatusCode::OK);
+
+    Ok(())
+}
+
+#[gtest]
+#[tokio::test]
+async fn test_sse_events_database_replaced_and_created_on_import() -> Result<()> {
+    let (_project, client, _) = spawn_server(false).await?;
+
+    let (_empty_proj, empty_client, _) = spawn_server(false).await?;
+    let empty_snap = empty_client
+        .get("/emulator/v1/export")
+        .send()
+        .await?
+        .bytes()
+        .await?;
+
+    expect_eq!(
+        client
+            .patch("/v1/projects/sse/databases/existing/documents/c/d1")
+            .json(&json!({ "fields": { "v": { "integerValue": "1" } } }))
+            .send()
+            .await?
+            .status(),
+        StatusCode::OK
+    );
+    expect_eq!(
+        client
+            .patch("/v1/projects/sse/databases/fresh/documents/c/d2")
+            .json(&json!({ "fields": { "v": { "integerValue": "2" } } }))
+            .send()
+            .await?
+            .status(),
+        StatusCode::OK
+    );
+
+    let snap = client
+        .get("/emulator/v1/export")
+        .send()
+        .await?
+        .bytes()
+        .await?;
+
+    // Clear `fresh` so importing `snap` replaces `existing` and creates `fresh`.
+    expect_eq!(
+        client
+            .delete("/emulator/v1/projects/sse/databases/fresh/documents")
+            .send()
+            .await?
+            .status(),
+        StatusCode::OK
+    );
+
+    let mut sse_res = client.get("/emulator/v1/events").send().await?;
+    expect_eq!(sse_res.status(), StatusCode::OK);
+
+    // 1. First non-empty import gets importId 1 and tags both database_replaced and
+    //    database_created.
+    let import_res_1 = client
+        .post("/emulator/v1/import")
+        .octet_stream(snap.clone())
+        .send()
+        .await?;
+    expect_eq!(import_res_1.status(), StatusCode::OK);
+    let summary_1: serde_json::Value = import_res_1.json().await?;
+    expect_eq!(summary_1["totalDatabases"], 2);
+    let import_id_1 = summary_1["importId"]
+        .as_u64()
+        .expect("non-empty import should include importId");
+    expect_eq!(import_id_1, 1);
+
+    // 2. Zero-database import omits importId from ImportSummaryResponse and emits no DB events.
+    let zero_import_res = client
+        .post("/emulator/v1/import")
+        .octet_stream(empty_snap)
+        .send()
+        .await?;
+    expect_eq!(zero_import_res.status(), StatusCode::OK);
+    let zero_summary: serde_json::Value = zero_import_res.json().await?;
+    expect_true!(zero_summary.get("importId").is_none());
+
+    // 3. Non-import lazy creation emits database_created without importId.
+    expect_eq!(
+        client
+            .get("/v1/projects/sse/databases/lazy-created")
+            .send()
+            .await?
+            .status(),
+        StatusCode::OK
+    );
+
+    // 4. Second non-empty import gets a strictly larger monotonic importId matching SSE events.
+    let import_res_2 = client
+        .post("/emulator/v1/import")
+        .octet_stream(snap)
+        .send()
+        .await?;
+    expect_eq!(import_res_2.status(), StatusCode::OK);
+    let summary_2: serde_json::Value = import_res_2.json().await?;
+    let import_id_2 = summary_2["importId"]
+        .as_u64()
+        .expect("second non-empty import should include importId");
+    expect_pred!(import_id_2 > import_id_1);
+    expect_eq!(import_id_2, 2);
+
+    // Emit a sentinel document change so we know all prior SSE events have flushed.
+    expect_eq!(
+        client
+            .post("/v1/projects/sse/databases/existing/documents/c?documentId=sentinel")
+            .json(&json!({ "fields": {} }))
+            .send()
+            .await?
+            .status(),
+        StatusCode::OK
+    );
+
+    let mut collected = String::new();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    while tokio::time::Instant::now() < deadline {
+        if collected.contains("\"documents_changed\"") {
+            break;
+        }
+        if let Ok(chunk_res) =
+            tokio::time::timeout(Duration::from_millis(500), sse_res.chunk()).await
+            && let Some(bytes) = chunk_res?
+        {
+            collected.push_str(&String::from_utf8_lossy(&bytes));
+        }
+    }
+
+    let events: Vec<serde_json::Value> = collected
+        .lines()
+        .filter_map(|line| line.strip_prefix("data: "))
+        .filter_map(|data| serde_json::from_str(data).ok())
+        .collect();
+
+    expect_that!(
+        events,
+        contains(eq(&json!({
+            "type": "database_replaced",
+            "database": "projects/sse/databases/existing/documents",
+            "importId": import_id_1,
+        })))
+    );
+    expect_that!(
+        events,
+        contains(eq(&json!({
+            "type": "database_created",
+            "database": "projects/sse/databases/fresh/documents",
+            "importId": import_id_1,
+        })))
+    );
+    expect_that!(
+        events,
+        contains(eq(&json!({
+            "type": "database_created",
+            "database": "projects/sse/databases/lazy-created/documents",
+        })))
+    );
+    expect_that!(
+        events,
+        contains(eq(&json!({
+            "type": "database_replaced",
+            "database": "projects/sse/databases/existing/documents",
+            "importId": import_id_2,
+        })))
+    );
+    expect_that!(
+        events,
+        contains(eq(&json!({
+            "type": "database_replaced",
+            "database": "projects/sse/databases/fresh/documents",
+            "importId": import_id_2,
+        })))
+    );
+    expect_false!(events.iter().any(|ev| ev["type"] == "database_cleared"));
+
+    Ok(())
+}
+
+fn assert_no_cors_headers(headers: &HeaderMap, context: &str) {
+    assert!(
+        headers.get(header::ACCESS_CONTROL_ALLOW_ORIGIN).is_none(),
+        "{context}: unexpected Access-Control-Allow-Origin header"
+    );
+    for name in headers.keys() {
+        assert!(
+            !name.as_str().starts_with("access-control-allow-"),
+            "{context}: unexpected CORS header {name}"
+        );
+    }
+}
+
+#[gtest]
+#[tokio::test]
+async fn test_emulator_export_head_headers_and_empty_body() -> Result<()> {
+    let (_project, client, _) = spawn_server(false).await?;
+
+    expect_eq!(
+        client
+            .post("/v1/projects/demo/databases/(default)/documents/items?documentId=d1")
+            .json(&json!({ "fields": { "v": { "integerValue": "1" } } }))
+            .send()
+            .await?
+            .status(),
+        StatusCode::OK
+    );
+    expect_eq!(
+        client
+            .post("/v1/projects/demo/databases/analytics/documents/items?documentId=d2")
+            .json(&json!({ "fields": { "v": { "integerValue": "2" } } }))
+            .send()
+            .await?
+            .status(),
+        StatusCode::OK
+    );
+
+    // 1. HEAD /emulator/v1/export (all DBs) preserves 200 and filename headers with an empty body.
+    let head_all = client
+        .request(Method::HEAD, "/emulator/v1/export")
+        .send()
+        .await?;
+    expect_eq!(head_all.status(), StatusCode::OK);
+    let all_filename = extract_export_filename(head_all.headers());
+    expect_that!(all_filename, starts_with("firestore-emulator-snapshot-"));
+    expect_true!(head_all.bytes().await?.is_empty());
+
+    // 2. HEAD /emulator/v1/export?database=... preserves single-DB filename header and empty body.
+    let head_single = client
+        .request(
+            Method::HEAD,
+            "/emulator/v1/export?database=projects/demo/databases/(default)",
+        )
+        .send()
+        .await?;
+    expect_eq!(head_single.status(), StatusCode::OK);
+    let single_filename = extract_export_filename(head_single.headers());
+    expect_that!(single_filename, starts_with("demo-_default_-"));
+    expect_true!(head_single.bytes().await?.is_empty());
+
+    // 3. HEAD on unknown ?database=... returns 404 with empty body and does not lazily create it.
+    let head_missing = client
+        .request(
+            Method::HEAD,
+            "/emulator/v1/export?database=projects/demo/databases/ghost",
+        )
+        .send()
+        .await?;
+    expect_eq!(head_missing.status(), StatusCode::NOT_FOUND);
+    expect_true!(head_missing.bytes().await?.is_empty());
+
+    let db_list: Vec<String> = client.get("/emulator/v1").send().await?.json().await?;
+    expect_false!(db_list.iter().any(|d| d.contains("ghost")));
+
+    Ok(())
+}
+
+#[gtest]
+#[tokio::test]
+async fn test_emulator_no_cors_headers_and_options_preflight_rejection() -> Result<()> {
+    let (_project, client, _) = spawn_server(false).await?;
+
+    expect_eq!(
+        client
+            .post("/v1/projects/cors/databases/(default)/documents/items?documentId=d1")
+            .json(&json!({ "fields": { "v": { "integerValue": "1" } } }))
+            .send()
+            .await?
+            .status(),
+        StatusCode::OK
+    );
+
+    // 1. OPTIONS preflight on /emulator/v1/import is rejected with 405, Allow: POST, JSON envelope,
+    //    and no access-control-allow-* headers.
+    let preflight = client
+        .request(Method::OPTIONS, "/emulator/v1/import")
+        .header(
+            header::ORIGIN,
+            HeaderValue::from_static("https://evil.example"),
+        )
+        .header(
+            header::ACCESS_CONTROL_REQUEST_METHOD,
+            HeaderValue::from_static("POST"),
+        )
+        .header(
+            header::ACCESS_CONTROL_REQUEST_HEADERS,
+            HeaderValue::from_static("content-type"),
+        )
+        .send()
+        .await?;
+    expect_eq!(preflight.status(), StatusCode::METHOD_NOT_ALLOWED);
+    expect_eq!(
+        preflight
+            .headers()
+            .get(header::ALLOW)
+            .and_then(|v| v.to_str().ok()),
+        Some("POST")
+    );
+    let preflight_ct = preflight
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    expect_that!(preflight_ct, starts_with("application/json"));
+    assert_no_cors_headers(preflight.headers(), "OPTIONS /emulator/v1/import");
+    let preflight_err: serde_json::Value = preflight.json().await?;
+    expect_eq!(preflight_err["error"]["code"], 405);
+    expect_eq!(preflight_err["error"]["status"], "METHOD_NOT_ALLOWED");
+
+    // 2. GET /emulator/v1/export with Origin omits Access-Control-Allow-Origin and all CORS
+    //    headers.
+    let export_res = client
+        .get("/emulator/v1/export")
+        .header(
+            header::ORIGIN,
+            HeaderValue::from_static("https://evil.example"),
+        )
+        .send()
+        .await?;
+    expect_eq!(export_res.status(), StatusCode::OK);
+    assert_no_cors_headers(export_res.headers(), "GET /emulator/v1/export");
+    let snap = export_res.bytes().await?;
+
+    // 3. POST /emulator/v1/import with Origin omits Access-Control-Allow-Origin and all CORS
+    //    headers.
+    let import_res = client
+        .post("/emulator/v1/import")
+        .header(
+            header::ORIGIN,
+            HeaderValue::from_static("https://evil.example"),
+        )
+        .octet_stream(snap)
+        .send()
+        .await?;
+    expect_eq!(import_res.status(), StatusCode::OK);
+    assert_no_cors_headers(import_res.headers(), "POST /emulator/v1/import");
 
     Ok(())
 }

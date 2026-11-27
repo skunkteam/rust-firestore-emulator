@@ -17,11 +17,33 @@ import { stringifyProtoJson } from "./values.js";
 
 /**
  * @typedef {{
- *   type: 'database_created' | 'database_cleared' | 'database_config_changed' | 'documents_changed' | 'resync',
+ *   name: string,
+ *   projectId: string,
+ *   databaseId: string,
+ *   databaseEdition: 'STANDARD' | 'ENTERPRISE',
+ *   concurrencyMode: 'PESSIMISTIC' | 'OPTIMISTIC',
+ *   documentCount: number,
+ *   replaced: boolean,
+ * }} ImportedDatabaseSummary
+ */
+
+/**
+ * @typedef {{
+ *   databases: ImportedDatabaseSummary[],
+ *   totalDatabases: number,
+ *   totalDocuments: number,
+ *   importId?: number,
+ * }} ImportSummary
+ */
+
+/**
+ * @typedef {{
+ *   type: 'database_created' | 'database_cleared' | 'database_replaced' | 'database_config_changed' | 'documents_changed' | 'resync',
  *   database?: string,
  *   paths?: string[],
  *   updateTime?: string,
  *   skipped?: number,
+ *   importId?: number,
  * }} EmulatorSseEvent
  */
 
@@ -172,6 +194,28 @@ export function parseRootRef(rootStr) {
 }
 
 /**
+ * Parses a failed HTTP response body into an ApiError.
+ * @param {Response} res
+ * @param {string} text
+ * @returns {ApiError}
+ */
+function parseApiError(res, text) {
+  try {
+    const parsed = JSON.parse(text);
+    if (parsed && typeof parsed === "object" && parsed.error) {
+      return new ApiError(
+        Number(parsed.error.code ?? res.status),
+        String(parsed.error.status ?? "UNKNOWN"),
+        String(parsed.error.message ?? res.statusText)
+      );
+    }
+  } catch {
+    // Fall back to raw text / statusText below
+  }
+  return new ApiError(res.status, "HTTP_ERROR", text || res.statusText);
+}
+
+/**
  * @template T
  * @param {string} url
  * @param {RequestInit} [init]
@@ -181,19 +225,7 @@ async function requestJson(url, init = {}) {
   const res = await fetch(url, init);
   const text = await res.text();
   if (!res.ok) {
-    try {
-      const parsed = JSON.parse(text);
-      if (parsed && typeof parsed === "object" && parsed.error) {
-        throw new ApiError(
-          Number(parsed.error.code ?? res.status),
-          String(parsed.error.status ?? "UNKNOWN"),
-          String(parsed.error.message ?? res.statusText)
-        );
-      }
-    } catch (err) {
-      if (err instanceof ApiError) throw err;
-    }
-    throw new ApiError(res.status, "HTTP_ERROR", text || res.statusText);
+    throw parseApiError(res, text);
   }
   if (!text) {
     return /** @type {T} */ ({});
@@ -453,6 +485,62 @@ export async function runQuery(parentPath, structuredQuery, opts = {}) {
     headers: { "Content-Type": "application/json" },
     body: stringifyProtoJson({ structuredQuery }),
     ...(opts.signal ? { signal: opts.signal } : {}),
+  });
+}
+
+const DEFAULT_EXPORT_FILENAME = "firestore-emulator-snapshot.fsemu";
+
+/**
+ * Extracts a safe basename from a Content-Disposition header value.
+ * @param {string | null | undefined} headerValue
+ * @returns {string}
+ */
+function parseContentDispositionFilename(headerValue) {
+  if (!headerValue) return DEFAULT_EXPORT_FILENAME;
+  const match = /(?:^|;)\s*filename\s*=\s*(?:"([^"]*)"|([^;]+))/i.exec(
+    headerValue
+  );
+  const raw = (match?.[1] ?? match?.[2] ?? "").trim();
+  const base = raw.split(/[\\/]/).pop() ?? "";
+  return base && base !== "." && base !== ".."
+    ? base
+    : DEFAULT_EXPORT_FILENAME;
+}
+
+/**
+ * Exports selected or all emulator databases as a binary `.fsemu` snapshot blob.
+ * @param {string[]} [databases]
+ * @returns {Promise<{ blob: Blob, filename: string }>}
+ */
+export async function exportSnapshot(databases = []) {
+  const params = new URLSearchParams();
+  for (const db of databases) {
+    params.append("database", db);
+  }
+  const qs = params.toString();
+  const url = `/emulator/v1/export${qs ? `?${qs}` : ""}`;
+  const res = await fetch(url);
+  if (!res.ok) {
+    const text = await res.text();
+    throw parseApiError(res, text);
+  }
+  const blob = await res.blob();
+  const filename = parseContentDispositionFilename(
+    res.headers?.get("content-disposition")
+  );
+  return { blob, filename };
+}
+
+/**
+ * Imports a binary `.fsemu` snapshot file into the running emulator.
+ * @param {File | Blob} file
+ * @returns {Promise<ImportSummary>}
+ */
+export async function importSnapshot(file) {
+  return requestJson("/emulator/v1/import", {
+    method: "POST",
+    headers: { "Content-Type": "application/octet-stream" },
+    body: file,
   });
 }
 

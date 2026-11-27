@@ -1,6 +1,8 @@
 use std::{
     collections::HashMap,
+    future::Future,
     marker::Unpin,
+    pin::Pin,
     sync::{
         Arc,
         atomic::{self, AtomicUsize},
@@ -23,10 +25,10 @@ use tokio_stream::{
     StreamExt, StreamMap, StreamNotifyClose,
     wrappers::{BroadcastStream, ReceiverStream, errors::BroadcastStreamRecvError},
 };
-use tracing::{Level, debug, instrument, warn};
+use tracing::{Level, debug, error, instrument, warn};
 
 use crate::{
-    FirestoreDatabase, FirestoreProject, GenericDatabaseError,
+    DatabaseEdition, FirestoreDatabase, FirestoreProject, GenericDatabaseError,
     database::{
         read_consistency::{ReadConsistency, validate_read_time},
         reference::Ref,
@@ -41,6 +43,7 @@ use crate::{
 };
 
 const TARGET_ID: i32 = 1;
+const MAX_RESET_RETRIES: usize = 3;
 
 const TARGET_CHANGE_DEFAULT: TargetChange = TargetChange {
     target_change_type: TargetChangeType::NoChange as _,
@@ -180,12 +183,7 @@ impl Listener {
                     match database_event {
                         // Database was dropped, reconnect to automatically create a new Database.
                         (db_name, None) => {
-                            let database = &*self.project.database(&db_name).await;
-                            self.database_events.insert(
-                                db_name,
-                                StreamNotifyClose::new(BroadcastStream::new(database.subscribe())),
-                            );
-                            if let Err(err) = self.reset(database).await {
+                            if let Err(err) = self.reacquire_and_reset(&db_name).await {
                                 self.send_err(err).await?;
                                 return Ok(());
                             }
@@ -205,8 +203,7 @@ impl Listener {
                                 "listener missed {} events, because of buffer overflow",
                                 count
                             );
-                            let database = &*self.project.database(&db_name).await;
-                            if let Err(err) = self.reset(database).await {
+                            if let Err(err) = self.reacquire_and_reset(&db_name).await {
                                 self.send_err(err).await?;
                                 return Ok(());
                             }
@@ -269,7 +266,7 @@ impl Listener {
                             ReadConsistency::Default,
                             database.enterprise_edition(),
                         )?;
-                        self.set_query(&database, query).await?;
+                        self.set_query(database, query).await?;
                     }
                     target::TargetType::Documents(target::DocumentsTarget { documents }) => {
                         let Ok(document) = documents.into_iter().exactly_one() else {
@@ -282,7 +279,7 @@ impl Listener {
                                 database.name
                             )));
                         }
-                        self.set_document(&database, doc_ref, resume_type).await?;
+                        self.set_document(database, doc_ref, resume_type).await?;
                     }
                 };
             }
@@ -307,8 +304,15 @@ impl Listener {
         let Some(database) = event.database.upgrade() else {
             return Ok(());
         };
+        if database.is_cleared() {
+            return Ok(());
+        }
 
-        let (complete_time, msgs) = target.process_event(&database, event).await?;
+        let (complete_time, msgs) = match target.process_event(&database, event).await {
+            Ok(res) => res,
+            Err(err) if is_cleared_retryable(&database, &err) => return Ok(()),
+            Err(err) => return Err(err),
+        };
 
         if msgs.is_empty() {
             return Ok(());
@@ -318,7 +322,22 @@ impl Listener {
         self.send_complete(complete_time).await
     }
 
-    async fn reset(&mut self, database: &FirestoreDatabase) -> Result<()> {
+    async fn reacquire_and_reset(&mut self, db_name: &RootRef) -> Result<()> {
+        let required_edition = self
+            .target
+            .as_ref()
+            .and_then(ListenerTarget::required_edition);
+        let database = reacquire_database(
+            self.project,
+            &mut self.database_events,
+            db_name,
+            required_edition,
+        )
+        .await?;
+        self.reset(database).await
+    }
+
+    async fn reset(&mut self, database: Arc<FirestoreDatabase>) -> Result<()> {
         // We rely on the fact that this function will complete before any other events are
         // processed. That's why we know for sure that the output stream is not used for
         // something else until we respond with our NO_CHANGE msg. That msg means that everything is
@@ -329,7 +348,8 @@ impl Listener {
             return Ok(());
         };
 
-        let (time, msgs) = target.reset(database).await?;
+        let (time, msgs) =
+            reset_target(self.project, &mut self.database_events, target, database).await?;
         self.send_all(msgs).await?;
         self.send_complete(time).await?;
         Ok(())
@@ -338,8 +358,8 @@ impl Listener {
     #[instrument(level = Level::DEBUG, skip_all, err(level = Level::DEBUG))]
     async fn set_document(
         &mut self,
-        database: &FirestoreDatabase,
-        name: DocumentRef,
+        database: Arc<FirestoreDatabase>,
+        mut name: DocumentRef,
         resume_type: Option<target::ResumeType>,
     ) -> Result<()> {
         // We rely on the fact that this function will complete before any other events are
@@ -348,7 +368,7 @@ impl Listener {
         // up to date until that point and this is (for now) the easiest way to make sure
         // that is actually the case. This is probably okay, but if it becomes a hotspot we
         // might look into optimizing later.
-        self.ensure_subscribed_to(database);
+        self.ensure_subscribed_to(&database);
 
         let send_if_newer_than = resume_type
             .map(|rt| match rt {
@@ -367,15 +387,28 @@ impl Listener {
         }))
         .await?;
 
-        let read_time = Timestamp::now();
-        debug!(%name);
+        let (read_time, doc) = retry_on_cleared(
+            self.project,
+            &mut self.database_events,
+            database,
+            None,
+            &mut name,
+            |doc_name, db| {
+                Box::pin(async move {
+                    let read_time = Timestamp::now();
+                    debug!(%doc_name);
 
-        // Now determine the latest version at the pinned snapshot timestamp so concurrent writes
-        // after `read_time` are delivered via the already-subscribed broadcast channel instead of
-        // duplicating the initial snapshot.
-        let doc = database
-            .get_doc(&name, ReadConsistency::ReadTime(read_time))
-            .await?;
+                    // Now determine the latest version at the pinned snapshot timestamp so
+                    // concurrent writes after `read_time` are delivered via the already-subscribed
+                    // broadcast channel instead of duplicating the initial snapshot.
+                    let doc = db
+                        .get_doc(doc_name, ReadConsistency::ReadTime(read_time))
+                        .await?;
+                    Ok((read_time, doc))
+                })
+            },
+        )
+        .await?;
 
         // Only send if newer than the resume_token
         let send_initial = match &send_if_newer_than {
@@ -403,14 +436,18 @@ impl Listener {
     }
 
     #[instrument(level = Level::DEBUG, skip_all, err(level = Level::DEBUG))]
-    async fn set_query(&mut self, database: &FirestoreDatabase, query: Box<Query>) -> Result<()> {
+    async fn set_query(
+        &mut self,
+        database: Arc<FirestoreDatabase>,
+        query: Box<Query>,
+    ) -> Result<()> {
         // We rely on the fact that this function will complete before any other events are
         // processed. That's why we know for sure that the output stream is not used for
         // something else until we respond with our NO_CHANGE msg. That msg means that everything is
         // up to date until that point and this is (for now) the easiest way to make sure
         // that is actually the case. This is probably okay, but if it becomes a hotspot we
         // might look into optimizing later.
-        self.ensure_subscribed_to(database);
+        self.ensure_subscribed_to(&database);
 
         debug!(?query);
 
@@ -422,12 +459,18 @@ impl Listener {
         }))
         .await?;
 
-        let mut target = QueryTarget::new(query);
-        let (read_time, msgs) = target.reset(database).await?;
+        let mut target = ListenerTarget::QueryTarget(QueryTarget::new(query));
+        let (read_time, msgs) = reset_target(
+            self.project,
+            &mut self.database_events,
+            &mut target,
+            database,
+        )
+        .await?;
         self.send_all(msgs).await?;
         self.send_complete(read_time).await?;
 
-        self.target = Some(ListenerTarget::QueryTarget(target));
+        self.target = Some(target);
 
         Ok(())
     }
@@ -490,12 +533,125 @@ impl Listener {
     }
 }
 
+fn is_cleared_retryable(database: &FirestoreDatabase, err: &GenericDatabaseError) -> bool {
+    database.is_cleared() && matches!(err, GenericDatabaseError::Aborted(_))
+}
+
+fn edition_mismatch_error(
+    db_name: &RootRef,
+    query_edition: DatabaseEdition,
+    db_edition: DatabaseEdition,
+) -> GenericDatabaseError {
+    error!(
+        database = %db_name,
+        %query_edition,
+        %db_edition,
+        "Database {} edition changed from {} to {}; terminating query listener",
+        db_name,
+        query_edition,
+        db_edition
+    );
+    GenericDatabaseError::failed_precondition(format!(
+        "Database {} edition changed from {} to {}; re-create query listener",
+        db_name, query_edition, db_edition
+    ))
+}
+
+async fn reacquire_database(
+    project: &'static FirestoreProject,
+    database_events: &mut StreamMap<
+        RootRef,
+        StreamNotifyClose<BroadcastStream<Arc<DatabaseEvent>>>,
+    >,
+    db_name: &RootRef,
+    required_edition: Option<DatabaseEdition>,
+) -> Result<Arc<FirestoreDatabase>> {
+    let database = match project
+        .database_for_listener(db_name, required_edition)
+        .await
+    {
+        Ok(database) => database,
+        Err(default_edition) => {
+            let query_edition = required_edition
+                .expect("database_for_listener only returns Err when required_edition is Some");
+            return Err(edition_mismatch_error(
+                db_name,
+                query_edition,
+                default_edition,
+            ));
+        }
+    };
+    database_events.insert(
+        database.name.clone(),
+        StreamNotifyClose::new(BroadcastStream::new(database.subscribe())),
+    );
+    Ok(database)
+}
+
+async fn retry_on_cleared<State: Send, T>(
+    project: &'static FirestoreProject,
+    database_events: &mut StreamMap<
+        RootRef,
+        StreamNotifyClose<BroadcastStream<Arc<DatabaseEvent>>>,
+    >,
+    mut database: Arc<FirestoreDatabase>,
+    required_edition: Option<DatabaseEdition>,
+    state: &mut State,
+    mut op: impl for<'a> FnMut(
+        &'a mut State,
+        &'a FirestoreDatabase,
+    ) -> Pin<Box<dyn Future<Output = Result<T>> + Send + 'a>>,
+) -> Result<T> {
+    let mut retries = 0;
+    loop {
+        match op(state, &database).await {
+            Ok(res) => return Ok(res),
+            Err(err) if is_cleared_retryable(&database, &err) && retries < MAX_RESET_RETRIES => {
+                retries += 1;
+                database =
+                    reacquire_database(project, database_events, &database.name, required_edition)
+                        .await?;
+            }
+            Err(err) => return Err(err),
+        }
+    }
+}
+
+async fn reset_target(
+    project: &'static FirestoreProject,
+    database_events: &mut StreamMap<
+        RootRef,
+        StreamNotifyClose<BroadcastStream<Arc<DatabaseEvent>>>,
+    >,
+    target: &mut ListenerTarget,
+    database: Arc<FirestoreDatabase>,
+) -> Result<(Timestamp, Vec<ResponseType>)> {
+    let required_edition = target.required_edition();
+    retry_on_cleared(
+        project,
+        database_events,
+        database,
+        required_edition,
+        target,
+        |target, db| Box::pin(target.reset(db)),
+    )
+    .await
+}
+
 enum ListenerTarget {
     DocumentTarget(DocumentTarget),
     QueryTarget(QueryTarget),
 }
 
 impl ListenerTarget {
+    fn required_edition(&self) -> Option<DatabaseEdition> {
+        match self {
+            ListenerTarget::DocumentTarget(_) => None,
+            ListenerTarget::QueryTarget(target) => Some(DatabaseEdition::from_enterprise(
+                target.query.enterprise_edition(),
+            )),
+        }
+    }
     async fn process_event(
         &mut self,
         database: &FirestoreDatabase,
@@ -585,11 +741,25 @@ impl QueryTarget {
         }
     }
 
+    fn ensure_matching_edition(&self, database: &FirestoreDatabase) -> Result<()> {
+        let query_edition = DatabaseEdition::from_enterprise(self.query.enterprise_edition());
+        let db_edition = database.settings().edition;
+        if query_edition != db_edition {
+            return Err(edition_mismatch_error(
+                &database.name,
+                query_edition,
+                db_edition,
+            ));
+        }
+        Ok(())
+    }
+
     async fn process_event(
         &mut self,
         database: &FirestoreDatabase,
         event: &DatabaseEvent,
     ) -> Result<(Timestamp, Vec<ResponseType>)> {
+        self.ensure_matching_edition(database)?;
         if event.update_time <= self.last_reset_time {
             return Ok((self.last_reset_time, vec![]));
         }
@@ -693,6 +863,7 @@ impl QueryTarget {
         &mut self,
         database: &FirestoreDatabase,
     ) -> Result<(Timestamp, Vec<ResponseType>)> {
+        self.ensure_matching_edition(database)?;
         let mut msgs = vec![target_reset()];
 
         self.doctargets_by_name.clear();
@@ -724,210 +895,4 @@ fn show_response_type(rt: &ResponseType) -> &'static str {
 }
 
 #[cfg(test)]
-mod tests {
-    use std::time::Duration;
-
-    use googleapis::google::firestore::v1::{
-        Document, ListenRequest, Target, listen_request,
-        listen_response::ResponseType,
-        target::{self, DocumentsTarget},
-    };
-    use tokio::sync::mpsc;
-    use tokio_stream::{StreamExt, wrappers::ReceiverStream};
-
-    use crate::{FirestoreConfig, FirestoreProject, reference::RootRef};
-
-    #[tokio::test]
-    async fn dropping_response_stream_terminates_idle_listener_task() {
-        let project = Box::leak(Box::new(FirestoreProject::new(FirestoreConfig::default())));
-        let root: RootRef = "projects/p/databases/(default)".parse().unwrap();
-        let (req_tx, req_rx) = mpsc::channel(4);
-
-        let mut resp_stream = project.listen(ReceiverStream::new(req_rx));
-        req_tx
-            .send(ListenRequest {
-                database: root.to_string(),
-                labels: Default::default(),
-                target_change: Some(listen_request::TargetChange::AddTarget(Target {
-                    target_id: 1,
-                    once: false,
-                    expected_count: None,
-                    target_type: Some(target::TargetType::Documents(DocumentsTarget {
-                        documents: vec![format!("{root}/col/doc1")],
-                    })),
-                    resume_type: None,
-                })),
-                request_options: None,
-            })
-            .await
-            .unwrap();
-
-        // Wait until initial snapshot framing reaches TargetChange(NoChange).
-        while let Some(frame) = resp_stream.next().await {
-            let frame = frame.unwrap();
-            if let Some(ResponseType::TargetChange(tc)) = frame.response_type
-                && tc.target_ids.is_empty()
-            {
-                break;
-            }
-        }
-
-        // Drop the response stream while keeping `req_tx` alive on an idle database.
-        drop(resp_stream);
-
-        tokio::time::timeout(Duration::from_secs(1), req_tx.closed())
-            .await
-            .expect("listener task must exit when response receiver is dropped");
-    }
-
-    #[tokio::test]
-    async fn query_and_document_target_watermarks_and_reset_consistency() {
-        use googleapis::google::firestore::v1::{
-            Precondition, Write, precondition, target_change::TargetChangeType, write,
-        };
-
-        let project = Box::leak(Box::new(FirestoreProject::new(FirestoreConfig::default())));
-        let root: RootRef = "projects/p/databases/(default)".parse().unwrap();
-        let db = project.database(&root).await;
-        let doc_name = format!("{root}/col/doc1");
-
-        // Pre-populate col/doc1.
-        db.write(Write {
-            operation: Some(write::Operation::Update(Document {
-                name: doc_name.clone(),
-                ..Default::default()
-            })),
-            current_document: Some(Precondition {
-                condition_type: Some(precondition::ConditionType::Exists(false)),
-            }),
-            ..Default::default()
-        })
-        .await
-        .unwrap();
-
-        // 1. DocumentTarget::reset emits TargetChange(Reset) + DocumentChange and ignores stale
-        //    DatabaseEvents at or before the pinned reset read_time.
-        let doc_ref: crate::reference::DocumentRef = doc_name.parse().unwrap();
-        let mut doc_target = super::DocumentTarget {
-            name: doc_ref.clone(),
-            last_read_time: Default::default(),
-        };
-        let (doc_reset_time, doc_msgs) = doc_target.reset(&db).await.unwrap();
-        assert_eq!(doc_target.last_read_time, doc_reset_time);
-        assert_eq!(doc_msgs.len(), 2);
-        assert!(matches!(
-            &doc_msgs[0],
-            ResponseType::TargetChange(tc)
-                if tc.target_change_type == TargetChangeType::Reset as i32
-        ));
-        assert!(matches!(&doc_msgs[1], ResponseType::DocumentChange(_)));
-
-        let stale_doc_event = crate::event::DatabaseEvent {
-            database:    std::sync::Arc::downgrade(&db),
-            update_time: doc_reset_time,
-            updates:     [(
-                doc_ref.clone(),
-                crate::document::DocumentVersion::Stored(std::sync::Arc::new(
-                    crate::document::StoredDocumentVersion {
-                        name: doc_ref,
-                        create_time: doc_reset_time,
-                        update_time: doc_reset_time,
-                        fields: Default::default(),
-                    },
-                )),
-            )]
-            .into(),
-        };
-        assert!(
-            doc_target
-                .process_event(&stale_doc_event)
-                .unwrap()
-                .is_empty()
-        );
-
-        // 2. QueryTarget::reset pins `last_reset_time` and ignores events at or before it.
-        let mut target = super::QueryTarget::new(
-            crate::query::QueryBuilder::from_collection(format!("{root}/col").parse().unwrap())
-                .build()
-                .unwrap()
-                .into(),
-        );
-        let (reset_time, init_msgs) = target.reset(&db).await.unwrap();
-        assert_eq!(init_msgs.len(), 2); // Reset + DocumentChange(doc1)
-
-        // An event at `reset_time` (or earlier) must be ignored completely even for an unseen doc.
-        let stale_doc_ref: crate::reference::DocumentRef =
-            format!("{root}/col/transient").parse().unwrap();
-        let stale_event = crate::event::DatabaseEvent {
-            database:    std::sync::Arc::downgrade(&db),
-            update_time: reset_time,
-            updates:     [(
-                stale_doc_ref.clone(),
-                crate::document::DocumentVersion::Stored(std::sync::Arc::new(
-                    crate::document::StoredDocumentVersion {
-                        name: stale_doc_ref,
-                        create_time: reset_time,
-                        update_time: reset_time,
-                        fields: Default::default(),
-                    },
-                )),
-            )]
-            .into(),
-        };
-        let (_, skipped) = target.process_event(&db, &stale_event).await.unwrap();
-        assert!(skipped.is_empty());
-    }
-
-    #[tokio::test]
-    async fn document_listener_rejects_invalid_resume_read_time() {
-        use googleapis::google::protobuf::Timestamp;
-
-        let project = Box::leak(Box::new(FirestoreProject::new(FirestoreConfig::default())));
-        let root: RootRef = "projects/p/databases/(default)".parse().unwrap();
-        let (req_tx, req_rx) = mpsc::channel(4);
-
-        let mut resp_stream = project.listen(ReceiverStream::new(req_rx));
-        req_tx
-            .send(ListenRequest {
-                database: root.to_string(),
-                labels: Default::default(),
-                target_change: Some(listen_request::TargetChange::AddTarget(Target {
-                    target_id: 1,
-                    once: false,
-                    expected_count: None,
-                    target_type: Some(target::TargetType::Documents(DocumentsTarget {
-                        documents: vec![format!("{root}/col/doc1")],
-                    })),
-                    resume_type: Some(target::ResumeType::ReadTime(Timestamp {
-                        seconds: -1,
-                        nanos:   0,
-                    })),
-                })),
-                request_options: None,
-            })
-            .await
-            .unwrap();
-
-        let mut saw_invalid_arg = false;
-        while let Some(frame) = resp_stream.next().await {
-            match frame {
-                Err(crate::GenericDatabaseError::InvalidArgument(_)) => {
-                    saw_invalid_arg = true;
-                    break;
-                }
-                Ok(resp) => {
-                    if let Some(ResponseType::TargetChange(tc)) = resp.response_type
-                        && tc.target_ids.is_empty()
-                    {
-                        break;
-                    }
-                }
-                Err(other) => panic!("unexpected listener error: {other:?}"),
-            }
-        }
-        assert!(
-            saw_invalid_arg,
-            "expected InvalidArgument for negative resume_type ReadTime"
-        );
-    }
-}
+mod tests;

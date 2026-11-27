@@ -8,6 +8,8 @@ repository = { workspace = true }
 
 [dependencies]
 base64 = { workspace = true }
+bytes = { workspace = true }
+crc32fast = { workspace = true }
 googleapis = { workspace = true }
 itertools = { workspace = true }
 prost = { workspace = true }

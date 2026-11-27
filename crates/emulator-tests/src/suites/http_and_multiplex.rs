@@ -81,10 +81,15 @@ async fn dynamic_logging_capture_poll_filter_update_and_delete_against_idempoten
     expect_that!(captured.as_ref(), contains_substring("DEBUG"));
     expect_that!(captured.as_ref(), contains_substring("tower_http"));
 
-    // 4. Reconfigure the handle filter to `error` (draining any interim logs), run a clean read,
-    //    and verify the next poll is empty.
+    // 4. Reconfigure the handle filter to `tower_http=error,emulator_grpc=error` (draining any
+    //    interim logs), run a clean read, and verify the next poll is empty.
     let (reconf_status, _) = db
-        .http_raw_body(Method::POST, handle_uri, Some("text/plain"), "error")
+        .http_raw_body(
+            Method::POST,
+            handle_uri,
+            Some("text/plain"),
+            "tower_http=error,emulator_grpc=error",
+        )
         .await;
     expect_eq!(reconf_status, StatusCode::OK);
 

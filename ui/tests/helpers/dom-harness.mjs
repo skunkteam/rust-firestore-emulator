@@ -169,6 +169,49 @@ function parseHtmlToFragment(htmlStr) {
   return frag;
 }
 
+/**
+ * Matches basic DOM selectors supported by the mock UI DOM.
+ * @param {DomElement} el
+ * @param {string} sel
+ * @returns {boolean}
+ */
+function matchesSimpleSelector(el, sel) {
+  const s = sel.trim();
+  if (!s) return false;
+  if (s === '[role="dialog"]') return el.getAttribute("role") === "dialog";
+  if (s === "[data-autofocus]:not([disabled])") {
+    return el.hasAttribute("data-autofocus") && !el.hasAttribute("disabled");
+  }
+  if (s === "a[href]") return el.tagName === "A" && el.hasAttribute("href");
+  if (s === "button:not([disabled])") {
+    return el.tagName === "BUTTON" && !el.hasAttribute("disabled");
+  }
+  if (s === 'input:not([disabled]):not([type="hidden"])') {
+    return (
+      el.tagName === "INPUT" &&
+      !el.hasAttribute("disabled") &&
+      el.getAttribute("type") !== "hidden"
+    );
+  }
+  if (s === "select:not([disabled])") {
+    return el.tagName === "SELECT" && !el.hasAttribute("disabled");
+  }
+  if (s === "textarea:not([disabled])") {
+    return el.tagName === "TEXTAREA" && !el.hasAttribute("disabled");
+  }
+  if (s === '[tabindex]:not([tabindex="-1"])') {
+    return el.hasAttribute("tabindex") && el.getAttribute("tabindex") !== "-1";
+  }
+  if (s.startsWith("[") && s.endsWith("]")) {
+    return el.hasAttribute(s.slice(1, -1));
+  }
+  if (s.startsWith(".")) {
+    const className = s.slice(1);
+    return (el.getAttribute("class") ?? "").split(/\s+/).includes(className);
+  }
+  return false;
+}
+
 export class DomElement extends DomNode {
   /** @param {string} tagName */
   constructor(tagName) {
@@ -176,6 +219,7 @@ export class DomElement extends DomNode {
     this.tagName = tagName;
     /** @type {Map<string, string>} */
     this._attrs = new Map();
+    this.focusCalls = 0;
     if (tagName === "TEMPLATE") {
       this.content = new DomFragment();
     }
@@ -255,27 +299,54 @@ export class DomElement extends DomNode {
   addEventListener() {}
   removeEventListener() {}
 
+  /** @returns {boolean} */
+  get isConnected() {
+    return true;
+  }
+
+  focus() {
+    this.focusCalls++;
+    harness.activeElement = this;
+  }
+
+  /**
+   * @param {unknown} target
+   * @returns {boolean}
+   */
+  contains(target) {
+    if (target === this) return true;
+    for (const c of this.childNodes) {
+      if (c === target || (c instanceof DomElement && c.contains(target))) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  /**
+   * @param {DomNode} node
+   * @returns {DomNode}
+   */
+  appendChild(node) {
+    return this.insertBefore(node, null);
+  }
+
   /**
    * @param {string} selector
    * @returns {DomElement[]}
    */
   querySelectorAll(selector) {
-    const attrName =
-      selector.startsWith("[") && selector.endsWith("]")
-        ? selector.slice(1, -1)
-        : null;
-    const className = selector.startsWith(".") ? selector.slice(1) : null;
+    const parts = selector
+      .split(",")
+      .map((p) => p.trim())
+      .filter(Boolean);
     /** @type {DomElement[]} */
     const out = [];
     /** @param {DomNode} node */
     const visit = (node) => {
       for (const c of node.childNodes) {
         if (c instanceof DomElement) {
-          if (attrName && c.hasAttribute(attrName)) out.push(c);
-          else if (
-            className &&
-            (c.getAttribute("class") ?? "").split(/\s+/).includes(className)
-          ) {
+          if (parts.some((p) => matchesSimpleSelector(c, p))) {
             out.push(c);
           }
           visit(c);
@@ -284,6 +355,14 @@ export class DomElement extends DomNode {
     };
     visit(this);
     return out;
+  }
+
+  /**
+   * @param {string} selector
+   * @returns {DomElement | null}
+   */
+  querySelector(selector) {
+    return this.querySelectorAll(selector)[0] ?? null;
   }
 
   _cloneShallow() {

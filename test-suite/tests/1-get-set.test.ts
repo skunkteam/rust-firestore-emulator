@@ -1,5 +1,33 @@
 import { DocumentReference, FieldPath, FieldValue, Timestamp } from '@google-cloud/firestore';
-import { editions, notImplementedInJava, readData, writeData } from './utils';
+import {
+    RawDocument,
+    RawProtoValue,
+    callRawUnaryRpc,
+    editions,
+    expectRpcCode,
+    notImplementedInJava,
+    notImplementedInRust,
+    readData,
+    writeData,
+} from './utils';
+
+const ONE_HOUR_MS = 60 * 60 * 1_000;
+
+interface RawCommitRequest {
+    database: string;
+    writes: Array<{
+        update: RawDocument;
+        updateTransforms?: Array<{
+            fieldPath: string;
+            appendMissingElements?: { values: RawProtoValue[] };
+        }>;
+    }>;
+}
+
+function rawTtlValue(): RawProtoValue {
+    const ttl = Timestamp.fromMillis(Date.now() + ONE_HOUR_MS);
+    return { timestampValue: { seconds: ttl.seconds, nanos: ttl.nanoseconds } };
+}
 
 describe.each(editions)('$description', fs => {
     let docRef: DocumentReference;
@@ -317,6 +345,123 @@ describe.each(editions)('$description', fs => {
                     if (str.length < 15) return str;
                     return `${str.substring(0, 15)}, length: ${str.length}`;
                 }
+            });
+        });
+
+        describe('timestampValue bounds', () => {
+            type RawTimestampValue = NonNullable<RawProtoValue['timestampValue']>;
+
+            async function commitRawWrite(write: RawCommitRequest['writes'][number], label: string): Promise<void> {
+                const database = (fs.firestore as unknown as { formattedName: string }).formattedName;
+                const req: RawCommitRequest = {
+                    database,
+                    writes: [write],
+                };
+                await callRawUnaryRpc<RawCommitRequest>(fs.firestore, 'commit', req, label);
+            }
+
+            async function commitTimestamp(ref: DocumentReference, timestampValue: RawTimestampValue, label: string): Promise<void> {
+                const database = (fs.firestore as unknown as { formattedName: string }).formattedName;
+                await commitRawWrite(
+                    {
+                        update: {
+                            name: `${database}/documents/${ref.path}`,
+                            fields: {
+                                ts: { timestampValue },
+                                ttl: rawTtlValue(),
+                            },
+                        },
+                    },
+                    label,
+                );
+            }
+
+            test.each([
+                { label: 'minimum boundary (0001-01-01T00:00:00Z)', seconds: -62_135_596_800, nanos: 0 },
+                { label: 'maximum microsecond boundary (9999-12-31T23:59:59.999999Z)', seconds: 253_402_300_799, nanos: 999_999_000 },
+            ])('accepts $label', async ({ label, seconds, nanos }) => {
+                await commitTimestamp(docRef, { seconds, nanos }, `ts-valid-${label}`);
+                expect(await getDoc(docRef)).toEqual({ ts: new Timestamp(seconds, nanos) });
+            });
+
+            test('accepts maximum nanosecond boundary (9999-12-31T23:59:59.999999999Z)', async () => {
+                await commitTimestamp(docRef, { seconds: 253_402_300_799, nanos: 999_999_999 }, 'ts-valid-maximum-nanosecond-boundary');
+                const snap = await docRef.get();
+                expect(snap.exists).toBeTrue();
+                const { ts } = readData<{ ts: Timestamp }>(snap.data());
+                expect(ts).toBeInstanceOf(Timestamp);
+                expect(ts.seconds).toBe(253_402_300_799);
+                expect(ts.nanoseconds).toBeGreaterThanOrEqual(999_999_000);
+                expect(ts.nanoseconds).toBeLessThanOrEqual(999_999_999);
+            });
+
+            notImplementedInRust ||
+                test('truncates sub-microsecond nanoseconds to microsecond precision on write', async () => {
+                    await commitTimestamp(docRef, { seconds: 253_402_300_799, nanos: 999_999_999 }, 'ts-truncate-submicrosecond');
+                    expect(await getDoc(docRef)).toEqual({ ts: new Timestamp(253_402_300_799, 999_999_000) });
+                });
+
+            const invalidTimestamps = [
+                { label: 'seconds below minimum (-62135596801)', seconds: -62_135_596_801, nanos: 0 },
+                { label: 'seconds above maximum (253402300800)', seconds: 253_402_300_800, nanos: 0 },
+                { label: 'negative nanos (-1)', seconds: 0, nanos: -1 },
+                { label: 'nanos equal to 1_000_000_000', seconds: 0, nanos: 1_000_000_000 },
+            ] as const;
+
+            test.each(invalidTimestamps)('rejects $label with 3 INVALID_ARGUMENT', async ({ label, seconds, nanos }) => {
+                await expectRpcCode(() => commitTimestamp(docRef, { seconds, nanos }, `ts-invalid-${label}`), 3, label);
+            });
+
+            describe.each([
+                {
+                    container: 'nested mapValue',
+                    buildWrite: (name: string, timestampValue: RawTimestampValue): RawCommitRequest['writes'][number] => ({
+                        update: {
+                            name,
+                            fields: {
+                                nested: { mapValue: { fields: { ts: { timestampValue } } } },
+                                ttl: rawTtlValue(),
+                            },
+                        },
+                    }),
+                },
+                {
+                    container: 'arrayValue',
+                    buildWrite: (name: string, timestampValue: RawTimestampValue): RawCommitRequest['writes'][number] => ({
+                        update: {
+                            name,
+                            fields: {
+                                list: { arrayValue: { values: [{ timestampValue }] } },
+                                ttl: rawTtlValue(),
+                            },
+                        },
+                    }),
+                },
+                {
+                    container: 'appendMissingElements transform',
+                    buildWrite: (name: string, timestampValue: RawTimestampValue): RawCommitRequest['writes'][number] => ({
+                        update: {
+                            name,
+                            fields: { ttl: rawTtlValue() },
+                        },
+                        updateTransforms: [
+                            {
+                                fieldPath: 'arr',
+                                appendMissingElements: { values: [{ timestampValue }] },
+                            },
+                        ],
+                    }),
+                },
+            ])('inside $container', ({ container, buildWrite }) => {
+                test.each(invalidTimestamps)('rejects $label with 3 INVALID_ARGUMENT', async ({ label, seconds, nanos }) => {
+                    const database = (fs.firestore as unknown as { formattedName: string }).formattedName;
+                    const name = `${database}/documents/${docRef.path}`;
+                    await expectRpcCode(
+                        () => commitRawWrite(buildWrite(name, { seconds, nanos }), `ts-invalid-${container}-${label}`),
+                        3,
+                        `${container}: ${label}`,
+                    );
+                });
             });
         });
     });

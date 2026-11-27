@@ -277,6 +277,8 @@ name = "emulator-database"
 version = "1.0.0"
 dependencies = [
  "base64",
+ "bytes",
+ "crc32fast",
  "futures-util",
  "googleapis",
  "googletest",
@@ -402,15 +404,19 @@ checksum = "1c66915cc5391097de7a2b0b972e8505aa33c0df401fd3a6811dbdb32881ba48"
 name = "firestore-emulator"
 version = "1.0.0"
 dependencies = [
+ "bytes",
  "clap",
  "emulator-database",
  "emulator-grpc",
  "emulator-http",
  "emulator-tracing",
  "futures-util",
+ "googleapis",
  "http",
+ "http-body-util",
  "hyper",
  "hyper-util",
+ "serde_json",
  "tikv-jemallocator",
  "tokio",
  "tonic",

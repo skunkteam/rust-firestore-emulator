@@ -897,6 +897,10 @@ impl Query {
         self.find_nearest.is_some()
     }
 
+    pub(crate) fn enterprise_edition(&self) -> bool {
+        self.enterprise_edition
+    }
+
     pub fn reset_on_update(&self) -> bool {
         self.find_nearest.is_none() && self.order_by.iter().any(|o| !o.field.is_document_name())
     }

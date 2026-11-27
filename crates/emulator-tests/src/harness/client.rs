@@ -1,4 +1,4 @@
-use std::{collections::HashMap, convert::Infallible};
+use std::{collections::HashMap, convert::Infallible, future::Future};
 
 use axum::{
     Router,
@@ -25,7 +25,7 @@ use googleapis::google::{
     },
     protobuf::Timestamp,
 };
-use http::{Method, Request, StatusCode, Uri};
+use http::{HeaderMap, Method, Request, StatusCode, Uri};
 use serde_json::json;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
@@ -137,6 +137,31 @@ impl TestDb {
         self.http_request(method, uri, content_type, body).await
     }
 
+    pub(crate) fn http_raw_request(
+        &self,
+        method: Method,
+        uri: &str,
+        headers: HeaderMap,
+        body: Body,
+    ) -> impl Future<Output = (StatusCode, HeaderMap, Bytes)> + Send + 'static {
+        let mut req = Request::builder()
+            .method(method)
+            .uri(uri)
+            .body(body)
+            .expect("valid http request");
+        *req.headers_mut() = headers;
+        let http = self.http.clone();
+        async move {
+            let resp = http.oneshot(req).await.expect("infallible router oneshot");
+            let status = resp.status();
+            let resp_headers = resp.headers().clone();
+            let bytes = to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .expect("in-memory response body read");
+            (status, resp_headers, bytes)
+        }
+    }
+
     pub(crate) async fn http_raw_body(
         &self,
         method: Method,
@@ -144,8 +169,17 @@ impl TestDb {
         content_type: Option<&str>,
         raw_body: impl Into<Bytes>,
     ) -> (StatusCode, Bytes) {
-        self.http_request(method, uri, content_type, Body::from(raw_body.into()))
-            .await
+        let mut headers = HeaderMap::new();
+        if let Some(ct) = content_type {
+            headers.insert(
+                http::header::CONTENT_TYPE,
+                ct.parse().expect("valid Content-Type header value"),
+            );
+        }
+        let (status, _headers, bytes) = self
+            .http_raw_request(method, uri, headers, Body::from(raw_body.into()))
+            .await;
+        (status, bytes)
     }
 
     /// Opens an in-memory SSE or streaming HTTP response via `oneshot`, returning status and

@@ -1,26 +1,42 @@
 #![allow(unused_crate_dependencies)]
 
-use std::{fmt, future::Future, net::SocketAddr, num::NonZeroU64, time::Duration};
+use std::{
+    borrow::Cow,
+    error::Error,
+    fmt,
+    fs::File,
+    future::Future,
+    io::{self, Read},
+    net::SocketAddr,
+    num::NonZeroU64,
+    path::{Path, PathBuf},
+    time::Duration,
+};
 
+use bytes::Bytes;
 use clap::Parser;
-use emulator_database::{FirestoreConfig, FirestoreProject};
+use emulator_database::{
+    FirestoreConfig, FirestoreProject,
+    snapshot::{EXPORT_CHUNK_BYTES, SnapshotError},
+};
 use emulator_tracing::DefaultTracing;
 use firestore_emulator::run;
 use tokio::net::TcpListener;
+use tracing::{Level, enabled, info};
 
 #[cfg(target_os = "linux")]
 #[global_allocator]
 static GLOBAL_ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
 struct CliError {
-    context:    Option<&'static str>,
-    source:     Box<dyn std::error::Error + Send + Sync>,
+    context:    Option<Cow<'static, str>>,
+    source:     Box<dyn Error + Send + Sync>,
     suggestion: Option<&'static str>,
 }
 
 impl fmt::Display for CliError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        if let Some(ctx) = self.context {
+        if let Some(ctx) = &self.context {
             write!(f, "{ctx}: {}", self.source)?;
         } else {
             write!(f, "{}", self.source)?;
@@ -58,10 +74,11 @@ struct Args {
     #[arg(long, env = "FIRESTORE_EMULATOR_LONG_CONTENTION_TIMEOUT")]
     long_contention_timeout: bool,
 
-    /// Default to Enterprise Edition for all new databases.
+    /// Default to Enterprise Edition for new databases created after startup.
     ///
-    /// The Firestore emulator can simulate both the Standard and Enterprise editions.
-    /// Enable this flag to default new databases to the Enterprise edition.
+    /// By default, new databases use Standard Edition (pessimistic concurrency). Enable this flag
+    /// to default new databases to Enterprise Edition (optimistic concurrency). Databases
+    /// preloaded via --import retain the edition and concurrency mode saved in the snapshot.
     #[arg(long, env = "FIRESTORE_EMULATOR_DEFAULT_ENTERPRISE")]
     default_enterprise: bool,
 
@@ -76,6 +93,130 @@ struct Args {
     /// Defaults to Cloud Firestore's 270-second maximum transaction lifetime when unset.
     #[arg(long, env = "FIRESTORE_EMULATOR_TRANSACTION_MAX_LIFETIME_MS")]
     transaction_max_lifetime_ms: Option<NonZeroU64>,
+
+    /// Optional path to a .fsemu snapshot file to preload before listening.
+    ///
+    /// Reads a binary .fsemu snapshot exported from /emulator/v1/export or the Web UI (Firebase
+    /// Java emulator export directories are not supported). Imported databases retain their saved
+    /// edition and concurrency settings regardless of --default-enterprise. Invalid, unreadable,
+    /// or directory paths fail startup with a non-zero exit code before listening.
+    #[arg(
+        long = "import",
+        value_name = "PATH",
+        env = "FIRESTORE_EMULATOR_IMPORT"
+    )]
+    import_path: Option<PathBuf>,
+}
+
+fn cli_io_import_error(path: &Path, err: io::Error) -> CliError {
+    let suggestion = if err.kind() == io::ErrorKind::IsADirectory || path.is_dir() {
+        "Pass a .fsemu snapshot file exported from /emulator/v1/export or the Web UI, not a \
+         directory (Firebase Java emulator export directories are not supported)."
+    } else if matches!(
+        err.kind(),
+        io::ErrorKind::NotFound | io::ErrorKind::PermissionDenied
+    ) {
+        "Verify that the snapshot file path exists and is readable by this process."
+    } else {
+        "Verify that the snapshot file path points to a readable .fsemu snapshot file."
+    };
+    CliError {
+        context:    Some(Cow::Owned(format!(
+            "Could not import snapshot from '{}'",
+            path.display()
+        ))),
+        source:     Box::new(err),
+        suggestion: Some(suggestion),
+    }
+}
+
+fn cli_snapshot_import_error(path: &Path, err: SnapshotError) -> CliError {
+    let suggestion = match &err {
+        SnapshotError::UnsupportedVersion { .. } => {
+            "Re-export the snapshot using a compatible version of firestore-emulator."
+        }
+        SnapshotError::Stream(_) => "Verify that the snapshot file remains readable and try again.",
+        SnapshotError::InvalidFormat(_)
+        | SnapshotError::Truncated(_)
+        | SnapshotError::FrameTooLarge { .. }
+        | SnapshotError::Validation(_) => {
+            "Verify that the file is a valid, uncorrupted .fsemu snapshot (or re-export it from \
+             /emulator/v1/export or the Web UI)."
+        }
+        SnapshotError::ImportInProgress => {
+            "Wait for any active snapshot import to finish and retry."
+        }
+    };
+    CliError {
+        context:    Some(Cow::Owned(format!(
+            "Could not import snapshot from '{}'",
+            path.display()
+        ))),
+        source:     Box::new(err),
+        suggestion: Some(suggestion),
+    }
+}
+
+async fn load_startup_snapshot(
+    project: &'static FirestoreProject,
+    path: &Path,
+) -> Result<(), CliError> {
+    let file = File::open(path).map_err(|err| cli_io_import_error(path, err))?;
+    let metadata = file
+        .metadata()
+        .map_err(|err| cli_io_import_error(path, err))?;
+    if metadata.is_dir() {
+        return Err(cli_io_import_error(
+            path,
+            io::Error::new(
+                io::ErrorKind::IsADirectory,
+                "path is a directory, expected a .fsemu snapshot file",
+            ),
+        ));
+    }
+
+    let stream = futures_util::stream::unfold(
+        Some((file, vec![0u8; EXPORT_CHUNK_BYTES])),
+        |state| async move {
+            let (mut file, mut buf) = state?;
+            loop {
+                match file.read(&mut buf) {
+                    Ok(0) => return None,
+                    Ok(n) => {
+                        let chunk = Bytes::copy_from_slice(&buf[..n]);
+                        return Some((Ok(chunk), Some((file, buf))));
+                    }
+                    Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
+                    Err(err) => {
+                        return Some((Err(SnapshotError::Stream(err.to_string())), None));
+                    }
+                }
+            }
+        },
+    );
+
+    let summary = project
+        .import_snapshot(Box::pin(stream))
+        .await
+        .map_err(|err| cli_snapshot_import_error(path, err))?;
+
+    if enabled!(Level::INFO) {
+        info!(
+            "Loaded snapshot from {}: {} database(s), {} document(s)",
+            path.display(),
+            summary.total_databases(),
+            summary.total_documents(),
+        );
+    } else {
+        eprintln!(
+            "Loaded snapshot from {}: {} database(s), {} document(s)",
+            path.display(),
+            summary.total_databases(),
+            summary.total_documents(),
+        );
+    }
+
+    Ok(())
 }
 
 #[cfg(unix)]
@@ -85,12 +226,12 @@ fn shutdown_signal() -> Result<impl Future<Output = ()> + Send + 'static, CliErr
     // Register both SIGINT and SIGTERM eagerly before `run(...)` prints "listening" to avoid a
     // startup race where an early signal hits the default termination disposition.
     let mut sigint = signal(SignalKind::interrupt()).map_err(|err| CliError {
-        context:    Some("Could not install SIGINT signal handler"),
+        context:    Some(Cow::Borrowed("Could not install SIGINT signal handler")),
         source:     Box::new(err),
         suggestion: None,
     })?;
     let mut sigterm = signal(SignalKind::terminate()).map_err(|err| CliError {
-        context:    Some("Could not install SIGTERM signal handler"),
+        context:    Some(Cow::Borrowed("Could not install SIGTERM signal handler")),
         source:     Box::new(err),
         suggestion: None,
     })?;
@@ -122,6 +263,7 @@ async fn main() -> Result<(), CliError> {
         default_enterprise,
         transaction_idle_timeout_ms,
         transaction_max_lifetime_ms,
+        import_path,
     } = Args::parse();
 
     // Create a new Firestore Project.
@@ -136,8 +278,13 @@ async fn main() -> Result<(), CliError> {
     // Make it live for the remainder of the program's life. ('static)
     let project = Box::leak(project);
 
+    if let Some(ref path) = import_path {
+        load_startup_snapshot(project, path).await?;
+    }
     let listener = TcpListener::bind(host_port).await.map_err(|err| CliError {
-        context:    Some("Could not start listener on provided address"),
+        context:    Some(Cow::Borrowed(
+            "Could not start listener on provided address",
+        )),
         source:     Box::new(err),
         suggestion: Some(
             "Use \"--host-port 127.0.0.1:0\" to listen to a random port on localhost.",
@@ -157,11 +304,12 @@ async fn main() -> Result<(), CliError> {
 
 #[cfg(test)]
 mod tests {
-    use std::{error::Error, fmt, io};
+    use std::{borrow::Cow, error::Error, fmt, io, path::Path};
 
     use clap::Parser;
+    use emulator_database::{GenericDatabaseError, snapshot::SnapshotError};
 
-    use super::{Args, CliError};
+    use super::{Args, CliError, cli_io_import_error, cli_snapshot_import_error};
 
     #[derive(Debug)]
     struct OuterError(io::Error);
@@ -181,7 +329,9 @@ mod tests {
     #[test]
     fn cli_error_formats_context_causes_and_suggestion() {
         let with_ctx = CliError {
-            context:    Some("Could not start listener on provided address"),
+            context:    Some(Cow::Borrowed(
+                "Could not start listener on provided address",
+            )),
             source:     Box::new(OuterError(io::Error::new(
                 io::ErrorKind::AddrInUse,
                 "address in use",
@@ -196,6 +346,18 @@ mod tests {
         assert_eq!(with_ctx.to_string(), expected);
         assert_eq!(format!("{with_ctx:?}"), expected);
 
+        let with_owned = CliError {
+            context:    Some(Cow::Owned(
+                "Could not import snapshot from 'snap.fsemu'".to_string(),
+            )),
+            source:     Box::new(io::Error::new(io::ErrorKind::NotFound, "missing")),
+            suggestion: Some("Check the path."),
+        };
+        assert_eq!(
+            with_owned.to_string(),
+            "Could not import snapshot from 'snap.fsemu': missing\n\nSuggestion: Check the path."
+        );
+
         let bare = CliError {
             context:    None,
             source:     Box::new(io::Error::other("server transport failed")),
@@ -203,6 +365,49 @@ mod tests {
         };
         assert_eq!(bare.to_string(), "server transport failed");
         assert_eq!(format!("{bare:?}"), "server transport failed");
+    }
+
+    #[test]
+    fn cli_import_errors_classify_suggestions_per_failure_class() {
+        let dir_err = cli_io_import_error(
+            Path::new("exports/firebase-dir"),
+            io::Error::new(io::ErrorKind::IsADirectory, "is a directory"),
+        )
+        .to_string();
+        assert!(dir_err.contains("Could not import snapshot from 'exports/firebase-dir'"));
+        assert!(dir_err.contains(".fsemu"));
+        assert!(dir_err.contains("directory"));
+
+        let missing_err = cli_io_import_error(
+            Path::new("missing.fsemu"),
+            io::Error::new(io::ErrorKind::NotFound, "not found"),
+        )
+        .to_string();
+        assert!(missing_err.contains("Could not import snapshot from 'missing.fsemu'"));
+        assert!(missing_err.contains("exists and is readable"));
+
+        let version_err = cli_snapshot_import_error(
+            Path::new("future.fsemu"),
+            SnapshotError::UnsupportedVersion {
+                found_major:     99,
+                supported_major: 1,
+            },
+        )
+        .to_string();
+        assert!(version_err.contains("Could not import snapshot from 'future.fsemu'"));
+        assert!(version_err.contains("found major 99, supported major 1"));
+        assert!(version_err.contains("compatible version"));
+
+        for err in [
+            SnapshotError::InvalidFormat("bad crc".to_string()),
+            SnapshotError::Truncated("eof".to_string()),
+            SnapshotError::FrameTooLarge { len: 100, max: 50 },
+            SnapshotError::Validation(GenericDatabaseError::InvalidArgument("bad ts".to_string())),
+        ] {
+            let formatted = cli_snapshot_import_error(Path::new("bad.fsemu"), err).to_string();
+            assert!(formatted.contains("Could not import snapshot from 'bad.fsemu'"));
+            assert!(formatted.contains("valid, uncorrupted .fsemu snapshot"));
+        }
     }
 
     #[test]
@@ -216,6 +421,7 @@ mod tests {
         assert!(!default_args.default_enterprise);
         assert_eq!(default_args.transaction_idle_timeout_ms, None);
         assert_eq!(default_args.transaction_max_lifetime_ms, None);
+        assert_eq!(default_args.import_path, None);
 
         let args = Args::try_parse_from([
             "firestore-emulator",
@@ -227,6 +433,8 @@ mod tests {
             "2000",
             "--transaction-max-lifetime-ms",
             "10000",
+            "--import",
+            "fixtures/state.fsemu",
         ])
         .unwrap();
         assert_eq!(args.host_port, "127.0.0.1:8085".parse().unwrap());
@@ -234,6 +442,10 @@ mod tests {
         assert!(args.default_enterprise);
         assert_eq!(args.transaction_idle_timeout_ms.unwrap().get(), 2000);
         assert_eq!(args.transaction_max_lifetime_ms.unwrap().get(), 10000);
+        assert_eq!(
+            args.import_path.as_deref(),
+            Some(Path::new("fixtures/state.fsemu"))
+        );
 
         // Zero values are rejected by NonZeroU64.
         assert!(
@@ -277,6 +489,7 @@ mod tests {
                 "transaction_max_lifetime_ms",
                 "FIRESTORE_EMULATOR_TRANSACTION_MAX_LIFETIME_MS",
             ),
+            ("import_path", "FIRESTORE_EMULATOR_IMPORT"),
         ] {
             let arg = cmd
                 .get_arguments()
@@ -288,5 +501,10 @@ mod tests {
                 "unexpected env binding for {arg_id}"
             );
         }
+        let import_arg = cmd
+            .get_arguments()
+            .find(|a| a.get_id() == "import_path")
+            .unwrap();
+        assert_eq!(import_arg.get_long(), Some("import"));
     }
 }

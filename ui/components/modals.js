@@ -6,6 +6,8 @@ import {
   createDocument,
   deleteCollection,
   deleteDocument,
+  exportSnapshot,
+  importSnapshot,
   listCollectionIds,
   patchDatabase,
 } from "../api.js";
@@ -27,6 +29,7 @@ import {
   pruneCachesWithPrefix,
 } from "../state.js";
 
+/** @typedef {import('../api.js').ImportSummary} ImportSummary */
 /** @typedef {import('../lit-html.js').TemplateResult} TemplateResult */
 /** @typedef {import('../state.js').ActiveModal} ActiveModal */
 /** @typedef {import('../state.js').AppState} AppState */
@@ -35,9 +38,10 @@ import {
  * @typedef {{
  *   onRerender: () => void,
  *   onSelectDatabase: (projectId: string, databaseId: string, initialSegments?: string[], replaceHistory?: boolean) => Promise<void>,
- *   onHydrateVisiblePath: (expectedDbEpoch?: number, expectedNavEpoch?: number, segmentsSnapshot?: string[]) => Promise<void>,
+ *   onHydrateVisiblePath: (expectedDbEpoch?: number, expectedNavEpoch?: number, segmentsSnapshot?: string[]) => Promise<unknown>,
  *   onRefreshDatabaseList: () => Promise<boolean>,
  *   onToast: (text: string, tone?: 'info' | 'success' | 'error') => void,
+ *   onImportSuccess: (summary: ImportSummary) => Promise<void>,
  * }} ModalCallbacks
  */
 
@@ -50,8 +54,12 @@ const FOCUSABLE_SELECTOR = [
   '[tabindex]:not([tabindex="-1"])',
 ].join(", ");
 
+const EXPORT_REVOKE_DELAY_MS = 60_000;
+
 /** @type {EventTarget | null} */
 let backdropMouseDownTarget = null;
+/** @type {HTMLInputElement | null} */
+let importFileInputEl = null;
 
 /**
  * Records whether a pointer press originated directly on the modal backdrop.
@@ -195,7 +203,9 @@ function renderDialogShell(p) {
           </button>
         </div>
         <div class="modal-body">
-          ${p.error ? html`<div class="error-banner">${p.error}</div>` : nothing}
+          ${p.error
+            ? html`<div class="error-banner modal-banner" role="alert">${p.error}</div>`
+            : nothing}
           ${p.body}
         </div>
         <div class="modal-footer">${p.footer}</div>
@@ -214,12 +224,14 @@ export function renderModal(state, callbacks) {
   const m = state.modal;
   if (!m) {
     backdropMouseDownTarget = null;
+    importFileInputEl = null;
     return nothing;
   }
 
   const close = () => {
     if (m.busy) return;
     backdropMouseDownTarget = null;
+    importFileInputEl = null;
     state.modal = null;
     callbacks.onRerender();
   };
@@ -235,6 +247,12 @@ export function renderModal(state, callbacks) {
   }
   if (m.kind === "delete_col") {
     return renderDeleteColModal(m, state, callbacks, close);
+  }
+  if (m.kind === "export_snapshot") {
+    return renderExportSnapshotModal(m, state, callbacks, close);
+  }
+  if (m.kind === "import_snapshot") {
+    return renderImportSnapshotModal(m, state, callbacks, close);
   }
   return renderClearDbModal(m, state, callbacks, close);
 }
@@ -767,6 +785,220 @@ function renderClearDbModal(m, state, callbacks, close) {
         @click=${confirmClearDb}
       >
         ${m.busy ? "Clearing..." : "Clear Database"}
+      </button>
+    `,
+  });
+}
+
+/**
+ * @param {Extract<ActiveModal, { kind: 'export_snapshot' }>} m
+ * @param {AppState} state
+ * @param {ModalCallbacks} callbacks
+ * @param {() => void} close
+ * @returns {TemplateResult}
+ */
+function renderExportSnapshotModal(m, state, callbacks, close) {
+  const activeRoot = getActiveRootPath(
+    state.activeProjectId,
+    state.activeDatabaseId
+  );
+  const activeLabel =
+    state.activeProjectId && state.activeDatabaseId
+      ? `${state.activeProjectId}/${state.activeDatabaseId}`
+      : null;
+
+  const triggerDownload = async (/** @type {'current' | 'all'} */ scope) => {
+    if (m.busy) return;
+    if (scope === "current" && !activeRoot) return;
+    m.busy = true;
+    m.busyScope = scope;
+    m.error = null;
+    callbacks.onRerender();
+    try {
+      const targets = scope === "current" && activeRoot ? [activeRoot] : [];
+      const { blob, filename } = await exportSnapshot(targets);
+      const objectUrl = URL.createObjectURL(blob);
+      /** @type {HTMLAnchorElement | null} */
+      let a = null;
+      try {
+        a = document.createElement("a");
+        a.href = objectUrl;
+        a.download = filename;
+        if (a.style) {
+          a.style.display = "none";
+        }
+        document.body?.appendChild(a);
+        a.click();
+      } finally {
+        a?.remove?.();
+        setTimeout(() => {
+          URL.revokeObjectURL(objectUrl);
+        }, EXPORT_REVOKE_DELAY_MS);
+      }
+      state.modal = null;
+      callbacks.onToast(`Exported snapshot ${filename}`, "info");
+    } catch (err) {
+      m.busy = false;
+      m.busyScope = null;
+      m.error = err instanceof Error ? err.message : String(err);
+      callbacks.onRerender();
+    }
+  };
+
+  return renderDialogShell({
+    titleId: "modal-title-export-snapshot",
+    title: "Export Snapshot",
+    busy: m.busy,
+    error: m.error,
+    close,
+    body: html`
+      <p style="margin: 0;">
+        Download a binary <span class="mono">.fsemu</span> snapshot preserving
+        documents, subcollections, empty databases, and database settings.
+      </p>
+      ${activeLabel
+        ? html`
+            <p style="margin: 0; font-size: 12px; color: var(--text-muted);">
+              Active database: <strong class="mono">${activeLabel}</strong>
+            </p>
+          `
+        : nothing}
+      <div class="snapshot-action-row">
+        <button
+          type="button"
+          class="btn btn-primary"
+          ?data-autofocus=${Boolean(activeRoot)}
+          ?disabled=${m.busy || !activeRoot}
+          @click=${() => triggerDownload("current")}
+        >
+          ${m.busy && m.busyScope === "current"
+            ? "Exporting..."
+            : "Current Database"}
+        </button>
+        <button
+          type="button"
+          class="btn"
+          ?data-autofocus=${!activeRoot}
+          ?disabled=${m.busy}
+          @click=${() => triggerDownload("all")}
+        >
+          ${m.busy && m.busyScope === "all"
+            ? "Exporting..."
+            : "All Databases"}
+        </button>
+      </div>
+    `,
+    footer: html`
+      <button type="button" class="btn" ?disabled=${m.busy} @click=${close}>
+        Cancel
+      </button>
+    `,
+  });
+}
+
+/**
+ * @param {Extract<ActiveModal, { kind: 'import_snapshot' }>} m
+ * @param {AppState} state
+ * @param {ModalCallbacks} callbacks
+ * @param {() => void} close
+ * @returns {TemplateResult}
+ */
+function renderImportSnapshotModal(m, state, callbacks, close) {
+  const hasDirtyEditors = Array.from(state.documentLevels.values()).some(
+    (level) => Boolean(level.editorSession?.isDirty)
+  );
+  const describedByIds = hasDirtyEditors
+    ? "import-snapshot-overwrite-warning import-snapshot-dirty-warning"
+    : "import-snapshot-overwrite-warning";
+
+  const submitImport = async () => {
+    if (m.busy) return;
+    if (!m.file) {
+      m.error = "Select a .fsemu snapshot file to import";
+      callbacks.onRerender();
+      return;
+    }
+    const file = m.file;
+    const fileInputEl = importFileInputEl;
+    m.busy = true;
+    m.error = null;
+    callbacks.onRerender();
+    try {
+      const summary = await importSnapshot(file);
+      state.modal = null;
+      importFileInputEl = null;
+      const dbWord = summary.totalDatabases === 1 ? "database" : "databases";
+      const docWord = summary.totalDocuments === 1 ? "document" : "documents";
+      callbacks.onToast(
+        `Imported ${summary.totalDatabases} ${dbWord}, ${summary.totalDocuments} ${docWord}`,
+        "success"
+      );
+      await callbacks.onImportSuccess(summary);
+    } catch (err) {
+      m.busy = false;
+      m.error = err instanceof Error ? err.message : String(err);
+    } finally {
+      m.file = null;
+      if (fileInputEl) {
+        fileInputEl.value = "";
+      }
+      callbacks.onRerender();
+    }
+  };
+
+  return renderDialogShell({
+    titleId: "modal-title-import-snapshot",
+    title: "Import Snapshot",
+    busy: m.busy,
+    error: m.error,
+    close,
+    body: html`
+      <div
+        class="conflict-banner modal-banner"
+        id="import-snapshot-overwrite-warning"
+      >
+        <span>Importing completely replaces (never merges) each database in the snapshot, deleting extra documents and overwriting settings. Databases not in the snapshot remain untouched.</span>
+      </div>
+      ${hasDirtyEditors
+        ? html`
+            <div
+              class="conflict-banner modal-banner"
+              id="import-snapshot-dirty-warning"
+            >
+              <span>You have unsaved edits in an open document editor. If this import updates or deletes that document, your local draft is kept with an option to keep, reload, or discard it.</span>
+            </div>
+          `
+        : nothing}
+      <div class="form-field">
+        <label for="modal-import-snapshot-file">Snapshot File (.fsemu)</label>
+        <input
+          id="modal-import-snapshot-file"
+          type="file"
+          class="input"
+          accept=".fsemu,application/octet-stream"
+          aria-describedby=${describedByIds}
+          ?disabled=${m.busy}
+          @change=${(/** @type {Event} */ e) => {
+            const input = /** @type {HTMLInputElement} */ (e.target);
+            importFileInputEl = input;
+            m.file = input.files?.[0] ?? null;
+            m.error = null;
+            callbacks.onRerender();
+          }}
+        />
+      </div>
+    `,
+    footer: html`
+      <button type="button" class="btn" ?disabled=${m.busy} @click=${close}>
+        Cancel
+      </button>
+      <button
+        type="button"
+        class="btn btn-primary"
+        ?disabled=${m.busy || !m.file}
+        @click=${submitImport}
+      >
+        ${m.busy ? "Importing..." : "Import Snapshot"}
       </button>
     `,
   });

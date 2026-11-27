@@ -4,14 +4,18 @@ use std::{
 };
 
 use thiserror::Error;
-use time::{Duration, OffsetDateTime, format_description::well_known::Iso8601};
+use time::{
+    Duration, OffsetDateTime,
+    format_description::{FormatItem, well_known::Iso8601},
+    macros::format_description,
+};
 
 use crate::google::protobuf::Timestamp;
 
 /// Minimum valid Proto3 `Timestamp` seconds (`0001-01-01T00:00:00Z`).
-pub(crate) const MIN_TIMESTAMP_SECONDS: i64 = -62_135_596_800;
+pub const MIN_TIMESTAMP_SECONDS: i64 = -62_135_596_800;
 /// Maximum valid Proto3 `Timestamp` seconds (`9999-12-31T23:59:59Z`).
-pub(crate) const MAX_TIMESTAMP_SECONDS: i64 = 253_402_300_799;
+pub const MAX_TIMESTAMP_SECONDS: i64 = 253_402_300_799;
 
 const NANOS_PER_SECOND: i128 = 1_000_000_000;
 /// Minimum valid Proto3 `Timestamp` Unix nanoseconds (`0001-01-01T00:00:00.000000000Z`).
@@ -103,6 +107,21 @@ impl Timestamp {
         }
         let nanos = i128::from(self.seconds) * NANOS_PER_SECOND + i128::from(self.nanos);
         Ok(nanos.to_be_bytes().to_vec())
+    }
+
+    /// Formats this timestamp as UTC `YYYYMMDDTHHMMSSZ`, falling back to Unix epoch
+    /// (`19700101T000000Z`) when outside Proto3 `0001-01-01T00:00:00Z`..=
+    /// `9999-12-31T23:59:59.999999999Z` range or when nanoseconds are out of range.
+    pub fn format_utc_compact(self) -> String {
+        const COMPACT_UTC_FORMAT: &[FormatItem<'static>] =
+            format_description!("[year][month][day]T[hour][minute][second]Z");
+        let dt = if (MIN_TIMESTAMP_SECONDS..=MAX_TIMESTAMP_SECONDS).contains(&self.seconds) {
+            OffsetDateTime::try_from(self).unwrap_or(OffsetDateTime::UNIX_EPOCH)
+        } else {
+            OffsetDateTime::UNIX_EPOCH
+        };
+        dt.format(COMPACT_UTC_FORMAT)
+            .expect("valid UTC timestamp format")
     }
 }
 
@@ -401,6 +420,61 @@ mod tests {
             nanos:   0,
         };
         expect_that!(timestamp, displays_as(eq("<Timestamp outside common era>")));
+    }
+
+    #[gtest]
+    fn timestamp_format_utc_compact() {
+        let timestamp: Timestamp = datetime!(2026-11-26 09:05:06.123456789 UTC).into();
+        expect_eq!(timestamp.format_utc_compact(), "20261126T090506Z");
+
+        let min_ts = Timestamp {
+            seconds: -62_135_596_800,
+            nanos:   0,
+        };
+        expect_eq!(min_ts.format_utc_compact(), "00010101T000000Z");
+
+        let max_ts = Timestamp {
+            seconds: 253_402_300_799,
+            nanos:   999_999_999,
+        };
+        expect_eq!(max_ts.format_utc_compact(), "99991231T235959Z");
+
+        for out_of_range in [
+            Timestamp {
+                seconds: i64::MAX,
+                nanos:   0,
+            },
+            Timestamp {
+                seconds: i64::MIN,
+                nanos:   0,
+            },
+            Timestamp {
+                seconds: MIN_TIMESTAMP_SECONDS - 1,
+                nanos:   999_999_999,
+            },
+            Timestamp {
+                seconds: MIN_TIMESTAMP_SECONDS - 1,
+                nanos:   0,
+            },
+            Timestamp {
+                seconds: -62_167_219_200,
+                nanos:   0,
+            },
+            Timestamp {
+                seconds: MAX_TIMESTAMP_SECONDS + 1,
+                nanos:   0,
+            },
+            Timestamp {
+                seconds: 1_700_000_000,
+                nanos:   -1,
+            },
+            Timestamp {
+                seconds: 1_700_000_000,
+                nanos:   1_000_000_000,
+            },
+        ] {
+            expect_eq!(out_of_range.format_utc_compact(), "19700101T000000Z");
+        }
     }
 
     mod proptests {

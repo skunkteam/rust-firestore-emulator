@@ -1,12 +1,15 @@
 use std::{cell::RefCell, collections::HashMap, future::Future};
 
-use googleapis::google::{
-    firestore::v1::{
-        Value,
-        structured_query::{field_filter, unary_filter},
+use googleapis::{
+    MAX_TIMESTAMP_SECONDS, MIN_TIMESTAMP_SECONDS,
+    google::{
+        firestore::v1::{
+            Value,
+            structured_query::{field_filter, unary_filter},
+        },
+        protobuf::Timestamp,
+        r#type::LatLng,
     },
-    protobuf::Timestamp,
-    r#type::LatLng,
 };
 use proptest::{prelude::*, sample::select};
 
@@ -17,11 +20,6 @@ use super::{
     client::TestDb,
     env::{DOCUMENTS_ROOT, TestEnv},
 };
-
-/// Minimum valid Proto3 `Timestamp` seconds (`0001-01-01T00:00:00Z`).
-const MIN_TIMESTAMP_SECONDS: i64 = -62_135_596_800;
-/// Maximum valid Proto3 `Timestamp` seconds (`9999-12-31T23:59:59Z`).
-const MAX_TIMESTAMP_SECONDS: i64 = 253_402_300_799;
 
 /// Fixed 16-ID vocabulary preventing unbounded `string_cache::DefaultAtom` global interning across
 /// multi-case `proptest` suites.

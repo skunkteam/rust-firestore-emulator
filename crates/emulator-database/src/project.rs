@@ -1,15 +1,34 @@
-use std::{collections::HashMap, ops::Deref, sync::Arc};
+use std::{
+    collections::{BTreeSet, HashMap},
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+};
 
-use googleapis::google::firestore::v1::{ListenRequest, ListenResponse};
-use tokio::sync::{RwLock, broadcast};
-use tokio_stream::Stream;
+use bytes::Bytes;
+use googleapis::google::{
+    firestore::v1::{ListenRequest, ListenResponse},
+    protobuf::Timestamp,
+};
+use tokio::sync::{Mutex, RwLock, broadcast};
+use tokio_stream::{Stream, StreamExt};
 use tracing::{Level, debug, instrument};
 
 use crate::{
     ContentionSnapshot, ContentionSseEvent, ContentionSubscription, DatabaseContentionSnapshot,
-    FirestoreDatabase, config::FirestoreConfig, database::lock::ContentionBroadcaster,
-    error::Result, event::ProjectEvent, listener::Listener, reference::RootRef, timeouts::Timeouts,
-    utils::RwLockHashMapExt,
+    DatabaseEdition, FirestoreDatabase, GenericDatabaseError,
+    config::FirestoreConfig,
+    database::lock::ContentionBroadcaster,
+    error::Result,
+    event::ProjectEvent,
+    listener::Listener,
+    reference::RootRef,
+    snapshot::{
+        ExportSnapshotPlan, ExportTarget, ImportSummary, ImportedDatabase, SnapshotError,
+        codec::SnapshotDecoder,
+    },
+    timeouts::Timeouts,
 };
 
 const MAX_PROJECT_EVENT_BACKLOG: usize = 1024;
@@ -20,6 +39,8 @@ pub struct FirestoreProject {
     databases: RwLock<HashMap<RootRef, Arc<FirestoreDatabase>>>,
     events: broadcast::Sender<ProjectEvent>,
     contention: ContentionBroadcaster,
+    import_lock: Mutex<()>,
+    next_import_id: AtomicU64,
 }
 
 // A lot of structs refer back to FirestoreProject, so make sure not to print them out in Debug to
@@ -56,6 +77,8 @@ impl FirestoreProject {
             databases: Default::default(),
             events: broadcast::channel(MAX_PROJECT_EVENT_BACKLOG).0,
             contention: ContentionBroadcaster::new(),
+            import_lock: Mutex::new(()),
+            next_import_id: AtomicU64::new(1),
         }
     }
 
@@ -129,9 +152,11 @@ impl FirestoreProject {
     ///
     /// All documents and collections will be lost. Active transactions will fail with ABORTED.
     ///
-    /// Listeners that are still actively listening to this database will automatically reconnect
-    /// to a new database with the same name, so all activity on the same database will still be
-    /// observed by these listeners.
+    /// Compatible listeners that are still actively listening to this database will automatically
+    /// reconnect to a new or replacement database with the same name, so all activity on that
+    /// database will still be observed. Query listeners whose query edition no longer matches the
+    /// replacement (or project default) database edition terminate with `FAILED_PRECONDITION`
+    /// without lazily re-creating an edition-mismatched database.
     #[instrument(level = Level::DEBUG)]
     pub async fn clear_database(&self, name: &RootRef) {
         let mut databases = self.databases.write().await;
@@ -157,19 +182,44 @@ impl FirestoreProject {
         self.databases.read().await.get(name).cloned()
     }
 
+    async fn get_or_create_database_with(
+        &'static self,
+        name: &RootRef,
+        required_edition: Option<DatabaseEdition>,
+    ) -> std::result::Result<Arc<FirestoreDatabase>, DatabaseEdition> {
+        if let Some(db) = self.databases.read().await.get(name) {
+            return Ok(Arc::clone(db));
+        }
+        let mut databases = self.databases.write().await;
+        if let Some(db) = databases.get(name) {
+            return Ok(Arc::clone(db));
+        }
+        let default_edition = DatabaseEdition::from_enterprise(self.default_enterprise);
+        if required_edition.is_some_and(|req| req != default_edition) {
+            return Err(default_edition);
+        }
+        let db = FirestoreDatabase::new(self, name.clone(), self.default_enterprise);
+        self.send_project_event(ProjectEvent::DatabaseCreated {
+            database:  name.clone(),
+            import_id: None,
+        });
+        databases.insert(name.clone(), Arc::clone(&db));
+        Ok(db)
+    }
+
     pub async fn database(&'static self, name: &RootRef) -> Arc<FirestoreDatabase> {
-        Arc::clone(
-            self.databases
-                .get_or_insert(name, || {
-                    let db = FirestoreDatabase::new(self, name.clone(), self.default_enterprise);
-                    self.send_project_event(ProjectEvent::DatabaseCreated {
-                        database: name.clone(),
-                    });
-                    db
-                })
-                .await
-                .deref(),
-        )
+        self.get_or_create_database_with(name, None)
+            .await
+            .expect("unconditional database creation cannot mismatch edition")
+    }
+
+    pub(crate) async fn database_for_listener(
+        &'static self,
+        name: &RootRef,
+        required_edition: Option<DatabaseEdition>,
+    ) -> std::result::Result<Arc<FirestoreDatabase>, DatabaseEdition> {
+        self.get_or_create_database_with(name, required_edition)
+            .await
     }
 
     pub async fn database_names(&self) -> Vec<RootRef> {
@@ -187,184 +237,120 @@ impl FirestoreProject {
     ) -> impl Stream<Item = Result<ListenResponse>> {
         Listener::start(self, request_stream)
     }
+
+    pub async fn prepare_export(
+        &self,
+        targets: Option<&[RootRef]>,
+    ) -> std::result::Result<ExportSnapshotPlan, GenericDatabaseError> {
+        let databases = self.databases.read().await;
+        let export_targets = match targets {
+            Some(roots) => {
+                let unique: BTreeSet<&RootRef> = roots.iter().collect();
+                let mut resolved = Vec::with_capacity(unique.len());
+                for root in unique {
+                    let db = databases.get(root).ok_or_else(|| {
+                        GenericDatabaseError::not_found(format!("database not found: {root}"))
+                    })?;
+                    resolved.push(ExportTarget {
+                        database: Arc::clone(db),
+                        settings: db.settings(),
+                    });
+                }
+                resolved
+            }
+            None => {
+                let mut all: Vec<ExportTarget> = databases
+                    .values()
+                    .map(|db| ExportTarget {
+                        database: Arc::clone(db),
+                        settings: db.settings(),
+                    })
+                    .collect();
+                all.sort_by(|a, b| a.database.name.cmp(&b.database.name));
+                all
+            }
+        };
+        let snapshot_time = Timestamp::now();
+        drop(databases);
+        Ok(ExportSnapshotPlan::new(snapshot_time, export_targets))
+    }
+
+    pub async fn import_snapshot(
+        &'static self,
+        mut stream: impl Stream<Item = std::result::Result<Bytes, SnapshotError>> + Unpin,
+    ) -> std::result::Result<ImportSummary, SnapshotError> {
+        let _import_guard = self
+            .import_lock
+            .try_lock()
+            .map_err(|_| SnapshotError::ImportInProgress)?;
+
+        let mut decoder = SnapshotDecoder::new();
+        while let Some(chunk_res) = stream.next().await {
+            let chunk = chunk_res?;
+            decoder.feed(&chunk)?;
+        }
+        let prepared = decoder.finish()?;
+        if prepared.is_empty() {
+            return Ok(ImportSummary {
+                databases: Vec::new(),
+                import_id: None,
+            });
+        }
+
+        let import_id = self.next_import_id.fetch_add(1, Ordering::Relaxed);
+        let mut replaced_dbs = Vec::new();
+        let mut summary_dbs = Vec::with_capacity(prepared.len());
+
+        {
+            let mut databases = self.databases.write().await;
+
+            for db_spec in &prepared {
+                if let Some(old_db) = databases.get(db_spec.name()) {
+                    old_db.mark_cleared();
+                }
+            }
+
+            let import_time = Timestamp::now();
+
+            for db_spec in prepared {
+                let (root, settings, document_count, new_db) =
+                    db_spec.into_database(self, import_time);
+                let old_db = databases.insert(root.clone(), new_db);
+                let replaced = old_db.is_some();
+                if let Some(old_db) = old_db {
+                    replaced_dbs.push(old_db);
+                    self.send_project_event(ProjectEvent::DatabaseReplaced {
+                        database: root.clone(),
+                        import_id,
+                    });
+                    self.contention
+                        .send_if_subscribed(|| ContentionSseEvent::DatabaseCleared {
+                            database: root.clone(),
+                        });
+                } else {
+                    self.send_project_event(ProjectEvent::DatabaseCreated {
+                        database:  root.clone(),
+                        import_id: Some(import_id),
+                    });
+                }
+                summary_dbs.push(ImportedDatabase {
+                    name: root,
+                    settings,
+                    document_count,
+                    replaced,
+                });
+            }
+        }
+
+        drop(replaced_dbs);
+        drop(_import_guard);
+
+        Ok(ImportSummary {
+            databases: summary_dbs,
+            import_id: Some(import_id),
+        })
+    }
 }
 
 #[cfg(test)]
-mod tests {
-    use std::{collections::HashMap, sync::Arc};
-
-    use googleapis::google::firestore::v1::{Document, Value, Write, write};
-    use tokio::sync::broadcast::error::RecvError;
-
-    use super::*;
-    use crate::{GenericDatabaseError, reference::DocumentRef};
-
-    #[tokio::test]
-    async fn clear_database_closes_events_and_suppresses_stale_inflight_emissions() {
-        let project: &'static FirestoreProject =
-            Box::leak(Box::new(FirestoreProject::new(FirestoreConfig::default())));
-        let root: RootRef = "projects/p/databases/(default)".parse().unwrap();
-        let mut proj_rx = project.subscribe_project_events();
-
-        let db1 = project.database(&root).await;
-        let mut db_rx = db1.subscribe();
-
-        // Drain initial DatabaseCreated.
-        assert!(matches!(
-            proj_rx.try_recv().unwrap(),
-            ProjectEvent::DatabaseCreated { .. }
-        ));
-
-        // Clear while `db1` still has an extra `Arc` held (simulating an in-flight RPC).
-        project.clear_database(&root).await;
-
-        // 1. DatabaseEvent channel closes immediately without waiting for `db1` Arc drop.
-        assert!(matches!(db_rx.recv().await, Err(RecvError::Closed)));
-
-        // 2. DatabaseCleared is emitted before any subsequent DatabaseCreated.
-        assert!(matches!(
-            proj_rx.try_recv().unwrap(),
-            ProjectEvent::DatabaseCleared { .. }
-        ));
-
-        // 3. Stale writes/commits/config changes on cleared `db1` fail or emit no project events.
-        let doc_ref: DocumentRef = "projects/p/databases/(default)/documents/c/d"
-            .parse()
-            .unwrap();
-        let write_err = db1
-            .write(Write {
-                operation: Some(write::Operation::Update(Document {
-                    name: doc_ref.to_string(),
-                    fields: HashMap::from([("k".to_string(), Value::integer(1))]),
-                    ..Default::default()
-                })),
-                ..Default::default()
-            })
-            .await
-            .unwrap_err();
-        assert!(matches!(write_err, GenericDatabaseError::Aborted(_)));
-
-        db1.set_enterprise_edition(true);
-        db1.set_optimistic_concurrency(true);
-        assert!(proj_rx.try_recv().is_err());
-
-        // 4. Recreating the database emits DatabaseCreated strictly after DatabaseCleared.
-        let db2 = project.database(&root).await;
-        assert!(!Arc::ptr_eq(&db1, &db2));
-        assert!(matches!(
-            proj_rx.try_recv().unwrap(),
-            ProjectEvent::DatabaseCreated { .. }
-        ));
-    }
-
-    #[tokio::test]
-    async fn clear_database_and_database_creation_preserve_event_order() {
-        let project: &'static FirestoreProject =
-            Box::leak(Box::new(FirestoreProject::new(FirestoreConfig::default())));
-        let root: RootRef = "projects/p/databases/(default)".parse().unwrap();
-        let mut proj_rx = project.subscribe_project_events();
-
-        drop(project.database(&root).await);
-        assert!(matches!(
-            proj_rx.try_recv().unwrap(),
-            ProjectEvent::DatabaseCreated { .. }
-        ));
-
-        let mut exists = true;
-        for _ in 0..32 {
-            let root_a = root.clone();
-            let root_b = root.clone();
-            tokio::join!(project.clear_database(&root_a), async move {
-                let _db = project.database(&root_b).await;
-            });
-            while let Ok(ev) = proj_rx.try_recv() {
-                match ev {
-                    ProjectEvent::DatabaseCleared { .. } => {
-                        assert!(exists, "DatabaseCleared emitted when DB was absent");
-                        exists = false;
-                    }
-                    ProjectEvent::DatabaseCreated { .. } => {
-                        assert!(!exists, "DatabaseCreated emitted while DB already existed");
-                        exists = true;
-                    }
-                    _ => {}
-                }
-            }
-        }
-    }
-
-    #[tokio::test]
-    async fn clear_database_emits_contention_database_cleared_and_suppresses_stale_emissions() {
-        use std::task::Poll;
-
-        use futures_util::poll;
-        use tokio::sync::broadcast::error::TryRecvError;
-
-        use crate::database::lock::{ContentionSseEvent, LockPriority, SessionKind};
-
-        let project: &'static FirestoreProject =
-            Box::leak(Box::new(FirestoreProject::new(FirestoreConfig::default())));
-        let root: RootRef = "projects/p/databases/(default)".parse().unwrap();
-        let db1 = project.database(&root).await;
-
-        let mut sub = project.subscribe_contention_events();
-        assert_eq!(project.contention_subscriber_count(), 1);
-
-        let d1: DocumentRef = "projects/p/databases/(default)/documents/c/d"
-            .parse()
-            .unwrap();
-        let holder = db1.locks.new_session(
-            None,
-            SessionKind::SingleWrite,
-            LockPriority::NextSeq,
-            false,
-            false,
-        );
-        let held = holder.acquire_write(&d1).await.unwrap();
-        let waiter = db1.locks.new_session(
-            None,
-            SessionKind::PointRead,
-            LockPriority::NextSeq,
-            false,
-            false,
-        );
-        let mut wait_fut = Box::pin(waiter.acquire_read(&d1));
-        assert!(matches!(poll!(&mut wait_fut), Poll::Pending));
-
-        assert_eq!(
-            sub.rx.try_recv().unwrap(),
-            ContentionSseEvent::ContentionChanged {
-                database: root.clone(),
-            }
-        );
-
-        project.clear_database(&root).await;
-        assert_eq!(
-            sub.rx.try_recv().unwrap(),
-            ContentionSseEvent::DatabaseCleared {
-                database: root.clone(),
-            }
-        );
-
-        // Waiter unblocked by DatabaseCleared; releasing/closing on cleared db1 must not emit stale
-        // SSE.
-        assert!(wait_fut.await.is_err());
-        drop(held);
-        holder.close();
-        waiter.close();
-        assert!(matches!(sub.rx.try_recv(), Err(TryRecvError::Empty)));
-
-        // Snapshot on absent cleared DB returns empty without creating a DB.
-        assert!(
-            project
-                .contention_snapshot(Some(&root))
-                .await
-                .databases
-                .is_empty()
-        );
-        assert!(matches!(sub.rx.try_recv(), Err(TryRecvError::Empty)));
-
-        drop(sub);
-        assert_eq!(project.contention_subscriber_count(), 0);
-    }
-}
+mod tests;

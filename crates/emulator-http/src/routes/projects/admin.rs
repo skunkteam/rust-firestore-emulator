@@ -1,23 +1,12 @@
 use axum::{Json, extract::State, http::Uri};
-use emulator_database::{FirestoreProject, reference::RootRef};
+use emulator_database::{
+    DatabaseConcurrencyMode, DatabaseEdition, DatabaseSettings, FirestoreDatabase,
+    FirestoreProject, reference::RootRef,
+};
 use serde::{Deserialize, Serialize};
 
-use super::{parse_raw_root_ref, query_params::percent_decode};
+use super::{parse_query_pairs, parse_raw_root_ref};
 use crate::error::{ApiJson, RestError, Result};
-
-#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
-#[serde(rename_all = "UPPERCASE")]
-enum DatabaseEdition {
-    Standard,
-    Enterprise,
-}
-
-#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
-#[serde(rename_all = "UPPERCASE")]
-enum ConcurrencyMode {
-    Pessimistic,
-    Optimistic,
-}
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -26,11 +15,11 @@ pub(super) struct DatabaseMetadata {
     uid: &'static str,
     r#type: &'static str,
     database_edition: DatabaseEdition,
-    concurrency_mode: ConcurrencyMode,
+    concurrency_mode: DatabaseConcurrencyMode,
 }
 
 impl DatabaseMetadata {
-    fn new(name: &RootRef, enterprise_edition: bool, optimistic_concurrency: bool) -> Self {
+    fn new(name: &RootRef, settings: DatabaseSettings) -> Self {
         Self {
             name: format!(
                 "projects/{}/databases/{}",
@@ -38,16 +27,8 @@ impl DatabaseMetadata {
             ),
             uid: "emulator-uid",
             r#type: "FIRESTORE_NATIVE",
-            database_edition: if enterprise_edition {
-                DatabaseEdition::Enterprise
-            } else {
-                DatabaseEdition::Standard
-            },
-            concurrency_mode: if optimistic_concurrency {
-                ConcurrencyMode::Optimistic
-            } else {
-                ConcurrencyMode::Pessimistic
-            },
+            database_edition: settings.edition,
+            concurrency_mode: settings.concurrency_mode,
         }
     }
 }
@@ -58,7 +39,7 @@ pub(super) struct PatchDatabase {
     #[serde(alias = "database_edition")]
     database_edition: Option<DatabaseEdition>,
     #[serde(alias = "concurrency_mode")]
-    concurrency_mode: Option<ConcurrencyMode>,
+    concurrency_mode: Option<DatabaseConcurrencyMode>,
     #[serde(alias = "firestore_data_access_mode")]
     firestore_data_access_mode: Option<serde_json::Value>,
     #[serde(alias = "mongodb_compatible_data_access_mode")]
@@ -74,11 +55,7 @@ pub(super) async fn get_database(
     let name = parse_raw_root_ref(uri.path())?;
 
     let db = project.database(&name).await;
-    Ok(Json(DatabaseMetadata::new(
-        &name,
-        db.enterprise_edition(),
-        db.optimistic_concurrency(),
-    )))
+    Ok(Json(DatabaseMetadata::new(&name, db.settings())))
 }
 
 pub(super) async fn patch_database(
@@ -110,9 +87,22 @@ pub(super) async fn patch_database(
     }
 
     let db = project.database(&name).await;
+    Ok(Json(apply_database_patch(
+        &db,
+        &name,
+        &payload,
+        update_mask.as_ref(),
+    )?))
+}
 
-    let apply_edition = update_mask.as_ref().is_none_or(|m| m.database_edition);
-    let apply_concurrency = update_mask.as_ref().is_none_or(|m| m.concurrency_mode);
+fn apply_database_patch(
+    db: &FirestoreDatabase,
+    name: &RootRef,
+    payload: &PatchDatabase,
+    update_mask: Option<&PatchDatabaseMask>,
+) -> Result<DatabaseMetadata> {
+    let apply_edition = update_mask.is_none_or(|m| m.database_edition);
+    let apply_concurrency = update_mask.is_none_or(|m| m.concurrency_mode);
 
     let effective_edition = if apply_edition {
         payload.database_edition
@@ -125,26 +115,22 @@ pub(super) async fn patch_database(
         None
     };
 
-    let prev_enterprise = db.enterprise_edition();
-    let target_enterprise = effective_edition
-        .map(|edition| matches!(edition, DatabaseEdition::Enterprise))
-        .unwrap_or(prev_enterprise);
-    let target_optimistic = if let Some(mode) = effective_concurrency {
-        matches!(mode, ConcurrencyMode::Optimistic)
-    } else if target_enterprise != prev_enterprise {
-        // Derive optimistic concurrency mode automatically when edition changes
-        target_enterprise
-    } else {
-        db.optimistic_concurrency()
-    };
+    let settings = db.try_update_settings(|settings| {
+        if let Some(edition) = effective_edition
+            && edition != settings.edition
+        {
+            settings.edition = edition;
+            if effective_concurrency.is_none() {
+                // Derive optimistic concurrency mode automatically when edition changes
+                settings.concurrency_mode = DatabaseSettings::for_edition(edition).concurrency_mode;
+            }
+        }
+        if let Some(mode) = effective_concurrency {
+            settings.concurrency_mode = mode;
+        }
+    })?;
 
-    db.set_config(target_enterprise, target_optimistic);
-
-    Ok(Json(DatabaseMetadata::new(
-        &name,
-        db.enterprise_edition(),
-        db.optimistic_concurrency(),
-    )))
+    Ok(DatabaseMetadata::new(name, settings))
 }
 
 #[derive(Debug, Default)]
@@ -159,13 +145,7 @@ fn parse_patch_database_mask(raw_query: Option<&str>) -> Result<Option<PatchData
     };
     let mut mask = PatchDatabaseMask::default();
     let mut saw_mask = false;
-    for pair in query.split('&') {
-        if pair.is_empty() {
-            continue;
-        }
-        let (raw_k, raw_v) = pair.split_once('=').unwrap_or((pair, ""));
-        let key = percent_decode(raw_k)?;
-        let val = percent_decode(raw_v)?;
+    for (key, val) in parse_query_pairs(query)? {
         if matches!(
             key.as_str(),
             "updateMask" | "update_mask" | "updateMask.paths" | "update_mask.paths"
@@ -201,4 +181,58 @@ fn parse_patch_database_mask(raw_query: Option<&str>) -> Result<Option<PatchData
         }
     }
     Ok(saw_mask.then_some(mask))
+}
+
+#[cfg(test)]
+mod tests {
+    use axum::{body::to_bytes, http::StatusCode, response::IntoResponse};
+    use emulator_database::{config::FirestoreConfig, snapshot::SnapshotError};
+    use tokio_stream::StreamExt;
+
+    use super::*;
+
+    async fn assert_409_aborted(err: RestError) {
+        let resp = err.into_response();
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["error"]["code"], 409);
+        assert_eq!(json["error"]["status"], "ABORTED");
+    }
+
+    #[tokio::test]
+    async fn apply_database_patch_returns_409_aborted_when_cleared_or_replaced() {
+        let project: &'static FirestoreProject =
+            Box::leak(Box::new(FirestoreProject::new(FirestoreConfig::default())));
+        let name: RootRef = "projects/p/databases/(default)".parse().unwrap();
+        let payload = PatchDatabase {
+            database_edition: Some(DatabaseEdition::Enterprise),
+            concurrency_mode: None,
+            firestore_data_access_mode: None,
+            mongodb_compatible_data_access_mode: None,
+            realtime_updates_mode: None,
+        };
+
+        // 1. Cleared database handle returns 409 Conflict (ABORTED).
+        let cleared_db = project.database(&name).await;
+        project.clear_database(&name).await;
+        let err = apply_database_patch(&cleared_db, &name, &payload, None)
+            .err()
+            .expect("patching a cleared database handle must abort");
+        assert_409_aborted(err).await;
+
+        // 2. Database handle replaced by snapshot import returns 409 Conflict (ABORTED).
+        let replaced_db = project.database(&name).await;
+        let snap_stream = project
+            .prepare_export(None)
+            .await
+            .unwrap()
+            .into_stream()
+            .map(|res| res.map_err(|err| SnapshotError::Stream(err.to_string())));
+        project.import_snapshot(snap_stream).await.unwrap();
+        let err = apply_database_patch(&replaced_db, &name, &payload, None)
+            .err()
+            .expect("patching a database handle replaced by import must abort");
+        assert_409_aborted(err).await;
+    }
 }

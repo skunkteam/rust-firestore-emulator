@@ -29,14 +29,7 @@ impl DocumentQueryParams {
             return Ok(Self::default());
         };
         let mut params = Self::default();
-        for pair in query.split('&') {
-            if pair.is_empty() {
-                continue;
-            }
-            let (raw_k, raw_v) = pair.split_once('=').unwrap_or((pair, ""));
-            let key = percent_decode(raw_k)?;
-            let val = percent_decode(raw_v)?;
-
+        for (key, val) in parse_query_pairs(query)? {
             match key.as_str() {
                 "documentId" | "document_id" => params.document_id = Some(val),
                 "pageSize" | "page_size" => {
@@ -176,6 +169,20 @@ pub(in crate::routes) fn decode_raw_path_segments(raw_path: &str) -> Result<Stri
         decoded_segments.push(seg);
     }
     Ok(decoded_segments.join("/"))
+}
+
+pub(in crate::routes) fn parse_query_pairs(raw_query: &str) -> Result<Vec<(String, String)>> {
+    let mut pairs = Vec::new();
+    for pair in raw_query.split('&') {
+        if pair.is_empty() {
+            continue;
+        }
+        let (raw_k, raw_v) = pair.split_once('=').unwrap_or((pair, ""));
+        let key = percent_decode(raw_k)?;
+        let val = percent_decode(raw_v)?;
+        pairs.push((key, val));
+    }
+    Ok(pairs)
 }
 
 pub(in crate::routes) fn percent_decode(input: &str) -> Result<String> {
